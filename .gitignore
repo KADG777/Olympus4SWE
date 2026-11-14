@@ -1,0 +1,17 @@
+# Local reference materials (kept local, not tracked in git)
+docs/references/
+
+# Python / uv / local artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.olympus/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
