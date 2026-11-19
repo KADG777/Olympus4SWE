@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Any, ClassVar, Literal, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -708,6 +708,15 @@ class ApprovalRecord(StrictModel):
         if self.decision == ApprovalDecision.ACCEPT_RISK and not self.reason.strip():
             raise ValueError("ACCEPT_RISK requires an explicit non-empty reason")
         return self
+
+
+class ProviderTimeoutRetry(StrictModel):
+    event_type: ClassVar[str] = "task.provider_timeout_retry"
+
+    retry_id: str
+    task_id: str
+    lease_generation: int = Field(ge=1)
+    phase: Literal["started", "recovered", "failed"]
 
 
 class RunEvent(StrictModel):

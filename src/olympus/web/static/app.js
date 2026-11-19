@@ -113,6 +113,9 @@
     design_spec_ready: "DesignSpec 就绪",
   };
 
+  const RETRY_MESSAGE = "调用超时，正在自动重试";
+  const RETRY_NEXT_STEP = "等待本次调用返回";
+
   const WORKFLOW_LABELS = {
     product_blueprint: "产品蓝图",
     full_sdlc_tdd: "全流程 TDD",
@@ -438,9 +441,10 @@
   }
 
   function renderBanner(projection) {
-    const banner = projection.hitl_banner;
+    const blocker = taskBlocker(projection);
+    const banner = blocker || projection.hitl_banner;
     const hasGate = renderGateActions(projection);
-    el.taskActions.hidden = !(banner && banner.kind === "task_blocked");
+    el.taskActions.hidden = !blocker;
     if (!banner && !hasGate) {
       el.banner.hidden = true;
       return;
@@ -450,15 +454,15 @@
     const tone = el.banner.dataset.tone;
     const glyph =
       tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
-    const headline = banner
-      ? banner.headline
-      : "候选版本待批准";
+    const headline = banner?.headline || "候选版本待批准";
     const hasGoalReview = state.approvalSnapshot.reviews.has("approve_spec");
-    const detail = hasGoalReview && banner?.detail === projection.spec?.goal ? "" : banner?.detail;
+    const detail = blocker
+      ? `受影响任务：${blocker.affected_task_ids.join("、")}。原因：${blocker.detail}`
+      : hasGoalReview && banner?.detail === projection.spec?.goal ? "" : banner?.detail;
     const cleanDetail = String(detail || "")
       .replace(/\s*\n+\s*/g, "，")
       .trim();
-    const localized = cleanDetail ? localizeError(cleanDetail) : "";
+    const localized = blocker ? cleanDetail : localizeError(cleanDetail);
     el.bannerHeadline.innerHTML = `<span aria-hidden="true">${glyph}</span><span>${esc(
       headline
     )}</span>`;
@@ -1119,6 +1123,9 @@
   }
 
   function renderDag(projection) {
+    const focusedTaskId = el.dag.contains(document.activeElement)
+      ? document.activeElement.dataset.taskId
+      : null;
     const nodes = projection.dag.nodes || [];
     const edges = projection.dag.edges || [];
     if (!nodes.length) {
@@ -1190,23 +1197,36 @@
         const meta = statusMeta(displayStatus, node.accepted_risk_reason);
         const selected = node.task_id === state.selectedTaskId ? "true" : "false";
         const centerX = pos.x + nodeWidth / 2;
+        const dependencyBlocked = Boolean(node.blocked_by?.length);
+        const issue = node.provider_retry ? "retry" : dependencyBlocked ? "dependency" : "";
+        const context = node.provider_retry
+          ? RETRY_MESSAGE
+          : `${node.role || "engineer"} · ${node.kind || "implement"}`;
+        const status = node.provider_retry
+          ? RETRY_NEXT_STEP
+          : dependencyBlocked ? "依赖受阻" : `${meta.glyph} ${meta.label}`;
+        const accessibleStatus = node.provider_retry ? `${context}，${status}` : status;
         return `<g class="dag-node" data-task-id="${esc(node.task_id)}" data-status="${esc(
           displayStatus
-        )}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
+        )}" data-issue="${issue}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
           node.task_id
-        )} ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
+        )} ${esc(accessibleStatus)}"><rect class="dag-node-box" x="${pos.x}" y="${
           pos.y
         }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
           pos.y + 22
         }" text-anchor="middle">${esc(node.task_id)}</text><text class="dag-node-kind" x="${centerX}" y="${
           pos.y + 38
-        }" text-anchor="middle">${esc(node.role || "engineer")} · ${esc(node.kind || "implement")}</text><text class="dag-node-meta" x="${centerX}" y="${
+        }" text-anchor="middle">${esc(context)}</text><text class="dag-node-meta" x="${centerX}" y="${
           pos.y + 54
-        }" text-anchor="middle">${meta.glyph} ${esc(meta.label)}</text></g>`;
+        }" text-anchor="middle">${esc(status)}</text></g>`;
       })
       .join("");
 
     el.dag.innerHTML = defs + paths + shapes;
+    if (focusedTaskId) {
+      el.dag.querySelector(`[data-task-id="${CSS.escape(focusedTaskId)}"]`)
+        ?.focus({ preventScroll: true });
+    }
   }
 
   function renderLanes(projection) {
@@ -1403,6 +1423,10 @@
     }
 
     if (state.activeTab === "events") {
+      const retryLabels = { started: RETRY_MESSAGE, recovered: "重试成功，调用已恢复", failed: "本次自动重试失败" };
+      const retryRows = (task.provider_retry_history || []).slice().reverse().map((event) =>
+        uiRow(`#${event.event_seq} · ${event.actor}`, esc(retryLabels[event.phase]))
+      ).join("");
       const rows = (projection.events || [])
         .slice()
         .reverse()
@@ -1415,7 +1439,8 @@
             )}</span></div>`
         )
         .join("");
-      return `<div class="event-log scroller">${rows || uiNotice("info", "暂无事件")}</div>`;
+      const retryHistory = retryRows ? uiCard("调用重试记录", `<div class="kv">${retryRows}</div>`) : "";
+      return `${retryHistory}<div class="event-log scroller">${rows || uiNotice("info", "暂无事件")}</div>`;
     }
 
     const checks = (task.acceptance_checks || [])
@@ -1434,6 +1459,16 @@
     ].join("");
 
     return [
+      task.provider_retry ? uiNotice("warn", `${RETRY_MESSAGE}。下一步：${RETRY_NEXT_STEP}。`) : "",
+      task.blocker
+        ? uiNotice("bad", `受影响任务：${esc(task.blocker.affected_task_ids.join("、"))}。原因：${esc(task.blocker.detail)}`)
+        : "",
+      ...(task.blocked_by || []).map((taskId) => {
+        const blocker = projection.dag.nodes.find((node) => node.task_id === taskId)?.blocker;
+        if (!blocker) return "";
+        return uiNotice("bad", `依赖任务 ${esc(taskId)} 受阻：${esc(blocker.detail)}`,
+          `<button type="button" class="btn" data-blocker-task-id="${esc(taskId)}">查看 ${esc(taskId)} 的处理操作</button>`);
+      }),
       uiCard("执行概览", `<div class="kv">${rows}</div>`),
       task.accepted_risk_reason
         ? uiNotice("warn", `未验证 · 人工接受：${esc(task.accepted_risk_reason)}`)
@@ -1732,6 +1767,7 @@
     state.workflowNode = null;
     state.selectedTaskId = taskId;
     state.userOpenedDock = true;
+    renderBanner(state.projection);
     renderWorkflow(state.projection);
     renderDag(state.projection);
     renderLanes(state.projection);
@@ -2096,9 +2132,15 @@
     el.dialog.showModal();
   }
 
+  function taskBlocker(projection) {
+    const banner = projection?.hitl_banner;
+    if (banner?.kind !== "task_blocked") return null;
+    const selected = projection.dag.nodes.find((node) => node.task_id === state.selectedTaskId);
+    return selected?.blocker || banner;
+  }
+
   function bannerTaskId() {
-    const banner = state.projection ? state.projection.hitl_banner : null;
-    return (banner && banner.task_id) || state.selectedTaskId;
+    return taskBlocker(state.projection)?.task_id;
   }
 
   async function openOutput(output) {
@@ -2407,6 +2449,12 @@
     });
 
     el.dock.addEventListener("click", (event) => {
+      const blockerButton = event.target.closest("[data-blocker-task-id]");
+      if (blockerButton) {
+        selectTask(blockerButton.dataset.blockerTaskId);
+        document.getElementById("btn-banner-retry").focus();
+        return;
+      }
       const tab = event.target.closest("[data-tab]");
       if (!tab || !state.projection) return;
       state.activeTab = tab.dataset.tab;

@@ -672,6 +672,8 @@ class OrchestrateStage:
             actor=f"argus:{task.task_id}",
             max_steps=8,
             trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
+            lease_generation=task.lease_generation,
+            task_id=task.task_id,
         )
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
@@ -783,6 +785,7 @@ class OrchestrateStage:
                 trace_path=art_dir / "worker.jsonl",
                 synthesize_on_max_steps=True,
                 task_id=leased.task_id,
+                lease_generation=leased.lease_generation,
                 pre_tool_hook=default_write_scope_hook(
                     leased.write_scope,
                     forbidden_globs=forbidden_contracts,

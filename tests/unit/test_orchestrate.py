@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -593,3 +594,175 @@ def test_propose_plan_repairs_broken_inline_python_check_via_validation_loop(
     assert "[PLAN VALIDATION FAILED]" in calls[1]
     assert "invalid Python syntax" in calls[1]
     assert plan.tasks[0].acceptance_checks[0].command == "python -m pytest -q"
+
+
+def test_timeout_retry_is_visible_while_an_independent_task_completes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[
+            {"id": "review", "kind": CheckKind.INDEPENDENT_REVIEW.value, "description": "Review"}
+        ],
+    )
+    plan["tasks"].append({**plan["tasks"][0], "task_id": "T2", "write_scope": ["other.py"]})
+    plan["tasks"].append(
+        {**plan["tasks"][0], "task_id": "T3", "depends_on": ["T1"], "write_scope": ["child.py"]}
+    )
+    feature = _stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+    other = _stage_responder(plan=plan, file_name="other.py", review_passes=[True])
+    child = _stage_responder(plan=plan, file_name="child.py", review_passes=[True])
+    timed_out = False
+    during_retry = None
+    after_recovery = None
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal timed_out, during_retry, after_recovery
+        prompt = messages[1].content
+        if "Task T1:" in prompt and not any(msg.role == "tool" for msg in messages):
+            if not timed_out:
+                timed_out = True
+                raise TimeoutError("test call timed out")
+            deadline = time.monotonic() + 5
+            while not any(
+                event.event_type == "task.accepted" and event.payload["task_id"] == "T2"
+                for event in store.list_events(run_id)
+            ):
+                assert time.monotonic() < deadline, "Independent task did not finish during retry"
+                time.sleep(0.01)
+            during_retry = build_run_projection(store, tmp_path, run_id)
+        elif "Task T1:" in prompt:
+            after_recovery = build_run_projection(store, tmp_path, run_id)
+        if "Task T2:" in prompt or '"task_id":"T2"' in prompt:
+            return other(messages, tools)
+        if "Task T3:" in prompt or '"task_id":"T3"' in prompt:
+            return child(messages, tools)
+        return feature(messages, tools)
+
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=respond), workspace_root=tmp_path
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    assert orch.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+
+    assert during_retry is not None
+    active = {node["task_id"]: node for node in during_retry["dag"]["nodes"]}
+    assert active["T1"]["status"] == "running"
+    assert active["T1"]["provider_retry"]["phase"] == "started"
+    assert active["T2"]["status"] == "accepted"
+    assert active["T3"]["status"] == "waiting"
+    assert active["T3"]["blocked_by"] == []
+    assert during_retry["progress"]["accepted_tasks"] == 1
+    assert during_retry["hitl_banner"] is None
+
+    assert after_recovery is not None
+    running = after_recovery["dag"]["nodes"][0]
+    assert running["status"] == "running"
+    assert running["provider_retry"] is None
+    assert running["provider_retry_history"][-1]["phase"] == "recovered"
+
+    final = build_run_projection(store, tmp_path, run_id)
+    task = final["dag"]["nodes"][0]
+    assert task["status"] == "accepted"
+    assert task["attempt"] == 1
+    assert task["provider_retry"] is None
+    history = task["provider_retry_history"]
+    assert [event["phase"] for event in history] == ["started", "recovered"]
+    assert history[0]["retry_id"] == history[1]["retry_id"]
+    assert history[0]["event_seq"] < history[1]["event_seq"]
+
+
+def test_failed_timeout_retry_blocks_only_its_dependency_chain(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        max_cycles=1,
+        checks=[
+            {"id": "review", "kind": CheckKind.INDEPENDENT_REVIEW.value, "description": "Review"}
+        ],
+    )
+    root = plan["tasks"][0]
+    root["deliverables"] = ["feature.py"]
+    plan["tasks"].extend(
+        {
+            **root,
+            "task_id": task_id,
+            "depends_on": deps,
+            "write_scope": [path],
+            "deliverables": [path],
+        }
+        for task_id, deps, path in [
+            ("T2", [], "other.py"),
+            ("T3", ["T1", "T2"], "child.py"),
+            ("T4", ["T3"], "release.py"),
+        ]
+    )
+    other = _stage_responder(plan=plan, file_name="other.py", review_passes=[True])
+    while_blocked = None
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal while_blocked
+        prompt = messages[1].content
+        if "Task T1:" in prompt:
+            raise TimeoutError("flag service timed out")
+        if "Task T2:" in prompt and not any(msg.role == "tool" for msg in messages):
+            deadline = time.monotonic() + 5
+            while not any(
+                event.event_type == "task.blocked" for event in store.list_events(run_id)
+            ):
+                assert time.monotonic() < deadline, "Expected T1 to reach its task cycle limit"
+                time.sleep(0.01)
+            while_blocked = build_run_projection(store, tmp_path, run_id)
+        return other(messages, tools)
+
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=respond), workspace_root=tmp_path
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    snap = orch.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+
+    assert while_blocked is not None
+    nodes = {node["task_id"]: node for node in while_blocked["dag"]["nodes"]}
+    assert nodes["T1"]["status"] == "blocked"
+    assert nodes["T1"]["provider_retry"] is None
+    assert [row["phase"] for row in nodes["T1"]["provider_retry_history"]] == ["started", "failed"]
+    assert nodes["T2"]["status"] == "running"
+    assert nodes["T2"]["blocked_by"] == []
+    assert nodes["T3"]["blocked_by"] == ["T1"]
+    assert nodes["T4"]["blocked_by"] == ["T1"]
+    banner = while_blocked["hitl_banner"]
+    assert banner["task_id"] == "T1"
+    assert banner["affected_task_ids"] == ["T1", "T3", "T4"]
+    assert "flag service timed out" in banner["detail"]
+    assert "retry" in banner["actions"]
+    assert {s["id"]: s["status"] for s in while_blocked["stage_pipeline"]}["execute"] == "active"
+    assert {(e["from"], e["to"]) for e in while_blocked["dag"]["edges"] if e["blocked_edge"]} == {
+        ("T1", "T3"),
+        ("T3", "T4"),
+    }
+
+    final = build_run_projection(store, tmp_path, run_id)
+    assert final["progress"]["accepted_tasks"] == 1
+    assert {s["id"]: s["status"] for s in final["stage_pipeline"]}["execute"] == "blocked"
+    orch.retry_blocked_task(
+        operation_id="retry-t1",
+        run_id=run_id,
+        task_id="T1",
+        expected_state_revision=snap["state_revision"],
+    )
+    after_manual_retry = build_run_projection(store, tmp_path, run_id)
+    nodes = {node["task_id"]: node for node in after_manual_retry["dag"]["nodes"]}
+    assert nodes["T1"]["status"] == "ready"
+    assert "flag service timed out" in nodes["T1"]["last_error"]
+    assert nodes["T1"]["diagnostic_output"] == "就绪待调度"
+    assert nodes["T1"]["provider_retry"] is None
+    assert nodes["T3"]["blocked_by"] == []
+    assert after_manual_retry["hitl_banner"] is None

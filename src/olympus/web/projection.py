@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import olympus.web.acceptance as delivery_review
 import olympus.web.demos as demo_runs
@@ -23,6 +23,7 @@ from olympus.core.contracts import (
     CritiqueSeverity,
     DesignSpec,
     GoalSpec,
+    ProviderTimeoutRetry,
     RequirementItem,
     ReviewFinding,
     ReviewSeverity,
@@ -55,6 +56,14 @@ _WF_FAN_OUT = 2.0
 _WF_MIN_WIDTH = 8.0
 _WF_MAX_OFFSET = 90.0
 _WF_REVIEW_WIDTH = 8.0
+
+
+class TaskBlocker(TypedDict):
+    task_id: str
+    headline: str
+    detail: str
+    affected_task_ids: list[str]
+    actions: list[str]
 
 
 def _compute_dag_layers_and_critical_path(
@@ -472,7 +481,11 @@ def _build_stage_pipeline(
         exec_state = "skipped"
         verify_state = "skipped"
     elif plan_approved:
-        exec_state = "blocked" if any_blocked else "active"
+        executing = status == RunStatus.RUNNING or (
+            status == RunStatus.PAUSED
+            and any(t.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING) for t in tasks)
+        )
+        exec_state = "blocked" if any_blocked and not executing else "active"
         verify_state = (
             "active" if any(t.status == TaskStatus.ACCEPTED for t in tasks) else "pending"
         )
@@ -1175,6 +1188,29 @@ def build_run_projection(
     tasks = plan.tasks if plan else []
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
     task_by_id = {t.task_id: t for t in tasks}
+    blocked_by: dict[str, list[str]] = {}
+    for task in sorted(tasks, key=lambda task: layers[task.task_id]):
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED):
+            blocked_by[task.task_id] = [task.task_id]
+        elif task.status in (TaskStatus.WAITING, TaskStatus.READY):
+            blocked_by[task.task_id] = sorted(
+                {blocker for dep in task.depends_on for blocker in blocked_by.get(dep, [])}
+            )
+    task_blockers: dict[str, TaskBlocker] = {
+        task.task_id: {
+            "task_id": task.task_id,
+            "headline": f"阻塞：{task.task_id} 需要人工处理",
+            "detail": (task.last_error or "").strip() or "任务当前无法继续，等待人工处理",
+            "affected_task_ids": [
+                affected.task_id
+                for affected in tasks
+                if task.task_id in blocked_by.get(affected.task_id, [])
+            ],
+            "actions": ["inspect", "retry", "hint", "reassign", "accept_risk"],
+        }
+        for task in tasks
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
+    }
 
     delivery_acceptance = delivery_review.build_delivery_acceptance(
         spec if spec_approved else None,
@@ -1185,7 +1221,13 @@ def build_run_projection(
 
     receipt_by_task: dict[str, dict[str, Any]] = {}
     receipt_by_actor: dict[str, dict[str, Any]] = {}
+    retries_by_task: dict[str, list[dict[str, Any]]] = {}
     for ev in events:
+        if ev.event_type == ProviderTimeoutRetry.event_type:
+            retry = ProviderTimeoutRetry.model_validate(ev.payload)
+            retries_by_task.setdefault(retry.task_id, []).append(
+                {**retry.model_dump(mode="json"), "event_seq": ev.event_seq, "actor": ev.actor}
+            )
         if ev.event_type != "turn.receipt":
             continue
         payload = dict(ev.payload)
@@ -1217,6 +1259,17 @@ def build_run_projection(
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
     for order, t in enumerate(tasks):
+        blocker = task_blockers.get(t.task_id)
+        dependency_blockers = [] if blocker else blocked_by.get(t.task_id, [])
+        retry_history = retries_by_task.get(t.task_id, [])
+        provider_retry = retry_history[-1] if retry_history else None
+        if provider_retry is not None and (
+            provider_retry["phase"] != "started"
+            or provider_retry["lease_generation"] != t.lease_generation
+            or t.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING)
+            or snap["status"] not in (RunStatus.RUNNING, RunStatus.PAUSED)
+        ):
+            provider_retry = None
         art = _read_task_artifacts(run_dir, t)
         stream = _build_subagent_stream(t, art)
         receipt = receipt_by_task.get(t.task_id) or _build_receipt(t, stream, art, order=order)
@@ -1226,18 +1279,16 @@ def build_run_projection(
             for dep in t.depends_on
             if not (task_by_id.get(dep) and task_by_id[dep].status == TaskStatus.ACCEPTED)
         ]
-        # Extract structured diagnostic fields if present in last_error or events
         diag_tool = ""
         diag_output = ""
         diag_attribution = ""
         for c in t.acceptance_checks:
             if c.command and not diag_tool:
                 diag_tool = f"{c.command} → {'通过' if c.passed else '失败'}"
-        if t.last_error:
-            parts = [line.strip() for line in t.last_error.splitlines() if line.strip()]
-            diag_output = parts[0] if parts else t.last_error
-            if len(parts) > 1:
-                diag_attribution = "；".join(parts[1:])
+        if blocker:
+            parts = blocker["detail"].splitlines()
+            diag_output = parts[0]
+            diag_attribution = "；".join(parts[1:]) or "等待人工处理"
         if not diag_attribution and t.accepted_risk_reason:
             diag_attribution = f"未验证 · 人工接受：{t.accepted_risk_reason}"
 
@@ -1250,6 +1301,10 @@ def build_run_projection(
                 t.status == TaskStatus.WAITING and not unmet_deps
             ):
                 diag_output = "就绪待调度"
+            elif t.status == TaskStatus.RUNNING:
+                diag_output = "正在执行"
+            elif t.status == TaskStatus.VERIFYING:
+                diag_output = "正在验收"
             else:
                 diag_output = "等待执行"
 
@@ -1264,6 +1319,8 @@ def build_run_projection(
                 t.status == TaskStatus.WAITING and not unmet_deps
             ):
                 diag_attribution = "无阻塞前置依赖，等待调度器认领执行"
+            elif t.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                diag_attribution = "调度器已认领任务"
             elif unmet_deps:
                 diag_attribution = f"等待前置产物解锁（{', '.join(unmet_deps)}）"
             else:
@@ -1289,6 +1346,10 @@ def build_run_projection(
                 "write_scope": t.write_scope,
                 "read_scope": t.read_scope,
                 "last_error": t.last_error,
+                "provider_retry": provider_retry,
+                "provider_retry_history": retry_history,
+                "blocked_by": dependency_blockers,
+                "blocker": blocker,
                 "accepted_risk_reason": t.accepted_risk_reason,
                 "executor": "Hephaestus-1"
                 if t.task_id.endswith(("1", "2", "3"))
@@ -1310,30 +1371,22 @@ def build_run_projection(
             }
         )
         for dep in t.depends_on:
-            dep_node = task_by_id.get(dep)
-            blocked_edge = bool(
-                dep_node and dep_node.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
-            )
             dag_edges.append(
                 {
                     "from": dep,
                     "to": t.task_id,
                     "critical": (dep, t.task_id) in crit_edges,
-                    "blocked_edge": blocked_edge,
+                    "blocked_edge": bool(dependency_blockers and blocked_by.get(dep)),
                 }
             )
 
-    blocked_tasks = [t for t in tasks if t.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     hitl_banner: dict[str, Any] | None = None
-    if blocked_tasks:
-        bt = blocked_tasks[0]
+    if task_blockers:
+        first_blocker = next(iter(task_blockers.values()))
         hitl_banner = {
+            **first_blocker,
             "kind": "task_blocked",
             "tone": "danger",
-            "task_id": bt.task_id,
-            "headline": f"阻塞：{bt.task_id} 重试 {max(1, bt.review_cycle)} 次仍失败，需要人工处理",
-            "detail": bt.last_error or "验收未通过且重试额度已用尽",
-            "actions": ["inspect", "retry", "hint", "reassign", "accept_risk"],
         }
     elif snap["status"] == RunStatus.FAILED:
         f_node = workflow_view.get("failed_node") or "workflow"

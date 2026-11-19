@@ -990,12 +990,14 @@ button {
 
 .dag-node[data-status="blocked"] .dag-node-box,
 .dag-node[data-status="failed"] .dag-node-box,
-.dag-node[data-status="error"] .dag-node-box {
+.dag-node[data-status="error"] .dag-node-box,
+.dag-node[data-issue="dependency"] .dag-node-box {
   fill: var(--bad-soft);
   stroke: var(--bad);
 }
 
-.dag-node[data-status="paused"] .dag-node-box {
+.dag-node[data-status="paused"] .dag-node-box,
+.dag-node[data-issue="retry"] .dag-node-box {
   fill: var(--warn-soft);
   stroke: var(--warn);
 }

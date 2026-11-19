@@ -8,9 +8,9 @@ from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from olympus.core.contracts import new_id, utc_now
+from olympus.core.contracts import ProviderTimeoutRetry, new_id, utc_now
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.harness.hooks import PreToolUseHook
@@ -63,6 +63,7 @@ class AgentLoop:
         pre_tool_hook: PreToolUseHook | None = None,
         trim_seen: bool = True,
         task_id: str | None = None,
+        lease_generation: int | None = None,
     ) -> None:
         self.provider = provider
         self.toolkit = toolkit
@@ -76,6 +77,31 @@ class AgentLoop:
         self.pre_tool_hook = pre_tool_hook
         self.trim_seen = trim_seen
         self.task_id = task_id
+        self.lease_generation = lease_generation
+
+    def _record_timeout_retry(
+        self, retry_id: str, phase: Literal["started", "recovered", "failed"]
+    ) -> None:
+        if (
+            self.store is None
+            or self.run_id is None
+            or self.task_id is None
+            or self.lease_generation is None
+        ):
+            return
+        retry = ProviderTimeoutRetry(
+            retry_id=retry_id,
+            task_id=self.task_id,
+            lease_generation=self.lease_generation,
+            phase=phase,
+        )
+        self.store.append_event(
+            run_id=self.run_id,
+            stage="orchestrate",
+            event_type=retry.event_type,
+            actor=self.actor,
+            payload=retry.model_dump(mode="json"),
+        )
 
     def _append_trace(self, entry: dict[str, Any]) -> None:
         if self.trace_path is None:
@@ -95,6 +121,7 @@ class AgentLoop:
         temperature: float,
     ) -> tuple[Any, str | None]:
         """Reserve budget, invoke provider (with 1 transient timeout retry), settle usage."""
+        retry_id = None
         for net_attempt in range(2):
             call_purpose = purpose if net_attempt == 0 else f"{purpose}_retry"
             if self.store is not None and self.run_id is not None:
@@ -104,6 +131,9 @@ class AgentLoop:
                     )
                 except ValueError as exc:
                     return None, f"budget_exhausted: {exc}"
+            if net_attempt == 1:
+                retry_id = new_id("retry")
+                self._record_timeout_retry(retry_id, "started")
             try:
                 resp = self.provider.complete(
                     messages=messages,
@@ -126,6 +156,8 @@ class AgentLoop:
                 is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
                 if is_timeout and net_attempt == 0:
                     continue
+                if retry_id is not None:
+                    self._record_timeout_retry(retry_id, "failed")
                 return None, f"provider_error: {exc}"
 
             if self.store is not None and self.run_id is not None:
@@ -135,6 +167,8 @@ class AgentLoop:
                     input_tokens=resp.usage.input_tokens,
                     output_tokens=resp.usage.output_tokens,
                 )
+            if retry_id is not None:
+                self._record_timeout_retry(retry_id, "recovered")
             return resp, None
         return None, "provider_error: retry exhausted"
 
