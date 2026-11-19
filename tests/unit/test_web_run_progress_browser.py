@@ -17,7 +17,8 @@ playwright = pytest.importorskip("playwright.sync_api")
 @pytest.fixture
 def workbench(tmp_path):
     store = RunStore(tmp_path / "runs.db")
-    run_id = seed_demo_runs(store, tmp_path)[0]
+    run_id = "run-campus-waitlist"
+    assert run_id in seed_demo_runs(store, tmp_path)
     app = AriadneApp(store=store, workspace_root=tmp_path)
     httpd = create_http_server(app, host="127.0.0.1", port=0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
