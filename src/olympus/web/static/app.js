@@ -14,6 +14,7 @@
     workflowNode: null,
     activeTab: TABS.includes(params.get("tab")) ? params.get("tab") : "overview",
     pendingAction: null,
+    approvalSnapshot: null,
     optionsLoaded: false,
     workflows: [],
     demos: [],
@@ -88,9 +89,8 @@
     taskActions: document.getElementById("hitl-task-actions"),
     gateActions: document.getElementById("hitl-gate-actions"),
     bannerDetail: document.getElementById("hitl-detail"),
-    approveSpec: document.getElementById("btn-approve-spec"),
-    approveDesign: document.getElementById("btn-approve-design"),
-    approvePlan: document.getElementById("btn-approve-plan"),
+    approvalReviews: document.getElementById("hitl-approval-reviews"),
+    approvalButtons: document.getElementById("hitl-approval-buttons"),
     promoteExecute: document.getElementById("btn-promote-execute"),
     retryWorkflow: document.getElementById("btn-retry-workflow"),
     inspectFailure: document.getElementById("btn-inspect-failure"),
@@ -339,21 +339,113 @@
     );
   }
 
+  const approvalLabels = {
+    approve_spec: "GoalSpec",
+    approve_design: "DesignSpec",
+    approve_plan: "任务计划",
+  };
+
+  function renderApprovalReview(action, review, artifact) {
+    const title = approvalLabels[action];
+    const approveButton = el.approvalButtons.content.querySelector(`[data-approve="${action}"]`);
+    const sections = review.sections
+      .filter((section) => section.entries.length || section.empty_text)
+      .map(({ title, entries, empty_text }) => `
+        <section class="approval-section">
+          <h4>${esc(title)}</h4>
+          <ul class="spec-list">${entries.map(({ text, label, ref, provenance }, index) => {
+            const badge = provenance === "agent_high_impact"
+              ? uiBadge("Agent 补充 · 高影响", "warn")
+              : provenance === "unknown" ? uiBadge("来源未记录", "muted") : "";
+            const entryName = label || (entries.length > 1 ? `${title} ${index + 1}` : title);
+            return `<li>${label ? `<strong>${esc(label)}</strong> ` : ""}${esc(text)} ${badge}
+              <button type="button" class="approval-ref" data-review-ref="${esc(ref)}"
+                aria-label="定位 ${esc(entryName)}">原条目</button></li>`;
+          }).join("") || `<li>${esc(empty_text)}</li>`}</ul>
+        </section>`)
+      .join("");
+    return `
+      <article class="approval-review" data-review-action="${action}" aria-labelledby="review-${action}">
+        <h3 id="review-${action}" tabindex="-1">${esc(title)}${artifact.version ? ` · v${esc(artifact.version)}` : ""}</h3>
+        ${sections ? `<div class="approval-sections">${sections}</div>` : ""}
+        <div class="approval-controls">
+          <details>
+            <summary>查看完整 ${esc(title)}</summary>
+            <div class="approval-origin" hidden></div>
+            <pre tabindex="0">${esc(JSON.stringify(artifact, null, 2))}</pre>
+          </details>
+          ${approveButton.outerHTML}
+        </div>
+      </article>`;
+  }
+
+  function renderApprovalReviews(projection) {
+    const runId = projection.run_id;
+    const previous = state.approvalSnapshot;
+    if (previous?.runId === runId && previous.revision > projection.state_revision) {
+      return previous.reviews.size > 0;
+    }
+    const reviews = new Map();
+    for (const [action, review] of Object.entries(projection.approval_reviews || {})) {
+      const artifact = projection[review.artifact];
+      if (approvalLabels[action] && artifact?.content_hash === review.target_hash) {
+        reviews.set(action, {
+          artifact,
+          command: {
+            action,
+            target_hash: review.target_hash,
+            expected_state_revision: projection.state_revision,
+          },
+        });
+      }
+    }
+    state.approvalSnapshot = { runId, revision: projection.state_revision, reviews };
+    const sameRun = previous?.runId === runId;
+    for (const action of Object.keys(approvalLabels)) {
+      const binding = reviews.get(action);
+      const existing = el.approvalReviews.querySelector(`[data-review-action="${action}"]`);
+      if (!binding) {
+        existing?.remove();
+        continue;
+      }
+      if (existing && sameRun &&
+          previous.reviews.get(action)?.command.target_hash === binding.command.target_hash) {
+        continue;
+      }
+      const html = renderApprovalReview(action, projection.approval_reviews[action], binding.artifact);
+      const hadFocus = existing?.contains(document.activeElement);
+      if (existing) existing.outerHTML = html;
+      else el.approvalReviews.insertAdjacentHTML("beforeend", html);
+      if (hadFocus) document.getElementById(`review-${action}`).focus();
+    }
+    el.approvalReviews.hidden = !reviews.size;
+    return reviews.size > 0;
+  }
+
+  function showApprovalOrigin(card, artifact, ref) {
+    const parts = ref.slice(1).split("/").map((key) => key.replaceAll("~1", "/").replaceAll("~0", "~"));
+    const value = parts.reduce((item, key) => item?.[key], artifact);
+    if (value === undefined) return;
+    const source = parts[0] === "requirements" ? artifact.requirements?.[parts[1]]?.source_ref : null;
+    const origin = card.querySelector(".approval-origin");
+    origin.innerHTML = `<code tabindex="-1">${esc(ref)}</code>
+      <p>${esc(typeof value === "string" ? value : JSON.stringify(value))}</p>
+      ${source ? `<p>规格引用 · ${esc(source)}</p>` : ""}`;
+    origin.hidden = false;
+    card.querySelector("details").open = true;
+    origin.querySelector("code").focus();
+  }
+
   function renderGateActions(projection) {
     const banner = projection.hitl_banner;
-    const specGate = Boolean(projection.spec && !projection.spec_approved);
-    const designGate = Boolean(projection.design && !projection.design_approved);
-    const planGate = Boolean(projection.plan && !projection.plan_approved);
+    const hasReview = renderApprovalReviews(projection);
     const promoteGate = Boolean(banner && banner.kind === "blueprint_completed");
     const runFailed = Boolean(banner && banner.kind === "run_failed");
-    el.approveSpec.hidden = !specGate;
-    el.approveDesign.hidden = !designGate;
-    el.approvePlan.hidden = !planGate;
     if (el.promoteExecute) el.promoteExecute.hidden = !promoteGate;
     el.retryWorkflow.hidden = !runFailed;
     el.inspectFailure.hidden = !runFailed;
-    el.gateActions.hidden = !(specGate || designGate || planGate || promoteGate || runFailed);
-    return specGate || designGate || planGate || promoteGate || runFailed;
+    el.gateActions.hidden = !(promoteGate || runFailed);
+    return hasReview || promoteGate || runFailed;
   }
 
   function renderBanner(projection) {
@@ -371,8 +463,10 @@
       tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
     const headline = banner
       ? banner.headline
-      : "关口待批准：当前产物已冻结，等待真人确认后继续推进";
-    const cleanDetail = String(banner ? banner.detail || "" : "")
+      : "候选版本待批准";
+    const hasGoalReview = state.approvalSnapshot.reviews.has("approve_spec");
+    const detail = hasGoalReview && banner?.detail === projection.spec?.goal ? "" : banner?.detail;
+    const cleanDetail = String(detail || "")
       .replace(/\s*\n+\s*/g, "，")
       .trim();
     const localized = cleanDetail ? localizeError(cleanDetail) : "";
@@ -1663,25 +1757,8 @@
     state.sse = source;
   }
 
-  function gateContentHash(projection, action) {
-    if (!projection) return null;
-    if (action === "approve_spec") {
-      return !projection.spec_approved && projection.spec ? projection.spec.content_hash : null;
-    }
-    if (action === "approve_design") {
-      return !projection.design_approved && projection.design
-        ? projection.design.content_hash
-        : null;
-    }
-    if (action === "approve_plan") {
-      return !projection.plan_approved && projection.plan ? projection.plan.content_hash : null;
-    }
-    return null;
-  }
-
-  async function sendCommand(body, successMessage, isRetry = false) {
-    if (!state.runId || !state.projection) return;
-    const priorGateHash = gateContentHash(state.projection, body.action);
+  async function sendCommand(body, successMessage, runId = state.runId) {
+    if (!runId || runId !== state.runId || state.projection?.run_id !== runId) return;
     const payload = Object.assign(
       {
         operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1690,31 +1767,29 @@
       },
       body
     );
-    const response = await fetch(`/api/runs/${encodeURIComponent(state.runId)}/command`, {
+    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/command`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const data = await response.json();
+    if (state.runId !== runId) return;
     if (!data.ok) {
       if (response.status === 409 || data.conflict) {
         let fresh = data.projection || null;
         if (!fresh) {
           try {
-            const latestRes = await fetch(`/api/runs/${encodeURIComponent(state.runId)}`);
+            const latestRes = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
             const latestData = await latestRes.json();
             if (latestData.ok) fresh = latestData.projection;
           } catch (error) {
             fresh = null;
           }
         }
+        if (state.runId !== runId) return;
         if (fresh) {
           renderAll(fresh);
           refreshRuns().catch(() => {});
-        }
-        const nextGateHash = gateContentHash(fresh, body.action);
-        if (!isRetry && priorGateHash && nextGateHash && priorGateHash === nextGateHash) {
-          return sendCommand(body, successMessage, true);
         }
         toast(`状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`);
         return;
@@ -1885,46 +1960,53 @@
       );
     });
 
-    el.approveSpec.addEventListener("click", async () => {
-      if (!state.projection) return;
-      const blockers = unresolvedAmbiguities(state.projection);
-      if (blockers.length) {
-        openDialog({
-          title: "GoalSpec 仍有未决阻断项",
-          description:
-            "先在上方澄清卡片回答阻断歧义；若必须带风险冻结，请填写接受风险理由，审批会记录为 accept_risk。",
-          label: "接受风险理由（必填）",
-          defaultValue: "首期范围已与业务确认，接受未决歧义风险先行冻结规格。",
-          requireNonEmpty: true,
-          onConfirm: async (reason) => {
-            await sendCommand(
-              { action: "approve_spec", accept_risk: true, reason },
-              "已带风险批准 GoalSpec，进入架构设计"
-            );
-          },
-        });
+    el.approvalReviews.addEventListener("click", async (event) => {
+      const card = event.target.closest("[data-review-action]");
+      const snapshot = state.approvalSnapshot;
+      if (!card || snapshot?.runId !== state.runId) return;
+      const binding = snapshot.reviews.get(card.dataset.reviewAction);
+      if (!binding) return;
+      const { artifact, command } = binding;
+      const ref = event.target.closest("[data-review-ref]")?.dataset.reviewRef;
+      if (ref) {
+        showApprovalOrigin(card, artifact, ref);
         return;
       }
-      await sendCommand(
-        { action: "approve_spec" },
-        "已批准 GoalSpec，进入架构设计"
-      );
-    });
+      if (!event.target.closest("[data-approve]")) return;
 
-    el.approveDesign.addEventListener("click", async () => {
-      await sendCommand(
-        { action: "approve_design" },
-        "已批准 DesignSpec，启动任务分解"
-      );
-    });
-
-    el.approvePlan.addEventListener("click", async () => {
-      const stopAfter =
-        state.projection && state.projection.workflow && state.projection.workflow.stop_after;
-      await sendCommand(
-        { action: "approve_plan" },
-        stopAfter === "plan" ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行"
-      );
+      const { runId } = snapshot;
+      if (command.action === "approve_spec") {
+        const blockers = unresolvedAmbiguities({ spec: artifact });
+        const blockingCritique = (artifact.minority_notes || []).some(
+          (note) => note.severity === "blocking" && !note.resolved
+        );
+        if (blockers.length || blockingCritique) {
+          openDialog({
+            title: `GoalSpec v${artifact.version} 仍有未决阻断项`,
+            description:
+              "请先处理阻断项。若要批准此版本，请填写接受风险的理由。",
+            label: "接受风险理由（必填）",
+            defaultValue: "首期范围已与业务确认，接受未决歧义风险先行冻结规格。",
+            requireNonEmpty: true,
+            onConfirm: async (reason) => {
+              await sendCommand(
+                { ...command, accept_risk: true, reason },
+                "已带风险批准 GoalSpec，进入架构设计",
+                runId
+              );
+            },
+          });
+          return;
+        }
+        await sendCommand(command, "已批准 GoalSpec，进入架构设计", runId);
+      } else if (command.action === "approve_design") {
+        await sendCommand(command, "已批准 DesignSpec，启动任务分解", runId);
+      } else {
+        const stopAfter = state.projection?.workflow?.stop_after;
+        const message = stopAfter === "plan"
+          ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行";
+        await sendCommand(command, message, runId);
+      }
     });
 
     if (el.promoteExecute) {

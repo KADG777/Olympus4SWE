@@ -630,6 +630,86 @@ button {
   margin-inline-start: auto;
 }
 
+.approval-reviews {
+  display: grid;
+  flex: 1 1 100%;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.approval-review {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-paper);
+  overflow-wrap: anywhere;
+}
+
+.approval-review h3 {
+  font-size: var(--text-sm);
+}
+
+.approval-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  gap: var(--space-3);
+}
+
+.approval-section h4 {
+  margin-block-end: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.approval-ref {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.approval-controls {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.approval-controls details {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  font-size: var(--text-sm);
+}
+
+.approval-controls details[open] {
+  flex-basis: 100%;
+}
+
+.approval-controls summary {
+  padding-block: var(--space-1);
+  cursor: pointer;
+}
+
+.approval-controls pre,
+.approval-origin {
+  margin-block: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  font-size: var(--text-xs);
+}
+
+.approval-controls pre {
+  max-block-size: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 /* ---------------------------------------------------------------------------
  * Views
  * ------------------------------------------------------------------------ */

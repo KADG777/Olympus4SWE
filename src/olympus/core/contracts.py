@@ -163,6 +163,10 @@ class GoalSpec(FingerprintedModel):
     out_of_scope: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    agent_high_impact_assumptions: list[str] = Field(
+        default_factory=list,
+        description="Agent-added assumptions affecting scope or acceptance, quoted verbatim.",
+    )
     open_ambiguities: list[AmbiguityItem] = Field(default_factory=list)
     minority_notes: list[CritiqueNote] = Field(default_factory=list)
     status: SpecStatus = SpecStatus.DRAFT
@@ -171,7 +175,17 @@ class GoalSpec(FingerprintedModel):
     actors: list[str] = Field(default_factory=list)
 
     def _hash_payload(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        """Keep existing approvals valid when provenance is absent."""
+        payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        if not self.agent_high_impact_assumptions:
+            del payload["agent_high_impact_assumptions"]
+        return payload
+
+    @model_validator(mode="after")
+    def _validate_assumption_provenance(self) -> Self:
+        if not set(self.agent_high_impact_assumptions).issubset(self.assumptions):
+            raise ValueError("Agent assumption provenance must reference existing assumption text")
+        return self
 
     def to_markdown(self) -> str:
         kind = self.deliverable_kind.value if self.deliverable_kind else "(unspecified)"

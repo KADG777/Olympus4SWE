@@ -36,6 +36,7 @@ from olympus.core.contracts import (
 from olympus.core.store import RunStore
 from olympus.graph import build_graph, load_workflow
 from olympus.harness.receipt import build_turn_receipt
+from olympus.web.approval_review import APPROVAL_ARTIFACTS, ApprovalReview, goal_review_sections
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
 _NOISE_LINE = re.compile(r"[=\-_*·~]{4,}(?:.*[=\-_*·~]{4,})?")
@@ -1008,6 +1009,17 @@ def build_run_projection(
         )
     )
 
+    approval_reviews: dict[str, ApprovalReview] = {}
+    approved = {"spec": spec_approved, "design": design_approved, "plan": plan_approved}
+    for action, key in APPROVAL_ARTIFACTS.items():
+        artifact = snap[key]
+        if artifact and not approved[key]:
+            approval_reviews[action] = {
+                "artifact": key,
+                "target_hash": artifact.content_hash,
+                "sections": goal_review_sections(artifact) if key == "spec" else [],
+            }
+
     tasks = plan.tasks if plan else []
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
     task_by_id = {t.task_id: t for t in tasks}
@@ -1321,6 +1333,7 @@ def build_run_projection(
             "ratio_text": f"{accepted_count} / {len(tasks)}",
         },
         "hitl_banner": hitl_banner,
+        "approval_reviews": approval_reviews,
         "spec": spec.model_dump(mode="json") if spec else None,
         "design": design.model_dump(mode="json") if design else None,
         "plan": plan.model_dump(mode="json") if plan else None,

@@ -419,10 +419,18 @@ class RunStore:
         )
         return new_rev
 
-    def get_run(self, run_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _check_revision(current: int, expected: int | None) -> None:
+        if expected is not None and current != expected:
+            raise ConcurrencyConflictError(
+                f"State revision mismatch: expected {expected}, got {current}"
+            )
+
+    def get_run(self, run_id: str, *, expected_revision: int | None = None) -> dict[str, Any]:
         conn = self._connect()
         try:
             row = self._get_run_row(conn, run_id)
+            self._check_revision(int(row["state_revision"]), expected_revision)
             spec = GoalSpec.model_validate_json(row["spec_json"]) if row["spec_json"] else None
             plan = TaskPlan.model_validate_json(row["plan_json"]) if row["plan_json"] else None
             design = (
@@ -489,15 +497,25 @@ class RunStore:
             )
             return new_rev
 
-    def save_spec(self, run_id: str, spec: GoalSpec, *, actor: str = "align") -> int:
+    def save_spec(
+        self,
+        run_id: str,
+        spec: GoalSpec,
+        *,
+        actor: str = "align",
+        expected_revision: int | None = None,
+        approval: ApprovalRecord | None = None,
+    ) -> int:
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
+            cur_rev = int(row["state_revision"])
+            self._check_revision(cur_rev, expected_revision)
             new_rev = self._bump_run_field(
                 conn,
                 run_id=run_id,
                 column="spec_json",
                 value=spec.model_dump_json(),
-                cur_rev=int(row["state_revision"]),
+                cur_rev=cur_rev,
             )
             self._insert_event(
                 conn,
@@ -513,17 +531,29 @@ class RunStore:
                 },
                 state_revision=new_rev,
             )
+            if approval is not None:
+                return self._record_approval(conn, approval, new_rev)
             return new_rev
 
-    def save_design(self, run_id: str, design: DesignSpec, *, actor: str = "design") -> int:
+    def save_design(
+        self,
+        run_id: str,
+        design: DesignSpec,
+        *,
+        actor: str = "design",
+        expected_revision: int | None = None,
+        approval: ApprovalRecord | None = None,
+    ) -> int:
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
+            cur_rev = int(row["state_revision"])
+            self._check_revision(cur_rev, expected_revision)
             new_rev = self._bump_run_field(
                 conn,
                 run_id=run_id,
                 column="design_json",
                 value=design.model_dump_json(),
-                cur_rev=int(row["state_revision"]),
+                cur_rev=cur_rev,
             )
             self._insert_event(
                 conn,
@@ -540,6 +570,8 @@ class RunStore:
                 },
                 state_revision=new_rev,
             )
+            if approval is not None:
+                return self._record_approval(conn, approval, new_rev)
             return new_rev
 
     def save_plan(self, run_id: str, plan: TaskPlan, *, actor: str = "orchestrate") -> int:
@@ -736,51 +768,60 @@ class RunStore:
             )
             return target_after
 
-    def record_approval(self, record: ApprovalRecord) -> int:
+    def record_approval(
+        self, record: ApprovalRecord, *, expected_revision: int | None = None
+    ) -> int:
         with self._tx() as conn:
             row = self._get_run_row(conn, record.run_id)
-            new_rev = int(row["state_revision"]) + 1
-            conn.execute(
-                """
-                INSERT INTO approvals (
-                    approval_id, run_id, target, target_id, target_hash,
-                    commit_sha, approver, decision, reason, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.approval_id,
-                    record.run_id,
-                    record.target.value,
-                    record.target_id,
-                    record.target_hash,
-                    record.commit_sha,
-                    record.approver,
-                    record.decision.value,
-                    record.reason,
-                    record.created_at.isoformat(),
-                ),
-            )
-            conn.execute(
-                "UPDATE runs SET state_revision = ?, updated_at = ? WHERE run_id = ?",
-                (new_rev, utc_now().isoformat(), record.run_id),
-            )
-            self._insert_event(
-                conn,
-                run_id=record.run_id,
-                stage="gate",
-                event_type="approval.recorded",
-                actor=record.approver,
-                payload={
-                    "approval_id": record.approval_id,
-                    "target": record.target.value,
-                    "target_id": record.target_id,
-                    "target_hash": record.target_hash,
-                    "commit_sha": record.commit_sha,
-                    "decision": record.decision.value,
-                },
-                state_revision=new_rev,
-            )
-            return new_rev
+            cur_rev = int(row["state_revision"])
+            self._check_revision(cur_rev, expected_revision)
+            return self._record_approval(conn, record, cur_rev)
+
+    def _record_approval(
+        self, conn: sqlite3.Connection, record: ApprovalRecord, cur_rev: int
+    ) -> int:
+        new_rev = cur_rev + 1
+        conn.execute(
+            """
+            INSERT INTO approvals (
+                approval_id, run_id, target, target_id, target_hash,
+                commit_sha, approver, decision, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.approval_id,
+                record.run_id,
+                record.target.value,
+                record.target_id,
+                record.target_hash,
+                record.commit_sha,
+                record.approver,
+                record.decision.value,
+                record.reason,
+                record.created_at.isoformat(),
+            ),
+        )
+        conn.execute(
+            "UPDATE runs SET state_revision = ?, updated_at = ? WHERE run_id = ?",
+            (new_rev, utc_now().isoformat(), record.run_id),
+        )
+        self._insert_event(
+            conn,
+            run_id=record.run_id,
+            stage="gate",
+            event_type="approval.recorded",
+            actor=record.approver,
+            payload={
+                "approval_id": record.approval_id,
+                "target": record.target.value,
+                "target_id": record.target_id,
+                "target_hash": record.target_hash,
+                "commit_sha": record.commit_sha,
+                "decision": record.decision.value,
+            },
+            state_revision=new_rev,
+        )
+        return new_rev
 
     def is_approved(
         self,

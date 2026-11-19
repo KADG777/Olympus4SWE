@@ -25,6 +25,7 @@ from olympus.graph.loader import load_workflow
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.web.approval_review import APPROVAL_ARTIFACTS
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
 from olympus.web.projection import build_run_projection, seed_demo_runs
 from olympus.web.supervisor import RunSupervisor
@@ -115,6 +116,17 @@ class AriadneApp:
         expected_rev = (
             int(expected_rev_raw) if expected_rev_raw is not None else int(snap["state_revision"])
         )
+        if action in APPROVAL_ARTIFACTS:
+            if snap["state_revision"] != expected_rev:
+                raise ConcurrencyConflictError(
+                    f"State revision mismatch: expected {expected_rev}, "
+                    f"got {snap['state_revision']}"
+                )
+            artifact = snap[APPROVAL_ARTIFACTS[action]]
+            if "target_hash" in body and (
+                artifact is None or body["target_hash"] != artifact.content_hash
+            ):
+                raise ConcurrencyConflictError("Approval target hash no longer matches")
 
         if action in ("pause", "resume"):
             target_status = RunStatus.PAUSED if action == "pause" else RunStatus.RUNNING
@@ -152,11 +164,6 @@ class AriadneApp:
                 handler=_toggle_status,
             )
         elif action == "approve_spec":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             align = AlignStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
@@ -168,6 +175,7 @@ class AriadneApp:
                 approver=actor,
                 accept_risk=bool(body.get("accept_risk", False)),
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = {
                 "run_id": run_id,
@@ -176,11 +184,6 @@ class AriadneApp:
                 "status": spec.status.value,
             }
         elif action == "approve_design":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             design_stage = DesignStage(
                 self.store,
                 self.supervisor.resolve_provider(run_id),
@@ -191,14 +194,10 @@ class AriadneApp:
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = record.model_dump(mode="json")
         elif action == "approve_plan":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
@@ -209,6 +208,7 @@ class AriadneApp:
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = rec.model_dump(mode="json")
         elif action == "clarify":

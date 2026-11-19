@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import pytest
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -30,7 +31,8 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.store import RunStore
+from olympus.core.fingerprint import content_hash
+from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph.loader import build_graph, load_workflow
 from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
@@ -146,6 +148,127 @@ def _seed_gated_run(store: RunStore) -> str:
     )
     store.save_plan(run_id, plan, actor="orchestrate")
     return run_id
+
+
+def test_goal_approval_review_snapshot_links_commitments_to_candidate(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    spec = store.get_run(run_id)["spec"].model_copy(update={"assumptions": ["最多 200 QPS"]})
+    store.save_spec(run_id, spec)
+
+    projection = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
+        "projection"
+    ]
+    review = projection["approval_reviews"]["approve_spec"]
+    assert review["target_hash"] == projection["spec"]["content_hash"]
+    sections = {section["title"]: section["entries"] for section in review["sections"]}
+    assert sections["目标"][0]["ref"] == "/goal"
+    assert sections["范围"] == [
+        {
+            "ref": "/requirements/0/description",
+            "label": "FR-100",
+            "text": spec.requirements[0].description,
+        }
+    ]
+    assert sections["排除项"][0]["text"] == "不发送短信或邮件通知"
+    assert sections["验收条件"][0]["ref"] == "/requirements/0/acceptance_criteria/0"
+    assert sections["验收条件"][0]["text"] == "递补在同一事务内完成且状态可观测"
+    assert sections["假设"][0] == {
+        "ref": "/assumptions/0",
+        "text": "最多 200 QPS",
+        "provenance": "unknown",
+    }
+
+
+def test_approval_rejects_viewed_hash_after_two_candidate_updates(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    snapshot = app.get_run_payload(run_id)["projection"]
+    viewed_hash = snapshot["approval_reviews"]["approve_spec"]["target_hash"]
+    spec = store.get_run(run_id)["spec"]
+    for version in (2, 3):
+        store.save_spec(
+            run_id, spec.model_copy(update={"version": version, "goal": f"候选 v{version}"})
+        )
+    latest = app.get_run_payload(run_id)["projection"]
+    command = {
+        "action": "approve_spec",
+        "target_hash": viewed_hash,
+        "expected_state_revision": latest["state_revision"],
+        "accept_risk": True,
+        "reason": "接受已审阅版本的风险",
+        "auto_advance": False,
+    }
+    with pytest.raises(ConcurrencyConflictError, match="hash"):
+        app.execute_command(run_id, command)
+    assert not app.get_run_payload(run_id)["projection"]["spec_approved"]
+
+    command["target_hash"] = latest["approval_reviews"]["approve_spec"]["target_hash"]
+    result = app.execute_command(run_id, command)["projection"]
+    assert result["spec_approved"]
+    assert result["spec"]["content_hash"] == command["target_hash"]
+    assert "approve_spec" not in result["approval_reviews"]
+
+
+def test_review_marks_explicit_agent_assumptions_and_preserves_legacy_fingerprints(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    payload = store.get_run(run_id)["spec"].model_dump(
+        exclude={"content_hash", "status", "agent_high_impact_assumptions"}
+    )
+    payload["assumptions"] = ["首版只开放给管理员", "高峰 200 QPS"]
+    legacy = GoalSpec.model_validate(payload)
+    assert legacy.content_hash == content_hash(payload)
+    spec = GoalSpec.model_validate(
+        {**payload, "agent_high_impact_assumptions": ["首版只开放给管理员"]}
+    )
+    store.save_spec(run_id, spec)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    projection = app.get_run_payload(run_id)["projection"]
+    review = projection["approval_reviews"]["approve_spec"]
+    assert review["target_hash"] != legacy.content_hash
+    assumptions = next(section for section in review["sections"] if section["title"] == "假设")
+    assert [entry["provenance"] for entry in assumptions["entries"]] == [
+        "agent_high_impact",
+        "unknown",
+    ]
+
+
+def test_approval_write_conflicts_if_candidate_changes_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    viewed = app.get_run_payload(run_id)["projection"]
+    save_spec = store.save_spec
+    candidate = store.get_run(run_id)["spec"].model_copy(update={"version": 2, "goal": "新版"})
+
+    def save_after_update(*args, **kwargs):
+        save_spec(run_id, candidate)
+        return save_spec(*args, **kwargs)
+
+    monkeypatch.setattr(store, "save_spec", save_after_update)
+    with pytest.raises(ConcurrencyConflictError, match="revision"):
+        app.execute_command(
+            run_id,
+            {
+                "action": "approve_spec",
+                "target_hash": viewed["approval_reviews"]["approve_spec"]["target_hash"],
+                "expected_state_revision": viewed["state_revision"],
+                "accept_risk": True,
+                "reason": "接受已审阅版本的风险",
+                "auto_advance": False,
+            },
+        )
+    fresh = app.get_run_payload(run_id)["projection"]
+    assert fresh["spec"]["content_hash"] == candidate.content_hash
+    assert fresh["spec"]["status"] == "draft"
+    assert not fresh["spec_approved"]
+    assert not any(event["event_type"] == "approval.recorded" for event in fresh["events"])
 
 
 def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:
@@ -562,12 +685,15 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
             spec_proj = approve_spec.json()["projection"]
             assert spec_proj["spec_approved"] is True
             assert spec_proj["hitl_banner"]["kind"] == "design_gate"
+            design_review = spec_proj["approval_reviews"]["approve_design"]
+            assert design_review["target_hash"] == spec_proj["design"]["content_hash"]
 
             approve_design = client.post(
                 f"/api/runs/{run_id}/command",
                 json={
                     "operation_id": "op-approve-design",
                     "action": "approve_design",
+                    "target_hash": design_review["target_hash"],
                     "expected_state_revision": spec_proj["state_revision"],
                     "auto_advance": False,
                 },
@@ -576,12 +702,15 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
             design_proj = approve_design.json()["projection"]
             assert design_proj["design_approved"] is True
             assert design_proj["hitl_banner"]["kind"] == "plan_gate"
+            plan_review = design_proj["approval_reviews"]["approve_plan"]
+            assert plan_review["target_hash"] == design_proj["plan"]["content_hash"]
 
             approve_plan = client.post(
                 f"/api/runs/{run_id}/command",
                 json={
                     "operation_id": "op-approve-plan",
                     "action": "approve_plan",
+                    "target_hash": plan_review["target_hash"],
                     "expected_state_revision": design_proj["state_revision"],
                     "auto_advance": False,
                 },

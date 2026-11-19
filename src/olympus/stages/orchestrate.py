@@ -533,9 +533,10 @@ class OrchestrateStage:
         run_id: str,
         approver: str = "zeus",
         reason: str = "",
+        expected_revision: int | None = None,
     ) -> ApprovalRecord:
         """Record human approval bound to the current TaskPlan content_hash."""
-        snap = self.store.get_run(run_id)
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
         plan: TaskPlan | None = snap["plan"]
         if plan is None:
             raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
@@ -583,7 +584,7 @@ class OrchestrateStage:
             decision=ApprovalDecision.APPROVED,
             reason=reason,
         )
-        self.store.record_approval(record)
+        self.store.record_approval(record, expected_revision=expected_revision)
         return record
 
     def _run_command_checks(

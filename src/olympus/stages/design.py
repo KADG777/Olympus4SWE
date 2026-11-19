@@ -466,14 +466,15 @@ class DesignStage:
         run_id: str,
         approver: str = "zeus",
         reason: str = "",
+        *,
+        expected_revision: int | None = None,
     ) -> ApprovalRecord:
         """Freeze the current DesignSpec and record a hash-bound approval."""
-        snap = self.store.get_run(run_id)
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
         design: DesignSpec | None = snap["design"]
         if design is None:
             raise ValueError(f"Run {run_id} has no DesignSpec to approve.")
         confirmed = design.model_copy(update={"status": SpecStatus.CONFIRMED})
-        self.store.save_design(run_id, confirmed, actor=approver)
         record = ApprovalRecord(
             run_id=run_id,
             target=ApprovalTarget.DESIGN_SPEC,
@@ -483,7 +484,9 @@ class DesignStage:
             decision=ApprovalDecision.APPROVED,
             reason=reason,
         )
-        self.store.record_approval(record)
+        self.store.save_design(
+            run_id, confirmed, actor=approver, expected_revision=expected_revision, approval=record
+        )
         return record
 
 
