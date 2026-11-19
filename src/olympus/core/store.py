@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+from pydantic import ValidationError
+
 from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
@@ -42,6 +44,18 @@ class NotFoundError(StoreError):
 
 class RunStateSnapshot(dict[str, Any]):
     """Typed convenience alias returned by get_run."""
+
+
+ApprovalArtifact = GoalSpec | DesignSpec | TaskPlan
+_APPROVAL_ARTIFACTS: dict[
+    ApprovalTarget, tuple[str, type[ApprovalArtifact], str]
+] = {
+    ApprovalTarget.GOAL_SPEC: ("spec_json", GoalSpec, "spec_id"),
+    ApprovalTarget.DESIGN_SPEC: ("design_json", DesignSpec, "design_id"),
+    ApprovalTarget.TASK_PLAN: ("plan_json", TaskPlan, "plan_id"),
+}
+_ARTIFACT_TARGETS = {fields[0]: target for target, fields in _APPROVAL_ARTIFACTS.items()}
+_APPROVED_DECISIONS = (ApprovalDecision.APPROVED, ApprovalDecision.ACCEPT_RISK)
 
 
 _SCHEMA_SQL = """
@@ -91,6 +105,11 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 CREATE INDEX IF NOT EXISTS idx_approvals_lookup
 ON approvals (run_id, target, target_id, target_hash);
+
+CREATE TABLE IF NOT EXISTS approval_artifacts (
+    approval_id TEXT PRIMARY KEY REFERENCES approvals (approval_id),
+    artifact_json TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS commands (
     operation_id TEXT PRIMARY KEY,
@@ -417,6 +436,8 @@ class RunStore:
         allowed = {"status", "spec_json", "plan_json", "design_json", "budget_ledger_json"}
         if column not in allowed:
             raise ValueError(f"Unsupported run column update: {column}")
+        if column in _ARTIFACT_TARGETS:
+            self._preserve_legacy_approval(conn, run_id, _ARTIFACT_TARGETS[column])
         new_rev = cur_rev + 1
         conn.execute(
             f"UPDATE runs SET {column} = ?, state_revision = ?, updated_at = ? WHERE run_id = ?",
@@ -431,9 +452,14 @@ class RunStore:
                 f"State revision mismatch: expected {expected}, got {current}"
             )
 
-    def get_run(self, run_id: str, *, expected_revision: int | None = None) -> dict[str, Any]:
+    def get_run(
+        self, run_id: str, *, expected_revision: int | None = None,
+        include_approval_baselines: bool = False,
+    ) -> dict[str, Any]:
         conn = self._connect()
         try:
+            if include_approval_baselines:
+                conn.execute("BEGIN")
             row = self._get_run_row(conn, run_id)
             self._check_revision(int(row["state_revision"]), expected_revision)
             spec = GoalSpec.model_validate_json(row["spec_json"]) if row["spec_json"] else None
@@ -443,7 +469,7 @@ class RunStore:
                 if row["design_json"]
                 else None
             )
-            return {
+            snapshot = {
                 "run_id": row["run_id"],
                 "title": row["title"],
                 "mode": RunMode(row["mode"]),
@@ -464,6 +490,24 @@ class RunStore:
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
+            if include_approval_baselines:
+                baselines: dict[ApprovalTarget, ApprovalArtifact | None] = {}
+                approved = {}
+                for target, (column, _, id_field) in _APPROVAL_ARTIFACTS.items():
+                    artifact = snapshot[column.removesuffix("_json")]
+                    approved[target] = artifact is not None and self._is_approved(
+                        conn, run_id, target, getattr(artifact, id_field), artifact.content_hash
+                    )
+                    approval = self._latest_artifact_approval(conn, run_id, target)
+                    if approval is not None:
+                        baselines[target] = (
+                            self._matching_artifact(target, approval, approval["artifact_json"])
+                            or self._matching_artifact(target, approval, row[column])
+                            or self._matching_archived_artifact(conn, run_id, target, approval)
+                        )
+                snapshot["approval_baselines"] = baselines
+                snapshot["artifact_approved"] = approved
+            return snapshot
         finally:
             conn.close()
 
@@ -782,6 +826,74 @@ class RunStore:
             self._check_revision(cur_rev, expected_revision)
             return self._record_approval(conn, record, cur_rev)
 
+    @staticmethod
+    def _latest_artifact_approval(
+        conn: sqlite3.Connection, run_id: str, target: ApprovalTarget
+    ) -> sqlite3.Row | None:
+        return cast(sqlite3.Row | None, conn.execute(
+            """
+            SELECT a.approval_id, a.target_id, a.target_hash, s.artifact_json
+            FROM approvals a LEFT JOIN approval_artifacts s USING (approval_id)
+            WHERE a.run_id = ? AND a.target = ? AND a.decision IN (?, ?)
+            ORDER BY a.rowid DESC LIMIT 1
+            """,
+            (run_id, target, *_APPROVED_DECISIONS),
+        ).fetchone())
+
+    @staticmethod
+    def _matching_artifact(
+        target: ApprovalTarget, approval: sqlite3.Row | ApprovalRecord, raw: str | None
+    ) -> ApprovalArtifact | None:
+        if raw is None:
+            return None
+        _, model, id_field = _APPROVAL_ARTIFACTS[target]
+        try:
+            artifact = model.model_validate_json(raw)
+        except ValidationError:
+            return None
+        target_id, target_hash = (
+            (approval.target_id, approval.target_hash) if isinstance(approval, ApprovalRecord)
+            else (approval["target_id"], approval["target_hash"])
+        )
+        if getattr(artifact, id_field) == target_id and artifact.content_hash == target_hash:
+            return artifact
+        return None
+
+    def _matching_archived_artifact(
+        self, conn: sqlite3.Connection, run_id: str, target: ApprovalTarget, approval: sqlite3.Row
+    ) -> ApprovalArtifact | None:
+        rows = conn.execute(
+            """
+            SELECT s.artifact_json FROM approvals a JOIN approval_artifacts s USING (approval_id)
+            WHERE a.run_id = ? AND a.target = ? AND a.target_id = ? AND a.target_hash = ?
+              AND a.approval_id != ?
+            ORDER BY a.rowid DESC
+            """,
+            (
+                run_id, target, approval["target_id"], approval["target_hash"],
+                approval["approval_id"],
+            ),
+        )
+        for row in rows:
+            artifact = self._matching_artifact(target, approval, row["artifact_json"])
+            if artifact is not None:
+                return artifact
+        return None
+
+    def _preserve_legacy_approval(
+        self, conn: sqlite3.Connection, run_id: str, target: ApprovalTarget
+    ) -> None:
+        approval = self._latest_artifact_approval(conn, run_id, target)
+        if approval is None or approval["artifact_json"] is not None:
+            return
+        column, _, _ = _APPROVAL_ARTIFACTS[target]
+        raw = self._get_run_row(conn, run_id)[column]
+        if self._matching_artifact(target, approval, raw) is not None:
+            conn.execute(
+                "INSERT INTO approval_artifacts (approval_id, artifact_json) VALUES (?, ?)",
+                (approval["approval_id"], raw),
+            )
+
     def _record_approval(
         self, conn: sqlite3.Connection, record: ApprovalRecord, cur_rev: int
     ) -> int:
@@ -810,6 +922,14 @@ class RunStore:
             "UPDATE runs SET state_revision = ?, updated_at = ? WHERE run_id = ?",
             (new_rev, utc_now().isoformat(), record.run_id),
         )
+        if record.target in _APPROVAL_ARTIFACTS and record.decision in _APPROVED_DECISIONS:
+            column, _, _ = _APPROVAL_ARTIFACTS[record.target]
+            raw = self._get_run_row(conn, record.run_id)[column]
+            if self._matching_artifact(record.target, record, raw) is not None:
+                conn.execute(
+                    "INSERT INTO approval_artifacts (approval_id, artifact_json) VALUES (?, ?)",
+                    (record.approval_id, raw),
+                )
         self._insert_event(
             conn,
             run_id=record.run_id,
@@ -840,31 +960,25 @@ class RunStore:
         """Return True if the latest matching approval for the hash/commit is approved."""
         conn = self._connect()
         try:
-            if commit_sha is None:
-                row = conn.execute(
-                    """
-                    SELECT decision FROM approvals
-                    WHERE run_id = ? AND target = ? AND target_id = ? AND target_hash = ?
-                    ORDER BY rowid DESC LIMIT 1
-                    """,
-                    (run_id, target.value, target_id, target_hash),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    SELECT decision FROM approvals
-                    WHERE run_id = ? AND target = ? AND target_id = ?
-                      AND target_hash = ? AND commit_sha = ?
-                    ORDER BY rowid DESC LIMIT 1
-                    """,
-                    (run_id, target.value, target_id, target_hash, commit_sha),
-                ).fetchone()
-            return row is not None and row["decision"] in (
-                ApprovalDecision.APPROVED.value,
-                ApprovalDecision.ACCEPT_RISK.value,
-            )
+            return self._is_approved(conn, run_id, target, target_id, target_hash, commit_sha)
         finally:
             conn.close()
+
+    @staticmethod
+    def _is_approved(
+        conn: sqlite3.Connection, run_id: str, target: ApprovalTarget,
+        target_id: str, target_hash: str, commit_sha: str | None = None,
+    ) -> bool:
+        row = conn.execute(
+            """
+            SELECT decision FROM approvals
+            WHERE run_id = ? AND target = ? AND target_id = ? AND target_hash = ?
+              AND (? IS NULL OR commit_sha = ?)
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (run_id, target, target_id, target_hash, commit_sha, commit_sha),
+        ).fetchone()
+        return bool(row is not None and row["decision"] in _APPROVED_DECISIONS)
 
     def list_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         conn = self._connect()

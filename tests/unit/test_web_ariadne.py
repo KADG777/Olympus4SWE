@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -178,6 +179,245 @@ def test_goal_approval_review_snapshot_links_commitments_to_candidate(tmp_path: 
         "text": "最多 200 QPS",
         "provenance": "unknown",
     }
+
+
+def test_goal_rereview_uses_last_approval_and_surfaces_unchanged_criteria(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    approved = store.get_run(run_id)["spec"].model_copy(update={
+        "requirements": [RequirementItem(
+            id="EXPORT", actor="管理员", description="仅管理员可以导出",
+            acceptance_criteria=["导出包含时间戳", "拒绝未登录访问"],
+        )],
+        "open_ambiguities": [],
+    })
+    store.save_spec(run_id, approved)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    current = app.get_run_payload(run_id)["projection"]
+    app.execute_command(run_id, {
+        "action": "approve_spec", "target_hash": approved.content_hash,
+        "expected_state_revision": current["state_revision"], "auto_advance": False,
+    })
+    store.save_spec(run_id, approved.model_copy(update={"goal": "未批准的中间稿"}))
+    revised = approved.model_copy(update={
+        "version": 2, "requirements": [approved.requirements[0].model_copy(update={
+            "actor": "所有成员", "description": "所有成员都可以导出",
+        })],
+    })
+    store.save_spec(run_id, revised)
+    projection = app.get_run_payload(run_id)["projection"]
+    review = projection["approval_reviews"]["approve_spec"]
+    assert review["target_hash"] == revised.content_hash
+    assert review["baseline"]["content_hash"] == approved.content_hash
+    entries = [entry for section in review["sections"] for entry in section["entries"]]
+    assert any(
+        entry["text"] == "所有成员都可以导出"
+        and entry["previous"]["text"] == "仅管理员可以导出"
+        for entry in entries
+    )
+    assert {entry["text"] for entry in entries if entry["change"] == "affected"} == {
+        "导出包含时间戳", "拒绝未登录访问",
+    }
+    assert any(section["title"] == "排除项" for section in review["unchanged_sections"])
+    assert set(projection["approval_reviews"]) == {"approve_spec", "approve_design", "approve_plan"}
+
+
+@pytest.mark.parametrize("original_available", [False, True])
+def test_rereview_migrates_legacy_database(tmp_path: Path, original_available: bool) -> None:
+    db = tmp_path / "legacy.db"
+    store = RunStore(db)
+    run_id = _seed_gated_run(store)
+    old = store.get_run(run_id)["spec"]
+    approved = ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=old.spec_id,
+        target_hash=old.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    )
+    store.record_approval(approved)
+    candidate = old.model_copy(update={"version": 2, "goal": "当前完整目标"})
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE approval_artifacts")
+        if not original_available:
+            conn.execute(
+                "UPDATE runs SET spec_json = ? WHERE run_id = ?",
+                (candidate.model_dump_json(), run_id),
+            )
+
+    store = RunStore(db)
+    if original_available:
+        store.save_spec(run_id, candidate)
+    review = build_run_projection(store, tmp_path, run_id)["approval_reviews"]["approve_spec"]
+    if original_available:
+        assert review["baseline"]["content_hash"] == old.content_hash
+    else:
+        assert "缺少上次批准版本的可靠原文" in review["comparison_gap"]
+        assert "baseline" not in review and "unchanged_sections" not in review
+        assert {
+            entry["text"] for section in review["sections"] for entry in section["entries"]
+        } >= {"当前完整目标", "已报名者取消后自动递补最早的有效候补者",
+              "不发送短信或邮件通知", "递补在同一事务内完成且状态可观测",
+              '["报名、取消与递补共用单一写事务"]'}
+    assert store.is_approved(
+        run_id=run_id, target=approved.target,
+        target_id=approved.target_id, target_hash=approved.target_hash,
+    )
+    assert any(event.payload.get("approval_id") == approved.approval_id
+               for event in store.list_events(run_id))
+
+
+def test_rereview_does_not_skip_a_newer_approval_with_an_invalid_original(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    first = store.get_run(run_id)["spec"]
+    latest = first.model_copy(update={"version": 2, "goal": "已批准的新版目标"})
+    rejected = latest.model_copy(update={"version": 3, "goal": "被否决的目标"})
+    for artifact, decision in (
+        (first, ApprovalDecision.APPROVED), (latest, ApprovalDecision.APPROVED),
+        (rejected, ApprovalDecision.REJECTED),
+    ):
+        store.save_spec(run_id, artifact)
+        store.record_approval(ApprovalRecord(
+            run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=artifact.spec_id,
+            target_hash=artifact.content_hash, approver="human", decision=decision,
+        ))
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    review = app.get_run_payload(run_id)["projection"]["approval_reviews"]["approve_spec"]
+    assert review["baseline"]["content_hash"] == latest.content_hash
+    invalid = latest.model_dump(mode="json") | {"goal": "与已批准指纹不符的正文"}
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE approval_artifacts SET artifact_json = ? WHERE approval_id IN "
+            "(SELECT approval_id FROM approvals WHERE target_hash = ?)",
+            (json.dumps(invalid), latest.content_hash),
+        )
+    review = app.get_run_payload(run_id)["projection"]["approval_reviews"]["approve_spec"]
+    assert "baseline" not in review
+    assert "缺少上次批准版本的可靠原文" in review["comparison_gap"]
+    assert review["sections"][0]["entries"][0]["text"] == rejected.goal
+
+
+def test_rereview_all_gates_http_snapshot_sse_and_version_binding(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    baseline = store.get_run(run_id)
+    spec = baseline["spec"].model_copy(update={"open_ambiguities": []})
+    design = DesignSpec.model_validate({
+        **baseline["design"].model_dump(), "spec_hash": spec.content_hash,
+        "design_tradeoffs": [
+            {"impact": "rollback", "choice": "保留旧列", "cost": "延后清理"},
+            {"impact": "deployment", "choice": "同步切流", "cost": "集中值班"},
+        ],
+    })
+    plan = baseline["plan"].model_copy(update={
+        "design_hash": design.content_hash, "spec_id": spec.spec_id,
+        "spec_hash": spec.content_hash,
+    })
+    root = plan.tasks[0]
+    downstream = root.model_copy(update={
+        "task_id": "T02", "title": "更新查询", "depends_on": [root.task_id],
+        "write_scope": ["src/waitlist/api.py"], "deliverables": ["更新查询 API"],
+    })
+    plan = plan.model_copy(update={"tasks": [root, downstream]})
+    store.save_spec(run_id, spec)
+    store.save_design(run_id, design)
+    store.save_plan(run_id, plan)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    httpd = create_http_server(app, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    path = f"/api/runs/{run_id}"
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{httpd.server_port}") as client:
+            def approve(action, target_hash, projection):
+                return client.post(f"{path}/command", json={
+                    "action": action, "target_hash": target_hash,
+                    "expected_state_revision": projection["state_revision"], "auto_advance": False,
+                })
+
+            initial = client.get(path).json()["projection"]
+            projection = initial
+            for action, artifact in (
+                ("approve_spec", spec), ("approve_design", design), ("approve_plan", plan)
+            ):
+                response = approve(action, artifact.content_hash, projection)
+                assert response.status_code == 200, response.text
+                projection = response.json()["projection"]
+
+            store.acquire_task_lease(run_id, root.task_id)
+            updated = client.get(path).json()["projection"]
+            assert updated["plan"]["content_hash"] == plan.content_hash
+            assert updated["plan_approved"] and "approve_plan" not in updated["approval_reviews"]
+
+            revised_spec = spec.model_copy(update={
+                "version": 2, "requirements": [spec.requirements[0].model_copy(update={
+                    "description": "所有成员可以取消自己的报名",
+                })],
+            })
+            revised_design = DesignSpec.model_validate({
+                **design.model_dump(), "version": 2, "spec_hash": revised_spec.content_hash,
+                "design_tradeoffs": [
+                    {"impact": "rollback", "choice": "保留旧列", "cost": "延后清理一个月"},
+                    {"impact": "existing_system", "choice": "沿用现有入口", "cost": "保留兼容层"},
+                ],
+            })
+            revised_plan = plan.model_copy(update={
+                "version": 2, "design_hash": revised_design.content_hash,
+                "spec_hash": revised_spec.content_hash, "tasks": [
+                    root.model_copy(update={"deliverables": ["新的权限处理器"]}),
+                    downstream.model_copy(update={"depends_on": []}),
+                ],
+            })
+            store.save_spec(run_id, revised_spec)
+            store.save_design(run_id, revised_design)
+            store.save_plan(run_id, revised_plan)
+            rereview = client.get(path).json()["projection"]
+            stream = client.get(f"{path}/stream?after_seq={updated['latest_event_seq']}&once=1")
+            assert stream.status_code == 200
+            state = json.loads(next(line[6:] for line in stream.text.splitlines()
+                                    if line.startswith("data: ")))
+            assert state["state_revision"] == rereview["state_revision"]
+            assert [event["payload"]["content_hash"] for event in state["events"]] == [
+                revised_spec.content_hash, revised_design.content_hash, revised_plan.content_hash,
+            ]
+            for action, old, new in (
+                ("approve_spec", spec, revised_spec), ("approve_design", design, revised_design),
+                ("approve_plan", plan, revised_plan),
+            ):
+                review = rereview["approval_reviews"][action]
+                assert review["baseline"]["content_hash"] == old.content_hash
+                assert review["target_hash"] == new.content_hash
+                conflict = approve(action, old.content_hash, rereview)
+                assert conflict.status_code == 409 and conflict.json()["conflict"]
+                assert conflict.json()["projection"]["approval_reviews"][action] == review
+
+            reviews = rereview["approval_reviews"]
+            design_entries = [entry for section in reviews["approve_design"]["sections"]
+                              if section["title"] == "关键取舍" for entry in section["entries"]]
+            assert {entry["change"]: entry["text"] for entry in design_entries} == {
+                "changed": "保留旧列", "added": "沿用现有入口", "removed": "同步切流",
+            }
+            plan_review = reviews["approve_plan"]
+            assert plan_review["baseline"]["tasks"][0]["status"] == "ready"
+            plan_entries = [entry for section in plan_review["sections"]
+                            for entry in section["entries"]]
+            assert any(entry["change"] == "removed" and "T01" in entry["text"]
+                       and "T02" in entry["text"] for entry in plan_entries)
+            assert any(entry["change"] == "affected" and entry["text"] ==
+                       spec.requirements[0].acceptance_criteria[0] for entry in plan_entries)
+            for key, artifact in (
+                ("spec", revised_spec), ("design", revised_design), ("plan", revised_plan),
+            ):
+                response = approve(f"approve_{key}", artifact.content_hash, rereview)
+                assert response.status_code == 200, response.text
+                rereview = response.json()["projection"]
+                assert rereview[f"{key}_approved"]
+                assert rereview[key]["content_hash"] == artifact.content_hash
+            assert not rereview["approval_reviews"]
+            assert sum(event.event_type == "approval.recorded"
+                       for event in store.list_events(run_id)) == 6
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join()
 
 
 def test_design_approval_review_snapshot_projects_the_candidate_tradeoffs(tmp_path: Path) -> None:

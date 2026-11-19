@@ -43,7 +43,9 @@ from olympus.web.approval_review import (
     APPROVAL_ARTIFACTS,
     ApprovalReview,
     ReviewSection,
+    compare_approval_review,
     design_review_sections,
+    expand_candidate_review,
     goal_review_sections,
     plan_review_sections,
 )
@@ -1139,7 +1141,7 @@ def build_run_projection(
     artifacts_root: Path | None = None,
 ) -> dict[str, Any]:
     """Derive a complete read-only Ariadne console view from SQLite events and run artifacts."""
-    snap = store.get_run(run_id)
+    snap = store.get_run(run_id, include_approval_baselines=True)
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
     design: DesignSpec | None = snap.get("design")
@@ -1153,54 +1155,54 @@ def build_run_projection(
         else Path(workspace_root).resolve() / ".olympus" / "runs"
     ) / run_id
 
-    spec_approved = bool(
-        spec
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.GOAL_SPEC,
-            target_id=spec.spec_id,
-            target_hash=spec.content_hash,
-        )
-    )
-    plan_approved = bool(
-        plan
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
-        )
-    )
-    design_approved = bool(
-        design
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=design.design_id,
-            target_hash=design.content_hash,
-        )
-    )
+    approved = snap["artifact_approved"]
+    spec_approved = approved[ApprovalTarget.GOAL_SPEC]
+    design_approved = approved[ApprovalTarget.DESIGN_SPEC]
+    plan_approved = approved[ApprovalTarget.TASK_PLAN]
 
     approval_reviews: dict[str, ApprovalReview] = {}
-    approved = {"spec": spec_approved, "design": design_approved, "plan": plan_approved}
+    targets = {
+        "spec": ApprovalTarget.GOAL_SPEC, "design": ApprovalTarget.DESIGN_SPEC,
+        "plan": ApprovalTarget.TASK_PLAN,
+    }
+    baselines = snap["approval_baselines"]
+    tasks = plan.tasks if plan else []
+    layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
     for action, key in APPROVAL_ARTIFACTS.items():
         artifact = snap[key]
-        if artifact and not approved[key]:
-            sections: list[ReviewSection] = []
+        target = targets[key]
+        if artifact and not approved[target]:
+            sections: list[ReviewSection]
             if key == "spec":
                 sections = goal_review_sections(artifact)
             elif key == "design":
                 sections = design_review_sections(artifact)
-            approval_reviews[action] = {
+            else:
+                sections = plan_review_sections(artifact, layers)
+            review: ApprovalReview = {
                 "artifact": key,
                 "target_hash": artifact.content_hash,
                 "sections": sections,
             }
+            baseline = baselines.get(target)
+            if baseline is not None:
+                compare_approval_review(
+                    review, artifact, baseline,
+                    plan_layers=lambda tasks: _compute_dag_layers_and_critical_path(tasks)[0],
+                    goals=[item for item in (spec, baselines.get(ApprovalTarget.GOAL_SPEC))
+                           if item is not None],
+                    designs=[item for item in (design, baselines.get(ApprovalTarget.DESIGN_SPEC))
+                             if item is not None],
+                )
+            elif target in baselines:
+                review["comparison_gap"] = (
+                    "缺少上次批准版本的可靠原文。以下展示本次候选的全部关键承诺。"
+                )
+                expand_candidate_review(review, artifact)
+            else:
+                review["comparison_gap"] = "暂无已批准版本可供对照。"
+            approval_reviews[action] = review
 
-    tasks = plan.tasks if plan else []
-    layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
-    if plan is not None and not plan_approved:
-        approval_reviews["approve_plan"]["sections"] = plan_review_sections(plan, layers)
     task_by_id = {t.task_id: t for t in tasks}
     blocked_by: dict[str, list[str]] = {}
     for task in sorted(tasks, key=lambda task: layers[task.task_id]):

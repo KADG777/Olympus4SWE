@@ -339,44 +339,77 @@
     approve_plan: "任务计划",
   };
 
-  function renderApprovalReview(action, review, artifact) {
-    const title = approvalLabels[action];
-    const approveButton = el.approvalButtons.content.querySelector(`[data-approve="${action}"]`);
-    const sections = review.sections
+  function renderApprovalSections(sections) {
+    const changeLabels = {
+      changed: ["变更", "warn"],
+      added: ["新增", "ok"],
+      removed: ["移除", "warn"],
+      affected: ["需复核", "warn"],
+    };
+    return sections
       .filter((section) => section.entries.length || section.empty_text)
       .map(({ title, entries, empty_text }) => `
         <section class="approval-section">
           <h4>${esc(title)}</h4>
-          <ul class="spec-list">${entries.map(({ text, label, ref, provenance, cost }, index) => {
-            const badge = provenance === "agent_high_impact"
+          <ul class="spec-list">${entries.map((entry, index) => {
+            const { label, ref, change, previous, related } = entry;
+            const provenance = entry.provenance === "agent_high_impact"
               ? uiBadge("Agent 补充 · 高影响", "warn")
-              : provenance === "unknown" ? uiBadge("来源未记录", "muted") : "";
+              : entry.provenance === "unknown" ? uiBadge("来源未记录", "muted") : "";
+            const status = change ? uiBadge(...changeLabels[change]) : "";
             const entryName = label || (entries.length > 1 ? `${title} ${index + 1}` : title);
-            const content = cost === undefined
+            const content = ({ text, cost }) => cost === undefined
               ? `<span>${esc(text)}</span>`
               : `<br>${renderDesignTradeoff(text, cost)}`;
-            return `<li>${label ? `<strong>${esc(label)}</strong> ` : ""}${content} ${badge}
-              <button type="button" class="approval-ref" data-review-ref="${esc(ref)}"
-                aria-label="定位 ${esc(entryName)}">原条目</button></li>`;
+            const origin = (pointer, baseline) => `
+              <button type="button" class="approval-ref" data-review-ref="${esc(pointer)}"
+                ${baseline ? "data-review-old-ref" : ""}
+                aria-label="定位 ${baseline ? "上次批准的 " : ""}${esc(entryName)}">
+                ${baseline ? "上次原条目" : "原条目"}</button>`;
+            return `<li>${status} ${label ? `<strong>${esc(label)}</strong> ` : ""}
+              ${previous ? `<div><small>上次批准</small> ${previous.label && previous.label !== label
+                ? `<strong>${esc(previous.label)}</strong> ` : ""}${content(previous)}
+                ${origin(previous.ref, true)}</div><small>本次候选</small> ` : ""}
+              ${content(entry)} ${provenance}
+              ${related ? "" : origin(ref, change === "removed")}</li>`;
           }).join("") || `<li>${esc(empty_text)}</li>`}</ul>
         </section>`)
       .join("");
+  }
+
+  function renderApprovalReview(action, review, artifact) {
+    const title = approvalLabels[action];
+    const approveButton = el.approvalButtons.content.querySelector(`[data-approve="${action}"]`);
+    const sections = renderApprovalSections(review.sections);
+    const unchanged = renderApprovalSections(review.unchanged_sections || []);
+    const baseline = review.baseline;
     return `
       <article class="approval-review" data-review-action="${action}" aria-labelledby="review-${action}">
         <h3 id="review-${action}" tabindex="-1">${esc(title)}${artifact.version ? ` · v${esc(artifact.version)}` : ""}</h3>
-        ${sections ? `<div class="approval-sections">${sections}</div>` : ""}
+        ${review.comparison_gap ? `<p>${esc(review.comparison_gap)}</p>` : ""}
+        ${sections ? `<div class="approval-sections">${sections}</div>`
+          : baseline ? "<p>已核对的关键承诺一致。</p>" : ""}
+        ${unchanged ? `<details data-review-disclosure="unchanged">
+          <summary>查看已确认未变的条目</summary>
+          <div class="approval-sections">${unchanged}</div>
+        </details>` : ""}
         <div class="approval-controls">
-          ${review.artifact === "design" ? `<details>
+          ${review.artifact === "design" ? `<details data-review-disclosure="structure">
             <summary>查看模块、数据模型与接口</summary>
             ${renderDesignStructure(artifact)}
           </details>` : ""}
           ${action === "approve_plan"
             ? '<button type="button" class="btn" data-review-plan-graph>查看任务依赖图</button>' : ""}
-          <details>
+          <details data-review-disclosure="candidate">
             <summary>查看完整 ${esc(title)}</summary>
             <div class="approval-origin" hidden></div>
             <pre tabindex="0">${esc(JSON.stringify(artifact, null, 2))}</pre>
           </details>
+          ${baseline ? `<details data-review-disclosure="baseline" data-review-baseline>
+            <summary>查看上次批准的 ${esc(title)}</summary>
+            <div class="approval-origin" hidden></div>
+            <pre tabindex="0">${esc(JSON.stringify(baseline, null, 2))}</pre>
+          </details>` : ""}
           ${approveButton.outerHTML}
         </div>
       </article>`;
@@ -394,6 +427,11 @@
       if (approvalLabels[action] && artifact?.content_hash === review.target_hash) {
         reviews.set(action, {
           artifact,
+          baseline: review.baseline,
+          reviewKey: JSON.stringify([
+            review.target_hash, review.baseline?.content_hash, review.comparison_gap,
+            review.sections, review.unchanged_sections,
+          ]),
           command: {
             action,
             target_hash: review.target_hash,
@@ -412,7 +450,7 @@
         continue;
       }
       if (existing && sameRun &&
-          previous.reviews.get(action)?.command.target_hash === binding.command.target_hash) {
+          previous.reviews.get(action)?.reviewKey === binding.reviewKey) {
         continue;
       }
       const html = renderApprovalReview(action, projection.approval_reviews[action], binding.artifact);
@@ -425,12 +463,12 @@
     return reviews.size > 0;
   }
 
-  function showApprovalOrigin(card, artifact, ref) {
+  function showApprovalOrigin(card, artifact, ref, version) {
     const parts = ref.slice(1).split("/").map((key) => key.replaceAll("~1", "/").replaceAll("~0", "~"));
     const value = parts.reduce((item, key) => item?.[key], artifact);
     if (value === undefined) return;
     const source = parts[0] === "requirements" ? artifact.requirements?.[parts[1]]?.source_ref : null;
-    const origin = card.querySelector(".approval-origin");
+    const origin = card.querySelector(`[data-review-disclosure="${version}"] .approval-origin`);
     origin.innerHTML = `<code tabindex="-1">${esc(ref)}</code>
       <p>${esc(typeof value === "string" ? value : JSON.stringify(value))}</p>
       ${source ? `<p>规格引用 · ${esc(source)}</p>` : ""}`;
@@ -1705,7 +1743,8 @@
     if (!root) return () => null;
     if (root === element) return () => document.getElementById(root.id);
     const keys = ["data-output-key", "data-task-id", "data-workflow-node", "data-tab",
-      "data-run-id", "data-amb-input", "data-jump-task", "data-history-output", "aria-label"];
+      "data-run-id", "data-amb-input", "data-jump-task", "data-history-output",
+      "data-review-disclosure", "aria-label"];
     const key = keys.find((attribute) => element.hasAttribute(attribute));
     const tag = element.localName;
     const selector = key ? `${tag}[${key}="${CSS.escape(element.getAttribute(key))}"]` : tag;
@@ -2428,9 +2467,11 @@
       const binding = snapshot.reviews.get(card.dataset.reviewAction);
       if (!binding) return;
       const { artifact, command } = binding;
-      const ref = event.target.closest("[data-review-ref]")?.dataset.reviewRef;
-      if (ref) {
-        showApprovalOrigin(card, artifact, ref);
+      const origin = event.target.closest("[data-review-ref]");
+      if (origin) {
+        const old = origin.hasAttribute("data-review-old-ref");
+        showApprovalOrigin(card, old ? binding.baseline : artifact,
+          origin.dataset.reviewRef, old ? "baseline" : "candidate");
         return;
       }
       if (event.target.closest("[data-review-plan-graph]")) {

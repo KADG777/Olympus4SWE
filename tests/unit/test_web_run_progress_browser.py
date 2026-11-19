@@ -1,6 +1,7 @@
 """Run with uv run --with playwright pytest tests/unit/test_web_run_progress_browser.py."""
 
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -54,6 +55,76 @@ def browser():
             yield browser
         finally:
             browser.close()
+
+
+def test_goal_rereview_shows_permission_impact_after_live_update(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="导出权限返审")
+    approved = GoalSpec(
+        goal="导出报表",
+        requirements=[RequirementItem(
+            id="EXPORT", description="仅管理员可以导出",
+            acceptance_criteria=["导出包含时间戳"],
+        )],
+        out_of_scope=["定时导出"],
+    )
+    store.save_spec(run_id, approved)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=approved.spec_id,
+        target_hash=approved.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    expect(page.get_by_text("导出权限返审", exact=True).first).to_be_visible()
+
+    revised = approved.model_copy(update={
+        "version": 2, "requirements": [approved.requirements[0].model_copy(update={
+            "description": "所有成员都可以导出",
+        })],
+    })
+    store.save_spec(run_id, revised)
+    review = page.get_by_role("article", name="GoalSpec · v2")
+    expect(review.get_by_text("所有成员都可以导出", exact=True)).to_be_visible()
+    expect(review.get_by_text("仅管理员可以导出", exact=True)).to_be_visible()
+    expect(review.get_by_text("导出包含时间戳", exact=True)).to_be_visible()
+    unchanged = review.get_by_text("查看已确认未变的条目", exact=True)
+    expect(review.get_by_text("定时导出", exact=True)).to_be_hidden()
+    unchanged.click()
+    expect(review.get_by_text("定时导出", exact=True)).to_be_visible()
+    review.get_by_text("查看上次批准的 GoalSpec", exact=True).click()
+    expect(review.locator("[data-review-baseline] pre")).to_contain_text(approved.content_hash)
+
+
+def test_legacy_rereview_shows_candidate_when_the_approved_original_is_missing(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="旧库返审")
+    approved = GoalSpec(
+        goal="导出报表",
+        requirements=[RequirementItem(
+            id="EXPORT", description="仅管理员可以导出", acceptance_criteria=["导出保留时间戳"],
+        )],
+        out_of_scope=["定时导出"],
+    )
+    store.save_spec(run_id, approved)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=approved.spec_id,
+        target_hash=approved.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    store.save_spec(run_id, approved.model_copy(update={"version": 2, "goal": "导出当前报表"}))
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DROP TABLE approval_artifacts")
+    RunStore(store.db_path)
+
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    review = page.get_by_role("article", name="GoalSpec · v2")
+    expect(review.get_by_text("缺少上次批准版本的可靠原文", exact=False)).to_be_visible()
+    for commitment in ("导出当前报表", "仅管理员可以导出", "导出保留时间戳", "定时导出"):
+        expect(review.get_by_text(commitment, exact=True)).to_be_visible()
+    expect(review.locator("[data-review-baseline]")).to_have_count(0)
 
 
 def test_design_approval_shows_tradeoffs_and_reopens_review_after_conflict(workbench, browser):
@@ -289,6 +360,48 @@ def test_plan_review_rejects_stale_approval_and_retains_approved_checks(export_p
     full_plan = page.get_by_role("region", name="任务依赖图").locator("pre")
     expect(full_plan).to_contain_text(revised.content_hash)
     expect(full_plan).to_contain_text(new_command)
+
+
+def test_design_and_plan_rereview_show_previous_tradeoff_and_dependency(export_plan, browser):
+    store, run_id, url, plan = export_plan
+    design = DesignSpec.model_validate({
+        "architecture_summary": "同步导出。",
+        "modules": [{
+            "id": "EXPORT", "name": "导出", "responsibility": "管理权限与导出",
+            "target_paths": ["src/export.py"], "requirement_refs": ["EXPORT"],
+        }],
+        "design_tradeoffs": [{"impact": "rollback", "choice": "保留旧列", "cost": "占用空间"}],
+    })
+    store.save_design(run_id, design)
+    for target, artifact_id, fingerprint in (
+        (ApprovalTarget.DESIGN_SPEC, design.design_id, design.content_hash),
+        (ApprovalTarget.TASK_PLAN, plan.plan_id, plan.content_hash),
+    ):
+        store.record_approval(ApprovalRecord(
+            run_id=run_id, target=target, target_id=artifact_id, target_hash=fingerprint,
+            approver="human", decision=ApprovalDecision.APPROVED,
+        ))
+    store.save_design(run_id, design.model_copy(update={"version": 2, "design_tradeoffs": []}))
+    store.save_plan(run_id, plan.model_copy(update={
+        "version": 2, "tasks": [task.model_copy(update={"depends_on": []}) for task in plan.tasks],
+    }))
+
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    design_review = page.get_by_role("article", name="DesignSpec · v2")
+    old_choice = design_review.get_by_text("选择：保留旧列", exact=True)
+    expect(old_choice).to_be_visible()
+    expect(old_choice.locator("xpath=ancestor::li").get_by_text("移除", exact=True)).to_be_visible()
+    design_review.get_by_role("button", name="定位 上次批准的 回滚").click()
+    expect(design_review.get_by_text("/design_tradeoffs/0", exact=True)).to_be_focused()
+    expect(design_review.locator("[data-review-baseline] pre")).to_contain_text(design.content_hash)
+    plan_review = page.get_by_role("article", name="任务计划 · v2")
+    dependency = plan_review.get_by_text("才能开始", exact=False)
+    expect(dependency.first).to_be_visible()
+    expect(dependency.first.locator("xpath=ancestor::li").get_by_text("移除", exact=True)
+           ).to_be_visible()
+    expect(plan_review.get_by_role("button", name="查看任务依赖图")).to_be_visible()
 
 
 def test_plan_history_survives_task_graph_and_updates_over_sse(export_plan, browser):

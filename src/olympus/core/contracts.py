@@ -559,6 +559,22 @@ class TaskNode(StrictModel):
     kind: TaskKind = TaskKind.IMPLEMENT
     deliverables: list[str] = Field(default_factory=list)
 
+    def definition(self) -> dict[str, Any]:
+        """Return approval-bound task fields, excluding execution state."""
+        return self.model_dump(
+            include={
+                "task_id", "title", "objective", "requirement_refs", "depends_on",
+                "write_scope", "read_scope", "max_cycles", "design_refs", "role",
+                "kind", "deliverables",
+            },
+            mode="python",
+        ) | {
+            "acceptance_checks": [
+                check.model_dump(include={"id", "kind", "description", "command"}, mode="python")
+                for check in self.acceptance_checks
+            ]
+        }
+
 
 class DeliveryCheck(StrictModel):
     """Executable check for a 1-based criterion in the plan's bound GoalSpec."""
@@ -591,32 +607,6 @@ class TaskPlan(FingerprintedModel):
 
     def _hash_payload(self) -> dict[str, Any]:
         # Hash structural plan definition (not mutable runtime execution counters)
-        structural_tasks = [
-            t.model_dump(
-                include={
-                    "task_id",
-                    "title",
-                    "objective",
-                    "requirement_refs",
-                    "depends_on",
-                    "write_scope",
-                    "read_scope",
-                    "max_cycles",
-                    "design_refs",
-                    "role",
-                    "kind",
-                    "deliverables",
-                },
-                mode="python",
-            )
-            | {
-                "acceptance_checks": [
-                    c.model_dump(include={"id", "kind", "description", "command"}, mode="python")
-                    for c in t.acceptance_checks
-                ]
-            }
-            for t in self.tasks
-        ]
         payload = {
             "plan_id": self.plan_id,
             "spec_id": self.spec_id,
@@ -624,7 +614,7 @@ class TaskPlan(FingerprintedModel):
             "design_id": self.design_id,
             "design_hash": self.design_hash,
             "version": self.version,
-            "tasks": structural_tasks,
+            "tasks": [task.definition() for task in self.tasks],
         }
         if self.delivery_checks:
             payload["delivery_checks"] = [check.model_dump() for check in self.delivery_checks]
