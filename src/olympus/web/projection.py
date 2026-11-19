@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import olympus.web.acceptance as delivery_review
+import olympus.web.demos as demo_runs
 from olympus.core.contracts import (
     AcceptanceCheck,
     AmbiguityItem,
@@ -556,6 +558,8 @@ def _build_traceability_matrix(
     spec: GoalSpec | None,
     tasks: list[TaskNode],
     design: DesignSpec | None = None,
+    *,
+    delivery_acceptance: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build Requirement x DesignModule x Task x Verification Status rows."""
     if spec is None and design is None:
@@ -597,7 +601,21 @@ def _build_traceability_matrix(
             for module in (design.modules if design is not None else [])
             if req_id in module.requirement_refs
         ]
-        if not covering:
+        if spec is not None:
+            criteria = [
+                row for row in (delivery_acceptance or {}).get("criteria", [])
+                if row["requirement_id"] == req_id
+            ]
+            if any(row["status"] == "failed" for row in criteria):
+                v_status, v_label, evidence_note = "failed", "失败", "有验收条件失败"
+            elif any(row["risk_accepted"] for row in criteria):
+                v_status, v_label = "unverified_risk_accepted", "未验证 · 人工接受"
+                evidence_note = next(row["reason"] for row in criteria if row["risk_accepted"])
+            elif criteria and all(row["status"] == "passed" for row in criteria):
+                v_status, v_label, evidence_note = "verified", "通过", "所有验收条件均已通过"
+            else:
+                v_status, v_label, evidence_note = "pending", "未验证", "缺少可核验的逐条验收结果"
+        elif not covering:
             v_status = "pending"
             v_label = "待验证"
             evidence_note = "尚未分配执行任务"
@@ -1158,6 +1176,13 @@ def build_run_projection(
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
     task_by_id = {t.task_id: t for t in tasks}
 
+    delivery_acceptance = delivery_review.build_delivery_acceptance(
+        spec if spec_approved else None,
+        plan if plan_approved else None,
+        [event for event in events if event.state_revision <= snap["state_revision"]],
+        run_dir,
+    )
+
     receipt_by_task: dict[str, dict[str, Any]] = {}
     receipt_by_actor: dict[str, dict[str, Any]] = {}
     for ev in events:
@@ -1490,7 +1515,10 @@ def build_run_projection(
             receipt_by_actor,
             spec_approved=spec_approved,
         ),
-        "traceability_matrix": _build_traceability_matrix(spec, tasks, design),
+        "traceability_matrix": _build_traceability_matrix(
+            spec, tasks, design, delivery_acceptance=delivery_acceptance
+        ),
+        "delivery_acceptance": delivery_acceptance,
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }
@@ -1502,7 +1530,7 @@ def seed_demo_runs(
     *,
     artifacts_root: Path | None = None,
 ) -> list[str]:
-    """Seed deterministic walkthrough runs (Campus Activity Waitlist & cattrs) if missing."""
+    """Seed the delivery acceptance and campus waitlist walkthroughs if missing."""
     existing_ids = {r["run_id"] for r in store.list_runs(limit=100)}
     seeded: list[str] = []
     art_base = (
@@ -1510,6 +1538,10 @@ def seed_demo_runs(
         if artifacts_root is not None
         else Path(workspace_root).resolve() / ".olympus" / "runs"
     )
+
+    if demo_runs.DELIVERY_DEMO_ID not in existing_ids:
+        demo_runs.seed_delivery_acceptance_demo(store, art_base)
+        seeded.append(demo_runs.DELIVERY_DEMO_ID)
 
     demo_id = "run-campus-waitlist"
     if demo_id not in existing_ids:

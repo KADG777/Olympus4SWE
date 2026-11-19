@@ -34,7 +34,8 @@ from olympus.core.dag import (
     paths_overlap,
     validate_plan,
 )
-from olympus.core.store import RunStore
+from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.hooks import default_write_scope_hook
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
@@ -478,6 +479,10 @@ class OrchestrateStage:
             f"Remember: acceptance_checks[*].kind MUST be one of "
             f"'command', 'independent_review', or 'human' (never 'review'), and every "
             f"kind='command' check MUST include a non-empty 'command' string.\n"
+            "When a GoalSpec is supplied, optional delivery_checks bind one specific end-to-end "
+            "command per verifiable criterion by requirement_id and 1-based criterion_index. "
+            "Run these commands against the composed delivery after task execution. "
+            "Omit conditions without a reliable executable check. Task checks are separate.\n"
             f"{context_block}"
             f"{modular_block}"
             f"{chr(10).join(binding_lines)}\n"
@@ -1035,6 +1040,45 @@ class OrchestrateStage:
                 all_done = all(
                     t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for t in plan.tasks
                 )
+                if (
+                    all_done
+                    and plan.delivery_checks
+                    and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
+                    and snap["spec"] is not None
+                    and snap["spec"].content_hash == spec.content_hash
+                    and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
+                    and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
+                    and self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.GOAL_SPEC,
+                        target_id=spec.spec_id,
+                        target_hash=spec.content_hash,
+                    )
+                    and self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.TASK_PLAN,
+                        target_id=plan.plan_id,
+                        target_hash=plan.content_hash,
+                    )
+                ):
+                    run_dir = self._run_dir(run_id)
+                    receipt = run_delivery_checks(
+                        plan,
+                        workspace_root=self.workspace_root,
+                        overlay_dir=run_dir / "accepted_overlay",
+                        run_dir=run_dir,
+                    )
+                    try:
+                        self.store.append_event(
+                            run_id=run_id,
+                            stage="verify",
+                            event_type=DELIVERY_EVENT,
+                            actor="chronos",
+                            payload=receipt,
+                            expected_state_revision=snap["state_revision"],
+                        )
+                    except ConcurrencyConflictError:
+                        continue
                 target_status = RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
                 self.store.set_run_status(
                     run_id,

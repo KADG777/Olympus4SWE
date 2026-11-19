@@ -20,6 +20,7 @@ from olympus.providers.base import (
 )
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.web.projection import build_run_projection
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
@@ -34,7 +35,9 @@ def _init_repo(root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
 
 
-def _confirmed_run(tmp_path: Path) -> tuple[RunStore, str]:
+def _confirmed_run(
+    tmp_path: Path, *, criteria: list[str] | None = None
+) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
     run_id = store.create_run(title="Manifest run", mode=RunMode.SIMULATION)
     spec = GoalSpec(
@@ -44,7 +47,7 @@ def _confirmed_run(tmp_path: Path) -> tuple[RunStore, str]:
             {
                 "id": "R1",
                 "description": "Provide feature.py with FLAG = True",
-                "acceptance_criteria": ["feature.FLAG is True"],
+                "acceptance_criteria": criteria or ["feature.FLAG is True"],
             }
         ],
     )
@@ -145,6 +148,113 @@ def _stage_responder(
         raise AssertionError(f"Unexpected system prompt: {system_message[:80]}")
 
     return responder
+
+
+def test_delivery_acceptance_uses_executed_checks_on_the_composed_output(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, criteria=["feature.FLAG is True", "feature.AUDIT is True", "UI exposes FLAG"]
+    )
+    spec = store.get_run(run_id)["spec"]
+    checks = [
+        {
+            "id": "CHK-1",
+            "kind": "command",
+            "description": "Verify the flag module imports",
+            "command": "python3 -c 'import feature; assert feature.FLAG'",
+        }
+    ]
+    plan = _plan_payload(
+        spec_id=spec.spec_id, spec_hash=spec.content_hash, file_name="feature.py", checks=checks
+    )
+    plan["delivery_checks"] = [
+        {
+            "requirement_id": "R1",
+            "criterion_index": 1,
+            "command": "python3 -c 'import feature; assert feature.FLAG; print(\"tested FLAG\")'",
+        },
+        {
+            "requirement_id": "R1",
+            "criterion_index": 2,
+            "command": "python3 -c 'import feature; assert feature.AUDIT'",
+        },
+    ]
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+        ),
+        workspace_root=tmp_path,
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    pending = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert pending["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+
+    orch.run_execution(run_id=run_id)
+    review = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert review["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
+    passed, failed, unverified = review["criteria"]
+    assert [row["text"] for row in review["criteria"]] == [
+        "feature.FLAG is True", "feature.AUDIT is True", "UI exposes FLAG"
+    ]
+    assert "tested FLAG" in passed["evidence"]["log"]
+    assert failed["evidence"]["delivery_version"] == passed["evidence"]["delivery_version"]
+    assert failed["reason"] and unverified["reason"]
+    assert unverified["evidence"] is None
+    assert not (tmp_path / "feature.py").exists()
+
+    executed = next(
+        event
+        for event in store.list_events(run_id)
+        if event.event_seq == passed["evidence"]["event_seq"]
+    )
+    wrong_version = {"delivery_version": "sha256:" + "0" * 64}
+    store.append_event(
+        run_id=run_id,
+        stage=executed.stage,
+        event_type=executed.event_type,
+        actor=executed.actor,
+        payload=executed.payload | wrong_version,
+    )
+    stale = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert stale["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+    assert "交付版本" in stale["criteria"][0]["reason"]
+
+    store.append_event(
+        run_id=run_id,
+        stage=executed.stage,
+        event_type=executed.event_type,
+        actor=executed.actor,
+        payload=executed.payload,
+    )
+    artifact = tmp_path / ".olympus" / "runs" / run_id / "artifacts"
+    check_log = artifact / passed["evidence"]["receipt_id"] / "check-1.log"
+    check_log.write_text("different run output", encoding="utf-8")
+    tampered = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert tampered["counts"] == {"passed": 0, "failed": 1, "unverified": 2}
+    assert "指纹不一致" in tampered["criteria"][0]["reason"]
+
+    store.save_plan(run_id, store.get_run(run_id)["plan"])
+    replaced = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert replaced["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+
+    revised = spec.model_copy(
+        update={
+            "version": spec.version + 1,
+            "requirements": [
+                spec.requirements[0].model_copy(update={"acceptance_criteria": ["FLAG is false"]})
+            ],
+        }
+    )
+    store.save_spec(run_id, revised)
+    assert build_run_projection(store, tmp_path, run_id)["delivery_acceptance"] is None
+    AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path).confirm_spec(
+        run_id=run_id
+    )
+    new_review = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert new_review["spec_hash"] == revised.content_hash
+    assert new_review["counts"] == {"passed": 0, "failed": 0, "unverified": 1}
+    assert new_review["criteria"][0]["text"] == "FLAG is false"
 
 
 def test_orchestrate_writes_manifest_for_rejected_then_accepted_attempts(

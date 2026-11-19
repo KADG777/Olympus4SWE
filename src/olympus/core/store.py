@@ -312,11 +312,16 @@ class RunStore:
         event_type: str,
         actor: str,
         payload: dict[str, Any] | None = None,
+        expected_state_revision: int | None = None,
     ) -> RunEvent:
         """Atomically record a non-mutating audit/trace event for a run."""
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
             cur_rev = int(row["state_revision"])
+            if expected_state_revision is not None and cur_rev != expected_state_revision:
+                raise ConcurrencyConflictError(
+                    f"Run {run_id} changed while recording {event_type}"
+                )
             return self._insert_event(
                 conn,
                 run_id=run_id,

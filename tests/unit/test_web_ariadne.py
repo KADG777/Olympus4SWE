@@ -276,7 +276,7 @@ def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:
     store = RunStore(db_path)
 
     seeded = seed_demo_runs(store, tmp_path)
-    assert seeded == ["run-campus-waitlist"]
+    assert seeded == ["run-delivery-acceptance", "run-campus-waitlist"]
     # Second call is idempotent
     assert seed_demo_runs(store, tmp_path) == []
 
@@ -307,8 +307,9 @@ def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:
     assert any(e["from"] == "T03-R1" and e["to"] == "T06" for e in blocked_edges)
 
     matrix_by_req = {r["requirement_id"]: r for r in proj["traceability_matrix"]}
-    assert matrix_by_req["FR-003"]["verification_status"] == "failed"
+    assert matrix_by_req["FR-003"]["verification_status"] == "pending"
     assert matrix_by_req["FR-005"]["verification_status"] == "pending"
+    assert proj["delivery_acceptance"]["counts"] == {"passed": 0, "failed": 0, "unverified": 5}
 
     # Every node carries the cockpit's per-task panels
     for node in proj["dag"]["nodes"]:
@@ -370,6 +371,7 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert html_res.status_code == 200
             assert 'closedby="any"' in html_res.text
             assert "需求追踪矩阵" in html_res.text
+            assert "交付验收" in html_res.text
             assert 'href="/static/tokens.css"' in html_res.text
             assert 'href="/static/style.css"' in html_res.text
             assert 'src="/static/ui.js"' in html_res.text
@@ -407,6 +409,22 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             # 2. List runs & get projection
             runs_res = client.get("/api/runs").json()
             assert runs_res["default_run_id"] == "run-campus-waitlist"
+            demo = client.get("/api/runs/run-delivery-acceptance").json()["projection"]
+            acceptance = demo["delivery_acceptance"]
+            assert acceptance["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
+            passed, failed, unverified = acceptance["criteria"]
+            assert "Ready" in passed["evidence"]["log"]
+            assert failed["reason"] and failed["evidence"]
+            assert unverified["risk_accepted"] and "人工接受风险" in unverified["reason"]
+            assert unverified["evidence"] is None
+            seq = passed["evidence"]["event_seq"]
+            full_log = client.get(f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/1")
+            assert full_log.status_code == 200
+            assert full_log.headers["content-type"].startswith("text/plain")
+            assert "--- stdout ---\nReady\n" in full_log.text
+            assert client.get(
+                f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/3"
+            ).status_code == 404
 
             run_res = client.get("/api/runs/run-campus-waitlist").json()
             assert run_res["ok"] is True
@@ -509,6 +527,13 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert matrix["FR-003"]["verification_status"] == "unverified_risk_accepted"
             assert matrix["FR-003"]["verification_label"] == "未验证 · 人工接受"
             assert "首期单管理员手动取消" in matrix["FR-003"]["evidence_note"]
+            risk_review = proj_after_risk["delivery_acceptance"]
+            assert risk_review["counts"] == {"passed": 0, "failed": 0, "unverified": 5}
+            risk_row = next(
+                row for row in risk_review["criteria"] if row["requirement_id"] == "FR-003"
+            )
+            assert risk_row["risk_accepted"] and risk_row["evidence"] is None
+            assert t03_node["accepted_risk_reason"] in risk_row["reason"]
     finally:
         httpd.shutdown()
         httpd.server_close()

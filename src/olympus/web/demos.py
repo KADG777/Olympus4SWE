@@ -8,7 +8,24 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from olympus.core.contracts import new_id
+from olympus.core.contracts import (
+    AcceptanceCheck,
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalTarget,
+    CheckKind,
+    DeliveryCheck,
+    GoalSpec,
+    RequirementItem,
+    RunMode,
+    RunStatus,
+    TaskNode,
+    TaskPlan,
+    TaskStatus,
+    new_id,
+)
+from olympus.core.store import RunStore
+from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 
 _FALLBACK_B001: dict[str, Any] = {
     "case_id": "B-001",
@@ -184,3 +201,103 @@ def materialize_benchmark_demo(
         )
 
     return preset, target
+
+
+DELIVERY_DEMO_ID = "run-delivery-acceptance"
+
+
+def seed_delivery_acceptance_demo(store: RunStore, artifacts_root: Path) -> None:
+    """Seed a small delivery with real command logs and an explicit accepted risk."""
+    run_id = store.create_run(
+        title="演示 · 逐条核对交付验收", mode=RunMode.SIMULATION, run_id=DELIVERY_DEMO_ID
+    )
+    spec = GoalSpec(
+        goal="发布可供用户查看的公告",
+        requirements=[
+            RequirementItem(
+                id="ANNOUNCEMENT",
+                description="公告内容",
+                acceptance_criteria=["公告文本包含 Ready", "公告文本包含支持邮箱"],
+            ),
+            RequirementItem(
+                id="MOBILE",
+                description="移动端兼容性",
+                acceptance_criteria=["窄屏浏览公告时无需横向滚动"],
+            ),
+        ],
+    )
+    plan = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        delivery_checks=[
+            DeliveryCheck(
+                requirement_id="ANNOUNCEMENT",
+                criterion_index=1,
+                command="grep -Fx Ready announcement.txt",
+            ),
+            DeliveryCheck(
+                requirement_id="ANNOUNCEMENT",
+                criterion_index=2,
+                command="grep -Fx support@example.com announcement.txt",
+            ),
+        ],
+        tasks=[
+            TaskNode(
+                task_id="ANNOUNCEMENT",
+                title="交付示例公告",
+                objective="生成示例公告文件",
+                requirement_refs=["ANNOUNCEMENT"],
+                write_scope=["announcement.txt"],
+                status=TaskStatus.ACCEPTED,
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="file",
+                        kind=CheckKind.COMMAND,
+                        description="公告文件存在",
+                        command="test -f announcement.txt",
+                    ),
+                ],
+            ),
+            TaskNode(
+                task_id="MOBILE",
+                title="检查公告窄屏布局",
+                objective="在移动端视口打开公告",
+                requirement_refs=["MOBILE"],
+                write_scope=["mobile.css"],
+                status=TaskStatus.ACCEPTED,
+                accepted_risk_reason="本次演示缺少移动端布局，先审阅公告内容",
+                acceptance_checks=[
+                    AcceptanceCheck(id="viewport", kind=CheckKind.HUMAN, description="窄屏检查"),
+                ],
+            ),
+        ],
+    )
+    store.save_spec(run_id, spec)
+    store.save_plan(run_id, plan)
+    for target, target_id, target_hash in (
+        (ApprovalTarget.GOAL_SPEC, spec.spec_id, spec.content_hash),
+        (ApprovalTarget.TASK_PLAN, plan.plan_id, plan.content_hash),
+    ):
+        store.record_approval(
+            ApprovalRecord(
+                run_id=run_id,
+                target=target,
+                target_id=target_id,
+                target_hash=target_hash,
+                approver="demo",
+                decision=ApprovalDecision.APPROVED,
+                reason="演示夹具",
+            )
+        )
+
+    run_dir = artifacts_root / run_id
+    workspace = run_dir / "demo_workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "announcement.txt").write_text("Ready\n", encoding="utf-8")
+    receipt = run_delivery_checks(
+        plan, workspace_root=workspace, overlay_dir=run_dir / "accepted_overlay", run_dir=run_dir
+    )
+    store.append_event(
+        run_id=run_id, stage="verify", event_type=DELIVERY_EVENT, actor="chronos", payload=receipt
+    )
+    store.set_run_status(run_id, RunStatus.COMPLETED, actor="chronos", stage="orchestrate")

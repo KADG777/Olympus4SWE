@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+import olympus.web.acceptance as delivery_review
 from olympus.core.contracts import (
     ApprovalTarget,
     BudgetLedger,
@@ -589,6 +590,24 @@ def create_http_server(
                             app.get_events_payload(run_id, after_seq=after_seq),
                         )
                         return
+                    if len(parts) == 6 and parts[3] == "delivery-log":
+                        run_id, event_seq, position = parts[2], parts[4], parts[5]
+                        projection = app.get_run_payload(run_id)["projection"]
+                        review = projection["delivery_acceptance"] or {}
+                        for row in review.get("criteria", []):
+                            evidence = row["evidence"]
+                            if (
+                                evidence
+                                and str(evidence["event_seq"]) == event_seq
+                                and str(evidence["check_position"]) == position
+                            ):
+                                log = delivery_review.read_delivery_log(
+                                    app.artifacts_root / run_id, evidence
+                                )
+                                if log is not None:
+                                    self._send_bytes("text/plain; charset=utf-8", log)
+                                    return
+                        raise NotFoundError("No matching current delivery evidence")
                     if len(parts) == 4 and parts[3] == "stream":
                         run_id = parts[2]
                         after_seq = int(qs.get("after_seq", ["0"])[0])

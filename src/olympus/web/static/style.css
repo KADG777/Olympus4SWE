@@ -2335,3 +2335,42 @@ body[data-rail="collapsed"] .thread-list,
     margin-inline-start: 0;
   }
 }
+
+.delivery-acceptance {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.delivery-acceptance[hidden] {
+  display: none;
+}
+
+.delivery-criteria {
+  list-style: none;
+}
+
+.delivery-criterion {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: start;
+  gap: var(--space-2) var(--space-4);
+  padding-block: var(--space-2);
+  overflow-wrap: anywhere;
+}
+
+.delivery-criterion + .delivery-criterion {
+  border-block-start: 1px solid var(--rule);
+}
+
+.delivery-criterion p {
+  margin: 0;
+}
+
+.delivery-result {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}

@@ -539,6 +539,14 @@ class TaskNode(StrictModel):
     deliverables: list[str] = Field(default_factory=list)
 
 
+class DeliveryCheck(StrictModel):
+    """Executable check for a 1-based criterion in the plan's bound GoalSpec."""
+
+    requirement_id: str = Field(min_length=1)
+    criterion_index: int = Field(ge=1)
+    command: str = Field(pattern=r"\S")
+
+
 class TaskPlan(FingerprintedModel):
     plan_id: str = Field(default_factory=lambda: new_id("plan"))
     spec_id: str | None = None
@@ -547,6 +555,7 @@ class TaskPlan(FingerprintedModel):
     design_hash: str | None = None
     version: int = Field(default=1, ge=1)
     tasks: list[TaskNode] = Field(min_length=1)
+    delivery_checks: list[DeliveryCheck] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_upstream_binding(self) -> TaskPlan:
@@ -587,7 +596,7 @@ class TaskPlan(FingerprintedModel):
             }
             for t in self.tasks
         ]
-        return {
+        payload = {
             "plan_id": self.plan_id,
             "spec_id": self.spec_id,
             "spec_hash": self.spec_hash,
@@ -596,6 +605,9 @@ class TaskPlan(FingerprintedModel):
             "version": self.version,
             "tasks": structural_tasks,
         }
+        if self.delivery_checks:
+            payload["delivery_checks"] = [check.model_dump() for check in self.delivery_checks]
+        return payload
 
 
 class RunMode(StrEnum):

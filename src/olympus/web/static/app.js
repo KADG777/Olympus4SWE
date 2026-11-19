@@ -12,6 +12,8 @@
     view: VIEWS.includes(params.get("view")) ? params.get("view") : "topology",
     selectedTaskId: params.get("task") || null,
     workflowNode: null,
+    deliveryEvidence: null,
+    deliveryRowsHtml: "",
     activeTab: TABS.includes(params.get("tab")) ? params.get("tab") : "overview",
     pendingAction: null,
     approvalSnapshot: null,
@@ -53,6 +55,10 @@
     laneBadge: document.getElementById("lane-badge"),
     frStrip: document.getElementById("fr-strip"),
     matrixBody: document.getElementById("matrix-tbody"),
+    deliverySection: document.getElementById("delivery-acceptance"),
+    deliverySpec: document.getElementById("delivery-spec"),
+    deliveryCounts: document.getElementById("delivery-counts"),
+    deliveryCriteria: document.getElementById("delivery-criteria"),
     waterfall: document.getElementById("waterfall-list"),
     waterfallCount: document.getElementById("waterfall-count"),
     footNote: document.getElementById("foot-note"),
@@ -1226,6 +1232,43 @@
       .join("");
   }
 
+  const DELIVERY_STATUS = {
+    passed: ["✓ 通过", "ok"],
+    failed: ["✕ 失败", "bad"],
+    unverified: ["◷ 未验证", "muted"],
+  };
+
+  function renderDeliveryAcceptance(review) {
+    el.deliverySection.hidden = !review || !review.criteria.length;
+    if (el.deliverySection.hidden) return;
+
+    el.deliverySpec.textContent = `GoalSpec v${review.spec_version}`;
+    el.deliveryCounts.innerHTML = Object.entries(DELIVERY_STATUS)
+      .map(([status, [label, variant]]) => uiBadge(`${label} ${review.counts[status]}`, variant))
+      .join("");
+    const html = review.criteria.map((row, index) => {
+      const [label, variant] = DELIVERY_STATUS[row.status];
+      const ref = `${row.requirement_id} · 条件 ${row.criterion_index}`;
+      const evidenceButton = row.evidence
+        ? `<button type="button" class="btn btn-quiet" data-delivery-evidence="${index}" aria-controls="dock" aria-label="${esc(`查看证据 · ${ref}`)}">查看证据</button>`
+        : "";
+      return `<li class="delivery-criterion">
+        <div><span class="card-note">${esc(ref)}</span><p>${esc(row.text)}</p>${
+          row.reason ? `<p class="card-note">${esc(row.reason)}</p>` : ""
+        }</div>
+        <div class="delivery-result">${uiBadge(label, row.risk_accepted ? "warn" : variant)}${evidenceButton}</div>
+      </li>`;
+    }).join("");
+    if (html !== state.deliveryRowsHtml) {
+      const focusedIndex = document.activeElement?.dataset.deliveryEvidence;
+      el.deliveryCriteria.innerHTML = html;
+      state.deliveryRowsHtml = html;
+      if (focusedIndex !== undefined) {
+        el.deliveryCriteria.querySelector(`[data-delivery-evidence="${focusedIndex}"]`)?.focus();
+      }
+    }
+  }
+
   function renderMatrix(projection) {
     const rows = projection.traceability_matrix || [];
     const counts = { verified: 0, running: 0, failed: 0, risk: 0, pending: 0 };
@@ -1473,7 +1516,42 @@
     el.dockReceipt.innerHTML = "";
   }
 
+  function renderDeliveryDock(review, row) {
+    const evidence = row.evidence;
+    const runId = encodeURIComponent(state.projection.run_id);
+    const logUrl = `/api/runs/${runId}/delivery-log/${evidence.event_seq}/${evidence.check_position}`;
+    if (el.dockBody.dataset.deliveryLog === logUrl) return;
+    el.dockBody.dataset.deliveryLog = logUrl;
+    const [label, variant] = DELIVERY_STATUS[row.status];
+    el.dockTitle.textContent = `${row.requirement_id} · 条件 ${row.criterion_index}`;
+    el.dockStages.innerHTML = uiBadge(label, variant);
+    el.dockSubpane.innerHTML = "";
+    el.dockTools.innerHTML = "";
+    el.dockTabs.innerHTML = "";
+    el.dockReceipt.innerHTML = "";
+    const meta = [
+      uiRow("验收条件", esc(row.text)),
+      uiRow(`GoalSpec v${review.spec_version}`, esc(review.spec_hash), { mono: true }),
+      uiRow("交付版本", esc(evidence.delivery_version), { mono: true }),
+      uiRow("执行记录", `#${esc(evidence.event_seq)} · 退出码 ${esc(evidence.exit_code)}`),
+    ].join("");
+    el.dockBody.innerHTML = uiCard("证据引用", `<div class="kv">${meta}</div>`) +
+      uiCard("执行日志", `<pre class="code-block scroller">${esc(evidence.log)}</pre>
+        <a class="btn btn-quiet" href="${esc(logUrl)}" target="_blank" rel="noopener">打开完整日志</a>`);
+  }
+
   function renderDock(projection) {
+    const review = projection.delivery_acceptance;
+    const selection = state.deliveryEvidence;
+    if (selection && selection.runId === projection.run_id && selection.specHash === review?.spec_hash) {
+      const row = review.criteria[selection.index];
+      if (row?.evidence) {
+        renderDeliveryDock(review, row);
+        return;
+      }
+    }
+    state.deliveryEvidence = null;
+    delete el.dockBody.dataset.deliveryLog;
     if (state.workflowNode) {
       renderWorkflowDock(projection, state.workflowNode);
       return;
@@ -1638,6 +1716,7 @@
     renderWorkflow(projection);
     renderStageLivePanel(projection, previous);
     renderDag(projection);
+    renderDeliveryAcceptance(projection.delivery_acceptance);
     renderLanes(projection);
     renderMatrix(projection);
     renderDesign(projection);
@@ -1649,6 +1728,7 @@
 
   function selectTask(taskId) {
     if (!state.projection || !taskId) return;
+    state.deliveryEvidence = null;
     state.workflowNode = null;
     state.selectedTaskId = taskId;
     state.userOpenedDock = true;
@@ -1661,6 +1741,7 @@
 
   function selectWorkflowNode(name) {
     if (!state.projection || !name) return;
+    state.deliveryEvidence = null;
     state.workflowNode = name;
     state.userOpenedDock = true;
     renderWorkflow(state.projection);
@@ -2147,11 +2228,30 @@
     el.dockClose.addEventListener("click", () => {
       state.userOpenedDock = false;
       setDockOpen(false);
+      if (state.deliveryEvidence) {
+        const { index } = state.deliveryEvidence;
+        el.deliveryCriteria.querySelector(`[data-delivery-evidence="${index}"]`)?.focus();
+      }
     });
 
     el.dockOpen.addEventListener("click", () => {
       state.userOpenedDock = true;
       setDockOpen(true);
+    });
+
+    el.deliveryCriteria.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-delivery-evidence]");
+      const review = state.projection?.delivery_acceptance;
+      if (!button || !review) return;
+      state.deliveryEvidence = {
+        index: Number(button.dataset.deliveryEvidence),
+        specHash: review.spec_hash,
+        runId: state.projection.run_id,
+      };
+      state.userOpenedDock = true;
+      renderDock(state.projection);
+      setDockOpen(true);
+      el.dockTitle.focus();
     });
 
     el.dag.addEventListener("click", (event) => {
