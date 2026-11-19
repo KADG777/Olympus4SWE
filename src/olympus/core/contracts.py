@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from olympus.core.fingerprint import content_hash
 
@@ -303,6 +303,14 @@ class InterfaceContract(StrictModel):
     error_cases: list[str] = Field(default_factory=list)
 
 
+class DesignTradeoff(StrictModel):
+    """A selected design decision and its concrete cost at an approval boundary."""
+
+    impact: Literal["existing_system", "deployment", "rollback"]
+    choice: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    cost: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class DesignSpec(FingerprintedModel):
     """White-box design: invariants, contract seams, modules, data ownership, and strategy."""
 
@@ -319,6 +327,10 @@ class DesignSpec(FingerprintedModel):
     execution_strategy: ExecutionStrategy | None = None
     strategy_rationale: str = ""
     risks_and_tradeoffs: list[str] = Field(default_factory=list)
+    design_tradeoffs: list[DesignTradeoff] = Field(
+        default_factory=list,
+        description="Choices and costs affecting the existing system, deployment or rollback.",
+    )
     status: SpecStatus = SpecStatus.DRAFT
 
     def _hash_payload(self) -> dict[str, Any]:
@@ -334,6 +346,8 @@ class DesignSpec(FingerprintedModel):
             payload["execution_strategy"] = self.execution_strategy.value
         if not payload.get("strategy_rationale"):
             payload.pop("strategy_rationale", None)
+        if not self.design_tradeoffs:
+            del payload["design_tradeoffs"]
         for iface in payload.get("interfaces", []):
             if not iface.get("input_schema"):
                 iface.pop("input_schema", None)
@@ -421,6 +435,13 @@ class DesignSpec(FingerprintedModel):
                     lines.append(f"  - Data entities: {', '.join(iface.data_entity_refs)}")
                 if iface.error_cases:
                     lines.append(f"  - Errors: {', '.join(iface.error_cases)}")
+            lines.append("")
+        if self.design_tradeoffs:
+            lines.extend(["## Design tradeoffs", ""])
+            lines.extend(
+                f"- {item.impact.replace('_', ' ').capitalize()}: {item.choice} — cost: {item.cost}"
+                for item in self.design_tradeoffs
+            )
             lines.append("")
         if self.risks_and_tradeoffs:
             lines.extend(["## Risks and tradeoffs", ""])

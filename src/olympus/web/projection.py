@@ -39,7 +39,13 @@ from olympus.core.contracts import (
 from olympus.core.store import RunStore
 from olympus.graph import build_graph, load_workflow
 from olympus.harness.receipt import build_turn_receipt
-from olympus.web.approval_review import APPROVAL_ARTIFACTS, ApprovalReview, goal_review_sections
+from olympus.web.approval_review import (
+    APPROVAL_ARTIFACTS,
+    ApprovalReview,
+    ReviewSection,
+    design_review_sections,
+    goal_review_sections,
+)
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
 _NOISE_LINE = re.compile(r"[=\-_*·~]{4,}(?:.*[=\-_*·~]{4,})?")
@@ -1179,10 +1185,15 @@ def build_run_projection(
     for action, key in APPROVAL_ARTIFACTS.items():
         artifact = snap[key]
         if artifact and not approved[key]:
+            sections: list[ReviewSection] = []
+            if key == "spec":
+                sections = goal_review_sections(artifact)
+            elif key == "design":
+                sections = design_review_sections(artifact)
             approval_reviews[action] = {
                 "artifact": key,
                 "target_hash": artifact.content_hash,
-                "sections": goal_review_sections(artifact) if key == "spec" else [],
+                "sections": sections,
             }
 
     tasks = plan.tasks if plan else []

@@ -345,12 +345,15 @@
       .map(({ title, entries, empty_text }) => `
         <section class="approval-section">
           <h4>${esc(title)}</h4>
-          <ul class="spec-list">${entries.map(({ text, label, ref, provenance }, index) => {
+          <ul class="spec-list">${entries.map(({ text, label, ref, provenance, cost }, index) => {
             const badge = provenance === "agent_high_impact"
               ? uiBadge("Agent 补充 · 高影响", "warn")
               : provenance === "unknown" ? uiBadge("来源未记录", "muted") : "";
             const entryName = label || (entries.length > 1 ? `${title} ${index + 1}` : title);
-            return `<li>${label ? `<strong>${esc(label)}</strong> ` : ""}${esc(text)} ${badge}
+            const content = cost === undefined
+              ? `<span>${esc(text)}</span>`
+              : `<br>${renderDesignTradeoff(text, cost)}`;
+            return `<li>${label ? `<strong>${esc(label)}</strong> ` : ""}${content} ${badge}
               <button type="button" class="approval-ref" data-review-ref="${esc(ref)}"
                 aria-label="定位 ${esc(entryName)}">原条目</button></li>`;
           }).join("") || `<li>${esc(empty_text)}</li>`}</ul>
@@ -361,6 +364,10 @@
         <h3 id="review-${action}" tabindex="-1">${esc(title)}${artifact.version ? ` · v${esc(artifact.version)}` : ""}</h3>
         ${sections ? `<div class="approval-sections">${sections}</div>` : ""}
         <div class="approval-controls">
+          ${review.artifact === "design" ? `<details>
+            <summary>查看模块、数据模型与接口</summary>
+            ${renderDesignStructure(artifact)}
+          </details>` : ""}
           <details>
             <summary>查看完整 ${esc(title)}</summary>
             <div class="approval-origin" hidden></div>
@@ -424,7 +431,7 @@
       <p>${esc(typeof value === "string" ? value : JSON.stringify(value))}</p>
       ${source ? `<p>规格引用 · ${esc(source)}</p>` : ""}`;
     origin.hidden = false;
-    card.querySelector("details").open = true;
+    origin.closest("details").open = true;
     origin.querySelector("code").focus();
   }
 
@@ -455,10 +462,14 @@
     const glyph =
       tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
     const headline = banner?.headline || "候选版本待批准";
-    const hasGoalReview = state.approvalSnapshot.reviews.has("approve_spec");
-    const detail = blocker
-      ? `受影响任务：${blocker.affected_task_ids.join("、")}。原因：${blocker.detail}`
-      : hasGoalReview && banner?.detail === projection.spec?.goal ? "" : banner?.detail;
+    const reviews = state.approvalSnapshot.reviews;
+    const detailAlreadyShown =
+      (reviews.has("approve_spec") && banner?.detail === projection.spec?.goal)
+      || (reviews.has("approve_design") && banner?.detail === projection.design?.architecture_summary);
+    let detail = detailAlreadyShown ? "" : banner?.detail;
+    if (blocker) {
+      detail = `受影响任务：${blocker.affected_task_ids.join("、")}。原因：${blocker.detail}`;
+    }
     const cleanDetail = String(detail || "")
       .replace(/\s*\n+\s*/g, "，")
       .trim();
@@ -804,37 +815,30 @@
       .join(", ");
   }
 
-  function renderDesignSpecCard(design, projection) {
-    const invariants = design.shared_invariants || [];
-    const invariantBlock = invariants.length
-      ? uiTable({
-          className: "matrix-table",
-          caption: "全局不变量（防跨模块隐性漂移）",
-          columns: ["编号", "类别", "全局规则", "适用范围 / 提示"],
-          rows: invariants.map((inv) => [
-            `<span class="mono">${esc(inv.id)}</span>`,
-            uiBadge(inv.category || "rule", "muted"),
-            esc(inv.rule),
-            `${esc((inv.applies_to || []).join(", ") || "全局")}${
-              inv.enforcement_hint ? ` · <span class="card-note">${esc(inv.enforcement_hint)}</span>` : ""
-            }`,
-          ]),
-        })
-      : uiCard(
-          "全局不变量",
-          '<p class="view-note">v1 规格未声明结构化全局不变量（DesignSpec v2 新建架构将强制校验）。</p>'
-        );
+  function renderDesignTradeoff(choice, cost) {
+    return `<span>选择：${esc(choice)}</span><br><span>代价：${esc(cost)}</span>`;
+  }
+
+  function renderDesignStructure(design) {
+    const contracts = design.interfaces || [];
     const moduleTable = uiTable({
       className: "matrix-table",
-      caption: "模块边界与独占写入路径",
-      columns: ["模块", "名称", "职责", "关联需求", "目标路径"],
-      rows: (design.modules || []).map((module) => [
-        `<span class="mono">${esc(module.id)}</span>`,
-        esc(module.name),
-        esc(module.responsibility),
-        `<span class="mono">${esc((module.requirement_refs || []).join(", "))}</span>`,
-        `<span class="mono">${esc((module.target_paths || []).join(", "))}</span>`,
-      ]),
+      label: "模块图",
+      caption: "模块图 · 模块边界与独占写入路径",
+      columns: ["模块", "名称", "职责", "关联需求", "目标路径", "依赖模块"],
+      rows: (design.modules || []).map((module) => {
+        const providers = new Set(contracts
+          .filter((iface) => (iface.consumer_module_ids || []).includes(module.id))
+          .map((iface) => iface.provider_module_id));
+        return [
+          `<span class="mono">${esc(module.id)}</span>`,
+          esc(module.name),
+          esc(module.responsibility),
+          `<span class="mono">${esc((module.requirement_refs || []).join(", "))}</span>`,
+          `<span class="mono">${esc((module.target_paths || []).join(", "))}</span>`,
+          `<span class="mono">${esc([...providers].join(", ") || "—")}</span>`,
+        ];
+      }),
     });
     const dataModels = (design.data_models || [])
       .map(
@@ -846,7 +850,7 @@
           }</li>`
       )
       .join("");
-    const interfaces = (design.interfaces || [])
+    const interfaces = contracts
       .map((iface) => {
         const inText = formatSchemaFields(iface.input_schema);
         const outText = formatSchemaFields(iface.output_schema);
@@ -875,7 +879,40 @@
         }</li>`;
       })
       .join("");
-    const risks = (design.risks_and_tradeoffs || [])
+    return `${moduleTable}${uiCard(
+      "数据模型",
+      `<ul class="spec-list">${dataModels || "<li>（无）</li>"}</ul>`
+    )}${uiCard(
+      "接口契约",
+      `<ul class="spec-list">${interfaces || "<li>（无）</li>"}</ul>`
+    )}`;
+  }
+
+  function renderDesignSpecCard(design, projection) {
+    const invariants = design.shared_invariants || [];
+    const invariantBlock = invariants.length
+      ? uiTable({
+          className: "matrix-table",
+          caption: "全局不变量（防跨模块隐性漂移）",
+          columns: ["编号", "类别", "全局规则", "适用范围 / 提示"],
+          rows: invariants.map((inv) => [
+            `<span class="mono">${esc(inv.id)}</span>`,
+            uiBadge(inv.category || "rule", "muted"),
+            esc(inv.rule),
+            `${esc((inv.applies_to || []).join(", ") || "全局")}${
+              inv.enforcement_hint ? ` · <span class="card-note">${esc(inv.enforcement_hint)}</span>` : ""
+            }`,
+          ]),
+        })
+      : uiCard(
+          "全局不变量",
+          '<p class="view-note">v1 规格未声明结构化全局不变量（DesignSpec v2 新建架构将强制校验）。</p>'
+        );
+    const impacts = { existing_system: "现有系统", deployment: "部署", rollback: "回滚" };
+    const tradeoffs = (design.design_tradeoffs || []).map(({ impact, choice, cost }) =>
+      `<li><strong>${esc(impacts[impact])}</strong><br>${renderDesignTradeoff(choice, cost)}</li>`
+    ).join("");
+    const risks = tradeoffs + (design.risks_and_tradeoffs || [])
       .map((risk) => `<li>${esc(risk)}</li>`)
       .join("");
     const strategy = design.execution_strategy;
@@ -927,13 +964,10 @@
     const body = bodyRows.join("");
     return uiCard(
       "DesignSpec · 白盒设计",
-      `<div class="kv">${body}</div>${invariantBlock}${moduleTable}${uiCard(
-        "数据模型",
-        `<ul class="spec-list">${dataModels || "<li>（无）</li>"}</ul>`
-      )}${uiCard(
-        "接口契约",
-        `<ul class="spec-list">${interfaces || "<li>（无）</li>"}</ul>`
-      )}${uiCard("风险与取舍", `<ul class="spec-list">${risks || "<li>（无）</li>"}</ul>`)}`,
+      `<div class="kv">${body}</div>${invariantBlock}${renderDesignStructure(design)}${uiCard(
+        "风险与取舍",
+        `<ul class="spec-list">${risks || "<li>（无）</li>"}</ul>`
+      )}`,
       { id: "run-design-detail", note: `${(design.modules || []).length} 个模块` }
     );
   }

@@ -1,8 +1,9 @@
 """Presentation contract for the existing Ariadne approval gates."""
 
+import re
 from typing import Literal, NotRequired, TypedDict
 
-from olympus.core.contracts import GoalSpec
+from olympus.core.contracts import DesignSpec, GoalSpec
 
 ArtifactKey = Literal["spec", "design", "plan"]
 APPROVAL_ARTIFACTS: dict[str, ArtifactKey] = {
@@ -18,6 +19,7 @@ class ReviewEntry(TypedDict):
     ref: str
     text: str
     label: NotRequired[str]
+    cost: NotRequired[str]
     provenance: NotRequired[Literal["agent_high_impact", "unknown"]]
 
 
@@ -75,6 +77,30 @@ def goal_review_sections(spec: GoalSpec) -> list[ReviewSection]:
                 }
                 for i, req in enumerate(spec.requirements)
                 for j, text in enumerate(req.acceptance_criteria)
+            ],
+        },
+    ]
+
+
+def design_review_sections(design: DesignSpec) -> list[ReviewSection]:
+    summary = design.architecture_summary.strip()
+    sentence_ends = list(re.finditer(r"[。！？]+|[.!?]+(?=\s|$)", summary))
+    if len(sentence_ends) >= 2:
+        summary = summary[: sentence_ends[1].end()]
+    impacts = {"existing_system": "现有系统", "deployment": "部署", "rollback": "回滚"}
+    return [
+        {"title": "架构概述", "entries": [{"ref": "/architecture_summary", "text": summary}]},
+        {
+            "title": "关键取舍",
+            "empty_text": "规格未记录结构化取舍，可查看完整 DesignSpec 核对。",
+            "entries": [
+                {
+                    "ref": f"/design_tradeoffs/{i}",
+                    "label": impacts[item.impact],
+                    "text": item.choice,
+                    "cost": item.cost,
+                }
+                for i, item in enumerate(design.design_tradeoffs)
             ],
         },
     ]

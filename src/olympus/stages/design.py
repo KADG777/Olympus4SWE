@@ -94,7 +94,13 @@ Rules:
    human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
    `strategy_rationale`, `risks_and_tradeoffs`); for greenfield products unrelated to the
    host workspace, choose clean standalone repo-relative `target_paths`.
-10. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+10. Human design review: write `architecture_summary` in one or two sentences. In
+    `design_tradeoffs`, record each consequential decision affecting the existing system,
+    deployment or rollback. Use impact `existing_system`, `deployment` or `rollback`, and
+    state both the selected `choice` and its concrete `cost` (what gets harder or more
+    expensive, or which capability is reduced). Match the GoalSpec language. Base entries on
+    the proposed design and known constraints. Use [] if no such decision applies.
+11. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:
@@ -197,7 +203,8 @@ def _probe_with_provider(
         "paths, interfaces) or a frozen GoalSpec (requirements with verifiable acceptance "
         "criteria). Return ONLY JSON: {\"design\": <DesignSpec|null>, \"goal\": <GoalSpec|null>}. "
         "Never invent module boundaries that the input does not support; leave both null "
-        "when the text is just a raw idea.\n"
+        "when the text is just a raw idea. Preserve design_tradeoffs only when the input "
+        "explicitly supports both the selected choice and its cost.\n"
         f"DesignSpec schema: {design_schema}\n"
         f"GoalSpec schema: {goal_schema}\n\n"
         f"Input:\n{text}"

@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from olympus.core.contracts import DesignSpec
 from olympus.core.store import RunStore
 from olympus.web.projection import seed_demo_runs
 from olympus.web.server import AriadneApp, create_http_server
@@ -41,6 +42,111 @@ def browser():
             yield browser
         finally:
             browser.close()
+
+
+def test_design_approval_shows_tradeoffs_and_reopens_review_after_conflict(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="架构审阅", provider_config={"provider": "mock"})
+    design = DesignSpec.model_validate(
+        {
+            "architecture_summary": "保留现有入口。写入切到新表。迁移步骤见接口。",
+            "modules": [
+                {
+                    "id": "API",
+                    "name": "报名入口",
+                    "responsibility": "接收请求",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["src/api.py"],
+                },
+                {
+                    "id": "STORE",
+                    "name": "席位存储",
+                    "responsibility": "写入席位",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["src/store.py"],
+                },
+            ],
+            "data_models": [{"name": "Seat", "fields": ["id"], "owner_module_id": "STORE"}],
+            "interfaces": [
+                {
+                    "id": "IF-SEAT",
+                    "provider_module_id": "STORE",
+                    "consumer_module_ids": ["API"],
+                    "signature": "reserve_seat(id: str) -> Seat",
+                }
+            ],
+            "risks_and_tradeoffs": ["迁移窗口长"],
+        }
+    )
+    store.save_design(run_id, design)
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    review = page.locator('[data-review-action="approve_design"]')
+    expect(review.get_by_text("规格未记录结构化取舍", exact=False)).to_be_visible()
+    expect(review.get_by_text("迁移窗口长", exact=False)).to_be_hidden()
+
+    candidate = DesignSpec.model_validate(
+        {
+            **design.model_dump(),
+            "version": 2,
+            "design_tradeoffs": [
+                {"impact": "rollback", "choice": "保留旧列", "cost": "延后清理旧数据"}
+            ],
+        }
+    )
+    store.save_design(run_id, candidate)
+    expect(review.get_by_role("heading", name="DesignSpec · v2")).to_be_visible()
+    expect(review.get_by_text("保留现有入口。写入切到新表。", exact=True)).to_be_visible()
+    full_summary = "保留现有入口。写入切到新表。迁移步骤见接口。"
+    expect(page.get_by_text(full_summary, exact=True)).to_be_hidden()
+    expect(review.get_by_text("选择：保留旧列", exact=True)).to_be_visible()
+    expect(review.get_by_text("代价：延后清理旧数据", exact=True)).to_be_visible()
+    structure = review.get_by_text("查看模块、数据模型与接口", exact=True)
+    modules = review.get_by_role("table", name="模块图 · 模块边界与独占写入路径")
+    expect(structure.locator("..")).to_have_js_property("open", False)
+    structure.click()
+    expect(
+        modules.get_by_role("row", name="API 报名入口 接收请求 R1 src/api.py STORE")
+    ).to_be_visible()
+    expect(review.get_by_role("heading", name="数据模型")).to_be_visible()
+    expect(review.get_by_role("heading", name="接口契约")).to_be_visible()
+    expect(review.get_by_text("reserve_seat(id: str) -> Seat", exact=True)).to_be_visible()
+    review.get_by_role("button", name="定位 回滚").click()
+    expect(review.get_by_text("/design_tradeoffs/0", exact=True)).to_be_focused()
+    expect(review.locator("pre")).to_contain_text(candidate.content_hash)
+
+    newer = candidate.model_copy(
+        update={
+            "version": 3,
+            "architecture_summary": "先验证再切流。",
+            "modules": [
+                candidate.modules[0].model_copy(update={"name": "新版报名入口"}),
+                candidate.modules[1],
+            ],
+        }
+    )
+
+    def supersede_before_command(route):
+        assert route.request.post_data_json["target_hash"] == candidate.content_hash
+        store.save_design(run_id, newer)
+        route.continue_()
+
+    page.route(f"{url}/api/runs/{run_id}/command", supersede_before_command, times=1)
+    with page.expect_response(
+        lambda response: response.url.endswith("/command") and response.status == 409
+    ):
+        review.get_by_role("button", name="批准 DesignSpec").click()
+    expect(page.get_by_text("请确认后重试", exact=False)).to_be_visible()
+    expect(review.get_by_role("heading", name="DesignSpec · v3")).to_be_visible()
+    expect(review.get_by_text("先验证再切流。", exact=True)).to_be_visible()
+    expect(structure.locator("..")).to_have_js_property("open", True)
+    expect(modules.get_by_text("新版报名入口", exact=True)).to_be_visible()
+    expect(modules.get_by_text("报名入口", exact=True)).to_have_count(0)
+    expect(review.get_by_text("查看完整 DesignSpec", exact=True).locator("..")).to_have_js_property(
+        "open", True
+    )
+    expect(review.locator("pre")).to_contain_text(newer.content_hash)
 
 
 def test_plan_history_survives_task_graph_and_updates_over_sse(workbench, browser):

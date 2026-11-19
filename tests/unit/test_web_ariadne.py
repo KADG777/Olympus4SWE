@@ -180,6 +180,90 @@ def test_goal_approval_review_snapshot_links_commitments_to_candidate(tmp_path: 
     }
 
 
+def test_design_approval_review_snapshot_projects_the_candidate_tradeoffs(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    original = store.get_run(run_id)["design"].model_dump()
+    tradeoffs = [
+        {"impact": "existing_system", "choice": "保留报名接口", "cost": "维护旧字段映射"},
+        {"impact": "deployment", "choice": "双写后切流", "cost": "部署期额外占用写入容量"},
+        {"impact": "rollback", "choice": "保留旧列一周", "cost": "延后清理旧数据"},
+    ]
+    design = DesignSpec.model_validate(
+        {
+            **original,
+            "architecture_summary": "入口仍由旧服务接收。写入使用新表。详细迁移步骤见模块。",
+            "design_tradeoffs": tradeoffs,
+        }
+    )
+    store.save_design(run_id, design)
+
+    snapshot = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
+        "projection"
+    ]
+    review = snapshot["approval_reviews"]["approve_design"]
+    assert review["artifact"] == "design"
+    assert review["target_hash"] == snapshot["design"]["content_hash"]
+    assert review["target_hash"] != original["content_hash"]
+    assert review["sections"] == [
+        {
+            "title": "架构概述",
+            "entries": [
+                {"ref": "/architecture_summary", "text": "入口仍由旧服务接收。写入使用新表。"}
+            ],
+        },
+        {
+            "title": "关键取舍",
+            "entries": [
+                {
+                    "ref": f"/design_tradeoffs/{index}",
+                    "label": label,
+                    "text": item["choice"],
+                    "cost": item["cost"],
+                }
+                for index, (label, item) in enumerate(
+                    zip(("现有系统", "部署", "回滚"), tradeoffs, strict=True)
+                )
+            ],
+            "empty_text": "规格未记录结构化取舍，可查看完整 DesignSpec 核对。",
+        },
+    ]
+    assert snapshot["design"]["design_tradeoffs"] == tradeoffs
+    tradeoffs[1]["cost"] = "切流需要两次值班"
+    revised = DesignSpec.model_validate({**design.model_dump(), "design_tradeoffs": tradeoffs})
+    assert revised.content_hash != design.content_hash
+
+
+def test_legacy_design_approval_keeps_its_original_fingerprint(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "test.db")
+    run_id = _seed_gated_run(store)
+    design = store.get_run(run_id)["design"]
+    legacy_json = design.model_dump_json(exclude={"design_tradeoffs"})
+    legacy_hash = "sha256:a31b6e6ee7b280949bc86bf6bb0fcf1c830ab1536a9caab8630f0d16f0fc8624"
+    assert DesignSpec.model_validate_json(legacy_json).content_hash == legacy_hash
+
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    snapshot = app.get_run_payload(run_id)["projection"]
+    review = snapshot["approval_reviews"]["approve_design"]
+    assert review["target_hash"] == legacy_hash
+    assert review["sections"][1] == {
+        "title": "关键取舍",
+        "empty_text": "规格未记录结构化取舍，可查看完整 DesignSpec 核对。",
+        "entries": [],
+    }
+    approved = app.execute_command(
+        run_id,
+        {
+            "action": "approve_design",
+            "target_hash": legacy_hash,
+            "expected_state_revision": snapshot["state_revision"],
+            "auto_advance": False,
+        },
+    )["projection"]
+    assert approved["design_approved"]
+    assert approved["design"]["content_hash"] == legacy_hash
+
+
 def test_approval_rejects_viewed_hash_after_two_candidate_updates(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "test.db")
     run_id = _seed_gated_run(store)
