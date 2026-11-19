@@ -513,7 +513,6 @@ def test_progress_motion_and_reading_position(workbench, browser, motion):
     expect(target).to_be_focused()
     assert abs(anchor.evaluate("node => node.getBoundingClientRect().top") - top) <= 2
 
-    # Replay the identical version, then make a normal event-sequence-only update.
     store.save_plan(run_id, store.get_run(run_id)["plan"])
     store.append_event(run_id=run_id, stage="system", event_type="budget.settled", actor="test")
     last = store.list_events(run_id)[-1].event_seq
