@@ -725,19 +725,19 @@ def validate_plan(
         )
 
     seen_criteria: set[tuple[str, int]] = set()
-    for check in plan.delivery_checks:
-        key = (check.requirement_id, check.criterion_index)
+    for delivery_check in plan.delivery_checks:
+        key = (delivery_check.requirement_id, delivery_check.criterion_index)
         requirements = [
-            req for req in spec.requirements if req.id == check.requirement_id
+            req for req in spec.requirements if req.id == delivery_check.requirement_id
         ] if spec else []
-        if len(requirements) != 1 or check.criterion_index > len(
+        if len(requirements) != 1 or delivery_check.criterion_index > len(
             requirements[0].acceptance_criteria
         ):
             violations.append(f"Delivery check references an unknown or ambiguous criterion: {key}")
         if key in seen_criteria:
             violations.append(f"Duplicate delivery check for criterion: {key}")
         seen_criteria.add(key)
-        if host_root_pattern is not None and host_root_pattern.search(check.command):
+        if host_root_pattern is not None and host_root_pattern.search(delivery_check.command):
             violations.append(f"Delivery check {key} hardcodes host path '{host_root_display}'.")
 
     by_id: dict[str, TaskNode] = {}
