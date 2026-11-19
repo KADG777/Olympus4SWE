@@ -7,7 +7,19 @@ from pathlib import Path
 import httpx
 import pytest
 
-from olympus.core.contracts import DesignSpec
+from olympus.core.contracts import (
+    AcceptanceCheck,
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalTarget,
+    CheckKind,
+    DeliveryCheck,
+    DesignSpec,
+    GoalSpec,
+    RequirementItem,
+    TaskNode,
+    TaskPlan,
+)
 from olympus.core.store import RunStore
 from olympus.web.projection import seed_demo_runs
 from olympus.web.server import AriadneApp, create_http_server
@@ -149,9 +161,138 @@ def test_design_approval_shows_tradeoffs_and_reopens_review_after_conflict(workb
     expect(review.locator("pre")).to_contain_text(newer.content_hash)
 
 
-def test_plan_history_survives_task_graph_and_updates_over_sse(workbench, browser):
-    store, demo_id, url = workbench
-    plan = store.get_run(demo_id)["plan"]
+@pytest.fixture
+def export_plan(workbench):
+    store, _, url = workbench
+    run_id = store.create_run(title="演示 · 先核对权限，再开放导出")
+    spec = GoalSpec(
+        goal="只有通过权限检查的成员才能导出报表",
+        requirements=[RequirementItem(
+            id="EXPORT", description="按成员权限开放导出",
+            acceptance_criteria=["无权限成员无法导出报表"],
+        )],
+    )
+    store.save_spec(run_id, spec)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=spec.spec_id,
+        target_hash=spec.content_hash, approver="zeus", decision=ApprovalDecision.APPROVED,
+    ))
+    review = AcceptanceCheck(id="review", kind=CheckKind.INDEPENDENT_REVIEW, description="复核实现")
+    plan = TaskPlan(
+        spec_id=spec.spec_id, spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="EXPORT", title="开放导出入口", objective="向有权限成员开放导出",
+                depends_on=["AUTH"], write_scope=["export.py"], deliverables=["报表导出入口"],
+                acceptance_checks=[AcceptanceCheck(
+                    id="member-preview", kind=CheckKind.HUMAN, description="人工试用成员导出入口",
+                )],
+            ),
+            TaskNode(
+                task_id="AUTH", title="校验成员权限", objective="拦截无权限成员的导出请求",
+                write_scope=["auth.py"], deliverables=["成员权限检查"], acceptance_checks=[review],
+            ),
+            TaskNode(
+                task_id="NOTES", title="整理内部记录", objective="整理开发记录",
+                depends_on=["AUTH"], write_scope=["notes.md"], acceptance_checks=[review],
+            ),
+        ],
+        delivery_checks=[DeliveryCheck(
+            requirement_id="EXPORT", criterion_index=1,
+            command="pytest tests/test_export.py -k denied_member",
+        )],
+    )
+    store.save_plan(run_id, plan)
+    return store, run_id, url, plan
+
+
+def test_plan_review_explains_export_batches_and_opens_evidence(export_plan, browser):
+    _, run_id, url, plan = export_plan
+    page = browser.new_page()
+    expect = playwright.expect
+    page.goto(f"{url}/?run={run_id}")
+
+    review = page.get_by_role("article", name="任务计划 · v1")
+    batches = review.get_by_role("heading", name="交付批次（按任务依赖）").locator("..")
+    expect(batches.get_by_text("第 1 批 · AUTH 校验成员权限")).to_be_visible()
+    expect(batches.get_by_text("第 2 批 · EXPORT 开放导出入口")).to_be_visible()
+    expect(batches.get_by_text("成员权限检查", exact=False)).to_be_visible()
+    expect(batches.get_by_text("报表导出入口", exact=False)).to_be_visible()
+    expect(batches.get_by_text("未声明交付物", exact=False)).to_be_visible()
+
+    deps = review.get_by_role("heading", name="影响交付的依赖").locator("..")
+    expect(deps).to_contain_text("验收「AUTH 校验成员权限」后，才能开始「EXPORT 开放导出入口」")
+    expect(deps).not_to_contain_text("NOTES")
+    human = review.get_by_role("heading", name="人工介入点").locator("..")
+    expect(human).to_contain_text("人工试用成员导出入口")
+    expect(human).not_to_contain_text("复核实现")
+
+    graph = page.get_by_role("heading", name="任务依赖图")
+    expect(graph).to_be_hidden()
+    expect(review.locator("pre")).to_be_hidden()
+    deps.get_by_role("button", name="定位 影响交付的依赖").click()
+    expect(review.get_by_text("/tasks/0/depends_on/0", exact=True)).to_be_focused()
+    expect(review.locator("pre")).to_contain_text(plan.content_hash)
+    expect(review.locator("pre")).to_contain_text(plan.delivery_checks[0].command)
+    human.get_by_role("button", name="定位 EXPORT 开放导出入口").click()
+    expect(review.get_by_text("/tasks/0/acceptance_checks/0", exact=True)).to_be_focused()
+
+    page.get_by_role("link", name="架构规格").click()
+    review.get_by_role("button", name="查看任务依赖图").click()
+    expect(graph).to_be_focused()
+    page.get_by_role("button", name="任务 EXPORT", exact=False).click()
+    expect(page.get_by_role("heading", name="EXPORT · 开放导出入口")).to_be_visible()
+    expect(page.locator("#dock-body").get_by_text("AUTH", exact=True)).to_be_visible()
+
+
+def test_plan_review_rejects_stale_approval_and_retains_approved_checks(export_plan, browser):
+    store, run_id, url, plan = export_plan
+    page = browser.new_page()
+    expect = playwright.expect
+    page.goto(f"{url}/?run={run_id}&nosse=1")
+
+    old_review = page.get_by_role("article", name="任务计划 · v1")
+    expect(old_review).to_be_visible()
+    old_revision = store.get_run(run_id)["state_revision"]
+    new_command = "pytest tests/test_export.py -k denied_and_allowed_members"
+    revised = plan.model_copy(update={
+        "version": 2,
+        "delivery_checks": [plan.delivery_checks[0].model_copy(update={"command": new_command})],
+    })
+    store.save_plan(run_id, revised)
+
+    endpoint = f"{url}/api/runs/{run_id}/command"
+    approve = page.get_by_role("button", name="批准任务计划", exact=True)
+    with page.expect_response(endpoint) as stale:
+        approve.click()
+    assert stale.value.status == 409
+    assert stale.value.request.post_data_json["target_hash"] == plan.content_hash
+    assert stale.value.request.post_data_json["expected_state_revision"] == old_revision
+    expect(page.get_by_text("请确认后重试", exact=False)).to_be_visible()
+    assert not store.is_approved(
+        run_id=run_id, target=ApprovalTarget.TASK_PLAN,
+        target_id=revised.plan_id, target_hash=revised.content_hash,
+    )
+
+    current = page.get_by_role("article", name="任务计划 · v2")
+    current.get_by_text("查看完整 任务计划", exact=True).click()
+    expect(current.locator("pre")).to_contain_text(new_command)
+    expect(current.locator("pre")).not_to_contain_text(plan.delivery_checks[0].command)
+    with page.expect_response(endpoint) as approved:
+        approve.click()
+    assert approved.value.status == 200
+    assert approved.value.request.post_data_json["target_hash"] == revised.content_hash
+    assert approved.value.json()["projection"]["plan_approved"]
+    expect(approve).to_be_hidden()
+
+    page.get_by_text("查看完整任务计划 · v2", exact=True).click()
+    full_plan = page.get_by_role("region", name="任务依赖图").locator("pre")
+    expect(full_plan).to_contain_text(revised.content_hash)
+    expect(full_plan).to_contain_text(new_command)
+
+
+def test_plan_history_survives_task_graph_and_updates_over_sse(export_plan, browser):
+    store, _, url, plan = export_plan
     run_id = store.create_run(title="等待计划")
     page = browser.new_page()
     page.goto(f"{url}/?run={run_id}")
@@ -160,19 +301,24 @@ def test_plan_history_survives_task_graph_and_updates_over_sse(workbench, browse
     expect(page.locator("#stat-band")).to_be_empty()
     expect(page.get_by_role("heading", name="任务依赖图")).to_be_hidden()
     store.save_plan(run_id, plan)
-    expect(page.get_by_role("heading", name="任务依赖图")).to_be_visible()
+    graph = page.get_by_role("heading", name="任务依赖图")
+    expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v1")
+    expect(graph).to_be_hidden()
+    page.locator("#run-output-detail").click()
+    expect(graph).to_be_visible()
     history = page.get_by_text("产物历史", exact=True)
     history.click()
     history.focus()
 
     store.save_plan(run_id, plan.model_copy(update={"version": 2}))
 
-    expect(page.get_by_text("任务计划 v2 已就绪，包含 9 个任务").first).to_be_visible()
+    expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2 已就绪，包含 3 个任务")
     expect(history).to_be_focused()
     expect(history.locator("..")).to_have_attribute("open", "")
     expect(page.get_by_text(plan.content_hash)).to_be_visible()
+    expect(graph).to_be_hidden()
     page.locator("#run-output-detail").click()
-    expect(page.get_by_role("heading", name="任务依赖图")).to_be_focused()
+    expect(graph).to_be_focused()
 
 
 def test_reconnect_keeps_last_confirmation_and_rejects_late_snapshot(workbench, browser):

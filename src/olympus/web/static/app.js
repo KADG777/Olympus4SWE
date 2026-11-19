@@ -17,6 +17,7 @@
     activeTab: TABS.includes(params.get("tab")) ? params.get("tab") : "overview",
     pendingAction: null,
     approvalSnapshot: null,
+    openedPlanGraphHash: null,
     optionsLoaded: false,
     workflows: [],
     demos: [],
@@ -104,6 +105,7 @@
     intentText: document.getElementById("intent-text"),
     stageLivePanel: document.getElementById("stage-live-panel"),
     taskDagSection: document.getElementById("task-dag-section"),
+    approvedPlanDetail: document.getElementById("run-plan-detail"),
     laneSection: document.getElementById("lane-section"),
   };
 
@@ -368,6 +370,8 @@
             <summary>查看模块、数据模型与接口</summary>
             ${renderDesignStructure(artifact)}
           </details>` : ""}
+          ${action === "approve_plan"
+            ? '<button type="button" class="btn" data-review-plan-graph>查看任务依赖图</button>' : ""}
           <details>
             <summary>查看完整 ${esc(title)}</summary>
             <div class="approval-origin" hidden></div>
@@ -1118,8 +1122,21 @@
 
   function renderStageLivePanel(projection, previous) {
     const hasDag = Boolean(projection.dag.nodes.length);
-    el.taskDagSection.hidden = !hasDag;
-    el.laneSection.hidden = !hasDag;
+    const awaitingPlanApproval = projection.hitl_banner?.kind === "plan_gate";
+    el.taskDagSection.hidden = !hasDag || (
+      awaitingPlanApproval && state.openedPlanGraphHash !== projection.plan?.content_hash
+    );
+    el.laneSection.hidden = !hasDag || awaitingPlanApproval;
+    const approvedPlan = projection.plan_approved ? projection.plan : null;
+    el.approvedPlanDetail.hidden = !approvedPlan;
+    if (!approvedPlan || !previous?.plan_approved ||
+        approvedPlan.content_hash !== previous.plan?.content_hash) {
+      el.approvedPlanDetail.open = false;
+      if (approvedPlan) {
+        writeText(el.approvedPlanDetail.querySelector("summary"), `查看完整任务计划 · v${approvedPlan.version}`);
+      }
+      writeText(el.approvedPlanDetail.querySelector("pre"), approvedPlan ? JSON.stringify(approvedPlan, null, 2) : "");
+    }
     el.stageLivePanel.hidden = false;
     const stage = currentStage(projection);
     const stageText = document.getElementById("run-current-stage");
@@ -1487,6 +1504,7 @@
         mono: true,
       }),
       uiRow("交付物", esc((task.deliverables || []).join(", ") || "（未声明）")),
+      uiRow("前置任务", esc((task.depends_on || []).join(", ") || "（无）"), { mono: true }),
       uiRow("写入范围", esc((task.write_scope || []).join(", ") || "（只读）"), { mono: true }),
       uiRow("诊断", `${esc(task.diagnostic_tool)} → ${esc(task.diagnostic_output)}`, { mono: true }),
       uiRow("归因", esc(task.diagnostic_attribution)),
@@ -1756,6 +1774,9 @@
        projection.latest_event_seq === previous.latest_event_seq)
     )) return;
     const restore = switchedRun ? null : captureReadingPosition();
+    if (previous?.plan?.content_hash !== projection.plan?.content_hash) {
+      state.openedPlanGraphHash = null;
+    }
     state.projection = projection;
     const nodes = projection.dag.nodes || [];
     if (
@@ -2177,6 +2198,14 @@
     return taskBlocker(state.projection)?.task_id;
   }
 
+  function openTaskGraph(planHash) {
+    if (!planHash || state.projection?.plan?.content_hash !== planHash) return;
+    state.openedPlanGraphHash = planHash;
+    setView("topology");
+    el.taskDagSection.hidden = false;
+    document.getElementById("topology-title").focus();
+  }
+
   async function openOutput(output) {
     if (!output) return;
     if (output.current && (output.kind === "spec" || output.kind === "design")) {
@@ -2187,7 +2216,7 @@
         detail.focus();
       }
     } else if (output.kind === "plan" && output.current) {
-      document.getElementById("topology-title").focus();
+      openTaskGraph(state.projection.plan?.content_hash);
     } else if (output.current) {
       state.activeTab = "artifacts";
       selectTask(output.artifact_id);
@@ -2402,6 +2431,10 @@
       const ref = event.target.closest("[data-review-ref]")?.dataset.reviewRef;
       if (ref) {
         showApprovalOrigin(card, artifact, ref);
+        return;
+      }
+      if (event.target.closest("[data-review-plan-graph]")) {
+        openTaskGraph(command.target_hash);
         return;
       }
       if (!event.target.closest("[data-approve]")) return;

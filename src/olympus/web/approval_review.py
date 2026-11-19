@@ -3,7 +3,7 @@
 import re
 from typing import Literal, NotRequired, TypedDict
 
-from olympus.core.contracts import DesignSpec, GoalSpec
+from olympus.core.contracts import CheckKind, DesignSpec, GoalSpec, TaskPlan
 
 ArtifactKey = Literal["spec", "design", "plan"]
 APPROVAL_ARTIFACTS: dict[str, ArtifactKey] = {
@@ -35,6 +35,57 @@ class ApprovalReview(TypedDict):
     artifact: ArtifactKey
     target_hash: str
     sections: list[ReviewSection]
+
+
+def plan_review_sections(plan: TaskPlan, layers: dict[str, int]) -> list[ReviewSection]:
+    tasks = plan.tasks
+    by_id = {task.task_id: task for task in tasks}
+    labels = {task.task_id: f"{task.task_id} {task.title}" for task in tasks}
+    ordered = sorted(enumerate(tasks), key=lambda item: layers[item[1].task_id])
+    batches: list[ReviewEntry] = []
+    dependencies: list[ReviewEntry] = []
+    human_checks: list[ReviewEntry] = []
+
+    delivery_lineage: set[str] = set()
+    prerequisites = [
+        task.task_id for task in tasks if any(item.strip() for item in task.deliverables)
+    ]
+    while prerequisites:
+        task_id = prerequisites.pop()
+        if task_id not in delivery_lineage:
+            delivery_lineage.add(task_id)
+            prerequisites.extend(dep for dep in by_id[task_id].depends_on if dep in by_id)
+
+    for i, task in ordered:
+        label = labels[task.task_id]
+        batches.append({
+            "ref": f"/tasks/{i}/deliverables",
+            "label": f"第 {layers[task.task_id] + 1} 批 · {label}",
+            "text": "、".join(item for item in task.deliverables if item.strip()) or "未声明交付物",
+        })
+        if task.task_id in delivery_lineage:
+            for j, dep in enumerate(task.depends_on):
+                text = (
+                    f"验收「{labels[dep]}」后，才能开始「{label}」"
+                    if dep in labels else f"「{label}」依赖 {dep}，计划中缺少该任务"
+                )
+                dependencies.append({"ref": f"/tasks/{i}/depends_on/{j}", "text": text})
+
+        human_checks.extend(
+            {"ref": f"/tasks/{i}/acceptance_checks/{j}", "label": label, "text": check.description}
+            for j, check in enumerate(task.acceptance_checks)
+            if check.kind == CheckKind.HUMAN
+        )
+
+    return [
+        {"title": "交付批次（按任务依赖）", "entries": batches},
+        {
+            "title": "影响交付的依赖",
+            "empty_text": "已声明的交付任务无前置依赖" if delivery_lineage else "计划未声明交付物",
+            "entries": dependencies,
+        },
+        {"title": "人工介入点", "empty_text": "计划未声明人工检查", "entries": human_checks},
+    ]
 
 
 def goal_review_sections(spec: GoalSpec) -> list[ReviewSection]:

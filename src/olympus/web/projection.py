@@ -45,6 +45,7 @@ from olympus.web.approval_review import (
     ReviewSection,
     design_review_sections,
     goal_review_sections,
+    plan_review_sections,
 )
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
@@ -1198,6 +1199,8 @@ def build_run_projection(
 
     tasks = plan.tasks if plan else []
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
+    if plan is not None and not plan_approved:
+        approval_reviews["approve_plan"]["sections"] = plan_review_sections(plan, layers)
     task_by_id = {t.task_id: t for t in tasks}
     blocked_by: dict[str, list[str]] = {}
     for task in sorted(tasks, key=lambda task: layers[task.task_id]):
