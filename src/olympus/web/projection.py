@@ -140,29 +140,36 @@ def _parse_tool_trace_line(raw_line: str) -> dict[str, Any] | None:
 def _read_task_artifacts(
     run_dir: Path,
     task: TaskNode,
+    *,
+    attempt: int | None = None,
 ) -> dict[str, Any]:
     """Load recorded diff, command check logs, review verdicts, manifest and worker trace."""
     task_art_root = run_dir / "artifacts" / task.task_id
-    attempt_idx = max(1, task.attempt)
+    attempt_idx = attempt if attempt is not None else max(1, task.attempt)
     art_dir = task_art_root / f"attempt-{attempt_idx}"
-    if not art_dir.exists() and task_art_root.exists():
+    if attempt is None and not art_dir.exists() and task_art_root.exists():
         candidates = sorted(task_art_root.glob("attempt-*"))
         if candidates:
             art_dir = candidates[-1]
 
+    def readable(path: Path) -> bool:
+        return path.is_file() and (attempt is None or not path.is_symlink())
+
     diff_text = ""
     diff_path = art_dir / "diff.patch"
-    if diff_path.exists():
+    if readable(diff_path):
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace")[:8000]
 
     manifest_md = ""
     manifest_path = art_dir / "MANIFEST.md"
-    if manifest_path.exists():
+    if readable(manifest_path):
         manifest_md = manifest_path.read_text(encoding="utf-8", errors="replace")[:12000]
 
     check_logs: dict[str, str] = {}
     if art_dir.exists():
         for log_file in sorted(art_dir.glob("check-*.log")):
+            if not readable(log_file):
+                continue
             check_logs[log_file.stem.removeprefix("check-")] = log_file.read_text(
                 encoding="utf-8", errors="replace"
             )[:4000]
@@ -170,6 +177,8 @@ def _read_task_artifacts(
     verdicts: list[dict[str, Any]] = []
     if art_dir.exists():
         for v_file in sorted(art_dir.glob("verdict-cycle-*.json")):
+            if not readable(v_file):
+                continue
             try:
                 verdicts.append(json.loads(v_file.read_text(encoding="utf-8")))
             except Exception:
@@ -177,7 +186,7 @@ def _read_task_artifacts(
 
     tool_calls: list[dict[str, Any]] = []
     trace_file = art_dir / "worker.jsonl"
-    if trace_file.exists():
+    if attempt is None and readable(trace_file):
         for raw_line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
             step = _parse_tool_trace_line(raw_line)
             if step is not None:
@@ -962,6 +971,128 @@ def _build_workflow_view(
     }
 
 
+def read_recorded_attempt(
+    run_dir: Path, plan: TaskPlan | None, task_id: str, attempt: int
+) -> dict[str, Any] | None:
+    task = next((task for task in plan.tasks if task.task_id == task_id), None) if plan else None
+    root = (run_dir / "artifacts").resolve()
+    target = (root / task_id / f"attempt-{attempt}").resolve()
+    if task is None or attempt < 1 or not target.is_relative_to(root) or not target.is_dir():
+        return None
+    art = _read_task_artifacts(run_dir, task, attempt=attempt)
+    return {name: art[name] for name in ("diff_patch", "manifest_md", "check_logs", "verdicts")}
+
+
+def _build_run_progress(
+    snap: dict[str, Any], events: list[RunEvent], dag_nodes: list[dict[str, Any]], run_dir: Path
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    publications = {
+        "spec.saved": ("spec", "GoalSpec", "spec_id"),
+        "design.saved": ("design", "DesignSpec", "design_id"),
+        "plan.saved": ("plan", "任务计划", "plan_id"),
+    }
+    milestones = {
+        "run.created", "intake.triaged", "spec.clarified", "approval.recorded",
+        "graph.node_started", "graph.node_finished", "graph.paused", "graph.failed",
+        "graph.finished", "run.status_changed", "run.workflow_promoted", "task.requeued",
+        "task.blocked", "task.accepted", "task.accepted_with_risk",
+    }
+    tasks = {node["task_id"]: node for node in dag_nodes}
+    attempts: dict[str, tuple[int, int]] = {}
+    last_publication: dict[str, str] = {}
+    outputs: dict[str, dict[str, Any]] = {}
+    recent = None
+    for event in events:
+        kind = event.event_type
+        payload = event.payload
+        entry = {
+            "event_seq": event.event_seq,
+            "created_at": event.created_at.isoformat(),
+            "event_type": kind,
+            "node": payload.get("node"),
+            "task_id": payload.get("task_id"),
+            "to": payload.get("to"),
+        }
+        output = None
+        if kind in publications:
+            category, label, id_field = publications[kind]
+            version = payload.get("version")
+            fingerprint = payload.get("content_hash")
+            artifact_id = payload.get(id_field)
+            if not fingerprint or not artifact_id or version is None:
+                continue
+            key = f"{category}:{artifact_id}:{version}:{fingerprint}"
+            if last_publication.get(category) == key:
+                continue
+            last_publication[category] = key
+            outputs.pop(key, None)
+            artifact = snap[category]
+            current = artifact is not None and artifact.content_hash == fingerprint
+            summary = f"{label} v{version} 已就绪"
+            if category == "spec" and current:
+                summary += f"，{artifact.goal}"
+            elif category == "plan" and isinstance(payload.get("task_count"), int):
+                summary += f"，包含 {payload['task_count']} 个任务"
+            elif category == "design" and isinstance(payload.get("module_count"), int):
+                summary += f"，包含 {payload['module_count']} 个模块"
+            output = {
+                "key": key, "kind": category, "artifact_id": artifact_id,
+                "version": version, "content_hash": fingerprint, "current": current,
+                "summary": summary,
+            }
+        elif kind == "task.leased":
+            task_id, lease, attempt = (
+                payload.get("task_id"), payload.get("lease_generation"), payload.get("attempt")
+            )
+            if isinstance(task_id, str) and isinstance(lease, int) and isinstance(attempt, int):
+                attempts[task_id] = (lease, attempt)
+        elif kind in {"task.verifying", "review.verdict_recorded", "check.command_completed"}:
+            task_id = payload.get("task_id")
+            if not isinstance(task_id, str) or task_id not in tasks:
+                continue
+            task = tasks[task_id]
+            category = "execution" if kind == "task.verifying" else "verification"
+            lease, leased_attempt = attempts.get(task_id, (None, None))
+            attempt = payload.get("attempt")
+            if attempt is None and lease == payload.get("lease_generation"):
+                attempt = leased_attempt
+            folder = run_dir / "artifacts" / task_id / f"attempt-{attempt}"
+            detail_available = False
+            if kind == "task.verifying":
+                diff = folder / "diff.patch"
+                if not attempt or not diff.is_file() or not diff.stat().st_size:
+                    continue
+                key = f"execution:{task_id}:{attempt}"
+                summary = f"{task_id} 第 {attempt} 次执行的代码变更已就绪"
+                detail_available = True
+            else:
+                key = f"verification:{event.event_seq}"
+                name = "独立复核" if kind == "review.verdict_recorded" else payload.get("check_id")
+                if not name or not isinstance(payload.get("passed"), bool):
+                    continue
+                result = "通过" if payload.get("passed") is True else "未通过"
+                summary = f"{task_id} · {name} · {result}"
+                if attempt and folder.is_dir():
+                    detail_available = (
+                        any(folder.glob("verdict-cycle-*.json"))
+                        if kind == "review.verdict_recorded"
+                        else (folder / f"check-{name}.log").is_file()
+                    )
+            output = {
+                "key": key, "kind": category, "artifact_id": task_id,
+                "version": attempt, "current": detail_available and attempt == task["attempt"],
+                "detail_available": detail_available, "summary": summary,
+            }
+        if output and output["key"] not in outputs:
+            outputs[output["key"]] = entry | output
+            recent = entry | {"summary": output["summary"]}
+        elif not output and kind in milestones:
+            if kind == "run.status_changed" and payload.get("from") == payload.get("to"):
+                continue
+            recent = entry
+    return recent, list(reversed(outputs.values()))
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
@@ -974,7 +1105,10 @@ def build_run_projection(
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
     design: DesignSpec | None = snap.get("design")
-    events = store.list_events(run_id, after_seq=0)
+    events = [
+        event for event in store.list_events(run_id, after_seq=0)
+        if event.state_revision <= snap["state_revision"]
+    ]
     run_dir = (
         artifacts_root
         if artifacts_root is not None
@@ -1251,6 +1385,9 @@ def build_run_projection(
         }
 
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
+    verified_count = sum(
+        1 for t in tasks if t.status == TaskStatus.ACCEPTED and not t.accepted_risk_reason
+    )
     ledger: BudgetLedger = snap["budget_ledger"]
     policy: BudgetPolicy = snap["budget_policy"]
     raw_input = spec.goal if spec is not None else str(snap["title"])
@@ -1292,6 +1429,7 @@ def build_run_projection(
                 }
             )
 
+    recent_progress, key_outputs = _build_run_progress(snap, events, dag_nodes, run_dir)
     return {
         "run_id": snap["run_id"],
         "title": snap["title"],
@@ -1307,6 +1445,8 @@ def build_run_projection(
         "blueprint_completed": blueprint_completed,
         "triage": triage_payload,
         "stage_activity": stage_activity[-12:],
+        "recent_progress": recent_progress,
+        "key_outputs": key_outputs,
         "spec_approved": spec_approved,
         "design_approved": design_approved,
         "plan_approved": plan_approved,
@@ -1329,6 +1469,7 @@ def build_run_projection(
         },
         "progress": {
             "accepted_tasks": accepted_count,
+            "verified_tasks": verified_count,
             "total_tasks": len(tasks),
             "ratio_text": f"{accepted_count} / {len(tasks)}",
         },

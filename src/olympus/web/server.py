@@ -27,7 +27,7 @@ from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.approval_review import APPROVAL_ARTIFACTS
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
-from olympus.web.projection import build_run_projection, seed_demo_runs
+from olympus.web.projection import build_run_projection, read_recorded_attempt, seed_demo_runs
 from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -101,6 +101,13 @@ class AriadneApp:
             "status": snap["status"].value,
             "events": events,
         }
+
+    def get_attempt_payload(self, run_id: str, task_id: str, attempt: int) -> dict[str, Any]:
+        plan = self.store.get_run(run_id)["plan"]
+        artifacts = read_recorded_attempt(self.artifacts_root / run_id, plan, task_id, attempt)
+        if artifacts is None:
+            raise NotFoundError("Recorded task attempt not found")
+        return {"ok": True, "artifacts": artifacts}
 
     def execute_command(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Execute an idempotent HITL command and return updated projection."""
@@ -587,6 +594,12 @@ def create_http_server(
                         after_seq = int(qs.get("after_seq", ["0"])[0])
                         once = qs.get("once", ["0"])[0] == "1"
                         self._handle_sse(run_id, after_seq=after_seq, once=once)
+                        return
+                    if len(parts) == 6 and parts[3] == "task-artifacts" and parts[5].isdigit():
+                        self._send_json(
+                            HTTPStatus.OK,
+                            app.get_attempt_payload(parts[2], unquote(parts[4]), int(parts[5])),
+                        )
                         return
 
                 self._send_json(

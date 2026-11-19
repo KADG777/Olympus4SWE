@@ -20,8 +20,8 @@
     demos: [],
     clarifySig: "",
     userOpenedDock: false,
-    sse: null,
-    reconnectTimer: null,
+    transport: null,
+    submitting: false,
   };
 
   const el = {
@@ -140,18 +140,6 @@
     validate_plan: "计划校验",
     gate_plan: "计划确认",
     execute: "并发执行",
-  };
-
-  const STAGE_EVENT_LABELS = {
-    "intake.triaged": "完成输入成熟度分级与入口路由",
-    "spec.drafted": "已生成 GoalSpec 需求草案",
-    "spec.clarified": "已合并澄清回答并更新 GoalSpec",
-    "spec.confirmed": "已批准并冻结 GoalSpec",
-    "design.generated": "已生成 DesignSpec 白盒架构草案",
-    "design.approved": "已批准并冻结 DesignSpec",
-    "plan.generated": "已生成 TaskPlan 任务依赖图",
-    "plan.approved": "已批准任务计划",
-    "run.workflow_promoted": "已升级为全流程执行（full_sdlc_tdd）",
   };
 
   function localizeTriageReason(text) {
@@ -290,7 +278,7 @@
   function renderStage(projection) {
     const runMeta = statusMeta(projection.status, null);
     el.runTitle.textContent = projection.title || "Ariadne 研发编排控制台";
-    el.runKicker.textContent = `${runMeta.glyph} ${runMeta.label} · r${projection.state_revision}`;
+    el.runKicker.textContent = `${runMeta.glyph} ${runMeta.label}`;
     el.runKicker.setAttribute("data-variant", runMeta.variant);
 
     el.pipeline.innerHTML = (projection.stage_pipeline || [])
@@ -313,15 +301,10 @@
       })
       .join("");
 
-    el.statBand.innerHTML = uiStatBand([
-      { label: "任务", value: projection.progress.ratio_text },
-      {
-        label: "LLM",
-        value: `${projection.budget.calls_used} / ${projection.budget.max_calls}`,
-      },
-      { label: "Token", value: formatTokens(projection.budget.total_tokens) },
-      { label: "修订", value: `r${projection.state_revision}` },
-    ]);
+    const { verified_tasks: done, total_tasks: total } = projection.progress;
+    el.statBand.innerHTML = total > 0
+      ? uiStatBand([{ label: "已验收任务", value: `${done} / ${total} · ${Math.floor(done * 100 / total)}%` }])
+      : "";
 
     const paused = projection.status === "paused";
     const hasTasks = (projection.dag && projection.dag.nodes && projection.dag.nodes.length > 0);
@@ -795,6 +778,7 @@
       uiCard("约束", `<ul class="spec-list">${constraints || "<li>（无）</li>"}</ul>`),
     ].join("");
     return uiCard("GoalSpec · 需求冻结", `<div class="kv">${body}</div>${extras}`, {
+      id: "run-spec-detail",
       note: "目标与验收标准",
     });
   }
@@ -940,7 +924,7 @@
         "接口契约",
         `<ul class="spec-list">${interfaces || "<li>（无）</li>"}</ul>`
       )}${uiCard("风险与取舍", `<ul class="spec-list">${risks || "<li>（无）</li>"}</ul>`)}`,
-      { note: `${(design.modules || []).length} 个模块` }
+      { id: "run-design-detail", note: `${(design.modules || []).length} 个模块` }
     );
   }
 
@@ -1001,64 +985,131 @@
     return data;
   }
 
-  function renderStageLivePanel(projection) {
-    const nodes = (projection.dag && projection.dag.nodes) || [];
-    const hasDag = nodes.length > 0;
+  function writeText(element, value) {
+    if (element.textContent !== value) element.textContent = value;
+  }
+
+  function progressText(event) {
+    if (!event) return "等待首条运行记录";
+    if (event.summary) return event.summary;
+    const node = NODE_LABELS[event.node] || event.node || "工作流";
+    return {
+      "run.created": "已接收编排请求",
+      "intake.triaged": "输入分流完成",
+      "spec.clarified": "已记录澄清回答",
+      "approval.recorded": "已记录人工决定",
+      "graph.node_started": `开始${node}`,
+      "graph.node_finished": `${node}完成`,
+      "graph.paused": `${node}等待继续`,
+      "graph.failed": `${node}执行中断`,
+      "graph.finished": "工作流完成",
+      "run.status_changed": `运行状态更新为${statusMeta(event.to).label}`,
+      "run.workflow_promoted": "已切换为全流程执行",
+      "task.requeued": `${event.task_id} 已重新排队`,
+      "task.blocked": `${event.task_id} 受阻`,
+      "task.accepted": `${event.task_id} 已验收`,
+      "task.accepted_with_risk": `${event.task_id} 保留未验证状态，已人工接受风险`,
+    }[event.event_type] || "已记录运行更新";
+  }
+
+  function currentStage(projection) {
+    const workflow = projection.workflow || {};
+    if (projection.status === "completed" || projection.status === "cancelled") {
+      return { key: projection.status, label: statusMeta(projection.status).label };
+    }
+    const node = workflow.current_node || workflow.paused?.node || workflow.failed_node;
+    const stages = projection.stage_pipeline || [];
+    const stage = stages.find(({ status }) => status === "blocked") ||
+      stages.findLast(({ status }) => status === "active");
+    const name = NODE_LABELS[node] || node || stage?.label || statusMeta(projection.status).label;
+    const label = projection.hitl_banner?.kind === "task_blocked" ? `${name} · 有任务受阻`
+      : projection.status === "failed" ? `${name} · 执行中断` : name;
+    return { key: node || stage?.id || projection.status, label };
+  }
+
+  function highlightProgress(element) {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !element.getClientRects().length) return;
+    element.getAnimations().forEach((animation) => animation.cancel());
+    element.animate(
+      [{ backgroundColor: "var(--accent-soft)" }, { backgroundColor: "var(--surface-raised)" }],
+      { duration: 240, easing: "cubic-bezier(0.23, 1, 0.32, 1)" }
+    );
+  }
+
+  const outputActions = {
+    spec: "查看 GoalSpec",
+    design: "查看 DesignSpec",
+    plan: "查看任务依赖图",
+    execution: "查看代码变更",
+    verification: "查看验收证据",
+  };
+
+  function renderOutputHistory(outputs) {
+    const history = document.getElementById("run-output-history");
+    const list = document.getElementById("run-output-versions");
+    history.hidden = !outputs.length;
+    const existing = new Map(Array.from(list.children, (row) => [row.dataset.outputKey, row]));
+    let next = list.firstElementChild;
+    for (const output of outputs) {
+      const row = existing.get(output.key) || document.createElement("li");
+      existing.delete(output.key);
+      row.dataset.outputKey = output.key;
+      row.tabIndex = -1;
+      const description = output.content_hash
+        ? `${output.artifact_id} · ${output.content_hash}`
+        : new Date(output.created_at).toLocaleString();
+      const action = output.current || output.detail_available
+        ? `<button type="button" class="btn" data-history-output="${esc(output.key)}">${esc(outputActions[output.kind])}</button>`
+        : "";
+      const markup = `<span>${esc(output.summary)}</span><code>${esc(description)}</code>${action}`;
+      if (row.dataset.markup !== markup) {
+        row.innerHTML = markup;
+        row.dataset.markup = markup;
+      }
+      if (row !== next) list.insertBefore(row, next);
+      next = row.nextElementSibling;
+    }
+    existing.forEach((row) => row.remove());
+  }
+
+  function renderStageLivePanel(projection, previous) {
+    const hasDag = Boolean(projection.dag.nodes.length);
     el.taskDagSection.hidden = !hasDag;
     el.laneSection.hidden = !hasDag;
-    if (hasDag) {
-      el.stageLivePanel.hidden = true;
-      el.stageLivePanel.innerHTML = "";
-      return;
-    }
     el.stageLivePanel.hidden = false;
-    const activity = (projection.stage_activity || []).slice(-8).reverse();
-    const activityHtml = activity.length
-      ? activity
-          .map((item) => {
-            const isFailed = item.event_type === "graph.failed";
-            const summaryText = isFailed
-              ? "当前阶段节点调用中断（详见上方提示栏，可直接点击“从断点重试”）"
-              : STAGE_EVENT_LABELS[item.summary] || item.summary;
-            return `<div class="stage-activity-item" data-tone="normal"><div class="stage-activity-main"><span class="mono">#${esc(
-              item.event_seq
-            )}</span>${uiBadge(item.stage || "stage", isFailed ? "warn" : "muted")}<span class="mono">${esc(
-              item.actor
-            )}</span><span class="stage-activity-summary">${esc(
-              summaryText
-            )}</span></div></div>`;
-          })
-          .join("")
-      : '<p class="view-note">工作流准备就绪，等待节点执行事件。</p>';
+    const stage = currentStage(projection);
+    const stageText = document.getElementById("run-current-stage");
+    writeText(stageText, `当前阶段 · ${stage.label}`);
+    if (previous && currentStage(previous).key !== stage.key) highlightProgress(stageText);
 
-    const artifactSummary = [];
-    if (projection.spec) {
-      artifactSummary.push(
-        uiCard(
-          "GoalSpec 草案",
-          `<p class="spec-list">${esc(projection.spec.goal)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="spec">在架构规格查看完整 GoalSpec →</button></div>`,
-          { note: `v${projection.spec.version || 1} · ${(projection.spec.requirements || []).length} 条需求` }
-        )
-      );
+    const recent = projection.recent_progress;
+    writeText(document.getElementById("run-recent-progress"), `最近确认 · ${progressText(recent)}`);
+    const time = document.getElementById("run-progress-time");
+    const stamp = recent?.created_at || projection.created_at;
+    if (time.dateTime !== stamp) {
+      time.dateTime = stamp;
+      writeText(time, stamp ? new Date(stamp).toLocaleString("zh-CN") : "");
     }
-    if (projection.design) {
-      artifactSummary.push(
-        uiCard(
-          "DesignSpec 白盒架构",
-          `<p class="spec-list">${esc(projection.design.architecture_summary)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="design">查看模块边界与接口契约 →</button></div>`,
-          { note: `${(projection.design.modules || []).length} 个模块` }
-        )
-      );
-    }
+    const stats = document.getElementById("run-detail-stats");
+    stats.innerHTML = uiStatBand([
+      { label: "LLM", value: `${projection.budget.calls_used} / ${projection.budget.max_calls}` },
+      { label: "Token", value: formatTokens(projection.budget.total_tokens) },
+      { label: "修订", value: `r${projection.state_revision}` },
+      { label: "最近事件", value: `#${projection.latest_event_seq}` },
+    ]);
 
-    el.stageLivePanel.innerHTML = [
-      uiCard(
-        "当前阶段执行动态",
-        `<div class="stage-activity-list">${activityHtml}</div>`,
-        { note: `r${projection.state_revision} · 任务分解尚未启动` }
-      ),
-      ...artifactSummary,
-    ].join("");
+    const outputs = projection.key_outputs || [];
+    renderOutputHistory(outputs);
+    const latest = outputs[0];
+    const outputPanel = document.getElementById("run-key-output");
+    const outputButton = document.getElementById("run-output-detail");
+    outputPanel.hidden = !latest;
+    outputButton.hidden = !latest;
+    if (latest) {
+      writeText(document.getElementById("run-output-summary"), latest.summary);
+      writeText(outputButton, (latest.current || latest.detail_available) ? outputActions[latest.kind] : "查看版本记录");
+      if (previous && previous.key_outputs?.[0]?.key !== latest.key) highlightProgress(outputPanel);
+    }
   }
 
   function renderDag(projection) {
@@ -1278,25 +1329,34 @@
     return `<pre class="code-block code-diff scroller">${rows}</pre>`;
   }
 
+  function recordedArtifactCards(artifacts, manifest, showEmpty = true) {
+    const verdicts = (artifacts.verdicts || [])
+      .map((verdict) => JSON.stringify(verdict, null, 2))
+      .join("\n\n");
+    const logs = Object.entries(artifacts.check_logs || {}).map(([id, log]) =>
+      uiCard(`检查日志 · ${id}`, `<pre class="code-block scroller">${esc(log)}</pre>`)
+    );
+    const cards = [
+      showEmpty || artifacts.diff_patch
+        ? uiCard("diff.patch", diffBlock(artifacts.diff_patch), { note: "隔离沙盒产物" }) : "",
+      showEmpty || manifest ? uiCard(
+        "MANIFEST.md",
+        `<pre class="code-block scroller">${esc(manifest || "（暂无 MANIFEST.md）")}</pre>`,
+        { note: "完整性清单" }
+      ) : "",
+      showEmpty || verdicts ? uiCard(
+        "Argus 独立复核",
+        `<pre class="code-block scroller">${esc(verdicts || "（暂无复核记录）")}</pre>`,
+        { note: "冷启动审查" }
+      ) : "",
+      ...logs,
+    ].join("");
+    return cards || uiNotice("info", "此版本的执行文件不可用");
+  }
+
   function renderDockBody(projection, task) {
     if (state.activeTab === "artifacts") {
-      const artifacts = task.artifacts || {};
-      const verdicts = (artifacts.verdicts || [])
-        .map((verdict) => JSON.stringify(verdict, null, 2))
-        .join("\n\n");
-      return [
-        uiCard("diff.patch", diffBlock(artifacts.diff_patch), { note: "隔离沙盒产物" }),
-        uiCard(
-          "MANIFEST.md",
-          `<pre class="code-block scroller">${esc(task.manifest_md || "（暂无 MANIFEST.md）")}</pre>`,
-          { note: "完整性清单" }
-        ),
-        uiCard(
-          "Argus 独立复核",
-          `<pre class="code-block scroller">${esc(verdicts || "（暂无复核记录）")}</pre>`,
-          { note: "冷启动审查" }
-        ),
-      ].join("");
+      return recordedArtifactCards(task.artifacts || {}, task.manifest_md);
     }
 
     if (state.activeTab === "events") {
@@ -1475,8 +1535,80 @@
     el.dockOpen.hidden = Boolean(open);
   }
 
+  function renderedElement(element) {
+    const root = element.closest("[id]");
+    if (!root) return () => null;
+    if (root === element) return () => document.getElementById(root.id);
+    const keys = ["data-output-key", "data-task-id", "data-workflow-node", "data-tab",
+      "data-run-id", "data-amb-input", "data-jump-task", "data-history-output", "aria-label"];
+    const key = keys.find((attribute) => element.hasAttribute(attribute));
+    const tag = element.localName;
+    const selector = key ? `${tag}[${key}="${CSS.escape(element.getAttribute(key))}"]` : tag;
+    const index = Array.from(root.querySelectorAll(selector)).indexOf(element);
+    return () => document.getElementById(root.id)?.querySelectorAll(selector)[index];
+  }
+
+  function captureReadingPosition() {
+    const active = document.activeElement || document.body;
+    const findActive = renderedElement(active);
+    const activeRow = active.closest("[data-output-key]");
+    const findActiveRow = activeRow && renderedElement(activeRow);
+    const scrollers = Array.from(document.querySelectorAll(".scroller"))
+      .filter((element) => element.scrollTop || element.scrollLeft)
+      .map((element) => ({
+        find: renderedElement(element), top: element.scrollTop, left: element.scrollLeft,
+      }));
+    const openDetails = Array.from(document.querySelectorAll("details[open]"), renderedElement);
+    const stage = document.getElementById("stage");
+    const header = stage.querySelector(".stage-head");
+    const documentScroll = getComputedStyle(header).position !== "sticky";
+    const scrollRoot = documentScroll ? document.scrollingElement : stage;
+    const pageTop = scrollRoot.scrollTop;
+    const readingLine = Math.max(0, header.getBoundingClientRect().bottom);
+    const anchors = pageTop ? Array.from(stage.querySelectorAll(
+      "[data-output-key], section[id], h2[id]"
+    )).filter((element) => {
+      const box = element.getBoundingClientRect();
+      return box.height && box.bottom > readingLine && box.top < window.innerHeight;
+    }) : [];
+    const anchor = anchors.reduce((closest, element) =>
+      Math.abs(element.getBoundingClientRect().top - readingLine) <
+      Math.abs(closest.getBoundingClientRect().top - readingLine) ? element : closest, anchors[0]);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const findAnchor = anchor && renderedElement(anchor);
+
+    return () => {
+      openDetails.forEach((find) => {
+        const details = find();
+        if (details) details.open = true;
+      });
+      if (!active.isConnected && document.activeElement === document.body) {
+        (findActive() || findActiveRow?.())?.focus({ preventScroll: true });
+      }
+      for (const { find, top, left } of scrollers) {
+        const element = find();
+        if (!element) continue;
+        element.scrollTo({ top, left, behavior: "instant" });
+      }
+      const target = findAnchor?.();
+      if (documentScroll) scrollRoot.scrollTop = pageTop;
+      if (target?.getClientRects().length) {
+        scrollRoot.scrollTop += target.getBoundingClientRect().top - anchorTop;
+      }
+    };
+  }
+
   function renderAll(projection) {
-    const switchedRun = !state.projection || state.projection.run_id !== projection.run_id;
+    if (projection.run_id !== state.runId) return;
+    const switchedRun = state.projection?.run_id !== projection.run_id;
+    const previous = switchedRun ? null : state.projection;
+    if (previous && (
+      projection.state_revision < previous.state_revision ||
+      projection.latest_event_seq < previous.latest_event_seq ||
+      (projection.state_revision === previous.state_revision &&
+       projection.latest_event_seq === previous.latest_event_seq)
+    )) return;
+    const restore = switchedRun ? null : captureReadingPosition();
     state.projection = projection;
     const nodes = projection.dag.nodes || [];
     if (
@@ -1504,7 +1636,7 @@
     renderTriage(projection);
     renderClarify(projection);
     renderWorkflow(projection);
-    renderStageLivePanel(projection);
+    renderStageLivePanel(projection, previous);
     renderDag(projection);
     renderLanes(projection);
     renderMatrix(projection);
@@ -1512,6 +1644,7 @@
     renderWaterfall(projection);
     renderThreads();
     renderDock(projection);
+    restore?.();
   }
 
   function selectTask(taskId) {
@@ -1666,18 +1799,27 @@
         payload.constraints = selectedDemo.constraints;
       }
     }
-    const response = await fetch("/api/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!data.ok || !data.run_id) {
-      toast(`创建失败：${data.error || "未知错误"}`);
+    if (state.submitting) return;
+    state.submitting = true;
+    document.getElementById("new-run-submit").disabled = true;
+    renderConnection();
+    let data;
+    try {
+      const response = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      data = await response.json();
+      if (!data.ok || !data.run_id) throw new Error(data.error || "未知错误");
+    } catch (error) {
+      toast(`创建请求失败：${error.message}`);
       return;
+    } finally {
+      state.submitting = false;
+      document.getElementById("new-run-submit").disabled = false;
+      renderConnection();
     }
-    await refreshRuns();
-    el.runSelector.value = data.run_id;
     if (el.newRunDemo) el.newRunDemo.value = "";
     applyDemoSelection();
     el.newRunInput.value = "";
@@ -1686,75 +1828,136 @@
     el.newRunFileNote.textContent = "支持 .md / .txt / .json / .yaml / .yml";
     state.selectedTaskId = null;
     state.workflowNode = null;
-    await loadRun(data.run_id);
-    toast(`已创建编排 ${data.run_id} · ${data.workflow || payload.workflow_name}`);
+    toast(`已接收编排 ${data.run_id}`);
+    const loading = loadRun(data.run_id);
+    refreshRuns().catch(() => {});
+    await loading;
   }
 
-  async function loadRun(runId) {
+  function renderConnection() {
+    const badge = document.getElementById("run-connection");
+    const text = state.submitting ? "正在提交…" : ({
+      loading: "正在加载快照…",
+      missing: "找不到运行",
+      reconnecting: "正在重连 · 保留上次确认",
+    }[state.transport?.phase] || "");
+    if (badge.textContent === text) return;
+    const restore = state.projection && captureReadingPosition();
+    badge.hidden = !text;
+    writeText(badge, text);
+    restore?.();
+  }
+
+  function setConnection(transport, phase) {
+    transport.phase = phase;
+    renderConnection();
+  }
+
+  function snapshotUrl(runId) {
+    return `/api/runs/${encodeURIComponent(runId)}`;
+  }
+
+  async function fetchSnapshot(runId) {
+    const response = await fetch(snapshotUrl(runId), { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || !data.ok || data.projection?.run_id !== runId) {
+      throw new Error(data.error || "加载运行快照失败", { cause: response.status });
+    }
+    return data.projection;
+  }
+
+  function applySnapshot(transport, projection) {
+    if (state.transport !== transport || projection.run_id !== transport.runId) return;
+    renderAll(projection);
+  }
+
+  function scheduleReconnect(transport) {
+    transport.source?.close();
+    transport.source = null;
+    setConnection(transport, "reconnecting");
+    if (transport.timer) return;
+    transport.timer = window.setTimeout(() => {
+      transport.timer = null;
+      if (state.transport === transport) syncAndConnect(transport);
+    }, 1200);
+  }
+
+  async function syncAndConnect(transport) {
+    try {
+      const projection = await fetchSnapshot(transport.runId);
+      if (state.transport !== transport) return;
+      applySnapshot(transport, projection);
+      connectStream(transport, state.projection.latest_event_seq);
+    } catch (error) {
+      if (state.transport !== transport) return;
+      if (error.cause === 404) {
+        setConnection(transport, "missing");
+        toast(error.message);
+      } else {
+        scheduleReconnect(transport);
+      }
+    }
+  }
+
+  function loadRun(runId) {
+    const previous = state.transport;
+    previous?.source?.close();
+    window.clearTimeout(previous?.timer);
+    const transport = { runId, source: null, timer: null };
+    state.transport = transport;
     state.runId = runId;
     state.userOpenedDock = false;
-    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-    const data = await response.json();
-    if (state.runId !== runId) return;
-    if (!data.ok) {
-      toast(data.error || "加载运行实例失败");
-      return;
-    }
-    renderAll(data.projection);
-    connectStream(runId, data.projection.latest_event_seq || 0);
+    setConnection(transport, "loading");
+    return syncAndConnect(transport);
   }
 
-  function connectStream(runId, afterSeq) {
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
+  function connectStream(transport, afterSeq) {
+    if (typeof EventSource === "undefined" || params.get("nosse") === "1") {
+      setConnection(transport, "online");
+      return;
     }
-    if (state.sse) {
-      state.sse.close();
-      state.sse = null;
-    }
-    if (typeof EventSource === "undefined" || params.get("nosse") === "1") return;
-    const source = new EventSource(
-      `/api/runs/${encodeURIComponent(runId)}/stream?after_seq=${afterSeq}`
-    );
+    const source = new EventSource(`${snapshotUrl(transport.runId)}/stream?after_seq=${afterSeq}`);
+    transport.source = source;
+    const isCurrent = () => state.transport === transport && transport.source === source;
+    let requestedRevision = -1;
+    let requestedSeq = afterSeq;
     source.addEventListener("state", async (event) => {
+      if (!isCurrent()) return;
+      let request;
       try {
-        if (state.runId !== runId) return;
         const payload = JSON.parse(event.data);
-        const hasNewEvents =
-          Array.isArray(payload.events) &&
-          payload.events.some(
-            (ev) => (ev.event_seq || 0) > ((state.projection && state.projection.latest_event_seq) || 0)
-          );
-        if (
-          state.projection &&
-          (payload.state_revision !== state.projection.state_revision || hasNewEvents)
-        ) {
-          const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-          const data = await response.json();
-          if (state.runId !== runId) return;
-          if (data.ok) {
-            renderAll(data.projection);
-            refreshRuns().catch(() => {});
+        if (payload.run_id !== transport.runId) return;
+        const revision = payload.state_revision;
+        const seq = payload.events.at(-1)?.event_seq ?? afterSeq;
+        const current = state.projection;
+        if (revision <= current.state_revision && seq <= current.latest_event_seq) {
+          if (requestedRevision <= current.state_revision && requestedSeq <= current.latest_event_seq) {
+            setConnection(transport, "online");
           }
+          return;
         }
+        if (revision <= requestedRevision && seq <= requestedSeq) return;
+        requestedRevision = Math.max(requestedRevision, revision);
+        requestedSeq = Math.max(requestedSeq, seq);
+        request = [requestedRevision, requestedSeq];
+        const projection = await fetchSnapshot(transport.runId);
+        if (!isCurrent()) return;
+        applySnapshot(transport, projection);
+        if (state.projection.state_revision >= requestedRevision &&
+            state.projection.latest_event_seq >= requestedSeq) {
+          setConnection(transport, "online");
+          return;
+        }
+        if (request[0] !== requestedRevision || request[1] !== requestedSeq) return;
       } catch (error) {
-        return;
+        if (!isCurrent() || (request &&
+          (request[0] !== requestedRevision || request[1] !== requestedSeq))) return;
       }
+      if (isCurrent()) scheduleReconnect(transport);
     });
     source.addEventListener("error", () => {
-      if (state.runId === runId && source.readyState === EventSource.CLOSED) {
-        source.close();
-        if (state.sse === source) state.sse = null;
-        if (!state.reconnectTimer) {
-          state.reconnectTimer = window.setTimeout(() => {
-            state.reconnectTimer = null;
-            if (state.runId === runId) loadRun(runId);
-          }, 1500);
-        }
-      }
+      if (isCurrent()) scheduleReconnect(transport);
     });
-    state.sse = source;
   }
 
   async function sendCommand(body, successMessage, runId = state.runId) {
@@ -1817,7 +2020,60 @@
     return (banner && banner.task_id) || state.selectedTaskId;
   }
 
+  async function openOutput(output) {
+    if (!output) return;
+    if (output.current && (output.kind === "spec" || output.kind === "design")) {
+      setView("design");
+      const detail = document.getElementById(`run-${output.kind}-detail`);
+      if (detail) {
+        detail.tabIndex = -1;
+        detail.focus();
+      }
+    } else if (output.kind === "plan" && output.current) {
+      document.getElementById("topology-title").focus();
+    } else if (output.current) {
+      state.activeTab = "artifacts";
+      selectTask(output.artifact_id);
+      el.dockTitle.focus();
+    } else {
+      const history = document.getElementById("run-output-history");
+      history.open = true;
+      if (!output.detail_available) {
+        history.querySelector("summary").focus();
+        return;
+      }
+      const row = history.querySelector(`[data-output-key="${CSS.escape(output.key)}"]`);
+      if (!row) return;
+      const loaded = row.querySelector(".run-attempt-detail");
+      if (loaded) {
+        loaded.focus();
+        return;
+      }
+      const detail = document.createElement("section");
+      detail.className = "run-attempt-detail";
+      detail.tabIndex = -1;
+      detail.setAttribute("aria-label", output.summary);
+      detail.textContent = "正在读取执行产物…";
+      row.append(detail);
+      detail.focus();
+      try {
+        const url = `${snapshotUrl(state.runId)}/task-artifacts/${encodeURIComponent(output.artifact_id)}/${output.version}`;
+        const response = await fetch(url);
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error);
+        detail.innerHTML = recordedArtifactCards(data.artifacts, data.artifacts.manifest_md, false);
+      } catch (error) {
+        detail.remove();
+        toast("读取执行产物失败，可重新打开");
+      }
+    }
+  }
+
   function wireEvents() {
+    window.addEventListener("offline", () => {
+      const transport = state.transport;
+      if (transport?.source) scheduleReconnect(transport);
+    });
     el.runSelector.addEventListener("change", () => {
       state.selectedTaskId = null;
       state.workflowNode = null;
@@ -2027,9 +2283,12 @@
       selectWorkflowNode(workflow.failed_node || workflow.current_node || "align");
     });
 
-    el.stageLivePanel.addEventListener("click", (event) => {
-      const jump = event.target.closest("[data-jump-design]");
-      if (jump) setView("design");
+    document.getElementById("run-output-detail").addEventListener("click", () => {
+      openOutput(state.projection?.key_outputs?.[0]);
+    });
+    document.getElementById("run-output-history").addEventListener("click", (event) => {
+      const key = event.target.closest("[data-history-output]")?.dataset.historyOutput;
+      if (key) openOutput(state.projection?.key_outputs?.find((item) => item.key === key));
     });
 
     el.lanes.addEventListener("click", (event) => {

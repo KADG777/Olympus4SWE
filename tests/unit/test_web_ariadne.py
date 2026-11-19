@@ -486,6 +486,8 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             t03_node = next(n for n in proj_after_risk["dag"]["nodes"] if n["task_id"] == "T03-R1")
             assert t03_node["status"] == TaskStatus.ACCEPTED.value
             assert t03_node["accepted_risk_reason"] == "首期单管理员手动取消，接受并发风险放行"
+            assert proj_after_risk["progress"]["accepted_tasks"] == 5
+            assert proj_after_risk["progress"]["verified_tasks"] == 4
 
             # Mark T06 & T08 accepted to verify FR-003/FR-004 show unverified_risk_accepted
             snap = store.get_run("run-campus-waitlist")
@@ -1272,3 +1274,25 @@ def test_completed_blueprint_projection_and_task_diagnostics(tmp_path: Path) -> 
     dep_task = next(n for n in by_task.values() if n["depends_on"])
     assert root_task["diagnostic_output"] == "就绪待调度"
     assert "等待前置产物解锁" in dep_task["diagnostic_attribution"]
+
+
+def test_run_snapshot_exposes_recorded_output_versions_with_task_graph(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    run_id = _seed_gated_run(store)
+    original = store.get_run(run_id)["plan"]
+    revised = original.model_copy(update={"version": 2})
+    store.save_plan(run_id, revised)
+    change = store.list_events(run_id)[-1]
+    store.append_event(run_id=run_id, stage="system", event_type="budget.settled", actor="test")
+
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    snapshot = app.get_run_payload(run_id)["projection"]
+    assert snapshot["dag"]["nodes"]
+    assert snapshot["recent_progress"]["event_seq"] == change.event_seq
+    assert snapshot["recent_progress"]["created_at"] == change.created_at.isoformat()
+    versions = [output for output in snapshot["key_outputs"] if output["kind"] == "plan"]
+    assert [(item["version"], item["content_hash"], item["current"]) for item in versions] == [
+        (2, revised.content_hash, True),
+        (1, original.content_hash, False),
+    ]
+    assert versions[0]["summary"] == "任务计划 v2 已就绪，包含 1 个任务"
