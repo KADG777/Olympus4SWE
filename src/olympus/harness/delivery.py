@@ -60,9 +60,11 @@ def run_delivery_checks(
             "criterion_index": check.criterion_index,
         }
         sandbox = None
+        failure_reason = "无法建立隔离验收环境"
         try:
             sandbox = create_sandbox(workspace_root, label=f"{receipt_id}-{position}")
             workspace = sandbox.workspace_path
+            failure_reason = "无法核验交付快照"
             if overlay_dir.is_dir():
                 shutil.copytree(overlay_dir, workspace, dirs_exist_ok=True)
             version = _delivery_version(workspace, sandbox.base_commit)
@@ -71,6 +73,7 @@ def run_delivery_checks(
             if version != delivery_version:
                 result["reason"] = "本次检查的输入与交付版本不一致"
             else:
+                failure_reason = "无法运行验收命令"
                 proc = subprocess.run(
                     ["bash", "-lc", check.command],
                     cwd=workspace,
@@ -84,6 +87,7 @@ def run_delivery_checks(
                 if proc.returncode < 0 or proc.returncode >= 126:
                     result["reason"] = f"验收命令未正常完成（退出码 {proc.returncode}）"
                 else:
+                    failure_reason = "无法保存可核验的执行日志"
                     log = (
                         f"command: {check.command}\nexit_code: {proc.returncode}\n"
                         f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n"
@@ -99,7 +103,7 @@ def run_delivery_checks(
         except subprocess.TimeoutExpired:
             result["reason"] = "验收命令超时，未取得可用结果"
         except (OSError, ValueError, RuntimeError):
-            result["reason"] = "无法建立交付快照或保存实际执行日志"
+            result["reason"] = failure_reason
         finally:
             if sandbox is not None:
                 remove_sandbox(sandbox)

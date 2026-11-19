@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -593,6 +594,31 @@ def test_approval_write_conflicts_if_candidate_changes_after_validation(
     assert fresh["spec"]["status"] == "draft"
     assert not fresh["spec_approved"]
     assert not any(event["event_type"] == "approval.recorded" for event in fresh["events"])
+
+
+def test_delivery_demo_reseeds_in_git_workspace_with_retained_artifacts(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(
+        [
+            "git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "--no-gpg-sign", "-qm", "Fixture",
+        ],
+        cwd=workspace,
+        check=True,
+    )
+
+    evidence_logs = workspace / ".olympus" / "runs" / "run-delivery-acceptance" / "artifacts"
+    for generation in (1, 2):
+        store = RunStore(tmp_path / f"generation-{generation}.db")
+        seed_demo_runs(store, workspace)
+        review = build_run_projection(store, workspace, "run-delivery-acceptance")[
+            "delivery_acceptance"
+        ]
+        assert review["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
+        assert "Ready" in review["criteria"][0]["evidence"]["log"]
+        assert len(list(evidence_logs.glob("delivery-*/check-1.log"))) == generation
 
 
 def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:

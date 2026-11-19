@@ -6,6 +6,7 @@ import copy
 import json
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from olympus.core.contracts import (
@@ -291,12 +292,15 @@ def seed_delivery_acceptance_demo(store: RunStore, artifacts_root: Path) -> None
         )
 
     run_dir = artifacts_root / run_id
-    workspace = run_dir / "demo_workspace"
-    workspace.mkdir(parents=True)
-    (workspace / "announcement.txt").write_text("Ready\n", encoding="utf-8")
-    receipt = run_delivery_checks(
-        plan, workspace_root=workspace, overlay_dir=run_dir / "accepted_overlay", run_dir=run_dir
-    )
+    with TemporaryDirectory(prefix="olympus-delivery-demo-") as demo_workspace:
+        workspace = Path(demo_workspace)
+        (workspace / "announcement.txt").write_text("Ready\n", encoding="utf-8")
+        receipt = run_delivery_checks(
+            plan,
+            workspace_root=workspace,
+            overlay_dir=workspace / "accepted_overlay",
+            run_dir=run_dir,
+        )
     store.append_event(
         run_id=run_id, stage="verify", event_type=DELIVERY_EVENT, actor="chronos", payload=receipt
     )
