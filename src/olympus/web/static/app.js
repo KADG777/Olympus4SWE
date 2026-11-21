@@ -25,6 +25,8 @@
     userOpenedDock: false,
     transport: null,
     submitting: false,
+    dagIsland: null,
+    workflowIsland: null,
   };
 
   const el = {
@@ -51,7 +53,7 @@
     dockReceipt: document.getElementById("dock-receipt"),
     banner: document.getElementById("hitl-banner"),
     bannerHeadline: document.getElementById("hitl-headline"),
-    dag: document.getElementById("dag-svg"),
+    dagGraph: document.getElementById("dag-graph"),
     lanes: document.getElementById("swimlanes"),
     laneBadge: document.getElementById("lane-badge"),
     frStrip: document.getElementById("fr-strip"),
@@ -89,7 +91,7 @@
     clarifyPanel: document.getElementById("clarify-panel"),
     clarifyItems: document.getElementById("clarify-items"),
     clarifySubmit: document.getElementById("btn-clarify-submit"),
-    workflowSvg: document.getElementById("workflow-svg"),
+    workflowGraph: document.getElementById("workflow-graph"),
     workflowBadge: document.getElementById("workflow-badge"),
     designBody: document.getElementById("design-body"),
     designBadge: document.getElementById("design-badge"),
@@ -607,188 +609,74 @@
     return (spec.open_ambiguities || []).filter((amb) => amb && !amb.answer);
   }
 
-  function workflowLayers(graph) {
-    const nodes = graph.nodes || [];
-    const names = nodes.map((node) => node.name);
-    const known = new Set(names);
-    const orderOf = new Map(names.map((name, idx) => [name, idx]));
-    const forwardEdges = (graph.edges || []).filter(
-      (edge) =>
-        known.has(edge.source) &&
-        known.has(edge.target) &&
-        (orderOf.get(edge.target) || 0) > (orderOf.get(edge.source) || 0)
+  const WORKFLOW_STATUS_TEXT = {
+    completed: "✓ 已完成",
+    running: "▶ 运行中",
+    paused: "◷ 待确认",
+    failed: "✕ 中断/阻塞",
+    error: "✕ 中断/阻塞",
+    skipped: "— 已跳过",
+    pending: "◷ 等待",
+  };
+
+  function workflowCurrentNode(workflow) {
+    return workflow.current_node || workflow.failed_node || (workflow.paused && workflow.paused.node) || null;
+  }
+
+  /** Plain JSON view model for the workflow Graph Island; the host owns every label and status word. */
+  function workflowGraphProps(projection) {
+    const workflow = projection.workflow || {};
+    const graph = workflow.graph || {};
+    const statuses = workflow.node_statuses || {};
+    const taken = new Set(
+      (workflow.traversed_edges || []).map((edge) => `${edge.source}\u2192${edge.target}`)
     );
-    const incoming = new Map(names.map((name) => [name, 0]));
-    forwardEdges.forEach((edge) =>
-      incoming.set(edge.target, (incoming.get(edge.target) || 0) + 1)
-    );
-    const layerOf = new Map();
-    const starts = (graph.start || []).filter((name) => known.has(name));
-    const roots = starts.length
-      ? starts
-      : names.filter((name) => !incoming.get(name));
-    const queue = (roots.length ? roots : names.slice(0, 1)).slice();
-    queue.forEach((name) => layerOf.set(name, 0));
-    let guard = names.length * Math.max(4, forwardEdges.length + 1);
-    while (queue.length && guard > 0) {
-      guard -= 1;
-      const name = queue.shift();
-      const layer = layerOf.get(name) || 0;
-      forwardEdges
-        .filter((edge) => edge.source === name)
-        .forEach((edge) => {
-          const next = layer + 1;
-          if (!layerOf.has(edge.target) || layerOf.get(edge.target) < next) {
-            layerOf.set(edge.target, next);
-            queue.push(edge.target);
-          }
-        });
-    }
-    names.forEach((name, idx) => {
-      if (!layerOf.has(name)) {
-        layerOf.set(name, idx);
-      }
-    });
-    return layerOf;
+    return {
+      runId: projection.run_id,
+      selectedId: state.workflowNode,
+      focusId: workflowCurrentNode(workflow),
+      onSelect: selectWorkflowNode,
+      ariaLabel: "工作流拓扑有向图",
+      emptyMessage: "当前工作流未提供拓扑描述",
+      nodes: (graph.nodes || []).map((node) => {
+        const status = statuses[node.name] || "pending";
+        const label = NODE_LABELS[node.name] || node.name;
+        const meta = statusMeta(status, null);
+        const statusText = WORKFLOW_STATUS_TEXT[status] || `${meta.glyph} ${meta.label}`;
+        return {
+          id: node.name,
+          label,
+          kind: node.kind || "",
+          status,
+          statusText,
+          title: `${label} · ${node.kind || node.name}`,
+          ariaLabel: `${label} (${node.name}) ${statusText}`,
+        };
+      }),
+      edges: (graph.edges || []).map((edge) => ({
+        source: edge.source,
+        target: edge.target,
+        conditional: Boolean(edge.conditional),
+        traversed: taken.has(`${edge.source}\u2192${edge.target}`),
+      })),
+    };
   }
 
   function renderWorkflow(projection) {
     const workflow = projection.workflow || {};
     const graph = workflow.graph;
-    const statuses = workflow.node_statuses || {};
     const name = workflow.name || projection.workflow_name || "workflow";
     const wfLabel = WORKFLOW_LABELS[name] || name;
     if (!graph || !graph.nodes || !graph.nodes.length) {
       el.workflowBadge.textContent = `${wfLabel} · 拓扑不可用`;
-      el.workflowSvg.setAttribute("width", "760");
-      el.workflowSvg.setAttribute("height", "120");
-      el.workflowSvg.setAttribute("viewBox", "0 0 760 120");
-      el.workflowSvg.innerHTML =
-        '<text class="dag-empty" x="32" y="64">当前工作流未提供拓扑描述</text>';
-      return;
+    } else {
+      const current = workflowCurrentNode(workflow);
+      const currentText = current ? `${NODE_LABELS[current] || current} (${current})` : "";
+      el.workflowBadge.textContent = `${wfLabel} · ${workflow.topology || "topology"} · stop=${
+        workflow.stop_after || "-"
+      }${currentText ? ` · 当前 ${currentText}` : ""}`;
     }
-
-    const nodeNames = graph.nodes.map((node) => node.name);
-    const known = new Set(nodeNames);
-    const edges = (graph.edges || []).filter(
-      (edge) => known.has(edge.source) && known.has(edge.target)
-    );
-    const layerOf = workflowLayers(graph);
-    const byLayer = new Map();
-    graph.nodes.forEach((node) => {
-      const layer = layerOf.get(node.name) || 0;
-      if (!byLayer.has(layer)) byLayer.set(layer, []);
-      byLayer.get(layer).push(node);
-    });
-    const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
-    const nodeWidth = 116;
-    const nodeHeight = 58;
-    const rowGap = 14;
-    const columnGap = 140;
-    const topPad = 30;
-    const bottomPad = 42;
-    const tallest = Math.max(...layers.map((layer) => byLayer.get(layer).length));
-    const canvasWidth = Math.max(760, layers.length * columnGap + 24);
-    const canvasHeight = Math.max(
-      148,
-      topPad + tallest * nodeHeight + Math.max(0, tallest - 1) * rowGap + bottomPad
-    );
-    el.workflowSvg.setAttribute("width", String(canvasWidth));
-    el.workflowSvg.setAttribute("height", String(canvasHeight));
-    el.workflowSvg.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
-
-    const coords = new Map();
-    const innerHeight = canvasHeight - topPad - bottomPad;
-    layers.forEach((layer, column) => {
-      const columnNodes = byLayer.get(layer);
-      const totalHeight =
-        columnNodes.length * nodeHeight + (columnNodes.length - 1) * rowGap;
-      const startY = topPad + Math.max(0, Math.round((innerHeight - totalHeight) / 2));
-      columnNodes.forEach((node, row) => {
-        coords.set(node.name, {
-          x: 20 + column * columnGap,
-          y: startY + row * (nodeHeight + rowGap),
-          column,
-          node,
-        });
-      });
-    });
-
-    const defs = `<defs>
-      <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
-      <marker id="wf-arrow-cond" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
-    </defs>`;
-
-    let skipIndex = 0;
-    let backIndex = 0;
-    const paths = edges
-      .map((edge) => {
-        const source = coords.get(edge.source);
-        const target = coords.get(edge.target);
-        if (!source || !target) return "";
-        const colDelta = target.column - source.column;
-        if (colDelta <= 0) {
-          backIndex += 1;
-          const x1 = source.x + nodeWidth / 2;
-          const y1 = source.y;
-          const x2 = target.x + nodeWidth / 2;
-          const y2 = target.y;
-          const arcY = Math.max(8, topPad - 12 - (backIndex % 2) * 8);
-          return `<path class="dag-edge" data-conditional="true" data-backedge="true" d="M${x1},${y1} C${x1},${arcY} ${x2},${arcY} ${x2},${y2}" marker-end="url(#wf-arrow-cond)"></path>`;
-        }
-        if (colDelta > 1) {
-          skipIndex += 1;
-          const x1 = source.x + nodeWidth * 0.65;
-          const y1 = source.y + nodeHeight;
-          const x2 = target.x + nodeWidth * 0.35;
-          const y2 = target.y + nodeHeight;
-          const railY = canvasHeight - 10 - ((skipIndex - 1) % 3) * 8;
-          return `<path class="dag-edge" data-conditional="true" d="M${x1},${y1} C${x1},${railY} ${x2},${railY} ${x2},${y2}" marker-end="url(#wf-arrow-cond)"></path>`;
-        }
-        const x1 = source.x + nodeWidth;
-        const y1 = source.y + nodeHeight / 2;
-        const x2 = target.x;
-        const y2 = target.y + nodeHeight / 2;
-        const mid = (x1 + x2) / 2;
-        const marker = edge.conditional ? "wf-arrow-cond" : "wf-arrow";
-        return `<path class="dag-edge" data-conditional="${
-          edge.conditional ? "true" : "false"
-        }" d="M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}" marker-end="url(#${marker})"></path>`;
-      })
-      .join("");
-
-    const shapes = graph.nodes
-      .map((node) => {
-        const pos = coords.get(node.name);
-        if (!pos) return "";
-        const status = statuses[node.name] || "pending";
-        const meta = statusMeta(status, null);
-        const label = NODE_LABELS[node.name] || node.name;
-        const selected = node.name === state.workflowNode ? "true" : "false";
-        const centerX = pos.x + nodeWidth / 2;
-        return `<g class="dag-node wf-node" data-workflow-node="${esc(
-          node.name
-        )}" data-status="${esc(status)}" aria-selected="${selected}" tabindex="0" role="button" aria-label="${esc(
-          label
-        )} (${esc(node.name)}) ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
-          pos.y
-        }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
-          pos.y + 20
-        }" text-anchor="middle">${esc(label)}</text><text class="dag-node-kind" x="${centerX}" y="${
-          pos.y + 34
-        }" text-anchor="middle">${esc(node.name)}</text><text class="dag-node-meta" x="${centerX}" y="${
-          pos.y + 49
-        }" text-anchor="middle">${meta.glyph} ${esc(meta.label)}</text></g>`;
-      })
-      .join("");
-
-    el.workflowSvg.innerHTML = defs + paths + shapes;
-
-    const current = workflow.current_node || workflow.failed_node || (workflow.paused && workflow.paused.node);
-    const currentText = current ? `${NODE_LABELS[current] || current} (${current})` : "";
-    el.workflowBadge.textContent = `${wfLabel} · ${workflow.topology || "topology"} · stop=${
-      workflow.stop_after || "-"
-    }${currentText ? ` · 当前 ${currentText}` : ""}`;
+    renderIsland("workflowIsland", el.workflowGraph, "mountWorkflow", workflowGraphProps(projection), "编排工作流");
   }
 
   function requirementList(spec) {
@@ -1220,111 +1108,90 @@
     }
   }
 
-  function renderDag(projection) {
-    const focusedTaskId = el.dag.contains(document.activeElement)
-      ? document.activeElement.dataset.taskId
-      : null;
+  const LIVE_TASK_STATUSES = new Set(["running", "verifying"]);
+
+  /** Plain JSON view model for the Graph Island; the host owns every label and status word. */
+  function dagGraphProps(projection) {
     const nodes = projection.dag.nodes || [];
     const edges = projection.dag.edges || [];
-    if (!nodes.length) {
-      el.dag.setAttribute("width", "760");
-      el.dag.setAttribute("height", "120");
-      el.dag.setAttribute("viewBox", "0 0 760 120");
-      el.dag.innerHTML =
-        '<text class="dag-empty" x="32" y="64">当前运行尚未生成任务 DAG</text>';
-      return;
-    }
-
-    const byLayer = new Map();
-    nodes.forEach((node) => {
-      const layer = node.layer || 0;
-      if (!byLayer.has(layer)) byLayer.set(layer, []);
-      byLayer.get(layer).push(node);
-    });
-    const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
-    const nodeWidth = 152;
-    const nodeHeight = 62;
-    const rowGap = 12;
-    const columnGap = 196;
-    const tallest = Math.max(...layers.map((layer) => byLayer.get(layer).length));
-    const canvasWidth = Math.max(760, layers.length * columnGap + 40);
-    const canvasHeight = Math.max(216, tallest * (nodeHeight + rowGap) + 32);
-    el.dag.setAttribute("width", String(canvasWidth));
-    el.dag.setAttribute("height", String(canvasHeight));
-    el.dag.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
-
-    const coords = new Map();
-    layers.forEach((layer, column) => {
-      const columnNodes = byLayer.get(layer);
-      const totalHeight = columnNodes.length * nodeHeight + (columnNodes.length - 1) * rowGap;
-      const startY = Math.max(12, Math.round((canvasHeight - totalHeight) / 2));
-      columnNodes.forEach((node, row) => {
-        const x = 24 + column * columnGap;
-        const y = startY + row * (nodeHeight + rowGap);
-        coords.set(node.task_id, { x, y, node });
-      });
-    });
-
-    const defs = `<defs>
-      <marker id="dag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
-      <marker id="dag-arrow-blocked" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow-blocked" d="M0,0 L10,5 L0,10 z"></path></marker>
-    </defs>`;
-
-    const paths = edges
-      .map((edge) => {
-        const source = coords.get(edge.from);
-        const target = coords.get(edge.to);
-        if (!source || !target) return "";
-        const x1 = source.x + nodeWidth;
-        const y1 = source.y + nodeHeight / 2;
-        const x2 = target.x;
-        const y2 = target.y + nodeHeight / 2;
-        const mid = (x1 + x2) / 2;
-        const marker = edge.blocked_edge ? "dag-arrow-blocked" : "dag-arrow";
-        return `<path class="dag-edge" data-critical="${edge.critical ? "true" : "false"}" data-blocked="${
-          edge.blocked_edge ? "true" : "false"
-        }" d="M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}" marker-end="url(#${marker})"></path>`;
-      })
-      .join("");
-
-    const shapes = nodes
-      .map((node) => {
-        const pos = coords.get(node.task_id);
-        if (!pos) return "";
-        const displayStatus = taskDisplayStatus(node, projection);
-        const meta = statusMeta(displayStatus, node.accepted_risk_reason);
-        const selected = node.task_id === state.selectedTaskId ? "true" : "false";
-        const centerX = pos.x + nodeWidth / 2;
+    const displayStatus = new Map(
+      nodes.map((node) => [node.task_id, taskDisplayStatus(node, projection)])
+    );
+    return {
+      runId: projection.run_id,
+      selectedId: state.selectedTaskId,
+      onSelect: selectTask,
+      ariaLabel: "任务依赖有向无环图",
+      emptyMessage: "当前运行尚未生成任务 DAG",
+      nodes: nodes.map((node) => {
+        const status = displayStatus.get(node.task_id);
+        const meta = statusMeta(status, node.accepted_risk_reason);
         const dependencyBlocked = Boolean(node.blocked_by?.length);
-        const issue = node.provider_retry ? "retry" : dependencyBlocked ? "dependency" : "";
-        const context = node.provider_retry
+        const retrying = Boolean(node.provider_retry);
+        const context = retrying
           ? RETRY_MESSAGE
           : `${node.role || "engineer"} · ${node.kind || "implement"}`;
-        const status = node.provider_retry
+        const statusText = retrying
           ? RETRY_NEXT_STEP
           : dependencyBlocked ? "依赖受阻" : `${meta.glyph} ${meta.label}`;
-        const accessibleStatus = node.provider_retry ? `${context}，${status}` : status;
-        return `<g class="dag-node" data-task-id="${esc(node.task_id)}" data-status="${esc(
-          displayStatus
-        )}" data-issue="${issue}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
-          node.task_id
-        )} ${esc(accessibleStatus)}"><rect class="dag-node-box" x="${pos.x}" y="${
-          pos.y
-        }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
-          pos.y + 22
-        }" text-anchor="middle">${esc(node.task_id)}</text><text class="dag-node-kind" x="${centerX}" y="${
-          pos.y + 38
-        }" text-anchor="middle">${esc(context)}</text><text class="dag-node-meta" x="${centerX}" y="${
-          pos.y + 54
-        }" text-anchor="middle">${esc(status)}</text></g>`;
-      })
-      .join("");
+        const tone = retrying
+          ? "warn"
+          : dependencyBlocked ? "bad" : status === "planned" ? "planned" : meta.variant;
+        const pill = retrying
+          ? { text: "重试中", tone: "warn" }
+          : node.accepted_risk_reason
+            ? { text: "⚠ 风险", tone: "warn" }
+            : node.attempt > 1 ? { text: `×${node.attempt}`, tone: "muted" } : null;
+        return {
+          id: node.task_id,
+          layer: node.layer || 0,
+          status,
+          tone,
+          meta: context,
+          statusText,
+          pill,
+          title: node.title || "",
+          issue: retrying ? "retry" : dependencyBlocked ? "dependency" : "",
+          risk: Boolean(node.accepted_risk_reason),
+          ariaLabel: `任务 ${node.task_id} ${retrying ? `${context}，${statusText}` : statusText}`,
+        };
+      }),
+      edges: edges.map((edge) => ({
+        source: edge.from,
+        target: edge.to,
+        critical: Boolean(edge.critical),
+        blocked: Boolean(edge.blocked_edge),
+        running: !edge.blocked_edge && LIVE_TASK_STATUSES.has(displayStatus.get(edge.to)),
+      })),
+    };
+  }
 
-    el.dag.innerHTML = defs + paths + shapes;
-    if (focusedTaskId) {
-      el.dag.querySelector(`[data-task-id="${CSS.escape(focusedTaskId)}"]`)
-        ?.focus({ preventScroll: true });
+  /** Mount or patch one Graph Island; a missing bundle degrades to a notice, never a crash. */
+  function renderIsland(key, host, mount, props, name) {
+    const graph = window.AriadneGraph;
+    if (!graph) {
+      if (!host.dataset.graphUnavailable) {
+        host.dataset.graphUnavailable = "true";
+        host.innerHTML = uiNotice(
+          "warn",
+          `${name}组件未能加载（/static/graph/ariadne-graph.js），其余控制台功能不受影响。`
+        );
+      }
+      return;
     }
+    if (state[key]) {
+      state[key].update(props);
+      return;
+    }
+    try {
+      state[key] = graph[mount](host, props);
+    } catch (error) {
+      host.innerHTML = uiNotice("warn", `${name}渲染失败：${esc(error.message)}`);
+    }
+  }
+
+  function renderDag(projection) {
+    renderIsland("dagIsland", el.dagGraph, "mountDag", dagGraphProps(projection), "任务依赖图");
   }
 
   function renderLanes(projection) {
@@ -2405,32 +2272,6 @@
       renderDock(state.projection);
       setDockOpen(true);
       el.dockTitle.focus();
-    });
-
-    el.dag.addEventListener("click", (event) => {
-      const node = event.target.closest(".dag-node");
-      if (node) selectTask(node.dataset.taskId);
-    });
-
-    el.dag.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      const node = event.target.closest(".dag-node");
-      if (!node) return;
-      event.preventDefault();
-      selectTask(node.dataset.taskId);
-    });
-
-    el.workflowSvg.addEventListener("click", (event) => {
-      const node = event.target.closest("[data-workflow-node]");
-      if (node) selectWorkflowNode(node.dataset.workflowNode);
-    });
-
-    el.workflowSvg.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      const node = event.target.closest("[data-workflow-node]");
-      if (!node) return;
-      event.preventDefault();
-      selectWorkflowNode(node.dataset.workflowNode);
     });
 
     el.clarifyItems.addEventListener("click", (event) => {

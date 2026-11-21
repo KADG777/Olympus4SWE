@@ -47,11 +47,6 @@ def _declarations() -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def _is_svg_text(selector: str) -> bool:
-    """SVG label sizes live in the viewBox's own units; the type scale is CSS-only."""
-    return all(part.strip().startswith(".dag-svg") for part in selector.split(","))
-
-
 def test_design_files_load_in_order() -> None:
     html = _text("index.html")
     tokens_at = html.find('href="/static/tokens.css"')
@@ -78,6 +73,38 @@ def test_no_colour_literals() -> None:
         assert not found, f"{name} holds raw colours — use var(--token): {found[:8]}"
     found_decls = [(f, s, p, v) for f, s, p, v in _declarations() if COLOUR.search(v)]
     assert not found_decls, f"raw colours in declarations: {found_decls[:8]}"
+
+
+GRAPH_SOURCES = Path(__file__).resolve().parents[2] / "web-graph" / "src"
+
+
+def test_graph_island_reads_tokens_only() -> None:
+    """The Graph Island stylesheet and components name no colour; tokens.css drives both themes."""
+    sources = [*GRAPH_SOURCES.rglob("*.css"), *GRAPH_SOURCES.rglob("*.tsx"),
+               *GRAPH_SOURCES.rglob("*.ts")]
+    assert sources, "web-graph/src is missing"
+    for path in sources:
+        found = COLOUR.findall(path.read_text(encoding="utf-8"))
+        assert not found, f"{path.name} holds raw colours — use var(--token): {found[:8]}"
+    css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
+    decls = [(selector, prop, val) for selector, body in _blocks(css) for prop, val in _decls(body)]
+    sizes = [v for _s, p, v in decls if p == "font-size"]
+    assert sizes and set(sizes) <= SIZES, f"graph font-size must be a --text-* token: {sizes}"
+    faces = [
+        (s, v)
+        for s, p, v in decls
+        if p == "font-family" and v != "inherit" and not v.startswith("var(--face-")
+    ]
+    assert not faces, f"graph font-family must be a --face-* token: {faces}"
+    corners = [(s, v) for s, p, v in decls if p == "border-radius" and not set(v.split()) <= SHAPES]
+    assert not corners, f"graph border-radius must use SHAPES tokens: {corners}"
+    bad_motion = [
+        (s, v)
+        for s, p, v in decls
+        if p in ("transition", "transition-duration")
+        and re.search(r"(?<![\w-])\d*\.?\d+m?s\b", v)
+    ]
+    assert not bad_motion, f"graph transitions must use var(--motion-fast): {bad_motion}"
 
 
 def test_no_shadows_except_floating() -> None:
@@ -128,7 +155,7 @@ def test_font_sizes_use_tokens() -> None:
     found = [
         (name, selector, value)
         for name, selector, prop, value in _declarations()
-        if prop == "font-size" and value not in SIZES | {"inherit"} and not _is_svg_text(selector)
+        if prop == "font-size" and value not in SIZES | {"inherit"}
     ]
     assert not found, f"font-size must be a --text-* token: {found[:10]}"
     shorthand = [
@@ -167,9 +194,13 @@ def test_soft_rounded_tokens() -> None:
     assert "--radius: 8px;" in tokens
     assert "--radius-lg: 12px;" in tokens
     assert "--shape-chip: 999px;" in tokens
-    app = _text("app.js")
-    assert 'rx="8"' in app
-    assert 'rx="2"' not in app
+    assert 'rx="2"' not in _text("app.js")
+    graph_css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
+    card_corners = [
+        value for selector, body in _blocks(graph_css) if selector == ".ag-card"
+        for prop, value in _decls(body) if prop == "border-radius"
+    ]
+    assert card_corners == ["var(--radius)"], "graph cards share the soft --radius corner"
 
 
 def test_faces_and_corners_come_from_tokens() -> None:

@@ -922,128 +922,19 @@ button {
  * Topology — dependency graph and swimlanes
  * ------------------------------------------------------------------------ */
 
-.dag-frame {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
+/* Topology graph hosts (workflow + task DAG): the React Flow + ELK Graph Island mounts here and
+ * sets its own adaptive height; cards keep a fixed 1:1 size, so wide graphs pan, never scroll. */
+.graph-host {
+  position: relative;
+  min-inline-size: 0;
   border: 1px solid var(--rule);
   border-radius: var(--radius-lg);
   background: var(--surface-paper);
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
 }
 
-.dag-svg {
-  display: block;
-  inline-size: auto;
-  max-inline-size: none;
-  block-size: auto;
-  flex: 0 0 auto;
-}
-
-.dag-svg text {
-  font-family: var(--face-mono);
-  font-size: var(--text-xs);
-  fill: var(--text-ink);
-}
-
-.dag-svg .dag-node-title {
-  font-size: var(--text-sm);
-  font-weight: var(--font-weight-medium);
-}
-
-.dag-svg .dag-node-meta {
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-normal);
-  fill: var(--text-secondary);
-}
-
-.dag-node {
-  cursor: pointer;
-}
-
-.dag-node .dag-node-box {
-  fill: var(--surface-raised);
-  stroke: var(--rule-hard);
-  stroke-width: 1.2;
-  transition: stroke var(--motion-fast);
-}
-
-.dag-node:hover .dag-node-box,
-.dag-node:focus-visible .dag-node-box {
-  stroke: var(--text-ink);
-  stroke-width: 2;
-}
-
-.dag-node[data-status="accepted"] .dag-node-box,
-.dag-node[data-status="completed"] .dag-node-box {
-  fill: var(--ok-soft);
-  stroke: var(--ok);
-}
-
-.dag-node[data-status="running"] .dag-node-box,
-.dag-node[data-status="verifying"] .dag-node-box {
-  fill: var(--live-soft);
-  stroke: var(--live);
-}
-
-.dag-node[data-status="blocked"] .dag-node-box,
-.dag-node[data-status="failed"] .dag-node-box,
-.dag-node[data-status="error"] .dag-node-box,
-.dag-node[data-issue="dependency"] .dag-node-box {
-  fill: var(--bad-soft);
-  stroke: var(--bad);
-}
-
-.dag-node[data-status="paused"] .dag-node-box,
-.dag-node[data-issue="retry"] .dag-node-box {
-  fill: var(--warn-soft);
-  stroke: var(--warn);
-}
-
-.dag-node[data-status="planned"] .dag-node-box {
-  fill: var(--surface-paper);
-  stroke: var(--ok);
-  stroke-dasharray: 4 3;
-}
-
-.dag-node[data-risk="true"] .dag-node-box {
-  fill: var(--warn-soft);
-  stroke: var(--warn);
-}
-
-.dag-node[aria-selected="true"] .dag-node-box {
-  stroke: var(--text-ink);
-  stroke-width: 2.4;
-}
-
-.dag-edge {
-  fill: none;
-  stroke: var(--rule-hard);
-  stroke-width: 1.2;
-}
-
-.dag-edge[data-critical="true"] {
-  stroke: var(--text-ink);
-  stroke-width: 2.2;
-}
-
-.dag-edge[data-blocked="true"] {
-  stroke: var(--bad);
-  stroke-dasharray: 6 5;
-}
-
-.dag-arrow {
-  fill: var(--rule-hard);
-}
-
-.dag-arrow-blocked {
-  fill: var(--bad);
-}
-
-.dag-empty {
-  fill: var(--text-muted);
+.graph-host > .notice {
+  margin: var(--space-3);
 }
 
 .dag-legend {
@@ -1069,12 +960,25 @@ button {
   border-radius: var(--shape-pill);
 }
 
-.legend-swatch[data-tone="critical"] {
+.legend-swatch[data-tone="critical"],
+.legend-swatch[data-tone="traversed"] {
   background: var(--text-ink);
 }
 
 .legend-swatch[data-tone="blocked"] {
   background: var(--bad);
+}
+
+.legend-swatch[data-tone="running"] {
+  background: var(--live);
+}
+
+.legend-ring {
+  display: inline-block;
+  inline-size: 12px;
+  block-size: 10px;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius);
 }
 
 .lanes {
@@ -2102,25 +2006,6 @@ body[data-rail="collapsed"] .thread-list,
   padding-block-start: var(--space-2);
 }
 
-.dag-svg .dag-node-kind {
-  font-family: var(--face-mono);
-  font-size: var(--text-xs);
-  fill: var(--text-muted);
-}
-
-.dag-edge[data-conditional="true"] {
-  stroke-dasharray: 5 4;
-}
-
-.dag-edge[data-backedge="true"] {
-  stroke: var(--warn);
-  stroke-dasharray: 4 3;
-}
-
-.wf-node {
-  cursor: pointer;
-}
-
 .design-grid {
   display: flex;
   flex-direction: column;
@@ -2326,11 +2211,6 @@ body[data-rail="collapsed"] .thread-list,
 
   .event-payload {
     grid-column: 1 / -1;
-  }
-
-  .dag-frame {
-    overflow-x: auto;
-    padding: var(--space-2);
   }
 
   .hitl-risk-sep {

@@ -20,6 +20,7 @@ from olympus.core.contracts import (
     RequirementItem,
     TaskNode,
     TaskPlan,
+    TaskStatus,
 )
 from olympus.core.store import RunStore
 from olympus.web.demos import seed_demo_runs
@@ -497,7 +498,7 @@ def test_progress_motion_and_reading_position(workbench, browser, motion):
     expect = playwright.expect
     expect(page.locator("#run-current-stage")).to_contain_text("有任务受阻")
     page.get_by_text("产物历史", exact=True).click()
-    target = page.locator("#dag-svg [data-task-id='T01']")
+    target = page.locator("#dag-graph [data-task-id='T01']")
     target.evaluate("""node => {
       const stage = document.querySelector("#stage");
       stage.scrollTop += document.querySelector("#topology-title").getBoundingClientRect().top
@@ -599,4 +600,965 @@ def test_eventsource_error_reopens_from_snapshot(workbench, browser):
     expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2")
     expect(page.locator("#run-connection")).to_be_hidden()
     assert len(requests) == 2 and requests[1].endswith(f"after_seq={latest}")
+    page.close()
+
+
+# ---------------------------------------------------------------------------
+# Task Dependency Graph island (React Flow + ELK) — real-browser geometry seams
+# ---------------------------------------------------------------------------
+
+SKIP_DEPS = {
+    "A": [], "B": [],
+    "C": ["A"], "D": ["B"],
+    "E": ["C", "A"], "F": ["D"],
+    "G": ["E", "B", "D"], "H": ["F"],
+}
+SKIP_WAVES = {"A": 0, "B": 0, "C": 1, "D": 1, "E": 2, "F": 2, "G": 3, "H": 3}
+
+GRAPH_GEOMETRY = """(host) => {
+  const screen = (m, p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f];
+  const cards = Array.from(host.querySelectorAll('[data-task-id]')).map((card) => {
+    const r = card.getBoundingClientRect();
+    return {id: card.dataset.taskId, x: r.left, y: r.top, w: r.width, h: r.height};
+  });
+  const edges = Array.from(host.querySelectorAll('.ag-edge')).map((g) => {
+    const path = g.querySelector('path');
+    const m = path.getScreenCTM();
+    const total = path.getTotalLength();
+    const points = [];
+    for (let s = 0; s <= total; s += 2) points.push(screen(m, path.getPointAtLength(s)));
+    const ref = (path.getAttribute('marker-end') || '').match(/#([^)'"]+)/);
+    const marker = ref && document.getElementById(ref[1]);
+    const style = getComputedStyle(path);
+    return {
+      source: g.dataset.edgeSource, target: g.dataset.edgeTarget, tone: g.dataset.tone,
+      points, end: screen(m, path.getPointAtLength(total)),
+      stroke: style.stroke, dash: style.strokeDasharray,
+      markerUnits: marker && marker.getAttribute('markerUnits'),
+      markerFill: marker && getComputedStyle(marker.querySelector('path')).fill,
+    };
+  });
+  const waves = Array.from(host.querySelectorAll('[data-wave]')).map((w) => {
+    const r = w.getBoundingClientRect();
+    return {layer: Number(w.dataset.wave), text: w.textContent, x: r.left, bottom: r.bottom};
+  });
+  const viewport = host.querySelector('.react-flow__viewport');
+  return {
+    cards, edges, waves,
+    transform: viewport ? getComputedStyle(viewport).transform : null,
+    hostWidth: host.getBoundingClientRect().width,
+  };
+}"""
+
+TOKEN_COLOUR = """(name) => {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  document.body.append(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  return value;
+}"""
+
+
+def _token(page, name):
+    return page.evaluate(TOKEN_COLOUR, name)
+
+
+def _wait_for_layout(page, mode="elk"):
+    island = page.locator(f"#dag-graph .ag-island[data-layout='{mode}']")
+    playwright.expect(island).to_be_visible()
+    page.wait_for_function(
+        "() => document.querySelectorAll('#dag-graph .ag-edge path').length > 0"
+    )
+    return page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
+
+
+def _inside(point, card, inset=1.0):
+    x, y = point
+    return (card["x"] + inset < x < card["x"] + card["w"] - inset
+            and card["y"] + inset < y < card["y"] + card["h"] - inset)
+
+
+@pytest.fixture
+def skip_dag(workbench):
+    store, _, url = workbench
+    run_id = store.create_run(title="跨层依赖 DAG")
+    spec = GoalSpec(goal="跨层依赖", requirements=[RequirementItem(
+        id="R1", description="多层跳跃依赖", acceptance_criteria=["路径不穿过卡片"],
+    )])
+    store.save_spec(run_id, spec)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=spec.spec_id,
+        target_hash=spec.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    review = AcceptanceCheck(id="review", kind=CheckKind.INDEPENDENT_REVIEW, description="复核")
+    plan = TaskPlan(spec_id=spec.spec_id, spec_hash=spec.content_hash, tasks=[
+        TaskNode(task_id=task_id, title=f"任务 {task_id}", objective="跨层", depends_on=deps,
+                 write_scope=[f"{task_id.lower()}.py"], acceptance_checks=[review])
+        for task_id, deps in SKIP_DEPS.items()
+    ])
+    store.save_plan(run_id, plan)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.TASK_PLAN, target_id=plan.plan_id,
+        target_hash=plan.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    return store, run_id, url
+
+
+def test_task_dag_island_keeps_fixed_scale_and_routes_around_cards(skip_dag, browser):
+    _, run_id, url = skip_dag
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    geo = _wait_for_layout(page)
+    cards = {card["id"]: card for card in geo["cards"]}
+    assert set(cards) == set(SKIP_DEPS)
+
+    # Fixed 1:1 physical card size, never stretched to the (much wider) frame.
+    assert geo["transform"] in ("none", "matrix(1, 0, 0, 1, 0, 0)") or geo["transform"].startswith(
+        "matrix(1, 0, 0, 1,"
+    ), geo["transform"]
+    for card in cards.values():
+        assert abs(card["w"] - 184) <= 0.5 and abs(card["h"] - 76) <= 0.5, card
+    assert geo["hostWidth"] > 4 * 184 + 3 * 96
+
+    # Wave columns: one shared x per wave, ordered left to right, under a matching header.
+    wave_x = {}
+    for task_id, wave in SKIP_WAVES.items():
+        wave_x.setdefault(wave, cards[task_id]["x"])
+        assert abs(cards[task_id]["x"] - wave_x[wave]) <= 0.5, (task_id, wave)
+    assert [wave_x[w] for w in sorted(wave_x)] == sorted(wave_x.values())
+    headers = {header["layer"]: header for header in geo["waves"]}
+    assert sorted(headers) == [0, 1, 2, 3]
+    for wave, header in headers.items():
+        assert header["text"] == f"Wave {wave}"
+        assert abs(header["x"] - wave_x[wave]) <= 1
+        assert header["bottom"] <= min(cards[t]["y"] for t, w in SKIP_WAVES.items() if w == wave)
+
+    # Every dependency renders; no edge passes through a non-endpoint card.
+    edges = {(edge["source"], edge["target"]): edge for edge in geo["edges"]}
+    assert set(edges) == {(dep, task) for task, deps in SKIP_DEPS.items() for dep in deps}
+    for (source, target), edge in edges.items():
+        for card_id, card in cards.items():
+            if card_id in (source, target):
+                continue
+            hits = [p for p in edge["points"] if _inside(p, card)]
+            assert not hits, f"{source}->{target} crosses {card_id} at {hits[:3]}"
+
+    # Multi-parent G: incoming heads land on G's west side at separated y coordinates.
+    incoming = [edges[(dep, "G")]["end"] for dep in SKIP_DEPS["G"]]
+    for x, _ in incoming:
+        assert abs(x - cards["G"]["x"]) <= 2
+    ys = sorted(y for _, y in incoming)
+    assert all(b - a >= 6 for a, b in zip(ys, ys[1:], strict=False)), ys
+
+    # Fixed-size heads whose fill matches each edge's stroke tone.
+    ink, rule = _token(page, "--text-ink"), _token(page, "--rule-hard")
+    for edge in edges.values():
+        assert edge["markerUnits"] == "userSpaceOnUse"
+        assert edge["markerFill"] == edge["stroke"]
+        assert edge["stroke"] == (ink if edge["tone"] == "critical" else rule)
+    assert edges[("E", "G")]["tone"] == "critical"
+    assert edges[("B", "G")]["tone"] == "default"
+    page.close()
+
+
+def test_task_dag_island_separates_selection_from_critical_path(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    geo = _wait_for_layout(page)
+    edges = {(edge["source"], edge["target"]): edge for edge in geo["edges"]}
+
+    ink, bad, live, accent = (
+        _token(page, name) for name in ("--text-ink", "--bad", "--live", "--accent")
+    )
+    assert accent != ink
+    assert edges[("T01", "T03")]["tone"] == "critical"
+    assert edges[("T01", "T03")]["stroke"] == ink
+    blocked = edges[("T03-R1", "T06")]
+    assert blocked["tone"] == "blocked" and blocked["stroke"] == bad
+    assert blocked["dash"] not in ("none", "") and blocked["markerFill"] == bad
+    running = edges[("T03", "T05")]
+    assert running["tone"] == "running" and running["stroke"] == live
+
+    def ring(task_id):
+        return expect(page.locator(f"#dag-graph [data-task-id='{task_id}']"))
+
+    blocked_card = page.locator("#dag-graph [data-task-id='T03-R1']")
+    expect(blocked_card).to_have_attribute("aria-selected", "true")
+    expect(blocked_card).to_have_attribute("data-status", "blocked")
+    expect(blocked_card).to_have_attribute("role", "button")
+    expect(blocked_card).to_have_attribute("tabindex", "0")
+    ring("T03-R1").to_have_css("outline-color", accent)
+    ring("T03-R1").to_have_css("outline-style", "solid")
+    ring("T03-R1").to_have_css("outline-width", "2px")
+    ring("T01").not_to_have_css("outline-color", accent)
+
+    card = page.locator("#dag-graph [data-task-id='T05']")
+    card.focus()
+    page.keyboard.press("Enter")
+    expect(card).to_have_attribute("aria-selected", "true")
+    expect(blocked_card).to_have_attribute("aria-selected", "false")
+    expect(page.locator("body")).to_have_attribute("data-dock", "open")
+    expect(page.locator("#dock-title")).to_contain_text("T05")
+    expect(card).to_be_focused()
+
+    first = page.locator("#dag-graph [data-task-id='T01']")
+    first.focus()
+    page.keyboard.press(" ")
+    expect(first).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#dock-title")).to_contain_text("T01")
+    page.locator("#dag-graph [data-task-id='T02']").click()
+    expect(page.locator("#dock-title")).to_contain_text("T02")
+    ring("T02").to_have_css("outline-color", accent)
+    ring("T03").not_to_have_css("outline-color", accent)
+
+    # Dark theme: cards and edges re-read tokens in place, without remounting.
+    light_surface = first.evaluate("node => getComputedStyle(node).backgroundColor")
+    page.locator("#theme-toggle").click()
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    assert _token(page, "--ok-soft") != light_surface
+    expect(first).to_have_css("background-color", _token(page, "--ok-soft"))
+    dark = page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
+    dark_edges = {(edge["source"], edge["target"]): edge for edge in dark["edges"]}
+    assert dark_edges[("T01", "T03")]["stroke"] == _token(page, "--text-ink") != ink
+    ring("T02").to_have_css("outline-color", _token(page, "--accent"))
+    assert len(dark["cards"]) == len(geo["cards"])
+    assert first.evaluate("node => node.isConnected")
+    assert not errors, errors
+    page.close()
+
+
+def test_task_dag_island_preserves_viewport_on_live_updates(workbench, browser):
+    store, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    host = page.locator("#dag-graph")
+    viewport = host.locator(".react-flow__viewport")
+    before = viewport.evaluate("node => getComputedStyle(node).transform")
+    host.scroll_into_view_if_needed()
+    box = host.bounding_box()
+    page.mouse.move(box["x"] + 12, box["y"] + box["height"] - 12)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 72, box["y"] + box["height"] - 32, steps=6)
+    page.mouse.up()
+    panned = viewport.evaluate("node => getComputedStyle(node).transform")
+    assert panned != before
+    card = host.locator("[data-task-id='T05']").element_handle()
+
+    plan = store.get_run(run_id)["plan"]
+    store.save_plan(run_id, plan.model_copy(update={"version": 2}))
+    playwright.expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2")
+    assert viewport.evaluate("node => getComputedStyle(node).transform") == panned
+    assert card.evaluate("node => node.isConnected")
+    page.close()
+
+
+def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    expect = playwright.expect
+
+    page.evaluate("""() => {
+      const make = (id) => {
+        const host = document.createElement('div');
+        host.id = id;
+        host.style.width = '900px';
+        document.querySelector('#view-topology').prepend(host);
+        return host;
+      };
+      const view = (id, layer) => ({
+        id, layer, status: 'waiting', tone: 'muted', meta: 'engineer · implement',
+        statusText: '◷ 等待', ariaLabel: `任务 ${id} ◷ 等待`,
+      });
+      window.emptyHandle = window.AriadneGraph.mountDag(make('graph-empty'), {
+        runId: 'empty', nodes: [], edges: [], emptyMessage: '当前运行尚未生成任务 DAG',
+      });
+      window.cycleHandle = window.AriadneGraph.mountDag(make('graph-cycle'), {
+        runId: 'cycle',
+        nodes: [view('X', 0), view('Y', 1), view('Z', 2)],
+        edges: [
+          {source: 'X', target: 'Y'}, {source: 'Y', target: 'Z'}, {source: 'Z', target: 'X'},
+          {source: 'Z', target: 'ghost'},
+        ],
+      });
+    }""")
+    empty = page.locator("#graph-empty")
+    expect(empty.get_by_text("当前运行尚未生成任务 DAG", exact=True)).to_be_visible()
+    expect(empty.locator("[data-task-id]")).to_have_count(0)
+
+    cycle = page.locator("#graph-cycle")
+    expect(cycle.locator(".ag-island[data-layout='fallback']")).to_be_visible()
+    expect(cycle.locator("[data-task-id]")).to_have_count(3)
+    expect(cycle.locator(".ag-edge path")).to_have_count(3)
+    for task_id in ("X", "Y", "Z"):
+        box = cycle.locator(f"[data-task-id='{task_id}']").bounding_box()
+        assert abs(box["width"] - 184) <= 0.5 and abs(box["height"] - 76) <= 0.5
+
+    page.evaluate("""() => window.cycleHandle.update({
+      runId: 'cycle', selectedId: 'Y',
+      nodes: ['X', 'Y', 'Z'].map((id, layer) => ({
+        id, layer, status: 'running', tone: 'live', meta: 'engineer · implement',
+        statusText: '▶ 运行中', ariaLabel: `任务 ${id} ▶ 运行中`,
+      })),
+      edges: [{source: 'X', target: 'Y'}, {source: 'Y', target: 'Z'}, {source: 'Z', target: 'X'}],
+    })""")
+    expect(cycle.locator("[data-task-id='Y']")).to_have_attribute("aria-selected", "true")
+    expect(cycle.locator("[data-task-id='Y']")).to_have_attribute("data-status", "running")
+    page.evaluate("() => { window.cycleHandle.destroy(); window.emptyHandle.destroy(); }")
+    expect(cycle.locator(".ag-island")).to_have_count(0)
+    page.close()
+
+    broken = browser.new_page()
+    broken.route("**/static/graph/ariadne-graph.js", lambda route: route.abort())
+    broken.goto(f"{url}/?run={run_id}")
+    expect(broken.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+    expect(broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
+    expect(broken.locator("#workflow-badge")).to_contain_text("产品蓝图")
+    expect(broken.locator("#run-current-stage")).to_contain_text("有任务受阻")
+    broken.close()
+
+
+# ---------------------------------------------------------------------------
+# Orchestration Workflow island — trajectory, node kinds and shared card scale
+# ---------------------------------------------------------------------------
+
+WORKFLOW_GEOMETRY = """(host) => {
+  const screen = (m, p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f];
+  const cards = Array.from(host.querySelectorAll('[data-workflow-node]')).map((card) => {
+    const r = card.getBoundingClientRect();
+    const style = getComputedStyle(card);
+    const badge = card.querySelector('.ag-card-kind');
+    return {
+      id: card.dataset.workflowNode, status: card.dataset.status, kind: card.dataset.nodeKind,
+      text: card.textContent, x: r.left, y: r.top, w: r.width, h: r.height,
+      borderStyle: style.borderLeftStyle, borderTopStyle: style.borderTopStyle,
+      background: style.backgroundColor, outline: style.outlineColor,
+      titleSize: getComputedStyle(card.querySelector('.ag-card-title')).fontSize,
+      badge: badge ? badge.textContent : null,
+      badgeBorder: badge ? getComputedStyle(badge).borderTopColor : null,
+      marker: getComputedStyle(card, '::before').backgroundColor,
+    };
+  });
+  const edges = Array.from(host.querySelectorAll('.ag-edge')).map((g) => {
+    const path = g.querySelector('path');
+    const m = path.getScreenCTM();
+    const total = path.getTotalLength();
+    const points = [];
+    for (let s = 0; s <= total; s += 2) points.push(screen(m, path.getPointAtLength(s)));
+    const ref = (path.getAttribute('marker-end') || '').match(/#([^)'"]+)/);
+    const marker = ref && document.getElementById(ref[1]);
+    const style = getComputedStyle(path);
+    return {
+      source: g.dataset.edgeSource, target: g.dataset.edgeTarget, tone: g.dataset.tone,
+      traversed: g.dataset.traversed, conditional: g.dataset.conditional,
+      backedge: g.dataset.backedge, opacity: Number(getComputedStyle(g).opacity),
+      points, end: screen(m, path.getPointAtLength(total)),
+      stroke: style.stroke, dash: style.strokeDasharray, width: style.strokeWidth,
+      markerUnits: marker && marker.getAttribute('markerUnits'),
+      markerFill: marker && getComputedStyle(marker.querySelector('path')).fill,
+    };
+  });
+  const viewport = host.querySelector('.react-flow__viewport');
+  const box = host.getBoundingClientRect();
+  return {
+    cards, edges,
+    transform: viewport ? getComputedStyle(viewport).transform : null,
+    host: {x: box.left, y: box.top, w: box.width, h: box.height},
+  };
+}"""
+
+
+def _wait_for_workflow(page, host="#workflow-graph", mode="elk"):
+    playwright.expect(page.locator(f"{host} .ag-island[data-layout='{mode}']")).to_be_visible()
+    page.wait_for_function(
+        "(host) => document.querySelectorAll(`${host} .ag-edge path`).length > 0", arg=host
+    )
+    return page.locator(host).evaluate(WORKFLOW_GEOMETRY)
+
+
+def _assert_routes_avoid_cards(cards, edges):
+    for (source, target), edge in edges.items():
+        for card_id, card in cards.items():
+            if card_id in (source, target):
+                continue
+            hits = [p for p in edge["points"] if _inside(p, card)]
+            assert not hits, f"{source}->{target} crosses {card_id} at {hits[:3]}"
+
+
+def _unscaled(transform):
+    return transform in ("none",) or transform.startswith("matrix(1, 0, 0, 1,")
+
+
+@pytest.fixture
+def skipped_workflow(workbench):
+    """full_sdlc_tdd run whose router jumped align -> gate_spec, bypassing critic."""
+    store, _, url = workbench
+    run_id = store.create_run(title="跳过评审的全流程", workflow_name="full_sdlc_tdd")
+    for event_type, payload in (
+        ("graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        ("graph.node_started", {"node": "align"}),
+        ("graph.node_finished", {"node": "align"}),
+        ("graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        ("graph.node_started", {"node": "gate_spec"}),
+        ("graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+    ):
+        store.append_event(
+            run_id=run_id, stage="graph", event_type=event_type, actor="graph", payload=payload,
+        )
+    return store, run_id, url
+
+
+def test_workflow_and_dag_islands_share_one_physical_card_scale(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    dag = _wait_for_layout(page)
+    flow = _wait_for_workflow(page)
+    cards = {card["id"]: card for card in flow["cards"]}
+    assert len(cards) == 10
+
+    # Both graphs open at 1:1 with the same card frame and title type size.
+    assert _unscaled(flow["transform"]), flow["transform"]
+    assert _unscaled(dag["transform"]), dag["transform"]
+    for card in [*cards.values(), *dag["cards"]]:
+        assert abs(card["w"] - 184) <= 0.5 and abs(card["h"] - 76) <= 0.5, card
+    task_size = page.locator("#dag-graph .ag-card-id").first.evaluate(
+        "node => getComputedStyle(node).fontSize"
+    )
+    assert {card["titleSize"] for card in cards.values()} == {task_size}
+
+    # A compact frame; the ten-node workflow is wider than it and pans rather than shrinking.
+    assert 220 <= flow["host"]["h"] <= 360, flow["host"]
+    assert flow["host"]["w"] < 10 * 184
+
+    # ELK orthogonal routing: skip edges route around cards; incoming heads stay separated.
+    edges = {(edge["source"], edge["target"]): edge for edge in flow["edges"]}
+    assert ("intake", "gate_spec") in edges and ("intake", "validate_design") in edges
+    _assert_routes_avoid_cards(cards, edges)
+    incoming = sorted(e["end"][1] for (_, t), e in edges.items() if t == "gate_spec")
+    assert len(incoming) == 3
+    assert all(b - a >= 6 for a, b in zip(incoming, incoming[1:], strict=False)), incoming
+    for edge in edges.values():
+        assert edge["markerUnits"] == "userSpaceOnUse"
+        assert edge["markerFill"] == edge["stroke"]
+        assert abs(edge["end"][0] - cards[edge["target"]]["x"]) <= 2
+
+    # Node kinds: human gates, deterministic validators and stages read differently.
+    for name in ("gate_spec", "gate_design", "gate_plan"):
+        assert cards[name]["kind"] == "gate" and cards[name]["badge"] == "关口"
+    for name in ("validate_design", "validate_plan"):
+        assert cards[name]["kind"] == "validator" and cards[name]["badge"] == "校验"
+        assert cards[name]["borderTopStyle"] == "double"
+    for name in ("intake", "align", "critic", "design", "plan"):
+        assert cards[name]["kind"] == "stage" and cards[name]["badge"] is None
+    accent = _token(page, "--accent")
+    assert cards["gate_spec"]["marker"] == accent
+    assert cards["gate_spec"]["badgeBorder"] == accent
+    assert cards["align"]["marker"] != accent
+    page.close()
+
+
+def test_workflow_island_marks_skipped_critic_and_traversed_path(skipped_workflow, browser):
+    _, run_id, url = skipped_workflow
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    page.goto(f"{url}/?run={run_id}")
+    flow = _wait_for_workflow(page)
+    cards = {card["id"]: card for card in flow["cards"]}
+    assert len(cards) == 11
+
+    statuses = {name: card["status"] for name, card in cards.items()}
+    assert statuses["intake"] == statuses["align"] == "completed"
+    assert statuses["critic"] == "skipped"
+    assert statuses["gate_spec"] == "paused"
+    assert {statuses[n] for n in ("design", "plan", "execute")} == {"pending"}
+    assert "— 已跳过" in cards["critic"]["text"]
+    assert "◷ 等待" in cards["design"]["text"]
+    assert "◷ 待确认" in cards["gate_spec"]["text"]
+    assert "✓ 已完成" in cards["align"]["text"]
+
+    # Skipped recedes (dashed, sunk ground); waiting stays a plain solid card.
+    assert cards["critic"]["borderStyle"] == "dashed"
+    assert cards["critic"]["background"] == _token(page, "--surface-sunk")
+    assert cards["design"]["borderStyle"] == "solid"
+    assert cards["design"]["background"] == _token(page, "--surface-raised")
+
+    # Traversed path in full-contrast solid ink; untaken router fan-out dashed and lowered.
+    edges = {(edge["source"], edge["target"]): edge for edge in flow["edges"]}
+    ink, rule = _token(page, "--text-ink"), _token(page, "--rule-hard")
+    for pair in (("intake", "align"), ("align", "gate_spec")):
+        edge = edges[pair]
+        assert edge["traversed"] == "true" and edge["tone"] == "traversed", pair
+        assert edge["stroke"] == ink and edge["markerFill"] == ink
+        assert edge["dash"] in ("none", "") and edge["opacity"] == 1
+    for pair in (("align", "critic"), ("critic", "gate_spec"), ("intake", "validate_design")):
+        edge = edges[pair]
+        assert edge["traversed"] == "false" and edge["conditional"] == "true", pair
+        assert edge["stroke"] == rule and edge["markerFill"] == rule
+        assert edge["dash"] not in ("none", "") and edge["opacity"] < 1
+    assert edges[("gate_spec", "design")]["traversed"] == "false"
+    _assert_routes_avoid_cards(cards, edges)
+
+    # The paused gate is kept in view on first paint even though the workflow overflows.
+    gate, host = cards["gate_spec"], flow["host"]
+    assert host["x"] <= gate["x"] and gate["x"] + gate["w"] <= host["x"] + host["w"]
+    expect = playwright.expect
+    expect(page.locator("#workflow-badge")).to_contain_text("当前 需求确认 (gate_spec)")
+    page.close()
+
+
+def test_workflow_island_selection_opens_dock_and_follows_dark_theme(skipped_workflow, browser):
+    _, run_id, url = skipped_workflow
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_workflow(page)
+    expect = playwright.expect
+    accent = _token(page, "--accent")
+
+    def node(name):
+        return page.locator(f"#workflow-graph [data-workflow-node='{name}']")
+
+    critic = node("critic")
+    expect(critic).to_have_attribute("role", "button")
+    expect(critic).to_have_attribute("tabindex", "0")
+    expect(critic).to_have_attribute("aria-selected", "false")
+    critic.click()
+    expect(critic).to_have_attribute("aria-selected", "true")
+    expect(critic).to_have_css("outline-color", accent)
+    expect(critic).to_have_css("outline-style", "solid")
+    expect(page.locator("body")).to_have_attribute("data-dock", "open")
+    expect(page.locator("#dock-title")).to_have_text("多维评审 · critic")
+
+    gate = node("gate_spec")
+    gate.focus()
+    page.keyboard.press("Enter")
+    expect(gate).to_have_attribute("aria-selected", "true")
+    expect(critic).to_have_attribute("aria-selected", "false")
+    expect(page.locator("#dock-title")).to_have_text("需求确认 · gate_spec")
+    expect(gate).to_be_focused()
+
+    align = node("align")
+    align.focus()
+    page.keyboard.press(" ")
+    expect(align).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#dock-title")).to_have_text("需求对齐 · align")
+    expect(align).to_have_css("outline-color", accent)
+    expect(gate).not_to_have_css("outline-color", accent)
+
+    # Dark theme: cards, edges and the ring re-read tokens in place without remounting.
+    light_sunk = _token(page, "--surface-sunk")
+    page.locator("#theme-toggle").click()
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    assert _token(page, "--surface-sunk") != light_sunk
+    expect(critic).to_have_css("background-color", _token(page, "--surface-sunk"))
+    expect(align).to_have_css("outline-color", _token(page, "--accent"))
+    dark = page.locator("#workflow-graph").evaluate(WORKFLOW_GEOMETRY)
+    taken = next(e for e in dark["edges"] if (e["source"], e["target"]) == ("align", "gate_spec"))
+    assert taken["stroke"] == taken["markerFill"] == _token(page, "--text-ink")
+    assert len(dark["cards"]) == 11
+    assert critic.evaluate("node => node.isConnected")
+    assert not errors, errors
+    page.close()
+
+
+def test_workflow_island_empty_unmapped_and_retry_loop(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="旧版工作流", workflow_name="legacy_unmapped_flow")
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    host = page.locator("#workflow-graph")
+    expect(host.get_by_text("当前工作流未提供拓扑描述", exact=True)).to_be_visible()
+    expect(host.locator("[data-workflow-node]")).to_have_count(0)
+    expect(page.locator("#workflow-badge")).to_contain_text("拓扑不可用")
+
+    # A repair back-edge plus a skip edge still lay out cleanly; the loop recedes dashed.
+    page.evaluate("""() => {
+      const host = document.createElement('div');
+      host.id = 'graph-loop';
+      host.style.width = '1100px';
+      document.querySelector('#view-topology').prepend(host);
+      const view = (id, kind, status) => ({
+        id, label: id, kind, status, statusText: status, ariaLabel: id,
+      });
+      window.loopHandle = window.AriadneGraph.mountWorkflow(host, {
+        runId: 'loop',
+        nodes: [
+          view('plan', 'pm_decompose', 'completed'),
+          view('validate_plan', 'validate_plan', 'failed'),
+          view('gate_plan', 'human_gate', 'pending'),
+          view('execute', 'execute_task_dag', 'pending'),
+        ],
+        edges: [
+          {source: 'plan', target: 'validate_plan', traversed: true},
+          {source: 'validate_plan', target: 'plan', conditional: true},
+          {source: 'validate_plan', target: 'gate_plan', conditional: true},
+          {source: 'gate_plan', target: 'execute'},
+          {source: 'plan', target: 'execute', conditional: true},
+          {source: 'execute', target: 'ghost'},
+        ],
+      });
+    }""")
+    loop = _wait_for_workflow(page, host="#graph-loop")
+    cards = {card["id"]: card for card in loop["cards"]}
+    edges = {(edge["source"], edge["target"]): edge for edge in loop["edges"]}
+    assert set(cards) == {"plan", "validate_plan", "gate_plan", "execute"}
+    assert len(edges) == 5
+    back = edges[("validate_plan", "plan")]
+    assert back["backedge"] == "true" and back["traversed"] == "false"
+    assert back["dash"] not in ("none", "") and back["opacity"] < 1
+    assert edges[("plan", "validate_plan")]["tone"] == "traversed"
+    _assert_routes_avoid_cards(cards, edges)
+    assert cards["validate_plan"]["status"] == "failed"
+    assert cards["validate_plan"]["background"] == _token(page, "--bad-soft")
+
+    page.evaluate("() => window.loopHandle.update({runId: 'loop', nodes: [], edges: []})")
+    expect(page.locator("#graph-loop").get_by_text("当前工作流未提供拓扑描述")).to_be_visible()
+    page.evaluate("() => window.loopHandle.destroy()")
+    expect(page.locator("#graph-loop .ag-island")).to_have_count(0)
+    assert not errors, errors
+    page.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph interactions: scroll-safe controls, lineage highlight & SSE viewport
+# ---------------------------------------------------------------------------
+
+VIEWPORT_MATRIX = """(host) => {
+  const raw = getComputedStyle(host.querySelector('.react-flow__viewport')).transform;
+  const match = raw.match(/matrix\\(([^)]+)\\)/);
+  if (!match) return { zoom: 1, x: 0, y: 0, raw };
+  const [a, , , , e, f] = match[1].split(',').map(Number);
+  return { zoom: a, x: e, y: f, raw };
+}"""
+
+
+def test_graph_islands_scroll_safe_controls_and_readonly_cards(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1200, "height": 720})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_workflow(page)
+    _wait_for_layout(page)
+
+    stage = page.locator("#stage")
+    wf_host = page.locator("#workflow-graph")
+    dag_host = page.locator("#dag-graph")
+
+    # Unmodified wheel over either graph scrolls #stage vertically without zooming the graph.
+    wf_host.scroll_into_view_if_needed()
+    wf_before = wf_host.evaluate(VIEWPORT_MATRIX)
+    wf_box = wf_host.bounding_box()
+    scroll_before = stage.evaluate("el => el.scrollTop")
+    page.mouse.move(wf_box["x"] + wf_box["width"] / 2, wf_box["y"] + wf_box["height"] / 2)
+    page.mouse.wheel(0, 260)
+    page.wait_for_function(
+        "(prev) => document.getElementById('stage').scrollTop > prev",
+        arg=scroll_before,
+    )
+    assert abs(wf_host.evaluate(VIEWPORT_MATRIX)["zoom"] - wf_before["zoom"]) < 0.001
+
+    dag_host.scroll_into_view_if_needed()
+    dag_before = dag_host.evaluate(VIEWPORT_MATRIX)
+    dag_box = dag_host.bounding_box()
+    scroll_mid = stage.evaluate("el => el.scrollTop")
+    page.mouse.move(dag_box["x"] + dag_box["width"] / 2, dag_box["y"] + dag_box["height"] / 2)
+    page.mouse.wheel(0, -180)
+    page.wait_for_function(
+        "(prev) => document.getElementById('stage').scrollTop < prev",
+        arg=scroll_mid,
+    )
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - dag_before["zoom"]) < 0.001
+
+    # Ctrl + Wheel zooms the graph smoothly around the pointer.
+    dag_host.locator(".ag-island").evaluate(
+        """el => el.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: -120, ctrlKey: true, bubbles: true, cancelable: true,
+          clientX: el.getBoundingClientRect().left + 120,
+          clientY: el.getBoundingClientRect().top + 80,
+        }))"""
+    )
+    assert dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] > dag_before["zoom"] + 0.05
+
+    # Corner toolbar (+, -, fit, 100%) drives both graphs cleanly.
+    dag_host.locator("[data-graph-control='reset']").click()
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+    dag_host.locator("[data-graph-control='zoom-in']").click()
+    zoomed_in = dag_host.evaluate(VIEWPORT_MATRIX)["zoom"]
+    assert zoomed_in > 1.1
+    dag_host.locator("[data-graph-control='zoom-out']").click()
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.02
+
+    # Wide workflow graph: "适应画布" scales down so all 11 cards fit inside the host frame.
+    wf_host.scroll_into_view_if_needed()
+    wf_host.locator("[data-graph-control='fit']").click()
+    wf_fit = wf_host.evaluate(VIEWPORT_MATRIX)
+    assert wf_fit["zoom"] < 0.95
+    wf_frame = wf_host.locator(".ag-island").bounding_box()
+    for card in wf_host.evaluate(WORKFLOW_GEOMETRY)["cards"]:
+        assert card["x"] >= wf_frame["x"] - 2
+        assert card["x"] + card["w"] <= wf_frame["x"] + wf_frame["width"] + 2
+    wf_host.locator("[data-graph-control='reset']").click()
+    assert abs(wf_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+
+    # Read-only semantic layout: dragging a node card does not displace its coordinates.
+    dag_host.scroll_into_view_if_needed()
+    node_wrap = dag_host.locator(".react-flow__node[data-id='T01']")
+    before_transform = node_wrap.evaluate("el => el.style.transform")
+    card = dag_host.locator("[data-task-id='T01']")
+    before_card = card.bounding_box()
+    page.mouse.move(
+        before_card["x"] + before_card["width"] / 2,
+        before_card["y"] + before_card["height"] / 2,
+    )
+    page.mouse.down()
+    page.mouse.move(before_card["x"] + 160, before_card["y"] + 80, steps=6)
+    page.mouse.up()
+    assert node_wrap.evaluate("el => el.style.transform") == before_transform
+    after_card = card.bounding_box()
+    assert abs(after_card["x"] - before_card["x"]) <= 4.0
+    assert abs(after_card["y"] - before_card["y"]) <= 4.0
+    assert not errors, errors
+    page.close()
+
+
+def test_graph_islands_hover_lineage_highlighting(skip_dag, browser):
+    _, run_id, url = skip_dag
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    _wait_for_workflow(page)
+    _wait_for_layout(page)
+
+    dag = page.locator("#dag-graph")
+
+    def card(tid):
+        return dag.locator(f"[data-task-id='{tid}']")
+
+    def edge(s, t):
+        return dag.locator(f".ag-edge[data-edge-source='{s}'][data-edge-target='{t}']")
+
+    # Select B first so we also prove hover lineage leaves selection ring untouched.
+    card("B").click()
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    # Hover C: ancestors={A}, focus={C}, descendants={E, G}; siblings B, D, F, H are dimmed.
+    card("C").hover()
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    for related in ("A", "E", "G"):
+        expect(card(related)).to_have_attribute("data-lineage", "related")
+    for dimmed in ("B", "D", "F", "H"):
+        expect(card(dimmed)).to_have_attribute("data-lineage", "dim")
+    expect(card("B")).to_have_css("opacity", "0.26")
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    for src, dst in (("A", "C"), ("C", "E"), ("E", "G")):
+        expect(edge(src, dst)).to_have_attribute("data-lineage", "related")
+    for src, dst in (("A", "E"), ("B", "D"), ("D", "F"), ("F", "H"), ("B", "G")):
+        expect(edge(src, dst)).to_have_attribute("data-lineage", "dim")
+
+    # Moving pointer off the card clears hover dimming while keeping selection.
+    page.mouse.move(10, 10)
+    for tid in ("A", "B", "C", "D", "E", "F", "G", "H"):
+        expect(card(tid)).not_to_have_attribute("data-lineage", "dim")
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    # Keyboard :focus-visible lineage survives a pointer enter+leave pass.
+    page.keyboard.press("Tab")
+    card("C").focus()
+    assert card("C").evaluate('node => node.matches(":focus-visible")')
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    card("C").hover()
+    page.mouse.move(10, 10)
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    assert card("C").evaluate("node => node === document.activeElement")
+
+    # Workflow hover: hovering critic highlights intake/align -> critic -> gate_spec..
+    # and dims the bypass edge align -> gate_spec.
+    wf = page.locator("#workflow-graph")
+    wf.locator("[data-graph-control='fit']").click()
+
+    def wf_node(nid):
+        return wf.locator(f"[data-workflow-node='{nid}']")
+
+    def wf_edge(s, t):
+        return wf.locator(f".ag-edge[data-edge-source='{s}'][data-edge-target='{t}']")
+    wf_node("critic").hover()
+    expect(wf_node("critic")).to_have_attribute("data-lineage", "focus")
+    expect(wf_node("align")).to_have_attribute("data-lineage", "related")
+    expect(wf_node("gate_spec")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("align", "critic")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("critic", "gate_spec")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("align", "gate_spec")).to_have_attribute("data-lineage", "dim")
+    page.mouse.move(10, 10)
+    expect(wf_edge("align", "gate_spec")).not_to_have_attribute("data-lineage", "dim")
+    assert not errors, errors
+    page.close()
+
+
+def test_task_dag_live_sse_status_update_preserves_zoom_and_pan_and_resets_on_run_switch(
+    workbench, browser
+):
+    store, run_id, url = workbench
+    second_id = store.create_run(title="第二个独立拓扑")
+    spec2 = GoalSpec(goal="独立拓扑", requirements=[RequirementItem(
+        id="R2", description="单任务", acceptance_criteria=["可切换"],
+    )])
+    store.save_spec(second_id, spec2)
+    store.record_approval(ApprovalRecord(
+        run_id=second_id, target=ApprovalTarget.GOAL_SPEC, target_id=spec2.spec_id,
+        target_hash=spec2.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    plan2 = TaskPlan(spec_id=spec2.spec_id, spec_hash=spec2.content_hash, tasks=[
+        TaskNode(
+            task_id="SOLO-1", title="单独任务", objective="验证切线程重置视口",
+            depends_on=[], write_scope=["solo.py"],
+            acceptance_checks=[
+                AcceptanceCheck(id="c1", kind=CheckKind.INDEPENDENT_REVIEW, description="ok")
+            ],
+        ),
+    ])
+    store.save_plan(second_id, plan2)
+    store.record_approval(ApprovalRecord(
+        run_id=second_id, target=ApprovalTarget.TASK_PLAN, target_id=plan2.plan_id,
+        target_hash=plan2.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    _wait_for_layout(page)
+    dag = page.locator("#dag-graph")
+    dag.scroll_into_view_if_needed()
+
+    # Manually zoom in AND drag-pan the Task DAG viewport.
+    dag.locator("[data-graph-control='zoom-in']").click()
+    box = dag.bounding_box()
+    page.mouse.move(box["x"] + 20, box["y"] + box["height"] - 20)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 90, box["y"] + box["height"] - 50, steps=6)
+    page.mouse.up()
+    pinned = dag.evaluate(VIEWPORT_MATRIX)
+    assert pinned["zoom"] > 1.1
+    card_handle = dag.locator("[data-task-id='T05']").element_handle()
+
+    # Live SSE mutation: update T05 status RUNNING -> ACCEPTED on the same topology.
+    plan = store.get_run(run_id)["plan"]
+    updated_tasks = [
+        t.model_copy(update={"status": TaskStatus.ACCEPTED}) if t.task_id == "T05" else t
+        for t in plan.tasks
+    ]
+    store.save_plan(run_id, plan.model_copy(update={"tasks": updated_tasks}))
+    expect(dag.locator("[data-task-id='T05']")).to_have_attribute("data-status", "accepted")
+    expect(dag.locator("[data-task-id='T05']")).to_contain_text("已验收")
+    assert dag.evaluate(VIEWPORT_MATRIX)["raw"] == pinned["raw"]
+    assert card_handle.evaluate("node => node.isConnected")
+
+    # Switching runs changes topology signature -> triggers fresh ELK layout and 1:1 auto-fit.
+    page.locator(f"#thread-list [data-run-id='{second_id}']").click()
+    expect(dag.locator("[data-task-id='SOLO-1']")).to_be_visible()
+    assert abs(dag.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+    page.close()
+
+
+def test_task_dag_handles_arrow_ids_and_high_fanin_port_spacing(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="箭头字符与高扇入回归")
+    goal = GoalSpec(
+        goal="回归验证",
+        requirements=[
+            RequirementItem(id="R1", description="保留全部边", acceptance_criteria=["不丢边"])
+        ],
+    )
+    store.save_spec(run_id, goal)
+    inputs = {"A": [], "A→B": [], "B→C": ["A"], "C": ["A→B"]}
+    review = AcceptanceCheck(id="review", kind=CheckKind.INDEPENDENT_REVIEW, description="ok")
+    plan = TaskPlan(
+        spec_id=goal.spec_id,
+        spec_hash=goal.content_hash,
+        tasks=[
+            TaskNode(
+                task_id=task_id,
+                title=task_id,
+                objective="test",
+                depends_on=deps,
+                write_scope=[f"task{index}.py"],
+                acceptance_checks=[review],
+            )
+            for index, (task_id, deps) in enumerate(inputs.items())
+        ],
+    )
+    store.save_plan(run_id, plan)
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+            approver="human",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    rendered = page.locator("#dag-graph .ag-edge[data-edge-source]").evaluate_all(
+        "els => els.map(el => [el.dataset.edgeSource, el.dataset.edgeTarget])"
+    )
+    assert sorted(rendered) == [["A", "B→C"], ["A→B", "C"]]
+
+    # High fan-in (12 edges into T): card expands cleanly so fixed 7.2px arrowheads never overlap.
+    page.evaluate(
+        """() => {
+          const host = document.createElement('div');
+          host.id = 'fanin-check';
+          host.style.width = '1100px';
+          document.querySelector('#view-topology').prepend(host);
+          const nodes = [...Array(12)].map((_, i) => ({
+            id: 'S' + i, layer: 0, status: 'accepted', tone: 'ok',
+            meta: 'engineer', statusText: '✓ 已验收', ariaLabel: 'S' + i,
+          })).concat({
+            id: 'T', layer: 1, status: 'waiting', tone: 'muted',
+            meta: 'engineer', statusText: '◷ 等待', ariaLabel: 'T',
+          });
+          const edges = nodes.slice(0, -1).map(n => ({ source: n.id, target: 'T' }));
+          window.faninHandle = window.AriadneGraph.mountDag(host, { runId: 'fanin', nodes, edges });
+        }"""
+    )
+    page.locator("#fanin-check [data-layout='elk']").wait_for()
+    fanin = page.evaluate(
+        """() => {
+          const card = document.querySelector('#fanin-check [data-task-id="T"]');
+          const wrap = card.closest('.react-flow__node');
+          const matrix = new DOMMatrix(getComputedStyle(wrap).transform);
+          const ys = [...document.querySelectorAll(
+            '#fanin-check .ag-edge[data-edge-target="T"] path.ag-edge-path'
+          )].map(p => p.getPointAtLength(p.getTotalLength()).y - matrix.f).sort((a, b) => a - b);
+          const marker = document.querySelector('#fanin-check marker[data-tone="default"]');
+          const arrowH = marker.querySelector('path').getBBox().height
+            * Number(marker.getAttribute('markerHeight')) / marker.viewBox.baseVal.height;
+          const minGap = Math.min(...ys.slice(1).map((y, i) => y - ys[i]));
+          return { count: ys.length, minGap, arrowH };
+        }"""
+    )
+    assert fanin["count"] == 12
+    assert fanin["minGap"] >= fanin["arrowH"], fanin
+    page.evaluate("() => window.faninHandle.destroy()")
     page.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -757,6 +758,24 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert "javascript" in app_res.headers["content-type"]
             assert "watchSlots();" in app_res.text
 
+            # 1c. The pre-built Graph Island loads offline from the same static root.
+            assert 'href="/static/graph/ariadne-graph.css"' in html_res.text
+            graph_at = html_res.text.find('src="/static/graph/ariadne-graph.js"')
+            assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
+            assert 'id="dag-graph"' in html_res.text
+            assert 'id="dag-svg"' not in html_res.text
+            assert 'id="workflow-graph"' in html_res.text
+            assert 'id="workflow-svg"' not in html_res.text
+            graph_js = client.get("/static/graph/ariadne-graph.js")
+            assert graph_js.status_code == 200
+            assert "javascript" in graph_js.headers["content-type"]
+            assert "window.AriadneGraph" in graph_js.text or "AriadneGraph=" in graph_js.text
+            graph_css = client.get("/static/graph/ariadne-graph.css")
+            assert graph_css.status_code == 200
+            assert graph_css.headers["content-type"].startswith("text/css")
+            assert ".ag-task-card" in graph_css.text
+            assert ".ag-wf-card" in graph_css.text
+
             assert client.get("/static/missing.css").status_code == 404
             assert client.get("/static/..%2fserver.py").status_code == 404
 
@@ -975,6 +994,136 @@ def test_projection_workflow_traceability_and_triage(tmp_path: Path) -> None:
     assert design["interfaces"][0]["consumer_module_ids"] == ["MOD-API"]
 
 
+def test_projection_derives_workflow_trajectory_and_skipped_nodes(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="轨迹投影测试", workflow_name="full_sdlc_tdd")
+    for event_type, payload in (
+        ("graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        ("graph.node_started", {"node": "align"}),
+        ("graph.node_finished", {"node": "align"}),
+        ("graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        ("graph.node_started", {"node": "gate_spec"}),
+        ("graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    proj = build_run_projection(store, tmp_path, run_id)
+    workflow = proj["workflow"]
+    assert {"source": "align", "target": "gate_spec"} in workflow["traversed_edges"]
+    assert {"source": "intake", "target": "align"} in workflow["traversed_edges"]
+    assert workflow["node_statuses"]["critic"] == "skipped"
+    assert next(n for n in workflow["nodes"] if n["name"] == "critic")["status"] == "skipped"
+    assert workflow["node_statuses"]["gate_spec"] == "paused"
+    for downstream in (
+        "design",
+        "validate_design",
+        "gate_design",
+        "plan",
+        "validate_plan",
+        "gate_plan",
+        "execute",
+    ):
+        assert workflow["node_statuses"][downstream] == "pending"
+
+    # Once the run executes to completion the bypassed node stays skipped.
+    for event_type, payload in (
+        ("graph.node_finished", {"node": "gate_spec"}),
+        ("graph.node_started", {"node": "design"}),
+        ("graph.node_finished", {"node": "design"}),
+        ("graph.routed", {"from": ["design"], "to": ["execute"], "wave": 3}),
+        ("graph.node_started", {"node": "execute"}),
+        ("graph.node_finished", {"node": "execute"}),
+        ("graph.finished", {"graph": "full_sdlc_tdd", "steps": 3}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.COMPLETED, actor="supervisor", stage="graph")
+
+    finished = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert finished["node_statuses"]["critic"] == "skipped"
+    assert finished["node_statuses"]["execute"] == "completed"
+
+
+def test_projection_skips_alignment_chain_on_design_ready_triage(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="分流投影测试", workflow_name="full_sdlc_tdd")
+    for event_type, payload in (
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.routed", {"from": ["intake"], "to": ["validate_design"], "wave": 1}),
+        ("graph.node_started", {"node": "validate_design"}),
+        ("graph.node_finished", {"node": "validate_design"}),
+        ("graph.routed", {"from": ["validate_design"], "to": ["gate_design"], "wave": 2}),
+        ("graph.node_started", {"node": "gate_design"}),
+        ("graph.paused", {"node": "gate_design", "reason": "human_gate"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    workflow = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert {"source": "intake", "target": "validate_design"} in workflow["traversed_edges"]
+    for bypassed in ("align", "critic", "gate_spec", "design"):
+        assert workflow["node_statuses"][bypassed] == "skipped"
+    assert workflow["node_statuses"]["gate_design"] == "paused"
+    for unreached in ("plan", "validate_plan", "gate_plan", "execute"):
+        assert workflow["node_statuses"][unreached] == "pending"
+
+
+def test_projection_derives_legacy_trajectory_without_routed_events(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="遗留运行", workflow_name="repo_fast_patch")
+    for event_type, payload in (
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.node_started", {"node": "align"}),
+        ("graph.node_finished", {"node": "align"}),
+        ("graph.node_started", {"node": "gate_spec"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    workflow = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert workflow["traversed_edges"] == [
+        {"source": "intake", "target": "align"},
+        {"source": "align", "target": "gate_spec"},
+    ]
+    assert "skipped" not in workflow["node_statuses"].values()
+    assert workflow["node_statuses"]["plan"] == "pending"
+
+    # Seeded demo runs predate graph.* events entirely: derivation stays empty, never raises.
+    for seeded_id in seed_demo_runs(store, tmp_path):
+        seeded = build_run_projection(store, tmp_path, seeded_id)["workflow"]
+        assert seeded["traversed_edges"] == []
+        assert "skipped" not in seeded["node_statuses"].values()
+
+
 def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
     db_path = tmp_path / ".olympus" / "olympus.db"
     store = RunStore(db_path)
@@ -1002,7 +1151,7 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
                 'id="new-run-file"',
                 'id="triage-banner"',
                 'id="clarify-panel"',
-                'id="workflow-svg"',
+                'id="workflow-graph"',
                 'id="view-design"',
                 'id="btn-approve-spec"',
                 'id="btn-approve-design"',
@@ -1678,3 +1827,34 @@ def test_run_snapshot_exposes_recorded_output_versions_with_task_graph(tmp_path:
         (1, original.content_hash, False),
     ]
     assert versions[0]["summary"] == "任务计划 v2 已就绪，包含 1 个任务"
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_WEB_GRAPH = _REPO_ROOT / "web-graph"
+_GRAPH_BUNDLE = _REPO_ROOT / "src" / "olympus" / "web" / "static" / "graph"
+
+
+def _web_graph_source_stamp() -> str:
+    """Mirror of web-graph/vite.config.ts `sourceStamp()`: sha256 over sorted `rel\\0bytes\\0`."""
+    files = [_WEB_GRAPH / name for name in (
+        "package.json", "pnpm-lock.yaml", "tsconfig.json", "vite.config.ts",
+    )]
+    files += [path for path in (_WEB_GRAPH / "src").rglob("*") if path.is_file()]
+    digest = hashlib.sha256()
+    for rel, path in sorted((path.relative_to(_WEB_GRAPH).as_posix(), path) for path in files):
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def test_committed_graph_bundle_matches_web_graph_sources() -> None:
+    """The offline bundle must be rebuilt (`pnpm --dir web-graph build`) after source edits."""
+    banner = f"/*! ariadne-graph | source-sha256:{_web_graph_source_stamp()} */"
+    for name in ("ariadne-graph.js", "ariadne-graph.css"):
+        first_line = (_GRAPH_BUNDLE / name).read_text(encoding="utf-8").splitlines()[0]
+        assert first_line == banner, f"{name} is stale; run `pnpm --dir web-graph build`"
+    bundle = (_GRAPH_BUNDLE / "ariadne-graph.js").read_text(encoding="utf-8")
+    assert "mountDag" in bundle and "mountWorkflow" in bundle
+    assert not (_GRAPH_BUNDLE / "ariadne-graph.js.map").exists()

@@ -433,7 +433,232 @@ def test_build_workflow_view_unknown_workflow_stays_renderable() -> None:
     assert view["stop_after"] is None
     assert view["nodes"] == []
     assert view["node_statuses"] == {}
+    assert view["traversed_edges"] == []
     assert view["finished"] is False
+
+
+# ------------------------------------------------------------- workflow trajectory
+
+
+def test_build_workflow_view_derives_traversed_edges_and_skips_bypassed_nodes() -> None:
+    events = [
+        _event(1, "graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        _event(2, "graph.node_started", {"node": "intake"}),
+        _event(3, "graph.node_finished", {"node": "intake"}),
+        _event(4, "graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        _event(5, "graph.node_started", {"node": "align"}),
+        _event(6, "graph.node_finished", {"node": "align"}),
+        _event(7, "graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        _event(8, "graph.node_started", {"node": "gate_spec"}),
+        _event(9, "graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+    ]
+    view = build_workflow_view("full_sdlc_tdd", events, RunStatus.AWAITING_HUMAN)
+
+    assert view["traversed_edges"] == [
+        {"source": "intake", "target": "align"},
+        {"source": "align", "target": "gate_spec"},
+    ]
+    assert view["node_statuses"]["critic"] == "skipped"
+    node_entries = {node["name"]: node["status"] for node in view["nodes"]}
+    assert node_entries["critic"] == "skipped"
+    for downstream in (
+        "design",
+        "validate_design",
+        "gate_design",
+        "plan",
+        "validate_plan",
+        "gate_plan",
+        "execute",
+    ):
+        assert view["node_statuses"][downstream] == "pending"
+
+
+def test_build_workflow_view_skips_alignment_chain_on_design_ready_triage() -> None:
+    events = [
+        _event(1, "graph.node_started", {"node": "intake"}),
+        _event(2, "graph.node_finished", {"node": "intake"}),
+        _event(3, "graph.routed", {"from": ["intake"], "to": ["validate_design"], "wave": 1}),
+        _event(4, "graph.node_started", {"node": "validate_design"}),
+        _event(5, "graph.node_finished", {"node": "validate_design"}),
+        _event(6, "graph.routed", {"from": ["validate_design"], "to": ["gate_design"], "wave": 2}),
+        _event(7, "graph.node_started", {"node": "gate_design"}),
+        _event(8, "graph.paused", {"node": "gate_design", "reason": "human_gate"}),
+    ]
+    view = build_workflow_view("full_sdlc_tdd", events, RunStatus.AWAITING_HUMAN)
+
+    assert {"source": "intake", "target": "validate_design"} in view["traversed_edges"]
+    assert {"source": "validate_design", "target": "gate_design"} in view["traversed_edges"]
+    for bypassed in ("align", "critic", "gate_spec", "design"):
+        assert view["node_statuses"][bypassed] == "skipped"
+    assert view["node_statuses"]["validate_design"] == "completed"
+    assert view["node_statuses"]["gate_design"] == "paused"
+    for unreached in ("plan", "validate_plan", "gate_plan", "execute"):
+        assert view["node_statuses"][unreached] == "pending"
+
+
+def test_build_workflow_view_falls_back_to_node_transitions_without_routed_events() -> None:
+    events = [
+        _event(1, "graph.node_started", {"node": "intake"}),
+        _event(2, "graph.node_finished", {"node": "intake"}),
+        _event(3, "graph.node_started", {"node": "align"}),
+        _event(4, "graph.node_finished", {"node": "align"}),
+        _event(5, "graph.node_started", {"node": "critic"}),
+        _event(6, "graph.node_finished", {"node": "critic"}),
+        _event(7, "graph.node_started", {"node": "gate_spec"}),
+        _event(8, "graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+    ]
+    view = build_workflow_view("product_blueprint", events, RunStatus.AWAITING_HUMAN)
+
+    assert view["traversed_edges"] == [
+        {"source": "intake", "target": "align"},
+        {"source": "align", "target": "critic"},
+        {"source": "critic", "target": "gate_spec"},
+    ]
+    assert view["node_statuses"]["critic"] == "completed"
+    assert view["node_statuses"]["gate_spec"] == "paused"
+    assert "skipped" not in view["node_statuses"].values()
+
+
+def test_build_workflow_view_dedupes_traversed_edges_and_drops_undeclared_pairs() -> None:
+    events = [
+        _event(1, "graph.routed", {"from": ["intake"], "to": ["align"]}),
+        _event(2, "graph.routed", {"from": ["intake"], "to": ["align"]}),
+        _event(3, "graph.routed", {"from": ["align"], "to": ["execute"]}),
+    ]
+    view = build_workflow_view("product_blueprint", events, RunStatus.RUNNING)
+
+    assert view["traversed_edges"] == [{"source": "intake", "target": "align"}]
+
+
+def test_build_workflow_view_preserves_skipped_after_execute_completes() -> None:
+    events = [
+        _event(1, "graph.node_started", {"node": "intake"}),
+        _event(2, "graph.node_finished", {"node": "intake"}),
+        _event(3, "graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        _event(4, "graph.node_started", {"node": "align"}),
+        _event(5, "graph.node_finished", {"node": "align"}),
+        _event(6, "graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        _event(7, "graph.node_started", {"node": "gate_spec"}),
+        _event(8, "graph.node_finished", {"node": "gate_spec"}),
+        _event(9, "graph.routed", {"from": ["gate_spec"], "to": ["design"], "wave": 3}),
+        _event(10, "graph.node_started", {"node": "design"}),
+        _event(11, "graph.node_finished", {"node": "design"}),
+        _event(12, "graph.routed", {"from": ["design"], "to": ["validate_design"], "wave": 4}),
+        _event(13, "graph.node_started", {"node": "validate_design"}),
+        _event(14, "graph.node_finished", {"node": "validate_design"}),
+        _event(15, "graph.routed", {"from": ["validate_design"], "to": ["gate_design"], "wave": 5}),
+        _event(16, "graph.node_started", {"node": "gate_design"}),
+        _event(17, "graph.node_finished", {"node": "gate_design"}),
+        _event(18, "graph.routed", {"from": ["gate_design"], "to": ["plan"], "wave": 6}),
+        _event(19, "graph.node_started", {"node": "plan"}),
+        _event(20, "graph.node_finished", {"node": "plan"}),
+        _event(21, "graph.routed", {"from": ["plan"], "to": ["validate_plan"], "wave": 7}),
+        _event(22, "graph.node_started", {"node": "validate_plan"}),
+        _event(23, "graph.node_finished", {"node": "validate_plan"}),
+        _event(24, "graph.routed", {"from": ["validate_plan"], "to": ["gate_plan"], "wave": 8}),
+        _event(25, "graph.node_started", {"node": "gate_plan"}),
+        _event(26, "graph.node_finished", {"node": "gate_plan"}),
+        _event(27, "graph.routed", {"from": ["gate_plan"], "to": ["execute"], "wave": 9}),
+        _event(28, "graph.node_started", {"node": "execute"}),
+        _event(29, "graph.node_finished", {"node": "execute"}),
+        _event(30, "graph.finished", {"graph": "full_sdlc_tdd", "steps": 9}),
+    ]
+    view = build_workflow_view("full_sdlc_tdd", events, RunStatus.COMPLETED)
+
+    assert view["finished"] is True
+    assert view["node_statuses"]["critic"] == "skipped"
+    assert view["node_statuses"]["execute"] == "completed"
+    assert {"source": "align", "target": "gate_spec"} in view["traversed_edges"]
+    assert {"source": "gate_plan", "target": "execute"} in view["traversed_edges"]
+
+
+def test_build_workflow_view_keeps_future_nodes_pending_after_failed_frontier() -> None:
+    events = [
+        _event(1, "graph.node_started", {"node": "intake"}),
+        _event(2, "graph.node_finished", {"node": "intake"}),
+        _event(3, "graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        _event(4, "graph.node_started", {"node": "align"}),
+        _event(5, "graph.node_finished", {"node": "align"}),
+        _event(6, "graph.routed", {"from": ["align"], "to": ["critic"], "wave": 2}),
+        _event(7, "graph.node_started", {"node": "critic"}),
+        _event(8, "graph.node_error", {"node": "critic", "error": "provider timeout"}),
+        _event(9, "graph.failed", {"error": "provider timeout"}),
+    ]
+    view = build_workflow_view("full_sdlc_tdd", events, RunStatus.FAILED)
+
+    assert view["node_statuses"]["critic"] == "failed"
+    for downstream in ("gate_spec", "design", "validate_design", "execute"):
+        assert view["node_statuses"][downstream] == "pending"
+
+
+def test_build_workflow_view_records_pause_resume_gate_transition() -> None:
+    events = [
+        _event(1, "graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        _event(2, "graph.node_started", {"node": "intake"}),
+        _event(3, "graph.node_finished", {"node": "intake"}),
+        _event(4, "graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        _event(5, "graph.node_started", {"node": "align"}),
+        _event(6, "graph.node_finished", {"node": "align"}),
+        _event(7, "graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        _event(8, "graph.node_started", {"node": "gate_spec"}),
+        _event(9, "graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+        _event(10, "graph.started", {"graph": "full_sdlc_tdd", "start_from": "design"}),
+        _event(11, "graph.node_started", {"node": "design"}),
+        _event(12, "graph.node_finished", {"node": "design"}),
+    ]
+    view = build_workflow_view(
+        "full_sdlc_tdd",
+        events,
+        RunStatus.RUNNING,
+        spec_approved=True,
+    )
+
+    assert view["node_statuses"]["gate_spec"] == "completed"
+    assert view["node_statuses"]["critic"] == "skipped"
+    assert {"source": "gate_spec", "target": "design"} in view["traversed_edges"]
+    assert view["node_statuses"]["validate_design"] == "pending"
+
+
+def test_derive_skipped_ignores_back_edges_in_cyclic_graphs() -> None:
+    from olympus.graph.progress import _derive_skipped
+
+    statuses = {"a": "completed", "b": "paused", "c": "pending"}
+    declared = [("a", "b"), ("b", "c"), ("c", "a")]
+    traversed = [{"source": "a", "target": "b"}]
+
+    assert _derive_skipped(statuses, declared, traversed, starts=["a"]) == set()
+
+
+def test_derive_skipped_is_independent_of_node_declaration_order() -> None:
+    from olympus.graph.progress import _derive_skipped
+
+    declared = [("gate_spec", "optional"), ("optional", "terminal"), ("gate_spec", "terminal")]
+    traversed = [{"source": "gate_spec", "target": "terminal"}]
+    for order in (
+        ("gate_spec", "optional", "terminal"),
+        ("gate_spec", "terminal", "optional"),
+    ):
+        statuses = {
+            name: ("pending" if name == "optional" else "completed")
+            for name in order
+        }
+        assert _derive_skipped(statuses, declared, traversed, starts=["gate_spec"]) == {"optional"}
+
+
+def test_derive_traversed_edges_preserves_declared_self_loop() -> None:
+    from olympus.graph.progress import _declared_edges, _derive_traversed_edges
+
+    description = {
+        "edges": [{"source": "gate_spec", "target": "gate_spec", "conditional": False}],
+    }
+    declared = _declared_edges(description)
+    events = [
+        _event(1, "graph.routed", {"from": ["gate_spec"], "to": ["gate_spec"], "wave": 1}),
+        _event(2, "graph.routed", {"from": ["gate_spec"], "to": ["gate_spec"], "wave": 2}),
+    ]
+    assert _derive_traversed_edges(events, declared) == [
+        {"source": "gate_spec", "target": "gate_spec"},
+    ]
 
 
 # -------------------------------------------------------------- blueprint completion

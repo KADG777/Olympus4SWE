@@ -128,6 +128,194 @@ def resolve_resume_node(
     return "intake" if "intake" in names else ("align" if "align" in names else None)
 
 
+_VISITED_STATUSES = frozenset({"running", "completed", "paused", "error", "failed"})
+
+
+def _declared_edges(description: Mapping[str, Any] | None) -> list[tuple[str, str]]:
+    """Return the workflow graph's declared ``(source, target)`` pairs in order."""
+    if not description:
+        return []
+    declared: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for edge in description.get("edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        source, target = edge.get("source"), edge.get("target")
+        if not isinstance(source, str) or not isinstance(target, str):
+            continue
+        if (source, target) in seen:
+            continue
+        seen.add((source, target))
+        declared.append((source, target))
+    return declared
+
+
+def _node_names(value: Any) -> list[str]:
+    """Normalize a ``graph.routed`` ``from``/``to`` payload into node names."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _derive_traversed_edges(
+    events: Sequence[RunEvent],
+    declared: Sequence[tuple[str, str]],
+) -> list[dict[str, str]]:
+    """Collect the executed trajectory against the declared workflow edges.
+
+    Live runs persist one ``graph.routed`` event per wave, so the ``from`` x
+    ``to`` product is the exact trajectory. Legacy and seeded runs never wrote
+    them; for those, consecutive ``graph.node_finished`` -> ``graph.node_started``
+    transitions are matched against the declared edges instead.
+    """
+    allowed = set(declared)
+    traversed: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def record(source: str, target: str) -> None:
+        if (source, target) not in allowed or (source, target) in seen:
+            return
+        seen.add((source, target))
+        traversed.append({"source": source, "target": target})
+
+    if any(event.event_type == "graph.routed" for event in events):
+        paused_node: str | None = None
+        for event in events:
+            if event.event_type == "graph.routed":
+                paused_node = None
+                for source in _node_names(event.payload.get("from")):
+                    for target in _node_names(event.payload.get("to")):
+                        record(source, target)
+            elif event.event_type == "graph.paused":
+                node = event.payload.get("node")
+                if isinstance(node, str):
+                    paused_node = node
+            elif event.event_type == "graph.started" and paused_node is not None:
+                start_from = event.payload.get("start_from")
+                if isinstance(start_from, str):
+                    record(paused_node, start_from)
+                    paused_node = None
+            elif event.event_type == "graph.node_started" and paused_node is not None:
+                node = event.payload.get("node")
+                if isinstance(node, str) and node != paused_node:
+                    record(paused_node, node)
+                    paused_node = None
+        return traversed
+
+    last_finished: str | None = None
+    for event in events:
+        node = event.payload.get("node")
+        if not isinstance(node, str):
+            continue
+        if event.event_type in ("graph.node_finished", "graph.paused"):
+            last_finished = node
+        elif event.event_type == "graph.node_started" and last_finished is not None:
+            record(last_finished, node)
+    return traversed
+
+
+def _forward_reachable(start: str, adjacency: Mapping[str, Sequence[str]]) -> set[str]:
+    """Return every node reachable downstream of ``start`` via forward declared edges."""
+    reached: set[str] = set()
+    stack = [start]
+    while stack:
+        for target in adjacency.get(stack.pop(), ()):
+            if target == start or target in reached:
+                continue
+            reached.add(target)
+            stack.append(target)
+    return reached
+
+
+def _acyclic_forward_adjacency(
+    nodes: Sequence[str],
+    declared: Sequence[tuple[str, str]],
+    starts: Sequence[str],
+) -> dict[str, list[str]]:
+    """Build forward adjacency stripping only DFS back-edges from workflow entry roots.
+
+    On acyclic graphs every declared edge survives regardless of YAML node declaration order;
+    on cyclic graphs retry back-edges are removed so unreached downstream nodes cannot loop
+    back to visited ancestors.
+    """
+    known = set(nodes)
+    raw: dict[str, list[str]] = {name: [] for name in nodes}
+    indegree: dict[str, int] = {name: 0 for name in nodes}
+    for source, target in declared:
+        if source in known and target in known and source != target and target not in raw[source]:
+            raw[source].append(target)
+            indegree[target] += 1
+
+    roots = [name for name in starts if name in known]
+    if not roots:
+        roots = [name for name in nodes if indegree[name] == 0]
+    order_seeds = list(dict.fromkeys([*roots, *nodes]))
+
+    adjacency: dict[str, list[str]] = {name: [] for name in nodes}
+    state: dict[str, int] = {}  # 1 = on DFS stack, 2 = finished
+    for seed in order_seeds:
+        if state.get(seed):
+            continue
+        stack: list[tuple[str, int]] = [(seed, 0)]
+        state[seed] = 1
+        while stack:
+            current, idx = stack[-1]
+            neighbors = raw[current]
+            if idx >= len(neighbors):
+                state[current] = 2
+                stack.pop()
+                continue
+            stack[-1] = (current, idx + 1)
+            nxt = neighbors[idx]
+            nxt_state = state.get(nxt, 0)
+            if nxt_state == 1:
+                continue
+            adjacency[current].append(nxt)
+            if nxt_state == 0:
+                state[nxt] = 1
+                stack.append((nxt, 0))
+    return adjacency
+
+
+def _derive_skipped(
+    statuses: Mapping[str, str],
+    declared: Sequence[tuple[str, str]],
+    traversed: Sequence[Mapping[str, str]],
+    starts: Sequence[str] = (),
+) -> set[str]:
+    """Return never-visited nodes the executed trajectory passed straight over."""
+    known = set(statuses)
+    adjacency = _acyclic_forward_adjacency(list(statuses), declared, starts)
+
+    visited = {name for name, status in statuses.items() if status in _VISITED_STATUSES}
+    if not visited:
+        return set()
+
+    reach = {name: _forward_reachable(name, adjacency) for name in known}
+    downstream_of_visited: set[str] = set()
+    for name in visited:
+        downstream_of_visited |= reach[name]
+    skip_edges = [
+        (str(edge["source"]), str(edge["target"]))
+        for edge in traversed
+        if edge["source"] in known and edge["target"] in known
+    ]
+
+    skipped: set[str] = set()
+    for name, status in statuses.items():
+        if status != "pending":
+            continue
+        between_visited = name in downstream_of_visited and bool(reach[name] & visited)
+        bypassed = any(
+            name in reach[source] and target in reach[name] for source, target in skip_edges
+        )
+        if between_visited or bypassed:
+            skipped.add(name)
+    return skipped
+
+
 def build_workflow_view(
     workflow_name: str,
     events: Sequence[RunEvent],
@@ -223,6 +411,14 @@ def build_workflow_view(
         if last_error is None:
             last_error = "工作流执行异常中断"
 
+    declared_edges = _declared_edges(description)
+    start_nodes = [
+        name for name in ((description or {}).get("start") or ()) if isinstance(name, str)
+    ]
+    traversed_edges = _derive_traversed_edges(events, declared_edges)
+    for name in _derive_skipped(statuses, declared_edges, traversed_edges, start_nodes):
+        statuses[name] = "skipped"
+
     return {
         "name": workflow_name,
         "topology": topology,
@@ -230,6 +426,7 @@ def build_workflow_view(
         "graph": description,
         "nodes": [{"name": name, "status": status} for name, status in statuses.items()],
         "node_statuses": dict(statuses),
+        "traversed_edges": traversed_edges,
         "current_node": current_node,
         "paused": paused,
         "failed_node": failed_node,
