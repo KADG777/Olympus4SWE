@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -287,6 +287,39 @@ class RunStore:
         )
         return new_rev
 
+    def update_status_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        cur_rev: int,
+        status: RunStatus,
+        stage: str,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Set runs.status and append the status event inside an active transaction."""
+        new_rev = cur_rev + 1
+        conn.execute(
+            """
+            UPDATE runs
+            SET status = ?, state_revision = ?, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (status.value, new_rev, utc_now().isoformat(), run_id),
+        )
+        self._insert_event(
+            conn,
+            run_id=run_id,
+            stage=stage,
+            event_type=event_type,
+            actor=actor,
+            payload=payload,
+            state_revision=new_rev,
+        )
+        return new_rev
+
     def update_plan_in_tx(
         self,
         conn: sqlite3.Connection,
@@ -462,34 +495,7 @@ class RunStore:
                 conn.execute("BEGIN")
             row = self._get_run_row(conn, run_id)
             self._check_revision(int(row["state_revision"]), expected_revision)
-            spec = GoalSpec.model_validate_json(row["spec_json"]) if row["spec_json"] else None
-            plan = TaskPlan.model_validate_json(row["plan_json"]) if row["plan_json"] else None
-            design = (
-                DesignSpec.model_validate_json(row["design_json"])
-                if row["design_json"]
-                else None
-            )
-            snapshot = {
-                "run_id": row["run_id"],
-                "title": row["title"],
-                "mode": RunMode(row["mode"]),
-                "status": RunStatus(row["status"]),
-                "state_revision": int(row["state_revision"]),
-                "budget_policy": BudgetPolicy.model_validate_json(row["budget_policy_json"]),
-                "budget_ledger": BudgetLedger.model_validate_json(row["budget_ledger_json"]),
-                "spec": spec,
-                "design": design,
-                "plan": plan,
-                "workflow_name": row["workflow_name"],
-                "provider_config": (
-                    json.loads(row["provider_config_json"])
-                    if row["provider_config_json"]
-                    else None
-                ),
-                "workspace_root": row["workspace_root"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
+            snapshot = self._snapshot_from_row(row)
             if include_approval_baselines:
                 baselines: dict[ApprovalTarget, ApprovalArtifact | None] = {}
                 approved = {}
@@ -510,6 +516,37 @@ class RunStore:
             return snapshot
         finally:
             conn.close()
+
+    def get_run_in_tx(self, conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        """Return the run snapshot as read inside an already open transaction."""
+        return self._snapshot_from_row(self._get_run_row(conn, run_id))
+
+    @staticmethod
+    def _snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        spec = GoalSpec.model_validate_json(row["spec_json"]) if row["spec_json"] else None
+        plan = TaskPlan.model_validate_json(row["plan_json"]) if row["plan_json"] else None
+        design = (
+            DesignSpec.model_validate_json(row["design_json"]) if row["design_json"] else None
+        )
+        return {
+            "run_id": row["run_id"],
+            "title": row["title"],
+            "mode": RunMode(row["mode"]),
+            "status": RunStatus(row["status"]),
+            "state_revision": int(row["state_revision"]),
+            "budget_policy": BudgetPolicy.model_validate_json(row["budget_policy_json"]),
+            "budget_ledger": BudgetLedger.model_validate_json(row["budget_ledger_json"]),
+            "spec": spec,
+            "design": design,
+            "plan": plan,
+            "workflow_name": row["workflow_name"],
+            "provider_config": (
+                json.loads(row["provider_config_json"]) if row["provider_config_json"] else None
+            ),
+            "workspace_root": row["workspace_root"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def set_run_status(
         self,
@@ -554,35 +591,68 @@ class RunStore:
         actor: str = "align",
         expected_revision: int | None = None,
         approval: ApprovalRecord | None = None,
+        extra_events: Sequence[tuple[str, str, dict[str, Any]]] = (),
     ) -> int:
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
             cur_rev = int(row["state_revision"])
             self._check_revision(cur_rev, expected_revision)
-            new_rev = self._bump_run_field(
+            return self.save_spec_in_tx(
                 conn,
                 run_id=run_id,
-                column="spec_json",
-                value=spec.model_dump_json(),
+                spec=spec,
+                actor=actor,
                 cur_rev=cur_rev,
+                approval=approval,
+                extra_events=extra_events,
             )
+
+    def save_spec_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        spec: GoalSpec,
+        actor: str,
+        cur_rev: int,
+        approval: ApprovalRecord | None = None,
+        extra_events: Sequence[tuple[str, str, dict[str, Any]]] = (),
+    ) -> int:
+        """Persist a GoalSpec, its audit events, and any approval in one transaction."""
+        new_rev = self._bump_run_field(
+            conn,
+            run_id=run_id,
+            column="spec_json",
+            value=spec.model_dump_json(),
+            cur_rev=cur_rev,
+        )
+        self._insert_event(
+            conn,
+            run_id=run_id,
+            stage="align",
+            event_type="spec.saved",
+            actor=actor,
+            payload={
+                "spec_id": spec.spec_id,
+                "version": spec.version,
+                "content_hash": spec.content_hash,
+                "status": spec.status.value,
+            },
+            state_revision=new_rev,
+        )
+        for stage, event_type, payload in extra_events:
             self._insert_event(
                 conn,
                 run_id=run_id,
-                stage="align",
-                event_type="spec.saved",
+                stage=stage,
+                event_type=event_type,
                 actor=actor,
-                payload={
-                    "spec_id": spec.spec_id,
-                    "version": spec.version,
-                    "content_hash": spec.content_hash,
-                    "status": spec.status.value,
-                },
+                payload=payload,
                 state_revision=new_rev,
             )
-            if approval is not None:
-                return self._record_approval(conn, approval, new_rev)
-            return new_rev
+        if approval is not None:
+            return self._record_approval(conn, approval, new_rev)
+        return new_rev
 
     def save_design(
         self,
@@ -597,31 +667,51 @@ class RunStore:
             row = self._get_run_row(conn, run_id)
             cur_rev = int(row["state_revision"])
             self._check_revision(cur_rev, expected_revision)
-            new_rev = self._bump_run_field(
+            return self.save_design_in_tx(
                 conn,
                 run_id=run_id,
-                column="design_json",
-                value=design.model_dump_json(),
-                cur_rev=cur_rev,
-            )
-            self._insert_event(
-                conn,
-                run_id=run_id,
-                stage="design",
-                event_type="design.saved",
+                design=design,
                 actor=actor,
-                payload={
-                    "design_id": design.design_id,
-                    "version": design.version,
-                    "content_hash": design.content_hash,
-                    "module_count": len(design.modules),
-                    "status": design.status.value,
-                },
-                state_revision=new_rev,
+                cur_rev=cur_rev,
+                approval=approval,
             )
-            if approval is not None:
-                return self._record_approval(conn, approval, new_rev)
-            return new_rev
+
+    def save_design_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        design: DesignSpec,
+        actor: str,
+        cur_rev: int,
+        approval: ApprovalRecord | None = None,
+    ) -> int:
+        """Persist a DesignSpec, its audit event, and any approval in one transaction."""
+        new_rev = self._bump_run_field(
+            conn,
+            run_id=run_id,
+            column="design_json",
+            value=design.model_dump_json(),
+            cur_rev=cur_rev,
+        )
+        self._insert_event(
+            conn,
+            run_id=run_id,
+            stage="design",
+            event_type="design.saved",
+            actor=actor,
+            payload={
+                "design_id": design.design_id,
+                "version": design.version,
+                "content_hash": design.content_hash,
+                "module_count": len(design.modules),
+                "status": design.status.value,
+            },
+            state_revision=new_rev,
+        )
+        if approval is not None:
+            return self._record_approval(conn, approval, new_rev)
+        return new_rev
 
     def save_plan(self, run_id: str, plan: TaskPlan, *, actor: str = "orchestrate") -> int:
         with self._tx() as conn:
@@ -826,6 +916,12 @@ class RunStore:
             self._check_revision(cur_rev, expected_revision)
             return self._record_approval(conn, record, cur_rev)
 
+    def record_approval_in_tx(
+        self, conn: sqlite3.Connection, record: ApprovalRecord, *, cur_rev: int
+    ) -> int:
+        """Record an approval and bump the run revision inside an open transaction."""
+        return self._record_approval(conn, record, cur_rev)
+
     @staticmethod
     def _latest_artifact_approval(
         conn: sqlite3.Connection, run_id: str, target: ApprovalTarget
@@ -964,6 +1060,31 @@ class RunStore:
         finally:
             conn.close()
 
+    def latest_approval_rowid(
+        self,
+        *,
+        run_id: str,
+        target: ApprovalTarget,
+        target_id: str,
+        target_hash: str,
+    ) -> int | None:
+        """Return the latest approved rowid for the exact artifact hash, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT rowid, decision FROM approvals
+                WHERE run_id = ? AND target = ? AND target_id = ? AND target_hash = ?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (run_id, target, target_id, target_hash),
+            ).fetchone()
+            if row is None or row["decision"] not in _APPROVED_DECISIONS:
+                return None
+            return int(row["rowid"])
+        finally:
+            conn.close()
+
     @staticmethod
     def _is_approved(
         conn: sqlite3.Connection, run_id: str, target: ApprovalTarget,
@@ -995,6 +1116,64 @@ class RunStore:
         finally:
             conn.close()
 
+    def lookup_command(
+        self,
+        *,
+        operation_id: str,
+        run_id: str,
+        action: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return a previously recorded command result, enforcing operation identity.
+
+        Reusing an ``operation_id`` for a different run, action, or payload is a
+        conflict rather than a silent replay of unrelated work.
+        """
+        conn = self._connect()
+        try:
+            existing = conn.execute(
+                """
+                SELECT run_id, action, payload_json, result_json
+                FROM commands WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if existing is None:
+            return None
+        self._assert_command_identity(
+            existing,
+            operation_id=operation_id,
+            run_id=run_id,
+            action=action,
+            payload=payload,
+        )
+        result: dict[str, Any] = json.loads(existing["result_json"])
+        return {**result, "deduplicated": True}
+
+    @staticmethod
+    def _assert_command_identity(
+        existing: sqlite3.Row,
+        *,
+        operation_id: str,
+        run_id: str,
+        action: str,
+        payload: dict[str, Any],
+    ) -> None:
+        canonical_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        recorded = (
+            str(existing["run_id"]),
+            str(existing["action"]),
+            str(existing["payload_json"]),
+        )
+        if recorded != (run_id, action, canonical_payload):
+            raise ConcurrencyConflictError(
+                f"operation_id '{operation_id}' was already used for "
+                f"action '{existing['action']}' on run '{existing['run_id']}' "
+                "with a different payload"
+            )
+
     def apply_idempotent_command(
         self,
         *,
@@ -1002,23 +1181,34 @@ class RunStore:
         run_id: str,
         actor: str,
         action: str,
-        expected_state_revision: int,
+        expected_state_revision: int | None,
         payload: dict[str, Any],
         handler: Callable[[sqlite3.Connection, int], dict[str, Any]],
     ) -> dict[str, Any]:
         """Execute a console/CLI command once per operation_id and enforce state_revision."""
+        canonical_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self._tx() as conn:
             existing = conn.execute(
-                "SELECT result_json FROM commands WHERE operation_id = ?",
+                """
+                SELECT run_id, action, payload_json, result_json
+                FROM commands WHERE operation_id = ?
+                """,
                 (operation_id,),
             ).fetchone()
             if existing is not None:
+                self._assert_command_identity(
+                    existing,
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    action=action,
+                    payload=payload,
+                )
                 result: dict[str, Any] = json.loads(existing["result_json"])
                 return {**result, "deduplicated": True}
 
             row = self._get_run_row(conn, run_id)
             cur_rev = int(row["state_revision"])
-            if cur_rev != expected_state_revision:
+            if expected_state_revision is not None and cur_rev != expected_state_revision:
                 raise ConcurrencyConflictError(
                     f"Command {action} rejected: expected revision "
                     f"{expected_state_revision}, got {cur_rev}"
@@ -1036,7 +1226,7 @@ class RunStore:
                     run_id,
                     actor,
                     action,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    canonical_payload,
                     json.dumps(result, ensure_ascii=False, sort_keys=True),
                     utc_now().isoformat(),
                 ),

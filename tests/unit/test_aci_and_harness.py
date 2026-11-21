@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+import olympus.tools.aci as aci_module
 from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
@@ -19,7 +22,12 @@ from olympus.providers.base import (
     ToolSpec,
     UsageStats,
 )
-from olympus.tools.aci import WorkspaceToolkit
+from olympus.tools.aci import (
+    IGNORED_DIR_NAMES,
+    WorkspacePolicy,
+    WorkspaceToolkit,
+    build_sandbox_env,
+)
 
 
 def test_aci_rejects_relative_and_escape_paths_and_enforces_write_scope(tmp_path: Path) -> None:
@@ -377,3 +385,312 @@ def test_run_structured_loop_salvages_submit_tool_and_recovers_max_steps(tmp_pat
     out2 = run_structured_loop(loop=loop2, system_prompt="S", user_prompt="U", model_cls=Out)
     assert out2.value == 11
     assert turns == 3
+
+
+def test_run_structured_forces_final_step_synthesis_without_mutating_flag(
+    tmp_path: Path,
+) -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    seen_tools: list[int] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages
+        seen_tools.append(len(tools))
+        if len(seen_tools) == 1:
+            return LLMResponse(
+                content="reading",
+                tool_calls=(
+                    ToolCall(
+                        id="tc-1",
+                        name="read_file",
+                        arguments={"path": str(tmp_path / "mod.py")},
+                    ),
+                ),
+            )
+        return LLMResponse(content=json.dumps({"value": 3}))
+
+    loop = AgentLoop(
+        provider=MockLLMProvider(responder=responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=2,
+    )
+    assert loop.synthesize_on_max_steps is False
+    out = loop.run_structured(system_prompt="SYS", user_prompt="GO", model_cls=Out)
+
+    assert out.value == 3
+    # Synthesis is requested per call; the loop-level flag must stay untouched.
+    assert loop.synthesize_on_max_steps is False
+    assert seen_tools == [3, 0]
+
+
+def test_run_structured_retries_domain_validation_with_feedback() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        prompts.append(messages[-1].content)
+        return LLMResponse(content=json.dumps({"value": 1 if len(prompts) == 1 else 5}))
+
+    def validator(candidate: Out) -> Sequence[str]:
+        return [] if candidate.value >= 5 else [f"value {candidate.value} is below 5"]
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="BASE PROMPT",
+        model_cls=Out,
+        max_validation_retries=2,
+        validation_header="[DOMAIN FAILED]",
+        validation_instruction="Return at least 5.",
+        validator=validator,
+    )
+
+    assert out.value == 5
+    assert len(prompts) == 2
+    assert prompts[0] == "BASE PROMPT"
+    assert "[DOMAIN FAILED]" in prompts[1]
+    assert "value 1 is below 5" in prompts[1]
+    assert "Return at least 5." in prompts[1]
+
+
+def test_run_structured_applies_transform_before_validation() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Bound(StrictModel):
+        value: int = Field(ge=1)
+        spec_id: str | None = None
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages, tools
+        return LLMResponse(content=json.dumps({"value": 2}))
+
+    seen_spec_ids: list[str | None] = []
+
+    def validator(candidate: Bound) -> Sequence[str]:
+        seen_spec_ids.append(candidate.spec_id)
+        return [] if candidate.spec_id == "spec-1" else ["missing spec binding"]
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="GO",
+        model_cls=Bound,
+        transform=lambda candidate: candidate.model_copy(update={"spec_id": "spec-1"}),
+        validator=validator,
+    )
+
+    assert seen_spec_ids == ["spec-1"]
+    assert out.spec_id == "spec-1"
+
+
+def test_run_structured_invokes_on_validation_exhausted() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    calls = 0
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal calls
+        del messages, tools
+        calls += 1
+        return LLMResponse(content=json.dumps({"value": 42}))
+
+    exhausted: list[tuple[int, list[str]]] = []
+
+    def on_exhausted(candidate: Out, violations: list[str]) -> Out:
+        exhausted.append((candidate.value, violations))
+        return candidate.model_copy(update={"value": 7})
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="GO",
+        model_cls=Out,
+        max_validation_retries=1,
+        validator=lambda candidate: ["value is forbidden"],
+        on_validation_exhausted=on_exhausted,
+    )
+
+    assert calls == 2
+    assert exhausted == [(42, ["value is forbidden"])]
+    assert out.value == 7
+
+
+def test_workspace_policy_authorizes_posix_scopes_and_rejects_escapes(tmp_path: Path) -> None:
+    workspace = (tmp_path / "ws").resolve()
+    workspace.mkdir()
+
+    policy = WorkspacePolicy(
+        workspace_root=workspace,
+        allowed_write_scope=["src/allowed.py", "docs/", "pkg/*"],
+    )
+
+    # Absolute paths inside the workspace root normalize to repo-relative form.
+    assert policy.authorize_tool("write_file", {"path": str(workspace / "src/allowed.py")}) == (
+        True,
+        "",
+    )
+    # Relative and "./"-prefixed paths cover directory prefixes and globs.
+    assert policy.authorize_tool("write_file", {"path": "./docs/nested/x.md"}) == (True, "")
+    assert policy.authorize_tool("write_file", {"path": "pkg/sub/mod.py"}) == (True, "")
+    assert policy.authorize_tool("read_file", {"path": "anything/outside.txt"}) == (True, "")
+
+    allowed, reason = policy.authorize_tool("write_file", {"path": "src/other.py"})
+    assert allowed is False
+    assert "outside authorized write_scope" in reason
+
+    allowed, reason = policy.authorize_tool("write_file", {"path": "/etc/passwd"})
+    assert allowed is False
+    assert "escapes workspace root" in reason
+
+    allowed, reason = policy.authorize_tool("write_file", {"path": "../escape.py"})
+    assert allowed is False
+    assert ".." in reason
+
+    # Symlink escapes are rejected for both absolute and relative spellings.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    for raw in (str(workspace / "link" / "escape.txt"), "link/escape.txt"):
+        allowed, reason = policy.authorize_tool("write_file", {"path": raw})
+        assert allowed is False
+        assert "escapes workspace root" in reason
+
+
+def test_workspace_policy_forbidden_scope_blocks_shared_contracts(tmp_path: Path) -> None:
+    workspace = tmp_path.resolve()
+    policy = WorkspacePolicy(
+        workspace_root=workspace,
+        allowed_write_scope=["src/"],
+        forbidden_write_scope=["src/contracts/", "src/generated/*.json"],
+    )
+    assert policy.authorize_tool("write_file", {"path": "src/api/app.py"}) == (True, "")
+    for target in ("src/contracts/dto.py", str(workspace / "src/contracts/dto.py")):
+        allowed, reason = policy.authorize_tool("write_file", {"path": target})
+        assert allowed is False
+        assert "read-only shared contract path" in reason
+    allowed, reason = policy.authorize_tool("write_file", {"path": "src/generated/schema.json"})
+    assert allowed is False
+    assert "read-only shared contract path" in reason
+
+
+def test_workspace_policy_gates_run_bash_on_writable_scope(tmp_path: Path) -> None:
+    assert frozenset({"read_file", "glob_files", "grep_files"}) == WorkspacePolicy.READ_ONLY_TOOLS
+    assert "run_bash" not in WorkspacePolicy.READ_ONLY_TOOLS
+    assert frozenset({"write_file", "edit_file"}) == WorkspacePolicy.WRITE_TOOLS
+
+    denied = WorkspacePolicy(workspace_root=tmp_path, allowed_write_scope=[])
+    assert denied.authorize_tool("run_bash", {"command": "ls"}) == (
+        False,
+        "No write_scope authorized for this worker.",
+    )
+    assert denied.authorize_tool("write_file", {"path": "x.py"}) == (
+        False,
+        "No write_scope authorized for this worker.",
+    )
+    assert denied.authorize_tool("grep_files", {"pattern": "x"}) == (True, "")
+
+    read_only = WorkspacePolicy(
+        workspace_root=tmp_path, read_only=True, allowed_write_scope=["src/"]
+    )
+    allowed, reason = read_only.authorize_tool("run_bash", {"command": "ls"})
+    assert allowed is False
+    assert "read-only" in reason
+    assert read_only.authorize_tool("read_file", {"path": "src/x.py"}) == (True, "")
+
+    assert WorkspacePolicy(
+        workspace_root=tmp_path, allowed_write_scope=["src/"]
+    ).authorize_tool("run_bash", {"command": "ls"}) == (True, "")
+    assert WorkspacePolicy(workspace_root=tmp_path).authorize_tool(
+        "run_bash", {"command": "ls"}
+    ) == (True, "")
+
+    unknown = WorkspacePolicy(workspace_root=tmp_path, allowed_write_scope=["src/"])
+    assert unknown.authorize_tool("submit_plan", {}) == (
+        False,
+        "Tool 'submit_plan' is not authorized for this worker.",
+    )
+
+
+def test_workspace_toolkit_shares_one_policy_with_its_hook(tmp_path: Path) -> None:
+    workspace = tmp_path.resolve()
+    toolkit = WorkspaceToolkit(
+        workspace,
+        allowed_write_scope=["docs/"],
+        forbidden_write_scope=["docs/locked/"],
+    )
+    assert toolkit.policy.workspace_root == workspace
+    assert toolkit.policy.allowed_write_scope == ("docs/",)
+    assert toolkit.policy.forbidden_write_scope == ("docs/locked/",)
+
+    hook = toolkit.as_pre_tool_hook()
+    assert hook("write_file", {"path": "docs/guide.md"}) == (True, "")
+    allowed, reason = hook("write_file", {"path": "docs/locked/secret.md"})
+    assert allowed is False
+    assert "read-only shared contract path" in reason
+
+    # The handler enforces the exact same policy, not only the loop hook.
+    err = toolkit.execute(
+        "write_file", {"path": str(workspace / "docs/locked/secret.md"), "content": "x"}
+    )
+    assert "read-only shared contract path" in err
+    assert not (workspace / "docs/locked/secret.md").exists()
+
+    ok = toolkit.execute(
+        "write_file", {"path": str(workspace / "docs/guide.md"), "content": "hello"}
+    )
+    assert "Wrote 5 chars" in ok
+    assert (workspace / "docs/guide.md").read_text(encoding="utf-8") == "hello"
+
+
+def test_workspace_toolkit_uses_injected_env_builder(tmp_path: Path) -> None:
+    calls: list[tuple[Path, Path]] = []
+
+    def fake_env(workspace: Path, env_root: Path) -> dict[str, str]:
+        calls.append((workspace, env_root))
+        return dict(os.environ)
+
+    workspace = tmp_path.resolve()
+    toolkit = WorkspaceToolkit(workspace, env_builder=fake_env)
+    out = toolkit.execute("run_bash", {"command": "printf ok"})
+    assert "ok" in out
+    assert calls == [(workspace, workspace)]
+
+
+def test_tools_aci_has_no_harness_imports_and_worktree_reexports_env_builder() -> None:
+    aci_path = Path(aci_module.__file__).resolve()
+    tree = ast.parse(aci_path.read_text(encoding="utf-8"))
+    harness_imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("olympus.harness"):
+            harness_imports.append(node.module or "")
+        elif isinstance(node, ast.Import):
+            harness_imports.extend(
+                alias.name for alias in node.names if alias.name.startswith("olympus.harness")
+            )
+    assert harness_imports == []
+
+    from olympus.harness.worktree import build_sandbox_env as worktree_env
+
+    assert worktree_env is build_sandbox_env
+    assert ".olympus" in IGNORED_DIR_NAMES

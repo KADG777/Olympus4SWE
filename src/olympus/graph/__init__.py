@@ -18,10 +18,20 @@ from olympus.graph.loader import (
     list_builtin_workflows,
     load_workflow,
 )
+from olympus.graph.progress import (
+    GATE_SPECS,
+    GateSpec,
+    build_workflow_view,
+    is_artifact_approved,
+    is_blueprint_completed,
+    resolve_resume_node,
+)
 
 __all__ = [
     "END",
+    "GATE_SPECS",
     "START",
+    "GateSpec",
     "Graph",
     "GraphPaused",
     "GraphStateCollision",
@@ -30,8 +40,12 @@ __all__ = [
     "WorkflowDefinition",
     "WorkflowRuntime",
     "build_graph",
+    "build_workflow_view",
     "describe_workflow",
+    "is_artifact_approved",
+    "is_blueprint_completed",
     "list_builtin_workflows",
     "load_workflow",
+    "resolve_resume_node",
     "run_graph",
 ]

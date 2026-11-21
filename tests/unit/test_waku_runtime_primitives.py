@@ -17,10 +17,15 @@ from olympus.core.contracts import (
 )
 from olympus.core.store import RunStore
 from olympus.harness.hooks import default_write_scope_hook
-from olympus.harness.loop import AgentLoop
-from olympus.harness.observer import compose_observers
-from olympus.harness.receipt import RECEIPT_KEYS, _format_k, build_turn_receipt
-from olympus.harness.trim import KEEP_CHARS, LONG_CHARS, TRIM_NOTE, chain, shrink_seen
+from olympus.harness.loop import (
+    KEEP_CHARS,
+    LONG_CHARS,
+    TRIM_NOTE,
+    AgentLoop,
+    compose_observers,
+    shrink_seen,
+)
+from olympus.harness.receipt import RECEIPT_KEYS, build_turn_receipt
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -72,18 +77,6 @@ def test_shrink_seen_without_assistant_returns_copy() -> None:
     shrunk = shrink_seen(messages)
     assert shrunk == messages
     assert shrunk is not messages
-
-
-def test_chain_composes_transforms_left_to_right() -> None:
-    def append_note(items: list[ChatMessage]) -> list[ChatMessage]:
-        return [*items, ChatMessage(role="user", content="note")]
-
-    def uppercase_last(items: list[ChatMessage]) -> list[ChatMessage]:
-        return [*items[:-1], ChatMessage(role="user", content=items[-1].content.upper())]
-
-    pipeline = chain(append_note, uppercase_last)
-    out = pipeline([ChatMessage(role="user", content="start")])
-    assert [m.content for m in out] == ["start", "NOTE"]
 
 
 def test_agent_loop_trims_seen_tool_output_before_third_step(tmp_path: Path) -> None:
@@ -307,11 +300,37 @@ def test_build_turn_receipt_aggregates_sanitizes_and_collapses() -> None:
     assert "SECRET_TOOL_OUTPUT" not in json.dumps(receipt)
 
 
-def test_format_k_thresholds() -> None:
-    assert _format_k(0) == "0"
-    assert _format_k(999) == "999"
-    assert _format_k(2000) == "2.0k"
-    assert _format_k(5700) == "5.7k"
+def test_build_turn_receipt_formats_token_thresholds_publicly() -> None:
+    def one_line(input_tokens: int, output_tokens: int) -> str:
+        return build_turn_receipt(
+            turn_id="turn-k",
+            actor="align:proposer",
+            events=[
+                {"kind": "llm", "input_tokens": input_tokens, "output_tokens": output_tokens}
+            ],
+        )["one_line"]
+
+    assert one_line(0, 999) == "align:proposer · 1 calls · 0 in / 999 out"
+    assert one_line(2000, 5700) == "align:proposer · 1 calls · 2.0k in / 5.7k out"
+
+
+def test_agent_loop_receipt_matches_public_builder_seam() -> None:
+    provider = MockLLMProvider(
+        responses=[
+            LLMResponse(content="done", usage=UsageStats(input_tokens=2000, output_tokens=5700))
+        ]
+    )
+    loop = AgentLoop(provider=provider, max_steps=2)
+    res = loop.run(system_prompt="SYS", user_prompt="GO")
+
+    assert res.completed is True
+    # The loop must expose exactly what the public builder derives from the same events.
+    assert res.receipt == build_turn_receipt(
+        turn_id=res.receipt["turn_id"],
+        actor="agent",
+        events=[{"kind": "llm", "input_tokens": 2000, "output_tokens": 5700}],
+    )
+    assert res.receipt["one_line"] == "agent · 1 calls · 2.0k in / 5.7k out"
 
 
 def test_loop_emits_events_and_persists_sanitized_receipt(tmp_path: Path) -> None:

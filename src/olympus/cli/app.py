@@ -9,6 +9,7 @@ from typing import Annotated
 import typer
 
 from olympus.core.contracts import RunMode, new_id
+from olympus.core.control import RunControl
 from olympus.core.store import NotFoundError, RunStore
 from olympus.providers.factory import build_provider
 from olympus.stages.align import AlignStage
@@ -126,11 +127,7 @@ def cmd_clarify(
     """Stage 1: Apply human answers to open ambiguities / blocking critiques."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    # Clarifications are pure deterministic updates; provider is unused here.
-    from olympus.providers.base import MockLLMProvider
-
-    stage = AlignStage(store=store, provider=MockLLMProvider(), workspace_root=ws)
-    spec = stage.apply_clarifications(
+    spec = RunControl(store).clarify_spec(
         run_id=run_id,
         answers=_parse_kv_pairs(list(answer or [])),
         resolutions=_parse_kv_pairs(list(resolve or [])),
@@ -162,10 +159,7 @@ def cmd_approve_spec(
     """Gate 1: Freeze and approve GoalSpec."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    from olympus.providers.base import MockLLMProvider
-
-    stage = AlignStage(store=store, provider=MockLLMProvider(), workspace_root=ws)
-    spec = stage.confirm_spec(
+    spec = RunControl(store).confirm_spec(
         run_id=run_id,
         approver=approver,
         accept_risk=accept_risk,
@@ -221,10 +215,7 @@ def cmd_approve_design(
     """Gate 1.5: Freeze and approve the current DesignSpec."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    from olympus.providers.base import MockLLMProvider
-
-    stage = DesignStage(store, MockLLMProvider(), ws)
-    record = stage.approve_design(run_id, approver=approver, reason=reason)
+    record = RunControl(store).approve_design(run_id, approver=approver, reason=reason)
     typer.echo(record.model_dump_json(indent=2))
 
 
@@ -272,10 +263,9 @@ def cmd_approve_plan(
     """Gate 2: Approve TaskPlan before execution."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    from olympus.providers.base import MockLLMProvider
-
-    stage = OrchestrateStage(store=store, provider=MockLLMProvider(), workspace_root=ws)
-    record = stage.approve_plan(run_id=run_id, approver=approver, reason=reason)
+    record = RunControl(store).approve_plan(
+        run_id=run_id, approver=approver, reason=reason
+    )
     typer.echo(record.model_dump_json(indent=2))
 
 
@@ -333,13 +323,10 @@ def cmd_retry(
     """Reset a blocked/failed task back to READY."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    from olympus.providers.base import MockLLMProvider
-
-    stage = OrchestrateStage(store=store, provider=MockLLMProvider(), workspace_root=ws)
-    res = stage.retry_blocked_task(
+    res = RunControl(store).retry_task(
+        run_id,
+        task_id,
         operation_id=operation_id or new_id("op"),
-        run_id=run_id,
-        task_id=task_id,
         expected_state_revision=expected_revision,
         hint=hint,
     )
@@ -359,13 +346,10 @@ def cmd_accept_risk(
     """Accept risk to close a blocked task with an explicit audit reason."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
-    from olympus.providers.base import MockLLMProvider
-
-    stage = OrchestrateStage(store=store, provider=MockLLMProvider(), workspace_root=ws)
-    res = stage.accept_task_risk(
+    res = RunControl(store).accept_task_risk(
+        run_id,
+        task_id,
         operation_id=operation_id or new_id("op"),
-        run_id=run_id,
-        task_id=task_id,
         expected_state_revision=expected_revision,
         reason=reason,
     )

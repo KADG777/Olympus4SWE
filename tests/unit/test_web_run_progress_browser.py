@@ -22,7 +22,7 @@ from olympus.core.contracts import (
     TaskPlan,
 )
 from olympus.core.store import RunStore
-from olympus.web.projection import seed_demo_runs
+from olympus.web.demos import seed_demo_runs
 from olympus.web.server import AriadneApp, create_http_server
 
 playwright = pytest.importorskip("playwright.sync_api")

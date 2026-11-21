@@ -9,9 +9,6 @@ from pathlib import Path
 from pydantic import Field
 
 from olympus.core.contracts import (
-    ApprovalDecision,
-    ApprovalRecord,
-    ApprovalTarget,
     CritiqueNote,
     CritiquePerspective,
     GoalSpec,
@@ -19,11 +16,12 @@ from olympus.core.contracts import (
     SpecStatus,
     StrictModel,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import validate_goal_spec
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory, run_structured_loop
+from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -153,37 +151,42 @@ class AlignStage:
             f"{strict_block}\n"
             f"Return GoalSpec JSON matching schema:\n{schema_json}"
         )
-        draft = run_structured_loop(
-            loop=loop,
+
+        gate_calls = {"count": 0}
+
+        def validation_gate(candidate: GoalSpec) -> list[str]:
+            # Blocking ambiguities are a human decision, not something the model repairs:
+            # only the initial draft may skip the single repair pass. A repaired draft is
+            # always re-validated so a repair that introduces a blocker is still surfaced.
+            gate_calls["count"] += 1
+            if gate_calls["count"] == 1 and candidate.unresolved_blockers():
+                return []
+            if not strict_canonical:
+                return []
+            return validate_goal_spec(candidate)
+
+        def record_validation_failure(candidate: GoalSpec, violations: list[str]) -> GoalSpec:
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="spec.validation_failed",
+                actor="align",
+                payload={"violations": violations},
+            )
+            return candidate
+
+        draft = loop.run_structured(
             system_prompt=_ALIGN_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model_cls=GoalSpec,
+            max_validation_retries=1,
+            validation_header="[GOALSPEC VALIDATION FAILED]",
+            validation_instruction=(
+                "Apply the canonical contract and return a corrected GoalSpec JSON object."
+            ),
+            validator=validation_gate,
+            on_validation_exhausted=record_validation_failure,
         )
-
-        if strict_canonical and not draft.unresolved_blockers():
-            violations = validate_goal_spec(draft)
-            if violations:
-                repair_prompt = (
-                    f"{user_prompt}\n\n"
-                    "[GOALSPEC VALIDATION FAILED]\n"
-                    f"Violations: {'; '.join(violations)}\n"
-                    "Apply the canonical contract and return a corrected GoalSpec JSON object."
-                )
-                draft = run_structured_loop(
-                    loop=loop,
-                    system_prompt=_ALIGN_SYSTEM_PROMPT,
-                    user_prompt=repair_prompt,
-                    model_cls=GoalSpec,
-                )
-                remaining = validate_goal_spec(draft)
-                if remaining:
-                    self.store.append_event(
-                        run_id=run_id,
-                        stage="align",
-                        event_type="spec.validation_failed",
-                        actor="align",
-                        payload={"violations": remaining},
-                    )
 
         notes: list[CritiqueNote] = list(draft.minority_notes)
         if enable_critique:
@@ -252,8 +255,7 @@ class AlignStage:
                 f"Set perspective='{perspective.value}' on every note.\n"
                 f"Return JSON matching schema:\n{critique_schema}"
             )
-            out = run_structured_loop(
-                loop=loop,
+            out = loop.run_structured(
                 system_prompt=sys_prompt,
                 user_prompt=user_prompt,
                 model_cls=CritiqueOutput,
@@ -276,47 +278,13 @@ class AlignStage:
         actor: str = "zeus",
     ) -> GoalSpec:
         """Apply human answers/resolutions, producing a new spec version (invalidates old hash)."""
-        snap = self.store.get_run(run_id)
-        spec: GoalSpec | None = snap["spec"]
-        if spec is None:
-            raise ValueError(f"Run {run_id} has no GoalSpec to clarify")
-
-        updated_ambiguities = [
-            amb.model_copy(update={"answer": answers[amb.id]}) if amb.id in answers else amb
-            for amb in spec.open_ambiguities
-        ]
-        res_map = resolutions or {}
-        updated_notes = [
-            note.model_copy(
-                update={"resolved": True, "resolution_note": res_map[note.id]}
-            )
-            if note.id in res_map
-            else note
-            for note in spec.minority_notes
-        ]
-        merged_oos = list(dict.fromkeys([*spec.out_of_scope, *(extra_out_of_scope or [])]))
-        next_spec = spec.model_copy(
-            update={
-                "version": spec.version + 1,
-                "open_ambiguities": updated_ambiguities,
-                "minority_notes": updated_notes,
-                "out_of_scope": merged_oos,
-                "status": SpecStatus.AWAITING_HUMAN,
-            }
-        )
-        self.store.save_spec(run_id, next_spec, actor=actor)
-        self.store.append_event(
+        return RunControl(self.store).clarify_spec(
             run_id=run_id,
-            stage="align",
-            event_type="spec.clarified",
+            answers=answers,
+            resolutions=resolutions,
+            extra_out_of_scope=extra_out_of_scope,
             actor=actor,
-            payload={
-                "version": next_spec.version,
-                "spec_hash": next_spec.content_hash,
-                "remaining_blockers": next_spec.unresolved_blockers(),
-            },
         )
-        return next_spec
 
     def confirm_spec(
         self,
@@ -329,34 +297,11 @@ class AlignStage:
         expected_revision: int | None = None,
     ) -> GoalSpec:
         """Freeze and approve the current GoalSpec once all blocking ambiguities are resolved."""
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        spec: GoalSpec | None = snap["spec"]
-        if spec is None:
-            raise ValueError(f"Run {run_id} has no GoalSpec to confirm")
-
-        blockers = spec.unresolved_blockers()
-        if blockers and not accept_risk:
-            raise ValueError(
-                f"Cannot confirm spec with unresolved blockers: {', '.join(blockers)}. "
-                "Resolve them via clarify or explicitly pass accept_risk=True with a reason."
-            )
-
-        decision = ApprovalDecision.ACCEPT_RISK if accept_risk else ApprovalDecision.APPROVED
-        confirmed = spec.model_copy(update={"status": SpecStatus.CONFIRMED})
-        self.store.save_spec(
-            run_id,
-            confirmed,
-            actor=approver,
+        return RunControl(self.store).confirm_spec(
+            run_id=run_id,
+            approver=approver,
+            accept_risk=accept_risk,
+            reason=reason,
+            commit_sha=commit_sha,
             expected_revision=expected_revision,
-            approval=ApprovalRecord(
-                run_id=run_id,
-                target=ApprovalTarget.GOAL_SPEC,
-                target_id=confirmed.spec_id,
-                target_hash=confirmed.content_hash,
-                commit_sha=commit_sha,
-                approver=approver,
-                decision=decision,
-                reason=reason,
-            ),
         )
-        return confirmed

@@ -11,7 +11,6 @@ import yaml
 from pydantic import Field
 
 from olympus.core.contracts import (
-    ApprovalTarget,
     DesignSpec,
     GoalSpec,
     InputMaturity,
@@ -19,9 +18,11 @@ from olympus.core.contracts import (
     SpecStatus,
     StrictModel,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import validate_design_spec, validate_plan
 from olympus.core.store import RunStore
 from olympus.graph.engine import END, Graph, GraphPaused, Node
+from olympus.graph.progress import GATE_SPECS, is_artifact_approved
 from olympus.providers.base import LLMProvider
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage, triage_input
@@ -272,6 +273,40 @@ def _gate_auto(runtime: WorkflowRuntime) -> bool:
     return runtime.auto_approve
 
 
+def _auto_approve_gate(
+    runtime: WorkflowRuntime,
+    gate: str,
+    run_id: str,
+    artifact: Any,
+    *,
+    expected_revision: int,
+) -> None:
+    control = RunControl(runtime.store)
+    if gate == "spec":
+        blockers = artifact.unresolved_blockers()
+        control.confirm_spec(
+            run_id=run_id,
+            approver=runtime.approver,
+            accept_risk=bool(blockers),
+            reason="workflow auto-approve" if blockers else "",
+            expected_revision=expected_revision,
+        )
+    elif gate == "design":
+        control.approve_design(
+            run_id=run_id,
+            approver=runtime.approver,
+            reason="workflow auto-approve",
+            expected_revision=expected_revision,
+        )
+    else:
+        control.approve_plan(
+            run_id=run_id,
+            approver=runtime.approver,
+            reason="workflow auto-approve",
+            expected_revision=expected_revision,
+        )
+
+
 def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
     runtime = _runtime(state)
     run_id = _run_id(state)
@@ -280,84 +315,32 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
     auto = _gate_auto(runtime) or not enabled
     snap = runtime.store.get_run(run_id)
 
-    if gate == "spec":
-        spec: GoalSpec | None = snap["spec"]
-        if spec is None:
-            raise GraphPaused("gate_spec", "Run has no GoalSpec to approve")
-        approved = runtime.store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.GOAL_SPEC,
-            target_id=spec.spec_id,
-            target_hash=spec.content_hash,
-        )
-        if not approved and auto:
-            blockers = spec.unresolved_blockers()
-            _align_stage(runtime).confirm_spec(
-                run_id=run_id,
-                approver=runtime.approver,
-                accept_risk=bool(blockers),
-                reason="workflow auto-approve" if blockers else "",
-            )
-            approved = True
-        if not approved:
-            raise GraphPaused(
-                "gate_spec",
-                f"GoalSpec {spec.spec_id} is awaiting human approval",
-                {"route": "awaiting"},
-            )
-        return {"route": "approved"}
+    gate_spec = GATE_SPECS.get(gate)
+    if gate_spec is None:
+        raise GraphPaused(f"gate_{gate}", f"Unknown human gate '{gate}'")
 
-    if gate == "design":
-        design: DesignSpec | None = snap["design"]
-        if design is None:
-            raise GraphPaused("gate_design", "Run has no DesignSpec to approve")
-        approved = runtime.store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=design.design_id,
-            target_hash=design.content_hash,
-        )
-        if not approved and auto:
-            _design_stage(runtime).approve_design(
-                run_id=run_id,
-                approver=runtime.approver,
-                reason="workflow auto-approve",
-            )
-            approved = True
-        if not approved:
-            raise GraphPaused(
-                "gate_design",
-                f"DesignSpec {design.design_id} is awaiting human approval",
-                {"route": "awaiting"},
-            )
-        return {"route": "approved"}
+    artifact = snap[gate_spec["snapshot_key"]]
+    if artifact is None:
+        raise GraphPaused(gate_spec["node"], f"Run has no {gate_spec['label']} to approve")
 
-    if gate == "plan":
-        plan = snap["plan"]
-        if plan is None:
-            raise GraphPaused("gate_plan", "Run has no TaskPlan to approve")
-        approved = runtime.store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
+    approved = is_artifact_approved(runtime.store, run_id, gate, snap)
+    if not approved and auto:
+        _auto_approve_gate(
+            runtime,
+            gate,
+            run_id,
+            artifact,
+            expected_revision=int(snap["state_revision"]),
         )
-        if not approved and auto:
-            _orchestrate_stage(runtime).approve_plan(
-                run_id=run_id,
-                approver=runtime.approver,
-                reason="workflow auto-approve",
-            )
-            approved = True
-        if not approved:
-            raise GraphPaused(
-                "gate_plan",
-                f"TaskPlan {plan.plan_id} is awaiting human approval",
-                {"route": "awaiting"},
-            )
-        return {"route": "approved"}
-
-    raise GraphPaused(f"gate_{gate}", f"Unknown human gate '{gate}'")
+        approved = True
+    if not approved:
+        target_id = getattr(artifact, gate_spec["id_attr"])
+        raise GraphPaused(
+            gate_spec["node"],
+            f"{gate_spec['label']} {target_id} is awaiting human approval",
+            {"route": "awaiting"},
+        )
+    return {"route": "approved"}
 
 
 def _node_execute(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:

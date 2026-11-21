@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,23 +13,12 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 import olympus.web.acceptance as delivery_review
-from olympus.core.contracts import (
-    ApprovalTarget,
-    BudgetLedger,
-    BudgetPolicy,
-    RunStatus,
-    TaskNode,
-    TaskStatus,
-    new_id,
-)
+from olympus.core.contracts import new_id
+from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
-from olympus.stages.align import AlignStage
-from olympus.stages.design import DesignStage
-from olympus.stages.orchestrate import OrchestrateStage
-from olympus.web.approval_review import APPROVAL_ARTIFACTS
-from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
-from olympus.web.projection import build_run_projection, read_recorded_attempt, seed_demo_runs
+from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
+from olympus.web.projection import build_run_projection, read_recorded_attempt
 from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -54,6 +44,7 @@ class AriadneApp:
         supervisor: RunSupervisor | None = None,
     ) -> None:
         self.store = store
+        self.control = RunControl(self.store)
         self.workspace_root = Path(workspace_root).resolve()
         self.artifacts_root = (
             artifacts_root
@@ -69,6 +60,12 @@ class AriadneApp:
                 artifacts_root=self.artifacts_root,
             )
         )
+        self._retry_guard = threading.Lock()
+        self._retry_locks: dict[str, threading.Lock] = {}
+
+    def _retry_lock_for(self, operation_id: str) -> threading.Lock:
+        with self._retry_guard:
+            return self._retry_locks.setdefault(operation_id, threading.Lock())
 
     def list_runs_payload(self, *, limit: int = 50) -> dict[str, Any]:
         runs = self.store.list_runs(limit=limit)
@@ -124,141 +121,109 @@ class AriadneApp:
         expected_rev = (
             int(expected_rev_raw) if expected_rev_raw is not None else int(snap["state_revision"])
         )
-        if action in APPROVAL_ARTIFACTS:
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
-            artifact = snap[APPROVAL_ARTIFACTS[action]]
-            if "target_hash" in body and (
-                artifact is None or body["target_hash"] != artifact.content_hash
-            ):
-                raise ConcurrencyConflictError("Approval target hash no longer matches")
+        target_hash: str | None = None
+        if "target_hash" in body:
+            raw_hash = body["target_hash"]
+            target_hash = str(raw_hash) if raw_hash is not None else ""
+        auto_advance = bool(body.get("auto_advance", True))
+        sync_flag = bool(body.get("sync", False))
+        # Omit default flags so legacy command rows replay cleanly while non-default
+        # flag changes under the same operation_id still raise a payload conflict.
+        dispatch_meta: dict[str, Any] = {}
+        if not auto_advance:
+            dispatch_meta["auto_advance"] = False
+        if sync_flag:
+            dispatch_meta["sync"] = True
 
         if action in ("pause", "resume"):
-            target_status = RunStatus.PAUSED if action == "pause" else RunStatus.RUNNING
-            evt_type = "run.paused" if action == "pause" else "run.resumed"
-
-            def _toggle_status(conn: Any, cur_rev: int) -> dict[str, Any]:
-                new_rev = cur_rev + 1
-                conn.execute(
-                    "UPDATE runs SET status = ?, state_revision = ?, updated_at = datetime('now') "
-                    "WHERE run_id = ?",
-                    (target_status.value, new_rev, run_id),
-                )
-                self.store.append_event_in_tx(
-                    conn,
-                    run_id=run_id,
-                    stage="orchestrate",
-                    event_type=evt_type,
-                    actor=actor,
-                    payload={"status": target_status.value},
-                    state_revision=new_rev,
-                )
-                return {
-                    "run_id": run_id,
-                    "status": target_status.value,
-                    "state_revision": new_rev,
-                }
-
-            cmd_result = self.store.apply_idempotent_command(
+            cmd_result = self.control.set_paused(
+                run_id,
+                paused=action == "pause",
                 operation_id=operation_id,
-                run_id=run_id,
-                actor=actor,
-                action=action,
                 expected_state_revision=expected_rev,
-                payload={"action": action},
-                handler=_toggle_status,
+                actor=actor,
             )
         elif action == "approve_spec":
-            align = AlignStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                trace_dir=self.artifacts_root,
-            )
-            spec = align.confirm_spec(
+            spec_result = self.control.confirm_spec(
                 run_id=run_id,
                 approver=actor,
                 accept_risk=bool(body.get("accept_risk", False)),
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
+                expected_target_hash=target_hash,
+                operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
-            cmd_result = {
-                "run_id": run_id,
-                "spec_id": spec.spec_id,
-                "spec_hash": spec.content_hash,
-                "status": spec.status.value,
-            }
+            cmd_result = (
+                spec_result
+                if isinstance(spec_result, dict)
+                else {
+                    "run_id": run_id,
+                    "spec_id": spec_result.spec_id,
+                    "spec_hash": spec_result.content_hash,
+                    "status": spec_result.status.value,
+                }
+            )
         elif action == "approve_design":
-            design_stage = DesignStage(
-                self.store,
-                self.supervisor.resolve_provider(run_id),
-                ws,
-                artifacts_root=self.artifacts_root,
-            )
-            record = design_stage.approve_design(
+            design_result = self.control.approve_design(
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
+                expected_target_hash=target_hash,
+                operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
-            cmd_result = record.model_dump(mode="json")
+            cmd_result = (
+                design_result
+                if isinstance(design_result, dict)
+                else design_result.model_dump(mode="json")
+            )
         elif action == "approve_plan":
-            orch = OrchestrateStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                artifacts_root=self.artifacts_root,
-            )
-            rec = orch.approve_plan(
+            plan_result = self.control.approve_plan(
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
+                expected_target_hash=target_hash,
+                operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
-            cmd_result = rec.model_dump(mode="json")
+            cmd_result = (
+                plan_result
+                if isinstance(plan_result, dict)
+                else plan_result.model_dump(mode="json")
+            )
         elif action == "clarify":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
-            align = AlignStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                trace_dir=self.artifacts_root,
-            )
-            spec = align.apply_clarifications(
+            clarify_result = self.control.clarify_spec(
                 run_id=run_id,
                 answers=dict(body.get("answers") or {}),
                 resolutions=dict(body.get("resolutions") or {}),
                 extra_out_of_scope=list(body.get("out_of_scope") or []),
+                actor=actor,
+                expected_revision=expected_rev,
+                operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
-            cmd_result = {
-                "run_id": run_id,
-                "version": spec.version,
-                "spec_hash": spec.content_hash,
-            }
+            cmd_result = (
+                clarify_result
+                if isinstance(clarify_result, dict)
+                else {
+                    "run_id": run_id,
+                    "version": clarify_result.version,
+                    "spec_hash": clarify_result.content_hash,
+                }
+            )
         elif action == "retry_task":
             task_id = str(body.get("task_id", "")).strip()
             if not task_id:
                 raise ValueError("retry_task requires non-empty 'task_id'")
-            hint = str(body.get("hint", "")).strip()
-            orch = OrchestrateStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                artifacts_root=self.artifacts_root,
-            )
-            cmd_result = orch.retry_blocked_task(
+            cmd_result = self.control.retry_task(
+                run_id,
+                task_id,
                 operation_id=operation_id,
-                run_id=run_id,
-                task_id=task_id,
                 expected_state_revision=expected_rev,
-                hint=hint,
+                hint=str(body.get("hint", "")).strip(),
                 actor=actor,
             )
         elif action == "accept_risk":
@@ -268,76 +233,51 @@ class AriadneApp:
                 raise ValueError("accept_risk requires non-empty 'task_id'")
             if not reason:
                 raise ValueError("accept_risk requires a non-empty 'reason'")
-            orch = OrchestrateStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                artifacts_root=self.artifacts_root,
-            )
-            cmd_result = orch.accept_task_risk(
+            cmd_result = self.control.accept_task_risk(
+                run_id,
+                task_id,
                 operation_id=operation_id,
-                run_id=run_id,
-                task_id=task_id,
                 expected_state_revision=expected_rev,
                 reason=reason,
                 actor=actor,
             )
         elif action == "reassign_human":
             task_id = str(body.get("task_id", "")).strip()
-            note = (
-                str(body.get("note", "")).strip()
-                or "已改派给人工工程师处理（提交后仍须经独立验收）"
-            )
             if not task_id:
                 raise ValueError("reassign_human requires non-empty 'task_id'")
-            orch = OrchestrateStage(
-                store=self.store,
-                provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=ws,
-                artifacts_root=self.artifacts_root,
-            )
-
-            def _mutate_reassign(t: TaskNode) -> TaskNode:
-                if t.status not in (TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.FAILED):
-                    raise ValueError(
-                        f"Task {t.task_id} in state {t.status.value} cannot be reassigned"
-                    )
-                return t.model_copy(
-                    update={
-                        "status": TaskStatus.READY,
-                        "last_error": f"[HUMAN_ASSIGNED] {note}",
-                    }
-                )
-
-            cmd_result = orch._apply_task_command(
+            cmd_result = self.control.reassign_task_human(
+                run_id,
+                task_id,
                 operation_id=operation_id,
-                run_id=run_id,
-                task_id=task_id,
                 expected_state_revision=expected_rev,
-                action="reassign_human",
-                event_type="task.reassigned_human",
+                note=str(body.get("note", "")).strip(),
                 actor=actor,
-                payload={"task_id": task_id, "note": note},
-                task_mutator=_mutate_reassign,
-                result_status=TaskStatus.READY.value,
             )
         elif action == "retry_workflow":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
+            retry_payload: dict[str, Any] = {"action": "retry_workflow"}
+            if sync_flag:
+                retry_payload["sync"] = True
+            with self._retry_lock_for(operation_id):
+                replay = self.store.lookup_command(
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    action="retry_workflow",
+                    payload=retry_payload,
                 )
-            if snap["status"] == RunStatus.FAILED:
-                self.store.set_run_status(
-                    run_id,
-                    RunStatus.RUNNING,
-                    actor=actor,
-                    stage="graph",
-                    detail={"action": "retry_workflow"},
-                )
-            cmd_result = self.supervisor.resume_run(
-                run_id, sync=bool(body.get("sync", False))
-            )
+                if replay is not None:
+                    cmd_result = replay
+                else:
+                    pre_snap = self.store.get_run(run_id, expected_revision=expected_rev)
+                    pre_rev = int(pre_snap["state_revision"])
+                    workflow = self.supervisor.resume_run(run_id, sync=sync_flag)
+                    cmd_result = self.control.complete_workflow_retry(
+                        run_id,
+                        operation_id=operation_id,
+                        workflow=workflow,
+                        pre_dispatch_revision=pre_rev,
+                        actor=actor,
+                        sync=sync_flag,
+                    )
         elif action == "promote_to_execute":
             target_workflow = str(body.get("workflow_name") or "full_sdlc_tdd").strip()
             target_def = load_workflow(target_workflow)
@@ -346,85 +286,19 @@ class AriadneApp:
                     f"Target workflow '{target_workflow}' must support stop_after='execute'"
                 )
             cur_def = load_workflow(snap["workflow_name"])
-            if cur_def.stop_after == "execute" and snap["status"] == RunStatus.COMPLETED:
-                raise ValueError(f"Run {run_id} already completed execution")
-            if snap["status"] in (
-                RunStatus.RUNNING,
-                RunStatus.ALIGNING,
-                RunStatus.DESIGNING,
-                RunStatus.PLANNING,
-            ):
-                raise ValueError(f"Run {run_id} is currently active ({snap['status'].value})")
-            plan = snap["plan"]
-            if plan is None:
-                raise ValueError(f"Run {run_id} has no TaskPlan to execute")
-            if not self.store.is_approved(
-                run_id=run_id,
-                target=ApprovalTarget.TASK_PLAN,
-                target_id=plan.plan_id,
-                target_hash=plan.content_hash,
-            ):
-                raise ValueError(f"TaskPlan {plan.plan_id} must be approved before execution")
-            spec = snap["spec"]
-            if spec is None:
-                raise ValueError(f"Run {run_id} has no GoalSpec required for execution")
-            if not self.store.is_approved(
-                run_id=run_id,
-                target=ApprovalTarget.GOAL_SPEC,
-                target_id=spec.spec_id,
-                target_hash=spec.content_hash,
-            ):
-                raise ValueError(f"GoalSpec {spec.spec_id} must be approved before execution")
-
-            policy: BudgetPolicy = snap["budget_policy"]
-            ledger: BudgetLedger = snap["budget_ledger"]
-            min_calls = ledger.llm_calls_used + max(60, len(plan.tasks) * 25)
-            new_max_calls = max(policy.max_llm_calls, min_calls)
-            if body.get("max_llm_calls") is not None:
-                new_max_calls = max(new_max_calls, int(body["max_llm_calls"]))
-            min_tokens = ledger.total_tokens + max(500_000, len(plan.tasks) * 250_000)
-            updated_policy = policy.model_copy(
-                update={
-                    "max_llm_calls": new_max_calls,
-                    "max_total_tokens": max(policy.max_total_tokens, min_tokens),
-                }
+            max_llm_calls = (
+                int(body["max_llm_calls"]) if body.get("max_llm_calls") is not None else None
             )
-            auto_adv = bool(body.get("auto_advance", True))
-            target_status = RunStatus.RUNNING if auto_adv else RunStatus.AWAITING_HUMAN
-
-            def _promote_tx(conn: Any, cur_rev: int) -> dict[str, Any]:
-                new_rev = self.store.promote_workflow_in_tx(
-                    conn,
-                    run_id=run_id,
-                    cur_rev=cur_rev,
-                    workflow_name=target_workflow,
-                    status=target_status,
-                    budget_policy=updated_policy,
-                    actor=actor,
-                    payload={
-                        "from_workflow": snap["workflow_name"],
-                        "to_workflow": target_workflow,
-                        "budget_max_calls": updated_policy.max_llm_calls,
-                        "budget_max_tokens": updated_policy.max_total_tokens,
-                    },
-                )
-                return {
-                    "run_id": run_id,
-                    "from_workflow": snap["workflow_name"],
-                    "workflow": target_workflow,
-                    "status": target_status.value,
-                    "budget_max_calls": updated_policy.max_llm_calls,
-                    "state_revision": new_rev,
-                }
-
-            cmd_result = self.store.apply_idempotent_command(
+            cmd_result = self.control.promote_to_execute(
+                run_id,
+                target_workflow=target_workflow,
+                current_stop_after=cur_def.stop_after,
                 operation_id=operation_id,
-                run_id=run_id,
-                actor=actor,
-                action="promote_to_execute",
                 expected_state_revision=expected_rev,
-                payload={"workflow_name": target_workflow},
-                handler=_promote_tx,
+                max_llm_calls=max_llm_calls,
+                auto_advance=auto_advance,
+                sync=sync_flag,
+                actor=actor,
             )
         else:
             raise ValueError(f"Unsupported HITL action: {action}")
@@ -432,15 +306,13 @@ class AriadneApp:
         if (
             action
             in ("clarify", "approve_spec", "approve_design", "approve_plan", "promote_to_execute")
-            and bool(body.get("auto_advance", True))
+            and auto_advance
             and not cmd_result.get("deduplicated")
             and (action == "promote_to_execute" or self.supervisor.is_supervised(run_id))
         ):
             cmd_result = {
                 **cmd_result,
-                "workflow": self.supervisor.resume_run(
-                    run_id, sync=bool(body.get("sync", False))
-                ),
+                "workflow": self.supervisor.resume_run(run_id, sync=sync_flag),
             }
 
         projection = build_run_projection(
@@ -787,12 +659,9 @@ def create_http_server(
                 req_parts = [p for p in path.split("/") if p]
                 if len(req_parts) == 4 and req_parts[0] == "api" and req_parts[1] == "runs":
                     with contextlib.suppress(Exception):
-                        conflict_payload["projection"] = build_run_projection(
-                            app.store,
-                            app._workspace_for(req_parts[2]),
-                            req_parts[2],
-                            artifacts_root=app.artifacts_root,
-                        )
+                        conflict_payload["projection"] = app.get_run_payload(
+                            req_parts[2]
+                        )["projection"]
                 self._send_json(HTTPStatus.CONFLICT, conflict_payload)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})

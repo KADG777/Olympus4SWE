@@ -38,7 +38,8 @@ from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph.loader import build_graph, load_workflow
 from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
-from olympus.web.projection import build_run_projection, seed_demo_runs
+from olympus.web.demos import seed_demo_runs
+from olympus.web.projection import build_run_projection
 from olympus.web.server import AriadneApp, create_http_server
 from olympus.web.supervisor import RunSupervisor
 
@@ -571,12 +572,18 @@ def test_approval_write_conflicts_if_candidate_changes_after_validation(
     viewed = app.get_run_payload(run_id)["projection"]
     save_spec = store.save_spec
     candidate = store.get_run(run_id)["spec"].model_copy(update={"version": 2, "goal": "新版"})
+    real_apply = store.apply_idempotent_command
+    injected = False
 
-    def save_after_update(*args, **kwargs):
-        save_spec(run_id, candidate)
-        return save_spec(*args, **kwargs)
+    def apply_after_update(*args, **kwargs):
+        """Model a concurrent write landing right before the approval transaction."""
+        nonlocal injected
+        if not injected:
+            injected = True
+            save_spec(run_id, candidate)
+        return real_apply(*args, **kwargs)
 
-    monkeypatch.setattr(store, "save_spec", save_after_update)
+    monkeypatch.setattr(store, "apply_idempotent_command", apply_after_update)
     with pytest.raises(ConcurrencyConflictError, match="revision"):
         app.execute_command(
             run_id,
