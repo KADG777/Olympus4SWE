@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from olympus.core.contracts import new_id, utc_now
+from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.harness.driver import ActiveTurnHandle, DriverEvent, DriverTurnRequest, TurnOutcome
 from olympus.harness.receipt import build_turn_receipt
@@ -506,6 +507,12 @@ class _PiTurn:
             self._on_tool_start(record)
         elif record_type == "tool_execution_end":
             self._on_tool_end(record)
+        elif record_type == "message_update":
+            delta = record.get("assistantMessageEvent")
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                text = delta.get("delta")
+                if isinstance(text, str) and text:
+                    self._emit("text_delta", {"text": text, "replace": False})
         elif record_type == "message_end":
             message = record.get("message")
             if isinstance(message, dict) and message.get("role") == "assistant":
@@ -558,6 +565,10 @@ class _PiTurn:
             duration_ms = 0
         arguments = record.get("args")
         target = _short_target(arguments if isinstance(arguments, dict) else {})
+        output_preview = _tool_result_preview(record.get("result"))
+        error_signature = (
+            content_hash({"tool": tool, "output": output_preview}) if is_error else ""
+        )
         self._trace.append(
             {
                 "event": "tool_end",
@@ -567,7 +578,7 @@ class _PiTurn:
                 "status": "error" if is_error else "ok",
                 "is_error": is_error,
                 "duration_ms": duration_ms,
-                "output": _tool_result_preview(record.get("result")),
+                "output": output_preview,
             }
         )
         self._receipt_events.append(
@@ -585,8 +596,10 @@ class _PiTurn:
                 "task_id": self._request.task_id,
                 "step": step,
                 "tool": tool,
+                "status": "error" if is_error else "ok",
                 "is_error": is_error,
                 "duration_ms": duration_ms,
+                "error_signature": error_signature,
             },
         )
 

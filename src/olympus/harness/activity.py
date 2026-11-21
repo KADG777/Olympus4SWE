@@ -15,6 +15,13 @@ _TOOL_TARGETS = {
     "glob_files": "workspace search",
     "grep_files": "workspace search",
     "run_bash": "shell command",
+    "read": "workspace file",
+    "write": "workspace file",
+    "edit": "workspace file",
+    "find": "workspace search",
+    "grep": "workspace search",
+    "ls": "workspace search",
+    "bash": "shell command",
 }
 _STEER_REASONS = {"human": "Operator guidance", "watchdog": "Watchdog guidance"}
 _PREVIEW_LIMIT = 240
