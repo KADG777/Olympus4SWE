@@ -36,7 +36,6 @@ from olympus.core.dag import (
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
-from olympus.harness.hooks import default_write_scope_hook
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
     SandboxHandle,
@@ -47,7 +46,7 @@ from olympus.harness.worktree import (
 )
 from olympus.providers.base import LLMProvider
 from olympus.stages.common import format_workspace_inventory, run_structured_loop
-from olympus.tools.aci import _IGNORED_DIR_NAMES, WorkspaceToolkit
+from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspaceToolkit
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
@@ -127,7 +126,7 @@ def _copy_matching_scope(
         if not p.is_file():
             continue
         rel_path = p.relative_to(src_root)
-        ignored = _IGNORED_DIR_NAMES | {".olympus"}
+        ignored = IGNORED_DIR_NAMES | {".olympus"}
         if any(part in ignored for part in rel_path.parts):
             continue
         rel = rel_path.as_posix()
@@ -722,16 +721,17 @@ class OrchestrateStage:
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
         try:
-            toolkit = WorkspaceToolkit(
-                sandbox.workspace_path,
-                allowed_write_scope=leased.write_scope,
-                read_only=False,
-                env_root=self.workspace_root,
-            )
             forbidden_contracts = (
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
                 else ()
+            )
+            toolkit = WorkspaceToolkit(
+                sandbox.workspace_path,
+                allowed_write_scope=leased.write_scope,
+                forbidden_write_scope=forbidden_contracts,
+                read_only=False,
+                env_root=self.workspace_root,
             )
             worker_loop = AgentLoop(
                 provider=self.provider,
@@ -744,11 +744,7 @@ class OrchestrateStage:
                 synthesize_on_max_steps=True,
                 task_id=leased.task_id,
                 lease_generation=leased.lease_generation,
-                pre_tool_hook=default_write_scope_hook(
-                    leased.write_scope,
-                    forbidden_globs=forbidden_contracts,
-                    workspace_root=sandbox.workspace_path,
-                ),
+                pre_tool_hook=toolkit.as_pre_tool_hook(),
             )
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"

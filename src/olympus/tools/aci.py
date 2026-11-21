@@ -2,21 +2,67 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import subprocess
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, ClassVar
 
 from olympus.core.dag import paths_overlap
-from olympus.harness.worktree import build_sandbox_env
 from olympus.providers.base import ToolSpec
 
-_IGNORED_DIR_NAMES = frozenset(
+IGNORED_DIR_NAMES = frozenset(
     {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".olympus"}
 )
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def build_sandbox_env(
+    workspace_root: Path | str,
+    host_root: Path | str | None = None,
+) -> dict[str, str]:
+    """Build an isolated subprocess environment bound to sandbox paths and target .venv."""
+    ws = Path(workspace_root).resolve()
+    host = Path(host_root).resolve() if host_root is not None else None
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("PYTHONHOME", None)
+
+    venv_candidates = [ws / ".venv"]
+    if host is not None and host != ws:
+        venv_candidates.append(host / ".venv")
+    current_prefix = Path(sys.executable).resolve().parent.parent
+    if (
+        (current_prefix / "pyvenv.cfg").exists()
+        and (current_prefix / "bin" / "pytest").exists()
+        and current_prefix not in venv_candidates
+    ):
+        venv_candidates.append(current_prefix)
+    for venv_dir in venv_candidates:
+        bin_dir = venv_dir / "bin"
+        if bin_dir.is_dir():
+            env["VIRTUAL_ENV"] = str(venv_dir)
+            existing_path = env.get("PATH", "")
+            env["PATH"] = f"{bin_dir}{os.pathsep}{existing_path}" if existing_path else str(bin_dir)
+            break
+
+    python_roots: list[str] = []
+    src_dir = ws / "src"
+    if src_dir.is_dir():
+        python_roots.append(str(src_dir))
+    python_roots.append(str(ws))
+    existing_pp = env.get("PYTHONPATH", "")
+    if existing_pp:
+        for entry in existing_pp.split(os.pathsep):
+            if entry and entry not in python_roots:
+                python_roots.append(entry)
+    env["PYTHONPATH"] = os.pathsep.join(python_roots)
+    return env
 
 
 def truncate_output(text: str, *, max_chars: int, hint: str) -> str:
@@ -34,6 +80,158 @@ class RegisteredTool:
     handler: Callable[[dict[str, Any]], str]
 
 
+@dataclass
+class WorkspacePolicy:
+    """Canonical authorization policy shared by tool handlers and pre-tool hooks."""
+
+    workspace_root: Path | None = None
+    allowed_write_scope: Sequence[str] | None = None
+    forbidden_write_scope: Sequence[str] = ()
+    read_only: bool = False
+
+    READ_ONLY_TOOLS: ClassVar[frozenset[str]] = frozenset(
+        {"read_file", "glob_files", "grep_files"}
+    )
+    WRITE_TOOLS: ClassVar[frozenset[str]] = frozenset({"write_file", "edit_file"})
+
+    def __post_init__(self) -> None:
+        if self.workspace_root is not None:
+            self.workspace_root = Path(self.workspace_root).expanduser().resolve()
+        if self.allowed_write_scope is not None:
+            self.allowed_write_scope = tuple(self.allowed_write_scope)
+        self.forbidden_write_scope = tuple(self.forbidden_write_scope)
+
+    @staticmethod
+    def _strip_dot_prefix(text: str) -> str:
+        while text.startswith("./"):
+            text = text[2:]
+        return text
+
+    def _relative_target(self, raw_path: Any) -> str:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("Write tools require a non-empty 'path' argument.")
+        text = self._strip_dot_prefix(raw_path.strip().replace("\\", "/"))
+        candidate = Path(raw_path)
+        if self.workspace_root is None:
+            if candidate.is_absolute():
+                raise ValueError(
+                    f"Absolute path '{raw_path}' cannot be validated without a workspace_root."
+                )
+            pure = PurePosixPath(text or ".")
+            if ".." in pure.parts:
+                raise ValueError(f"Path '{raw_path}' must not contain '..' traversal.")
+            return pure.as_posix()
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        else:
+            pure = PurePosixPath(text or ".")
+            if ".." in pure.parts:
+                raise ValueError(f"Path '{raw_path}' must not contain '..' traversal.")
+            resolved = (self.workspace_root / pure).resolve()
+        try:
+            return resolved.relative_to(self.workspace_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"Path '{resolved}' escapes workspace root '{self.workspace_root}'."
+            ) from exc
+
+    def _scope_pattern(self, raw: str) -> str | None:
+        pattern = self._strip_dot_prefix(raw.strip().replace("\\", "/"))
+        if not pattern:
+            return None
+        if pattern.startswith("/"):
+            if self.workspace_root is None:
+                return None
+            try:
+                pattern = Path(pattern).resolve().relative_to(self.workspace_root).as_posix()
+            except ValueError:
+                return None
+        if ".." in PurePosixPath(pattern.rstrip("/") or ".").parts:
+            return None
+        return pattern
+
+    def _scope_matches(self, rel: str, raw_pattern: str) -> bool:
+        pattern = self._scope_pattern(raw_pattern)
+        if pattern is None:
+            return False
+        if any(char in pattern for char in _GLOB_CHARS):
+            return fnmatch.fnmatch(rel, pattern)
+        try:
+            return paths_overlap(rel, pattern)
+        except ValueError:
+            return False
+
+    def _forbidden_match(self, rel: str) -> str | None:
+        for pattern in self.forbidden_write_scope:
+            if self._scope_matches(rel, pattern):
+                return pattern
+        return None
+
+    def authorize_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[bool, str]:
+        if tool_name in self.READ_ONLY_TOOLS:
+            return True, ""
+        if self.read_only:
+            return False, f"Toolkit is read-only; {tool_name} is disabled."
+        if self.allowed_write_scope is not None and len(self.allowed_write_scope) == 0:
+            return False, "No write_scope authorized for this worker."
+        if tool_name == "run_bash":
+            return True, ""
+        if tool_name not in self.WRITE_TOOLS:
+            return False, f"Tool '{tool_name}' is not authorized for this worker."
+
+        raw_path = arguments.get("path") or arguments.get("file_path") or ""
+        try:
+            rel = self._relative_target(raw_path)
+        except ValueError as exc:
+            return False, str(exc)
+        if self._forbidden_match(rel) is not None:
+            return (
+                False,
+                f"Target path '{rel}' is a read-only shared contract path "
+                f"({list(self.forbidden_write_scope)}): only contract tasks may modify it.",
+            )
+        if self.allowed_write_scope is None or any(
+            self._scope_matches(rel, pattern) for pattern in self.allowed_write_scope
+        ):
+            return True, ""
+        return (
+            False,
+            f"Target path '{rel}' is outside authorized write_scope: "
+            f"{list(self.allowed_write_scope)}",
+        )
+
+    def assert_write_allowed(self, resolved_path: Path) -> None:
+        if self.read_only:
+            raise PermissionError("Toolkit is read-only; write operations are disabled.")
+        resolved = resolved_path.resolve()
+        if self.workspace_root is None:
+            rel = resolved.as_posix()
+        else:
+            try:
+                rel = resolved.relative_to(self.workspace_root).as_posix()
+            except ValueError as exc:
+                raise PermissionError(
+                    f"Path '{resolved}' escapes workspace root '{self.workspace_root}'."
+                ) from exc
+        if self._forbidden_match(rel) is not None:
+            raise PermissionError(
+                f"Target path '{rel}' is a read-only shared contract path "
+                f"({list(self.forbidden_write_scope)}): only contract tasks may modify it."
+            )
+        if self.allowed_write_scope is None:
+            return
+        if any(self._scope_matches(rel, pattern) for pattern in self.allowed_write_scope):
+            return
+        allowed_str = ", ".join(self.allowed_write_scope)
+        raise PermissionError(f"Write to '{rel}' is outside allowed write_scope [{allowed_str}].")
+
+    def as_pre_tool_hook(self) -> Callable[[str, dict[str, Any]], tuple[bool, str]]:
+        def hook(tool_name: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+            return self.authorize_tool(tool_name, arguments)
+
+        return hook
+
+
 class WorkspaceToolkit:
     """Workspace-scoped Poka-Yoke toolset enforcing absolute paths and write_scope."""
 
@@ -41,17 +239,27 @@ class WorkspaceToolkit:
         self,
         workspace_root: Path | str,
         *,
-        allowed_write_scope: list[str] | None = None,
+        allowed_write_scope: Sequence[str] | None = None,
+        forbidden_write_scope: Sequence[str] = (),
         read_only: bool = False,
         max_output_chars: int = 12_000,
         env_root: Path | str | None = None,
+        env_builder: Callable[[Path, Path], dict[str, str]] | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.env_root = Path(env_root).resolve() if env_root is not None else self.workspace_root
-        self.allowed_write_scope = allowed_write_scope
-        self.read_only = read_only
+        self.policy = WorkspacePolicy(
+            workspace_root=self.workspace_root,
+            allowed_write_scope=allowed_write_scope,
+            forbidden_write_scope=forbidden_write_scope,
+            read_only=read_only,
+        )
         self.max_output_chars = max_output_chars
+        self._env_builder = env_builder or build_sandbox_env
         self._tools = self._build_tools()
+
+    def as_pre_tool_hook(self) -> Callable[[str, dict[str, Any]], tuple[bool, str]]:
+        return self.policy.as_pre_tool_hook()
 
     def tool_specs(self) -> list[ToolSpec]:
         return [self._tools[name].spec for name in sorted(self._tools)]
@@ -86,25 +294,12 @@ class WorkspaceToolkit:
             ) from exc
         return resolved
 
-    def _assert_write_allowed(self, resolved: Path) -> None:
-        if self.read_only:
-            raise PermissionError("Toolkit is read-only; write operations are disabled.")
-        if self.allowed_write_scope is None:
-            return
-        rel = resolved.relative_to(self.workspace_root).as_posix()
-        if any(paths_overlap(rel, scope) for scope in self.allowed_write_scope):
-            return
-        allowed_str = ", ".join(self.allowed_write_scope)
-        raise PermissionError(
-            f"Write to '{rel}' is outside allowed write_scope [{allowed_str}]."
-        )
-
     def _iter_workspace_files(self, base: Path) -> list[Path]:
         if base.is_file():
             return [base]
         files: list[Path] = []
         for root, dirs, names in os.walk(base):
-            dirs[:] = sorted(d for d in dirs if d not in _IGNORED_DIR_NAMES)
+            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIR_NAMES)
             for fname in sorted(names):
                 files.append(Path(root) / fname)
         return files
@@ -154,7 +349,7 @@ class WorkspaceToolkit:
         matches: list[Path] = []
         for p in sorted(base.glob(pattern)):
             rel_parts = p.resolve().relative_to(self.workspace_root).parts
-            if not any(part in _IGNORED_DIR_NAMES for part in rel_parts):
+            if not any(part in IGNORED_DIR_NAMES for part in rel_parts):
                 matches.append(p.resolve())
         max_items = 100
         lines = [str(p) for p in matches[:max_items]]
@@ -204,7 +399,7 @@ class WorkspaceToolkit:
 
     def _write_file(self, args: dict[str, Any]) -> str:
         target = self._resolve_abs_path(args.get("path"))
-        self._assert_write_allowed(target)
+        self.policy.assert_write_allowed(target)
         content = args.get("content")
         if not isinstance(content, str):
             raise ValueError("content must be a string")
@@ -214,7 +409,7 @@ class WorkspaceToolkit:
 
     def _edit_file(self, args: dict[str, Any]) -> str:
         target_path = self._resolve_abs_path(args.get("path"))
-        self._assert_write_allowed(target_path)
+        self.policy.assert_write_allowed(target_path)
         if not target_path.is_file():
             raise FileNotFoundError(
                 f"Cannot edit missing file '{target_path}'. Use write_file to create new files."
@@ -242,8 +437,9 @@ class WorkspaceToolkit:
         return f"Updated {target_path} (1 replacement)"
 
     def _run_bash(self, args: dict[str, Any]) -> str:
-        if self.read_only:
-            raise PermissionError("Toolkit is read-only; run_bash is disabled.")
+        allowed, reason = self.policy.authorize_tool("run_bash", args)
+        if not allowed:
+            raise PermissionError(reason)
         cmd = args.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
             raise ValueError("command must be a non-empty shell string")
@@ -251,7 +447,7 @@ class WorkspaceToolkit:
         proc = subprocess.run(
             ["bash", "-lc", cmd],
             cwd=self.workspace_root,
-            env=build_sandbox_env(self.workspace_root, host_root=self.env_root),
+            env=self._env_builder(self.workspace_root, self.env_root),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -321,7 +517,7 @@ class WorkspaceToolkit:
                 handler=self._grep_files,
             ),
         }
-        if not self.read_only:
+        if not self.policy.read_only:
             tools["write_file"] = RegisteredTool(
                 spec=ToolSpec(
                     name="write_file",
