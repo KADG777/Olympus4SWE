@@ -67,6 +67,8 @@ class RunSupervisor:
         self._run_locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
         self._managed_runs: set[str] = set()
+        self._active_runs: set[str] = set()
+        self._pending_resume: dict[str, int] = {}
         self._providers: dict[str, LLMProvider] = {}
         self.dotenv_loaded = self._load_dotenv()
 
@@ -352,16 +354,40 @@ class RunSupervisor:
                 start_from=start_from,
                 auto_approve=auto_approve,
             )
-        future = self._executor.submit(
-            self._advance_guarded,
-            run_id,
-            raw_input=raw_input,
-            start_from=start_from,
-            auto_approve=auto_approve,
-        )
+        # Mark active before submitting so rapid resume_run calls immediately coalesce
+        # instead of queueing a duplicate thread with a stale start_from.
+        snap = self.store.get_run(run_id)
+        coalesced = False
+        with self._guard:
+            if run_id in self._active_runs:
+                prev_rev = self._pending_resume.get(run_id, -1)
+                self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
+                coalesced = True
+            else:
+                self._active_runs.add(run_id)
+        if coalesced:
+            return {
+                "run_id": run_id,
+                "workflow": snap["workflow_name"],
+                "status": "queued",
+                "coalesced": True,
+                "state_revision": snap["state_revision"],
+                "paused": None,
+            }
+        try:
+            future = self._executor.submit(
+                self._advance_guarded,
+                run_id,
+                raw_input=raw_input,
+                start_from=start_from,
+                auto_approve=auto_approve,
+            )
+        except Exception:
+            with self._guard:
+                self._active_runs.discard(run_id)
+            raise
         with self._guard:
             self._future_by_run[run_id] = future
-        snap = self.store.get_run(run_id)
         return {
             "run_id": run_id,
             "workflow": snap["workflow_name"],
@@ -378,13 +404,54 @@ class RunSupervisor:
         start_from: str | None,
         auto_approve: bool,
     ) -> dict[str, Any]:
+        current_start = start_from
         try:
-            return self._advance(
-                run_id,
-                raw_input=raw_input,
-                start_from=start_from,
-                auto_approve=auto_approve,
-            )
+            while True:
+                start_rev = int(self.store.get_run(run_id)["state_revision"])
+                result = self._advance(
+                    run_id,
+                    raw_input=raw_input,
+                    start_from=current_start,
+                    auto_approve=auto_approve,
+                )
+                with self._guard:
+                    if run_id not in self._pending_resume:
+                        self._active_runs.discard(run_id)
+                        return result
+                    pending_rev = self._pending_resume.pop(run_id)
+                # A resume coalesced while we were advancing: re-read fresh state and
+                # recompute the entry node so a stale start_from never re-runs a
+                # superseded stage. Re-run only when state changed since this pass
+                # began (or after it finished) and we are not already parked at the
+                # same unapproved human gate.
+                snap = self.store.get_run(run_id)
+                definition = load_workflow(snap["workflow_name"])
+                entry = self.resume_node(definition, snap)
+                entry_node = definition.node(entry) if entry is not None else None
+                paused_node = (result.get("paused") or {}).get("node")
+                has_new_state = (
+                    pending_rev > start_rev
+                    or int(snap["state_revision"]) > int(result["state_revision"])
+                )
+                already_at_same_gate = (
+                    entry_node is not None
+                    and entry_node.type == "human_gate"
+                    and paused_node == entry
+                    and int(snap["state_revision"]) <= int(result["state_revision"])
+                )
+                if (
+                    entry is None
+                    or snap["status"]
+                    in (RunStatus.PAUSED, RunStatus.CANCELLED, RunStatus.COMPLETED)
+                    or not has_new_state
+                    or already_at_same_gate
+                ):
+                    with self._guard:
+                        if run_id in self._pending_resume:
+                            continue
+                        self._active_runs.discard(run_id)
+                    return result
+                current_start = entry
         except Exception as exc:  # noqa: BLE001 - background failures must be auditable
             self.store.append_event(
                 run_id=run_id,
@@ -400,12 +467,18 @@ class RunSupervisor:
                 stage="graph",
                 detail={"error": str(exc)},
             )
+            with self._guard:
+                self._active_runs.discard(run_id)
+                self._pending_resume.pop(run_id, None)
             return {
                 "run_id": run_id,
                 "status": RunStatus.FAILED.value,
                 "error": str(exc),
                 "paused": None,
             }
+        finally:
+            with self._guard:
+                self._active_runs.discard(run_id)
 
     def start_run(
         self,
@@ -477,6 +550,22 @@ class RunSupervisor:
     def resume_run(self, run_id: str, *, sync: bool = False) -> dict[str, Any]:
         """Advance a paused/awaiting run to its next gate or completion."""
         snap = self.store.get_run(run_id)
+        if not sync:
+            with self._guard:
+                if run_id in self._active_runs:
+                    # An advance is already in flight; coalesce instead of submitting a
+                    # duplicate thread with a stale start_from. The running pass will
+                    # recompute a fresh entry node after it finishes.
+                    prev_rev = self._pending_resume.get(run_id, -1)
+                    self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
+                    return {
+                        "run_id": run_id,
+                        "workflow": snap["workflow_name"],
+                        "status": "queued",
+                        "coalesced": True,
+                        "state_revision": snap["state_revision"],
+                        "paused": None,
+                    }
         definition = load_workflow(snap["workflow_name"])
         entry = self.resume_node(definition, snap)
         if entry is None:

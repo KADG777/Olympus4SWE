@@ -804,6 +804,12 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
+                if loop_res.stop_reason.startswith("budget_exhausted"):
+                    return self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -837,16 +843,25 @@ class OrchestrateStage:
             check_summary = "\n".join(
                 f"- {c.id} ({c.kind.value}): passed={c.passed}" for c in updated_checks
             )
-            verdict = self._run_independent_review(
-                run_id=run_id,
-                spec=spec,
-                task=verifying,
-                sandbox=sandbox,
-                diff_text=diff_text,
-                check_summary=check_summary,
-                art_dir=art_dir,
-                design=design,
-            )
+            try:
+                verdict = self._run_independent_review(
+                    run_id=run_id,
+                    spec=spec,
+                    task=verifying,
+                    sandbox=sandbox,
+                    diff_text=diff_text,
+                    check_summary=check_summary,
+                    art_dir=art_dir,
+                    design=design,
+                )
+            except RuntimeError as exc:
+                if "budget_exhausted" in str(exc):
+                    return self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {exc}",
+                    )
+                raise
             if not verdict.passed:
                 important_lines = [
                     f"[{f.severity.value}] {f.file_path}:{f.line or '-'} {f.message}"
@@ -938,6 +953,23 @@ class OrchestrateStage:
             ),
             actor="chronos",
             event_type=event_type,
+        )
+
+    def _pause_for_budget(self, *, run_id: str, task: TaskNode, reason: str) -> TaskNode:
+        """Return a task to READY without burning a review cycle when budget is exhausted."""
+        return self.store.update_task_with_lease(
+            run_id,
+            task.task_id,
+            expected_lease_generation=task.lease_generation,
+            mutator=lambda t: t.model_copy(
+                update={
+                    "status": TaskStatus.READY,
+                    "worktree_path": None,
+                    "last_error": reason,
+                }
+            ),
+            actor="chronos",
+            event_type="task.budget_paused",
         )
 
     def run_execution(
@@ -1044,6 +1076,22 @@ class OrchestrateStage:
                     actor="chronos",
                     stage="orchestrate",
                     detail={
+                        "accepted": sum(
+                            1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                        ),
+                        "total": len(plan.tasks),
+                    },
+                )
+                return self.store.get_run(run_id)
+
+            if not snap["budget_ledger"].can_reserve(policy):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.AWAITING_HUMAN,
+                    actor="chronos",
+                    stage="orchestrate",
+                    detail={
+                        "reason": "budget_exhausted",
                         "accepted": sum(
                             1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
                         ),
