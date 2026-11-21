@@ -45,7 +45,7 @@ from olympus.harness.worktree import (
     remove_sandbox,
 )
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory, run_structured_loop
+from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspaceToolkit
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
@@ -431,8 +431,7 @@ class OrchestrateStage:
             max_steps=max_steps,
             trace_path=self._run_dir(run_id) / "traces" / "planner.jsonl",
         )
-        planner_toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
-        inventory = format_workspace_inventory(planner_toolkit)
+        inventory = format_workspace_inventory(toolkit)
         schema_json = json.dumps(TaskPlan.model_json_schema(), ensure_ascii=False)
 
         binding_lines: list[str] = []
@@ -488,35 +487,31 @@ class OrchestrateStage:
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
         )
 
-        plan: TaskPlan | None = None
-        last_violations: list[str] = []
-        prompt = base_prompt
-        for attempt in range(3):
-            candidate = run_structured_loop(
-                loop=loop,
-                system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
-                user_prompt=prompt,
-                model_cls=TaskPlan,
-            ).model_copy(update=_plan_binding(design=design, spec=spec))
-            violations = validate_plan(
+        def stamp_binding(candidate: TaskPlan) -> TaskPlan:
+            return candidate.model_copy(update=_plan_binding(design=design, spec=spec))
+
+        def plan_gate(candidate: TaskPlan) -> list[str]:
+            return validate_plan(
                 candidate,
                 spec=spec,
                 design=design if modular else None,
                 workspace_root=self.workspace_root,
             )
-            if not violations:
-                plan = candidate
-                break
-            last_violations = violations
-            if attempt < 2:
-                prompt = (
-                    f"{base_prompt}\n\n"
-                    f"[PLAN VALIDATION FAILED]\n"
-                    f"Violations: {'; '.join(violations)}\n"
-                    "Fix all violations and return valid TaskPlan JSON."
-                )
-        if plan is None:
-            raise PlanValidationError(last_violations)
+
+        def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
+            raise PlanValidationError(violations)
+
+        plan = loop.run_structured(
+            system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
+            user_prompt=base_prompt,
+            model_cls=TaskPlan,
+            max_validation_retries=2,
+            validation_header="[PLAN VALIDATION FAILED]",
+            validation_instruction="Fix all violations and return valid TaskPlan JSON.",
+            transform=stamp_binding,
+            validator=plan_gate,
+            on_validation_exhausted=raise_exhausted,
+        )
 
         self.store.save_plan(run_id, plan, actor="orchestrate")
         if auto_approve:
@@ -664,17 +659,17 @@ class OrchestrateStage:
             f"incremental_only={str(incremental).lower()}.\n"
             f"Return ReviewVerdict JSON matching schema:\n{schema_json}"
         )
-        verdict = run_structured_loop(
-            loop=review_loop,
+        verdict = review_loop.run_structured(
             system_prompt=_REVIEWER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model_cls=ReviewVerdict,
-        ).model_copy(
-            update={
-                "task_id": task.task_id,
-                "attempt": task.attempt,
-                "incremental_only": incremental,
-            }
+            transform=lambda candidate: candidate.model_copy(
+                update={
+                    "task_id": task.task_id,
+                    "attempt": task.attempt,
+                    "incremental_only": incremental,
+                }
+            ),
         )
         (art_dir / f"verdict-cycle-{task.review_cycle + 1}.json").write_text(
             verdict.model_dump_json(indent=2), encoding="utf-8"

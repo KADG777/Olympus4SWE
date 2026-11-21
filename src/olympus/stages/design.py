@@ -25,7 +25,7 @@ from olympus.core.dag import validate_design_spec, validate_goal_spec
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory, run_structured_loop
+from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import WorkspaceToolkit
 
 # Free-form prose below this length can never carry a frozen contract.
@@ -210,8 +210,7 @@ def _probe_with_provider(
         f"Input:\n{text}"
     )
     try:
-        probe = run_structured_loop(
-            loop=loop,
+        probe = loop.run_structured(
             system_prompt=(
                 "You are the Olympus4SWE intake triager. Never trust filenames or UI claims; "
                 "judge only the actual content. Prefer returning null over inventing detail."
@@ -408,45 +407,44 @@ class DesignStage:
             f"Return DesignSpec JSON matching schema:\n{schema_json}"
         )
 
-        design: DesignSpec | None = None
-        last_violations: list[str] = []
-        prompt = base_prompt
-        for attempt in range(3):
-            loop = AgentLoop(
-                provider=self.provider,
-                toolkit=WorkspaceToolkit(self.workspace_root, read_only=True),
-                store=self.store,
-                run_id=run_id,
-                actor="design:architect",
-                max_steps=max_steps,
-                trace_path=trace_path,
-            )
-            candidate = run_structured_loop(
-                loop=loop,
-                system_prompt=_DESIGN_SYSTEM_PROMPT,
-                user_prompt=prompt,
-                model_cls=DesignSpec,
-            ).model_copy(
+        loop = AgentLoop(
+            provider=self.provider,
+            toolkit=toolkit,
+            store=self.store,
+            run_id=run_id,
+            actor="design:architect",
+            max_steps=max_steps,
+            trace_path=trace_path,
+        )
+
+        def stamp_binding(candidate: DesignSpec) -> DesignSpec:
+            return candidate.model_copy(
                 update={
                     "spec_id": spec.spec_id,
                     "spec_hash": spec.content_hash,
                     "status": SpecStatus.AWAITING_HUMAN,
                 }
             )
-            violations = validate_design_spec(candidate, spec, strict_v2=True)
-            if not violations:
-                design = candidate
-                break
-            last_violations = violations
-            if attempt < 2:
-                prompt = (
-                    f"{base_prompt}\n\n"
-                    "[DESIGN VALIDATION FAILED]\n"
-                    f"Violations: {'; '.join(violations)}\n"
-                    "Fix every violation and return a valid DesignSpec JSON object."
-                )
-        if design is None:
-            raise DesignValidationError(last_violations)
+
+        def design_gate(candidate: DesignSpec) -> list[str]:
+            return validate_design_spec(candidate, spec, strict_v2=True)
+
+        def raise_exhausted(candidate: DesignSpec, violations: list[str]) -> DesignSpec:
+            raise DesignValidationError(violations)
+
+        design = loop.run_structured(
+            system_prompt=_DESIGN_SYSTEM_PROMPT,
+            user_prompt=base_prompt,
+            model_cls=DesignSpec,
+            max_validation_retries=2,
+            validation_header="[DESIGN VALIDATION FAILED]",
+            validation_instruction=(
+                "Fix every violation and return a valid DesignSpec JSON object."
+            ),
+            transform=stamp_binding,
+            validator=design_gate,
+            on_validation_exhausted=raise_exhausted,
+        )
 
         self.store.save_design(run_id, design, actor="design")
         self.store.set_run_status(

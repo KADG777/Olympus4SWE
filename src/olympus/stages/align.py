@@ -21,7 +21,7 @@ from olympus.core.dag import validate_goal_spec
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory, run_structured_loop
+from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -151,37 +151,35 @@ class AlignStage:
             f"{strict_block}\n"
             f"Return GoalSpec JSON matching schema:\n{schema_json}"
         )
-        draft = run_structured_loop(
-            loop=loop,
+
+        def validation_gate(candidate: GoalSpec) -> list[str]:
+            # Blocking ambiguities are a human decision, not something the model repairs.
+            if not strict_canonical or candidate.unresolved_blockers():
+                return []
+            return validate_goal_spec(candidate)
+
+        def record_validation_failure(candidate: GoalSpec, violations: list[str]) -> GoalSpec:
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="spec.validation_failed",
+                actor="align",
+                payload={"violations": violations},
+            )
+            return candidate
+
+        draft = loop.run_structured(
             system_prompt=_ALIGN_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model_cls=GoalSpec,
+            max_validation_retries=1,
+            validation_header="[GOALSPEC VALIDATION FAILED]",
+            validation_instruction=(
+                "Apply the canonical contract and return a corrected GoalSpec JSON object."
+            ),
+            validator=validation_gate,
+            on_validation_exhausted=record_validation_failure,
         )
-
-        if strict_canonical and not draft.unresolved_blockers():
-            violations = validate_goal_spec(draft)
-            if violations:
-                repair_prompt = (
-                    f"{user_prompt}\n\n"
-                    "[GOALSPEC VALIDATION FAILED]\n"
-                    f"Violations: {'; '.join(violations)}\n"
-                    "Apply the canonical contract and return a corrected GoalSpec JSON object."
-                )
-                draft = run_structured_loop(
-                    loop=loop,
-                    system_prompt=_ALIGN_SYSTEM_PROMPT,
-                    user_prompt=repair_prompt,
-                    model_cls=GoalSpec,
-                )
-                remaining = validate_goal_spec(draft)
-                if remaining:
-                    self.store.append_event(
-                        run_id=run_id,
-                        stage="align",
-                        event_type="spec.validation_failed",
-                        actor="align",
-                        payload={"violations": remaining},
-                    )
 
         notes: list[CritiqueNote] = list(draft.minority_notes)
         if enable_critique:
@@ -250,8 +248,7 @@ class AlignStage:
                 f"Set perspective='{perspective.value}' on every note.\n"
                 f"Return JSON matching schema:\n{critique_schema}"
             )
-            out = run_structured_loop(
-                loop=loop,
+            out = loop.run_structured(
                 system_prompt=sys_prompt,
                 user_prompt=user_prompt,
                 model_cls=CritiqueOutput,

@@ -387,6 +387,155 @@ def test_run_structured_loop_salvages_submit_tool_and_recovers_max_steps(tmp_pat
     assert turns == 3
 
 
+def test_run_structured_forces_final_step_synthesis_without_mutating_flag(
+    tmp_path: Path,
+) -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    seen_tools: list[int] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages
+        seen_tools.append(len(tools))
+        if len(seen_tools) == 1:
+            return LLMResponse(
+                content="reading",
+                tool_calls=(
+                    ToolCall(
+                        id="tc-1",
+                        name="read_file",
+                        arguments={"path": str(tmp_path / "mod.py")},
+                    ),
+                ),
+            )
+        return LLMResponse(content=json.dumps({"value": 3}))
+
+    loop = AgentLoop(
+        provider=MockLLMProvider(responder=responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=2,
+    )
+    assert loop.synthesize_on_max_steps is False
+    out = loop.run_structured(system_prompt="SYS", user_prompt="GO", model_cls=Out)
+
+    assert out.value == 3
+    # Synthesis is requested per call; the loop-level flag must stay untouched.
+    assert loop.synthesize_on_max_steps is False
+    assert seen_tools == [3, 0]
+
+
+def test_run_structured_retries_domain_validation_with_feedback() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        prompts.append(messages[-1].content)
+        return LLMResponse(content=json.dumps({"value": 1 if len(prompts) == 1 else 5}))
+
+    def validator(candidate: Out) -> Sequence[str]:
+        return [] if candidate.value >= 5 else [f"value {candidate.value} is below 5"]
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="BASE PROMPT",
+        model_cls=Out,
+        max_validation_retries=2,
+        validation_header="[DOMAIN FAILED]",
+        validation_instruction="Return at least 5.",
+        validator=validator,
+    )
+
+    assert out.value == 5
+    assert len(prompts) == 2
+    assert prompts[0] == "BASE PROMPT"
+    assert "[DOMAIN FAILED]" in prompts[1]
+    assert "value 1 is below 5" in prompts[1]
+    assert "Return at least 5." in prompts[1]
+
+
+def test_run_structured_applies_transform_before_validation() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Bound(StrictModel):
+        value: int = Field(ge=1)
+        spec_id: str | None = None
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages, tools
+        return LLMResponse(content=json.dumps({"value": 2}))
+
+    seen_spec_ids: list[str | None] = []
+
+    def validator(candidate: Bound) -> Sequence[str]:
+        seen_spec_ids.append(candidate.spec_id)
+        return [] if candidate.spec_id == "spec-1" else ["missing spec binding"]
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="GO",
+        model_cls=Bound,
+        transform=lambda candidate: candidate.model_copy(update={"spec_id": "spec-1"}),
+        validator=validator,
+    )
+
+    assert seen_spec_ids == ["spec-1"]
+    assert out.spec_id == "spec-1"
+
+
+def test_run_structured_invokes_on_validation_exhausted() -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    calls = 0
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal calls
+        del messages, tools
+        calls += 1
+        return LLMResponse(content=json.dumps({"value": 42}))
+
+    exhausted: list[tuple[int, list[str]]] = []
+
+    def on_exhausted(candidate: Out, violations: list[str]) -> Out:
+        exhausted.append((candidate.value, violations))
+        return candidate.model_copy(update={"value": 7})
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=1)
+    out = loop.run_structured(
+        system_prompt="SYS",
+        user_prompt="GO",
+        model_cls=Out,
+        max_validation_retries=1,
+        validator=lambda candidate: ["value is forbidden"],
+        on_validation_exhausted=on_exhausted,
+    )
+
+    assert calls == 2
+    assert exhausted == [(42, ["value is forbidden"])]
+    assert out.value == 7
+
+
 def test_workspace_policy_authorizes_posix_scopes_and_rejects_escapes(tmp_path: Path) -> None:
     workspace = (tmp_path / "ws").resolve()
     workspace.mkdir()
