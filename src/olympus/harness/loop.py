@@ -18,10 +18,17 @@ from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.harness.hooks import PreToolUseHook
 from olympus.harness.receipt import build_turn_receipt
+from olympus.harness.turn_control import NativeTurnControl
 from olympus.providers.base import ChatMessage, LLMProvider, ToolSpec, canonical_tool_specs
 from olympus.tools.aci import WorkspaceToolkit
 
 Observer = Callable[[str, dict[str, Any]], None]
+
+
+class TurnCancelledError(RuntimeError):
+    def __init__(self, result: LoopResult) -> None:
+        super().__init__("cancelled")
+        self.last_result = result
 
 
 class BudgetExhaustedError(RuntimeError):
@@ -280,6 +287,7 @@ class AgentLoop:
         trim_seen: bool = True,
         task_id: str | None = None,
         lease_generation: int | None = None,
+        control: NativeTurnControl | None = None,
     ) -> None:
         self.provider = provider
         self.toolkit = toolkit
@@ -294,6 +302,7 @@ class AgentLoop:
         self.trim_seen = trim_seen
         self.task_id = task_id
         self.lease_generation = lease_generation
+        self.control = control
 
     def _record_timeout_retry(
         self, retry_id: str, phase: Literal["started", "recovered", "failed"]
@@ -326,6 +335,24 @@ class AgentLoop:
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def _cancelled(self) -> bool:
+        return self.control is not None and self.control.cancelled
+
+    def _inject_guidance(self, messages: list[ChatMessage], step: int, emit: Observer) -> None:
+        if self.control is None:
+            return
+        for guidance, source in self.control.take_guidance():
+            messages.append(ChatMessage(role="user", content=guidance))
+            emit(
+                "agent.steered",
+                {
+                    "actor": self.actor,
+                    "task_id": self.task_id,
+                    "step": step,
+                    "source": source,
+                },
+            )
+
     def _call_provider_with_budget(
         self,
         *,
@@ -335,10 +362,15 @@ class AgentLoop:
         tools: Sequence[ToolSpec],
         prefix_hash: str,
         temperature: float,
+        emit: Observer | None = None,
     ) -> tuple[Any, str | None]:
         """Reserve budget, invoke provider (with 1 transient timeout retry), settle usage."""
         retry_id = None
         for net_attempt in range(2):
+            if emit is not None:
+                self._inject_guidance(messages, step, emit)
+            if self._cancelled():
+                return None, "cancelled"
             call_purpose = purpose if net_attempt == 0 else f"{purpose}_retry"
             if self.store is not None and self.run_id is not None:
                 try:
@@ -347,6 +379,10 @@ class AgentLoop:
                     )
                 except ValueError as exc:
                     return None, f"budget_exhausted: {exc}"
+            if self._cancelled():
+                if self.store is not None and self.run_id is not None:
+                    self.store.settle_llm_call(self.run_id, actor=self.actor, cancelled=True)
+                return None, "cancelled"
             if net_attempt == 1:
                 retry_id = new_id("retry")
                 self._record_timeout_retry(retry_id, "started")
@@ -402,6 +438,7 @@ class AgentLoop:
         resp, err = self._call_provider_with_budget(
             step=step,
             purpose=f"repair_step_{step}",
+            emit=self.observer or compose_observers(),
             messages=messages,
             tools=(),
             prefix_hash=prefix_hash,
@@ -452,14 +489,44 @@ class AgentLoop:
         temperature: float,
     ) -> T:
         """One structured turn: explore, then tool-free repairs until JSON validates."""
-        last_err = ""
         res = self.run(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
             synthesize_on_max_steps=True,
         )
+        return self.validate_structured_result(
+            res, model_cls=model_cls, max_parse_retries=max_parse_retries, temperature=temperature
+        )[0]
+
+    def validate_structured_result[T: BaseModel](
+        self,
+        res: LoopResult,
+        *,
+        model_cls: type[T],
+        max_parse_retries: int = 2,
+        temperature: float = 0.0,
+    ) -> tuple[T, LoopResult]:
+        last_err = ""
+
+        def repair(current: LoopResult, correction: str, step: int) -> LoopResult:
+            repaired = self.complete_repair(
+                prior_messages=current.messages,
+                correction=correction,
+                step=step,
+                temperature=temperature,
+            )
+            return replace(
+                repaired,
+                steps_taken=current.steps_taken + repaired.steps_taken,
+                total_input_tokens=current.total_input_tokens + repaired.total_input_tokens,
+                total_output_tokens=current.total_output_tokens + repaired.total_output_tokens,
+                receipt=current.receipt,
+            )
+
         for attempt in range(max_parse_retries + 1):
+            if self._cancelled() or res.stop_reason == "cancelled":
+                raise TurnCancelledError(res)
             if not res.completed:
                 if res.stop_reason.startswith("budget_exhausted"):
                     raise BudgetExhaustedError(
@@ -471,7 +538,7 @@ class AgentLoop:
                     )
                 salvaged = _salvage_from_messages(res.messages, model_cls)
                 if salvaged is not None:
-                    return salvaged
+                    return salvaged, res
                 last_err = f"stopped early ({res.stop_reason})"
                 if attempt < max_parse_retries:
                     schema_hint = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
@@ -481,22 +548,17 @@ class AgentLoop:
                         "starting with '{' matching schema "
                         f"(no prose, no $comment/$schema/extra keys):\n{schema_hint}"
                     )
-                    res = self.complete_repair(
-                        prior_messages=res.messages,
-                        correction=correction,
-                        step=attempt + 1,
-                        temperature=temperature,
-                    )
+                    res = repair(res, correction, attempt + 1)
                     continue
                 raise RuntimeError(
                     f"AgentLoop stopped before producing final output: {res.stop_reason}"
                 )
             try:
-                return parse_model_json(res.final_content, model_cls)
+                return parse_model_json(res.final_content, model_cls), res
             except (json.JSONDecodeError, ValidationError) as exc:
                 salvaged = _salvage_from_messages(res.messages, model_cls)
                 if salvaged is not None:
-                    return salvaged
+                    return salvaged, res
                 last_err = str(exc)
                 if attempt < max_parse_retries:
                     schema_hint = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
@@ -512,12 +574,7 @@ class AgentLoop:
                         "a single valid JSON object starting with '{' matching schema "
                         f"(no $comment, $schema, or extra keys):\n{schema_hint}"
                     )
-                    res = self.complete_repair(
-                        prior_messages=res.messages,
-                        correction=correction,
-                        step=attempt + 1,
-                        temperature=temperature,
-                    )
+                    res = repair(res, correction, attempt + 1)
         raise ValueError(f"Failed to parse {model_cls.__name__} JSON: {last_err}")
 
     def run_structured[T: BaseModel](
@@ -630,6 +687,8 @@ class AgentLoop:
             total_input_tokens: int,
             total_output_tokens: int,
         ) -> LoopResult:
+            if self._cancelled():
+                completed, stop_reason, final_content = False, "cancelled", ""
             receipt = build_turn_receipt(
                 turn_id=turn_id,
                 actor=self.actor,
@@ -661,6 +720,16 @@ class AgentLoop:
             )
 
         for step in range(1, self.max_steps + 1):
+            if self._cancelled():
+                return _finalize_result(
+                    completed=False,
+                    stop_reason="cancelled",
+                    final_content="",
+                    steps_taken=step - 1,
+                    final_messages=messages,
+                    total_input_tokens=total_in,
+                    total_output_tokens=total_out,
+                )
             if step > 1 and self.trim_seen:
                 messages = shrink_seen(messages)
             _emit(
@@ -690,6 +759,7 @@ class AgentLoop:
             resp, err = self._call_provider_with_budget(
                 step=step,
                 purpose=f"loop_step_{step}",
+                emit=_emit,
                 messages=messages,
                 tools=step_tools,
                 prefix_hash=prefix_hash,
@@ -697,7 +767,9 @@ class AgentLoop:
             )
             if resp is None:
                 stop = err or "provider_error"
-                steps = step - 1 if stop.startswith("budget_exhausted") else step
+                steps = (
+                    step - 1 if stop == "cancelled" or stop.startswith("budget_exhausted") else step
+                )
                 return _finalize_result(
                     completed=False,
                     stop_reason=stop,
@@ -733,6 +805,8 @@ class AgentLoop:
             tool_outputs: list[dict[str, str]] = []
             if resp.tool_calls:
                 for tc in resp.tool_calls:
+                    if self._cancelled():
+                        break
                     denied_reason: str | None = None
                     if self.pre_tool_hook is not None:
                         allowed, reason = self.pre_tool_hook(tc.name, tc.arguments)
@@ -760,6 +834,8 @@ class AgentLoop:
                                 "tool": tc.name,
                             },
                         )
+                        if self._cancelled():
+                            break
                         started = time.monotonic()
                         if self.toolkit is None:
                             out = f"Error: no toolkit attached to execute tool '{tc.name}'."

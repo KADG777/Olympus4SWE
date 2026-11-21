@@ -1272,3 +1272,140 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
     assert (docs / "notes.md").is_file()
     assert (docs / "legacy.txt").is_file()
     assert not (docs / "notes-renamed.md").exists()
+
+
+def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Path) -> None:
+    from olympus.harness.driver import (
+        DriverRegistry,
+        DriverTurnRequest,
+        ExecutionDriversConfig,
+        TurnOutcome,
+    )
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[
+            {
+                "id": "CHK-REV",
+                "kind": "independent_review",
+                "description": "Audit the diff",
+            }
+        ],
+    )
+    provider = MockLLMProvider(responses=[LLMResponse(content=json.dumps(plan))])
+
+    class ScriptedDriver:
+        def __init__(self, name: str, responses: list[str]) -> None:
+            self.name = name
+            self.requests: list[DriverTurnRequest] = []
+            self.responses = iter(responses)
+
+        def run_turn(self, request: DriverTurnRequest, *, on_event=None, on_handle=None):
+            self.requests.append(request)
+            if self.name == "writer":
+                (request.workspace_path / "feature.py").write_text("FLAG = True\n")
+            return TurnOutcome(
+                True, "final_response", next(self.responses), 1, driver_name=self.name
+            )
+
+    writer = ScriptedDriver("writer", ["worker-only content"])
+    verifier = ScriptedDriver(
+        "verifier",
+        [
+            '{"task_id":"bad","attempt":1,"passed":true,"summary":"bad","extra":1}',
+            'Result:\n```json\n{"task_id":"wrong","attempt":99,"passed":true,"summary":"OK"}\n```',
+        ],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(
+            worker_driver="writer@worker-model",
+            reviewer_driver="verifier@different-model",
+        ),
+        driver_registry=DriverRegistry({"writer": writer, "verifier": verifier}),
+    )
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+    snap = stage.run_execution(run_id=run_id)
+
+    assert len(provider.recorded_requests) == 1
+    assert snap["status"] == RunStatus.COMPLETED
+    assert len(writer.requests) == 1 and len(verifier.requests) == 2
+    assert writer.requests[0].write_scope == ["feature.py"]
+    assert writer.requests[0].model == "worker-model" and not writer.requests[0].read_only
+    assert all(req.read_only and req.model == "different-model" for req in verifier.requests)
+    assert "worker-only content" not in verifier.requests[0].user_prompt
+    assert "VALIDATION" in verifier.requests[1].user_prompt
+    verdict = json.loads(
+        (
+            tmp_path
+            / ".olympus"
+            / "runs"
+            / run_id
+            / "artifacts"
+            / "T1"
+            / "attempt-1"
+            / "verdict-cycle-1.json"
+        ).read_text()
+    )
+    assert verdict["task_id"] == "T1" and verdict["attempt"] == 1
+
+
+def test_cli_run_combines_flags_and_env_for_role_models(tmp_path: Path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from olympus.cli import app as cli_app
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[{"id": "review", "kind": "independent_review", "description": "Audit the diff"}],
+    )
+    planner = MockLLMProvider(responses=[LLMResponse(content=json.dumps(plan))])
+    stage = OrchestrateStage(store=store, provider=planner, workspace_root=tmp_path)
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+    built_models: list[str | None] = []
+
+    def build_provider(*, model=None, **kwargs):
+        built_models.append(model)
+        return MockLLMProvider(
+            model_name=model or "primary",
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True]),
+        )
+
+    monkeypatch.setenv("OLYMPUS_WORKER_DRIVER", "native@ignored-worker-env")
+    monkeypatch.setenv("OLYMPUS_REVIEWER_DRIVER", "native@reviewer-env")
+    monkeypatch.setattr(cli_app, "build_provider", build_provider)
+    result = CliRunner().invoke(
+        cli_app.app,
+        [
+            "run",
+            run_id,
+            "--workspace",
+            str(tmp_path),
+            "--worker-driver",
+            "native@worker-flag",
+            "--monitor-model",
+            "monitor-flag",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["status"] == "completed"
+    assert set(built_models) == {None, "worker-flag", "reviewer-env"}
+    config_event = next(
+        event
+        for event in store.list_events(run_id)
+        if event.event_type == "run.status_changed" and "execution_drivers" in event.payload
+    )
+    assert config_event.payload["execution_drivers"]["monitor_model"] == "monitor-flag"

@@ -143,6 +143,8 @@ class AriadneApp:
                 expected_state_revision=expected_rev,
                 actor=actor,
             )
+            if action == "pause" and not cmd_result.get("deduplicated"):
+                self.supervisor.cancel_active_turns(run_id, reason="human_paused")
         elif action == "approve_spec":
             spec_result = self.control.confirm_spec(
                 run_id=run_id,
@@ -313,6 +315,7 @@ class AriadneApp:
                 "approve_plan",
                 "promote_to_execute",
                 "retry_task",
+                "resume",
             )
             and auto_advance
             and not cmd_result.get("deduplicated")
@@ -631,6 +634,9 @@ def create_http_server(
                         raw_input=raw_input,
                         workflow_name=str(body.get("workflow_name") or default_workflow),
                         provider_config=dict(body.get("provider_config") or {}),
+                        worker_driver=body.get("worker_driver"),
+                        reviewer_driver=body.get("reviewer_driver"),
+                        monitor_model=body.get("monitor_model"),
                         auto_approve=bool(body.get("auto_approve", False)),
                         sync=bool(body.get("sync", False)),
                         constraints=constraints,

@@ -23,6 +23,7 @@ from olympus.core.dag import validate_design_spec, validate_plan
 from olympus.core.store import RunStore
 from olympus.graph.engine import END, Graph, GraphPaused, Node
 from olympus.graph.progress import GATE_SPECS, is_artifact_approved
+from olympus.harness.driver import ActiveTurnHandle, DriverRegistry, ExecutionDriversConfig
 from olympus.providers.base import LLMProvider
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage, triage_input
@@ -93,6 +94,12 @@ class WorkflowRuntime:
     apply_to_workspace: bool = False
     topology: str = "modular_product"
     extra: dict[str, Any] = field(default_factory=dict)
+    execution_drivers: ExecutionDriversConfig = field(
+        default_factory=ExecutionDriversConfig.resolve
+    )
+    driver_registry: DriverRegistry = field(default_factory=DriverRegistry)
+    model_provider: Callable[[str], LLMProvider] | None = None
+    on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None
 
 
 def _runtime(state: Mapping[str, Any]) -> WorkflowRuntime:
@@ -133,6 +140,10 @@ def _orchestrate_stage(runtime: WorkflowRuntime) -> OrchestrateStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         artifacts_root=runtime.artifacts_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
+        model_provider=runtime.model_provider,
+        on_driver_handle=runtime.on_driver_handle,
     )
 
 

@@ -80,6 +80,9 @@
     newRunWorkflow: document.getElementById("new-run-workflow"),
     newRunProvider: document.getElementById("new-run-provider"),
     newRunModel: document.getElementById("new-run-model"),
+    newRunWorkerDriver: document.getElementById("new-run-worker-driver"),
+    newRunReviewerDriver: document.getElementById("new-run-reviewer-driver"),
+    newRunMonitorModel: document.getElementById("new-run-monitor-model"),
     newRunInput: document.getElementById("new-run-input"),
     newRunFile: document.getElementById("new-run-file"),
     newRunFileButton: document.getElementById("btn-new-run-file"),
@@ -1880,6 +1883,14 @@
       workflow_name: el.newRunWorkflow.value || "product_blueprint",
       provider_config: providerConfig,
     };
+    for (const [name, input] of [
+      ["worker_driver", el.newRunWorkerDriver],
+      ["reviewer_driver", el.newRunReviewerDriver],
+      ["monitor_model", el.newRunMonitorModel],
+    ]) {
+      const value = input.value.trim();
+      if (value) payload[name] = value;
+    }
     if (demoId) {
       payload.demo_id = demoId;
       if (selectedDemo && Array.isArray(selectedDemo.constraints)) {
