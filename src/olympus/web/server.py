@@ -128,52 +128,72 @@ class AriadneApp:
                 actor=actor,
             )
         elif action == "approve_spec":
-            spec = self.control.confirm_spec(
+            spec_result = self.control.confirm_spec(
                 run_id=run_id,
                 approver=actor,
                 accept_risk=bool(body.get("accept_risk", False)),
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
+                operation_id=operation_id,
             )
-            cmd_result = {
-                "run_id": run_id,
-                "spec_id": spec.spec_id,
-                "spec_hash": spec.content_hash,
-                "status": spec.status.value,
-            }
+            cmd_result = (
+                spec_result
+                if isinstance(spec_result, dict)
+                else {
+                    "run_id": run_id,
+                    "spec_id": spec_result.spec_id,
+                    "spec_hash": spec_result.content_hash,
+                    "status": spec_result.status.value,
+                }
+            )
         elif action == "approve_design":
-            record = self.control.approve_design(
+            design_result = self.control.approve_design(
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
+                operation_id=operation_id,
             )
-            cmd_result = record.model_dump(mode="json")
+            cmd_result = (
+                design_result
+                if isinstance(design_result, dict)
+                else design_result.model_dump(mode="json")
+            )
         elif action == "approve_plan":
-            record = self.control.approve_plan(
+            plan_result = self.control.approve_plan(
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
+                operation_id=operation_id,
             )
-            cmd_result = record.model_dump(mode="json")
+            cmd_result = (
+                plan_result
+                if isinstance(plan_result, dict)
+                else plan_result.model_dump(mode="json")
+            )
         elif action == "clarify":
-            spec = self.control.clarify_spec(
+            clarify_result = self.control.clarify_spec(
                 run_id=run_id,
                 answers=dict(body.get("answers") or {}),
                 resolutions=dict(body.get("resolutions") or {}),
                 extra_out_of_scope=list(body.get("out_of_scope") or []),
                 actor=actor,
                 expected_revision=expected_rev,
+                operation_id=operation_id,
             )
-            cmd_result = {
-                "run_id": run_id,
-                "version": spec.version,
-                "spec_hash": spec.content_hash,
-            }
+            cmd_result = (
+                clarify_result
+                if isinstance(clarify_result, dict)
+                else {
+                    "run_id": run_id,
+                    "version": clarify_result.version,
+                    "spec_hash": clarify_result.content_hash,
+                }
+            )
         elif action == "retry_task":
             task_id = str(body.get("task_id", "")).strip()
             if not task_id:
@@ -214,12 +234,22 @@ class AriadneApp:
                 actor=actor,
             )
         elif action == "retry_workflow":
-            self.control.prepare_workflow_retry(
-                run_id, expected_revision=expected_rev, actor=actor
+            retry_result = self.control.prepare_workflow_retry(
+                run_id,
+                expected_revision=expected_rev,
+                actor=actor,
+                operation_id=operation_id,
             )
-            cmd_result = self.supervisor.resume_run(
-                run_id, sync=bool(body.get("sync", False))
-            )
+            if retry_result.get("deduplicated"):
+                # A retried HTTP request must never resume the workflow a second time.
+                cmd_result = retry_result
+            else:
+                cmd_result = {
+                    **retry_result,
+                    "workflow": self.supervisor.resume_run(
+                        run_id, sync=bool(body.get("sync", False))
+                    ),
+                }
         elif action == "promote_to_execute":
             target_workflow = str(body.get("workflow_name") or "full_sdlc_tdd").strip()
             target_def = load_workflow(target_workflow)
@@ -602,12 +632,9 @@ def create_http_server(
                 req_parts = [p for p in path.split("/") if p]
                 if len(req_parts) == 4 and req_parts[0] == "api" and req_parts[1] == "runs":
                     with contextlib.suppress(Exception):
-                        conflict_payload["projection"] = build_run_projection(
-                            app.store,
-                            app._workspace_for(req_parts[2]),
-                            req_parts[2],
-                            artifacts_root=app.artifacts_root,
-                        )
+                        conflict_payload["projection"] = app.get_run_payload(
+                            req_parts[2]
+                        )["projection"]
                 self._send_json(HTTPStatus.CONFLICT, conflict_payload)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})

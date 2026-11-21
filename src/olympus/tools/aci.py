@@ -110,7 +110,9 @@ class WorkspacePolicy:
     def _relative_target(self, raw_path: Any) -> str:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError("Write tools require a non-empty 'path' argument.")
-        text = self._strip_dot_prefix(raw_path.strip().replace("\\", "/"))
+        # Preserve the caller's exact path characters (only separators are normalized):
+        # a trailing space names a different file and must not be silently trimmed.
+        text = self._strip_dot_prefix(raw_path.replace("\\", "/"))
         candidate = Path(raw_path)
         if self.workspace_root is None:
             if candidate.is_absolute():
@@ -151,21 +153,40 @@ class WorkspacePolicy:
         return pattern
 
     def _scope_matches(self, rel: str, raw_pattern: str) -> bool:
+        """Symmetric overlap matcher (globs + ancestor/descendant) for forbidden scopes."""
         pattern = self._scope_pattern(raw_pattern)
         if pattern is None:
             return False
-        if any(char in pattern for char in _GLOB_CHARS):
-            return fnmatch.fnmatch(rel, pattern)
         try:
             return paths_overlap(rel, pattern)
         except ValueError:
             return False
 
+    def _scope_contains(self, rel: str, raw_pattern: str) -> bool:
+        """True when ``rel`` sits at or below an authorized scope; never grants ancestors."""
+        pattern = self._scope_pattern(raw_pattern)
+        if pattern is None:
+            return False
+        if any(char in pattern for char in _GLOB_CHARS):
+            return fnmatch.fnmatch(rel, pattern)
+        norm_rel = self._strip_dot_prefix(rel).lstrip("/")
+        norm_pattern = pattern.rstrip("/")
+        if norm_pattern in ("", "."):
+            return True
+        return norm_rel == norm_pattern or norm_rel.startswith(f"{norm_pattern}/")
+
     def _forbidden_match(self, rel: str) -> str | None:
         for pattern in self.forbidden_write_scope:
-            if self._scope_matches(rel, pattern):
+            if self._scope_contains(rel, pattern) or self._scope_matches(rel, pattern):
                 return pattern
         return None
+
+    def allows_relative_path(self, rel: str) -> bool:
+        """Return True when a repo-relative path is inside the allowed write scope."""
+        if self.allowed_write_scope is None:
+            return True
+        norm_rel = self._strip_dot_prefix(str(rel).replace("\\", "/")).lstrip("/")
+        return any(self._scope_contains(norm_rel, pattern) for pattern in self.allowed_write_scope)
 
     def authorize_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[bool, str]:
         if tool_name in self.READ_ONLY_TOOLS:
@@ -191,7 +212,7 @@ class WorkspacePolicy:
                 f"({list(self.forbidden_write_scope)}): only contract tasks may modify it.",
             )
         if self.allowed_write_scope is None or any(
-            self._scope_matches(rel, pattern) for pattern in self.allowed_write_scope
+            self._scope_contains(rel, pattern) for pattern in self.allowed_write_scope
         ):
             return True, ""
         return (
@@ -220,7 +241,7 @@ class WorkspacePolicy:
             )
         if self.allowed_write_scope is None:
             return
-        if any(self._scope_matches(rel, pattern) for pattern in self.allowed_write_scope):
+        if any(self._scope_contains(rel, pattern) for pattern in self.allowed_write_scope):
             return
         allowed_str = ", ".join(self.allowed_write_scope)
         raise PermissionError(f"Write to '{rel}' is outside allowed write_scope [{allowed_str}].")
@@ -301,7 +322,15 @@ class WorkspaceToolkit:
         for root, dirs, names in os.walk(base):
             dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIR_NAMES)
             for fname in sorted(names):
-                files.append(Path(root) / fname)
+                candidate = Path(root) / fname
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                # Skip symlinks (or junctions) whose target escapes the workspace.
+                if not resolved.is_relative_to(self.workspace_root):
+                    continue
+                files.append(candidate)
         return files
 
     def list_relative_files(self, *, max_files: int = 40) -> tuple[list[str], int]:
@@ -348,9 +377,14 @@ class WorkspaceToolkit:
             raise FileNotFoundError(f"Search base does not exist: '{base}'")
         matches: list[Path] = []
         for p in sorted(base.glob(pattern)):
-            rel_parts = p.resolve().relative_to(self.workspace_root).parts
+            try:
+                resolved = p.resolve()
+                rel_parts = resolved.relative_to(self.workspace_root).parts
+            except (OSError, ValueError):
+                # Broken links and symlinks escaping the workspace are never reported.
+                continue
             if not any(part in IGNORED_DIR_NAMES for part in rel_parts):
-                matches.append(p.resolve())
+                matches.append(resolved)
         max_items = 100
         lines = [str(p) for p in matches[:max_items]]
         if len(matches) > max_items:

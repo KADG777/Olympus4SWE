@@ -152,9 +152,16 @@ class AlignStage:
             f"Return GoalSpec JSON matching schema:\n{schema_json}"
         )
 
+        gate_calls = {"count": 0}
+
         def validation_gate(candidate: GoalSpec) -> list[str]:
-            # Blocking ambiguities are a human decision, not something the model repairs.
-            if not strict_canonical or candidate.unresolved_blockers():
+            # Blocking ambiguities are a human decision, not something the model repairs:
+            # only the initial draft may skip the single repair pass. A repaired draft is
+            # always re-validated so a repair that introduces a blocker is still surfaced.
+            gate_calls["count"] += 1
+            if gate_calls["count"] == 1 and candidate.unresolved_blockers():
+                return []
+            if not strict_canonical:
                 return []
             return validate_goal_spec(candidate)
 

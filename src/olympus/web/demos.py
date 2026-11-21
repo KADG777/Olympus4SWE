@@ -34,10 +34,9 @@ from olympus.core.contracts import (
     TaskStatus,
     new_id,
 )
-from olympus.core.store import RunStore
+from olympus.core.store import NotFoundError, RunStore
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.receipt import build_turn_receipt
-from olympus.web.projection import _diff_line_stats, _synthesize_tool_stream
 
 _FALLBACK_B001: dict[str, Any] = {
     "case_id": "B-001",
@@ -318,6 +317,14 @@ def seed_delivery_acceptance_demo(store: RunStore, artifacts_root: Path) -> None
     store.set_run_status(run_id, RunStatus.COMPLETED, actor="chronos", stage="orchestrate")
 
 
+def _run_exists(store: RunStore, run_id: str) -> bool:
+    try:
+        store.get_run(run_id)
+    except NotFoundError:
+        return False
+    return True
+
+
 def seed_demo_runs(
     store: RunStore,
     workspace_root: Path,
@@ -325,7 +332,9 @@ def seed_demo_runs(
     artifacts_root: Path | None = None,
 ) -> list[str]:
     """Seed the delivery acceptance and campus waitlist walkthroughs if missing."""
-    existing_ids = {r["run_id"] for r in store.list_runs(limit=100)}
+    # Imported lazily: projection re-exports this function for backward compatibility.
+    from olympus.web.projection import _diff_line_stats, _synthesize_tool_stream
+
     seeded: list[str] = []
     art_base = (
         artifacts_root
@@ -333,12 +342,12 @@ def seed_demo_runs(
         else Path(workspace_root).resolve() / ".olympus" / "runs"
     )
 
-    if DELIVERY_DEMO_ID not in existing_ids:
+    if not _run_exists(store, DELIVERY_DEMO_ID):
         seed_delivery_acceptance_demo(store, art_base)
         seeded.append(DELIVERY_DEMO_ID)
 
     demo_id = "run-campus-waitlist"
-    if demo_id not in existing_ids:
+    if not _run_exists(store, demo_id):
         store.create_run(
             title="社团活动报名与候补自动递补系统 (I001-v2)",
             mode=RunMode.EXECUTION,

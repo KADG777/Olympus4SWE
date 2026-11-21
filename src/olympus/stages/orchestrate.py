@@ -27,11 +27,10 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import RunControl
+from olympus.core.control import RunControl, is_plan_bound_to_upstream
 from olympus.core.dag import (
     PlanValidationError,
     compute_dispatchable_tasks,
-    paths_overlap,
     validate_plan,
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
@@ -46,7 +45,7 @@ from olympus.harness.worktree import (
 )
 from olympus.providers.base import LLMProvider
 from olympus.stages.common import format_workspace_inventory
-from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspaceToolkit
+from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
@@ -122,6 +121,8 @@ def _copy_matching_scope(
     """Copy non-ignored files from src_root to dst_root, optionally filtered by write_scope."""
     if not src_root.exists():
         return
+    # Share the tool-gating matcher so glob scopes deliver exactly what they authorize.
+    policy = WorkspacePolicy(allowed_write_scope=write_scope)
     for p in sorted(src_root.rglob("*")):
         if not p.is_file():
             continue
@@ -130,7 +131,7 @@ def _copy_matching_scope(
         if any(part in ignored for part in rel_path.parts):
             continue
         rel = rel_path.as_posix()
-        if write_scope is not None and not any(paths_overlap(rel, scope) for scope in write_scope):
+        if write_scope is not None and not policy.allows_relative_path(rel):
             continue
         dst = dst_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -962,6 +963,11 @@ class OrchestrateStage:
         ):
             raise ValueError(
                 f"TaskPlan {plan.plan_id} ({plan.content_hash}) is not human-approved."
+            )
+        if not is_plan_bound_to_upstream(self.store, run_id, snap):
+            raise ValueError(
+                f"TaskPlan {plan.plan_id} is stale: its spec_hash/design_hash no longer "
+                "match the current approved upstream artifacts; regenerate the plan first."
             )
 
         effective_serial = serial_execution or (

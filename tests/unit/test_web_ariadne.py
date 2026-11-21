@@ -572,12 +572,19 @@ def test_approval_write_conflicts_if_candidate_changes_after_validation(
     viewed = app.get_run_payload(run_id)["projection"]
     save_spec = store.save_spec
     candidate = store.get_run(run_id)["spec"].model_copy(update={"version": 2, "goal": "新版"})
+    real_get_run = store.get_run
+    injected = False
 
-    def save_after_update(*args, **kwargs):
-        save_spec(run_id, candidate)
-        return save_spec(*args, **kwargs)
+    def get_run_after_update(*args, **kwargs):
+        """Model a concurrent write landing between the approval read and its write."""
+        nonlocal injected
+        snap = real_get_run(*args, **kwargs)
+        if kwargs.get("expected_revision") is not None and not injected:
+            injected = True
+            save_spec(run_id, candidate)
+        return snap
 
-    monkeypatch.setattr(store, "save_spec", save_after_update)
+    monkeypatch.setattr(store, "get_run", get_run_after_update)
     with pytest.raises(ConcurrencyConflictError, match="revision"):
         app.execute_command(
             run_id,

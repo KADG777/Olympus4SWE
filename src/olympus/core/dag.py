@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fnmatch
 import re
 import shlex
 import sys
@@ -108,12 +109,52 @@ def normalize_scope_path(raw: str) -> str:
     return f"{norm}/" if is_dir_hint else norm
 
 
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _has_glob(text: str) -> bool:
+    return any(char in text for char in _GLOB_CHARS)
+
+
+def _glob_static_prefix(pattern: str) -> str:
+    """Return the directory prefix a glob pattern is anchored to (e.g. ``docs/``)."""
+    cut = len(pattern)
+    for char in _GLOB_CHARS:
+        found = pattern.find(char)
+        if found != -1:
+            cut = min(cut, found)
+    prefix = pattern[:cut]
+    if "/" not in prefix:
+        return ""
+    return prefix[: prefix.rfind("/") + 1]
+
+
+def _glob_paths_overlap(a: str, b: str) -> bool:
+    """Conservatively decide whether a glob scope can collide with another path."""
+    a_glob, b_glob = _has_glob(a), _has_glob(b)
+    if a_glob and b_glob:
+        prefix_a, prefix_b = _glob_static_prefix(a), _glob_static_prefix(b)
+        if prefix_a == prefix_b:
+            return True
+        return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
+    pattern, concrete = (a, b) if a_glob else (b, a)
+    concrete = concrete.rstrip("/")
+    if fnmatch.fnmatchcase(concrete, pattern):
+        return True
+    prefix = _glob_static_prefix(pattern)
+    if not prefix:
+        return False
+    return concrete == prefix.rstrip("/") or concrete.startswith(prefix)
+
+
 def paths_overlap(a_raw: str, b_raw: str) -> bool:
-    """Return True if two normalized repo-relative paths or directory prefixes can overlap."""
+    """Return True if two normalized repo-relative paths, prefixes, or globs can overlap."""
     a = normalize_scope_path(a_raw).rstrip("/")
     b = normalize_scope_path(b_raw).rstrip("/")
     if a == "." or b == ".":
         return True
+    if _has_glob(a) or _has_glob(b):
+        return _glob_paths_overlap(a, b)
     if a == b:
         return True
     return a.startswith(f"{b}/") or b.startswith(f"{a}/")

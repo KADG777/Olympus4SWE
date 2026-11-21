@@ -278,6 +278,8 @@ def _auto_approve_gate(
     gate: str,
     run_id: str,
     artifact: Any,
+    *,
+    expected_revision: int,
 ) -> None:
     control = RunControl(runtime.store)
     if gate == "spec":
@@ -287,18 +289,21 @@ def _auto_approve_gate(
             approver=runtime.approver,
             accept_risk=bool(blockers),
             reason="workflow auto-approve" if blockers else "",
+            expected_revision=expected_revision,
         )
     elif gate == "design":
         control.approve_design(
             run_id=run_id,
             approver=runtime.approver,
             reason="workflow auto-approve",
+            expected_revision=expected_revision,
         )
     else:
         control.approve_plan(
             run_id=run_id,
             approver=runtime.approver,
             reason="workflow auto-approve",
+            expected_revision=expected_revision,
         )
 
 
@@ -320,7 +325,13 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
 
     approved = is_artifact_approved(runtime.store, run_id, gate, snap)
     if not approved and auto:
-        _auto_approve_gate(runtime, gate, run_id, artifact)
+        _auto_approve_gate(
+            runtime,
+            gate,
+            run_id,
+            artifact,
+            expected_revision=int(snap["state_revision"]),
+        )
         approved = True
     if not approved:
         target_id = getattr(artifact, gate_spec["id_attr"])

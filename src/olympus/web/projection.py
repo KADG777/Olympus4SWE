@@ -1472,3 +1472,5 @@ def build_run_projection(
         "latest_event_seq": events[-1].event_seq if events else 0,
     }
 
+# Backward-compatible re-export: demo seeding historically lived in this module.
+from olympus.web.demos import seed_demo_runs  # noqa: E402, F401

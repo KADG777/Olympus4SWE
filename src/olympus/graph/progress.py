@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from olympus.core.contracts import ApprovalTarget, RunEvent, RunStatus, TaskPlan, TaskStatus
+from olympus.core.control import is_plan_bound_to_upstream
 from olympus.core.store import RunStore
 
 if TYPE_CHECKING:
@@ -81,7 +82,11 @@ def resolve_resume_node(
     names = {node.name for node in definition.nodes}
     run_id = str(snap["run_id"])
 
-    if snap["plan"] is not None and is_artifact_approved(store, run_id, "plan", snap):
+    if (
+        snap["plan"] is not None
+        and is_artifact_approved(store, run_id, "plan", snap)
+        and is_plan_bound_to_upstream(store, run_id, snap)
+    ):
         if definition.stop_after == "execute" and "execute" in names:
             return "execute"
         # Re-enter the terminal gate so the graph records its final routed/END events.
@@ -144,7 +149,10 @@ def build_workflow_view(
     for event in events:
         payload = event.payload
         node = payload.get("node")
-        if event.event_type == "graph.node_started" and isinstance(node, str):
+        if event.event_type == "graph.started":
+            finished = False
+        elif event.event_type == "graph.node_started" and isinstance(node, str):
+            finished = False
             paused = None
             failed_node = None
             last_error = None
