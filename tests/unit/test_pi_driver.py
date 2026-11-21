@@ -444,6 +444,7 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
     assert argv[:2] == ["--mode", "rpc"]
     assert "--no-session" in argv and "--no-extensions" in argv
+    assert "--no-context-files" in argv and "--no-skills" in argv
     assert "--extension" in argv and argv[argv.index("--extension") + 1].endswith(
         "pi_scope_guard.ts"
     )
