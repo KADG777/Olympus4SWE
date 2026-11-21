@@ -341,20 +341,23 @@ class AgentLoop:
     def _cancelled(self) -> bool:
         return self.control is not None and self.control.cancelled
 
-    def _inject_guidance(self, messages: list[ChatMessage], step: int, emit: Observer) -> None:
+    def _inject_guidance(
+        self, messages: list[ChatMessage], step: int, emit: Observer | None
+    ) -> None:
         if self.control is None:
             return
         for guidance, source in self.control.take_guidance():
             messages.append(ChatMessage(role="user", content=guidance))
-            emit(
-                "agent.steered",
-                {
-                    "actor": self.actor,
-                    "task_id": self.task_id,
-                    "step": step,
-                    "source": source,
-                },
-            )
+            if emit is not None:
+                emit(
+                    "agent.steered",
+                    {
+                        "actor": self.actor,
+                        "task_id": self.task_id,
+                        "step": step,
+                        "source": source,
+                    },
+                )
 
     def _call_provider_with_budget(
         self,
@@ -370,8 +373,7 @@ class AgentLoop:
         """Reserve budget, invoke provider (with 1 transient timeout retry), settle usage."""
         retry_id = None
         for net_attempt in range(2):
-            if emit is not None:
-                self._inject_guidance(messages, step, emit)
+            self._inject_guidance(messages, step, emit)
             if self._cancelled():
                 return None, "cancelled"
             call_purpose = purpose if net_attempt == 0 else f"{purpose}_retry"
@@ -441,7 +443,7 @@ class AgentLoop:
         resp, err = self._call_provider_with_budget(
             step=step,
             purpose=f"repair_step_{step}",
-            emit=self.observer or compose_observers(),
+            emit=self.observer,
             messages=messages,
             tools=(),
             prefix_hash=prefix_hash,

@@ -8,7 +8,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -792,14 +792,14 @@ class OrchestrateStage:
         driver: AgentDriver,
         request: DriverTurnRequest,
         watchdog: Watchdog | None,
+        *,
+        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
+        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
         activity = self.live_activity
+        active_handle: list[ActiveTurnHandle] = []
 
         def observe(kind: str, payload: dict[str, Any]) -> None:
-            kind = {
-                "tool_start": "agent.tool_started",
-                "tool_end": "agent.tool_finished",
-            }.get(kind, kind)
             fields = milestone_fields(kind, payload)
             if fields is not None:
                 self.store.append_event(
@@ -827,20 +827,22 @@ class OrchestrateStage:
             if self.on_driver_event is not None:
                 self.on_driver_event(kind, payload)
 
-        def start_monitor(handle: ActiveTurnHandle) -> None:
-            assert watchdog is not None
-            watchdog.start(handle)
+        def register_handle(handle: ActiveTurnHandle) -> None:
+            active_handle.append(handle)
+            if on_handle_registered is not None:
+                on_handle_registered(handle)
+            if watchdog is not None:
+                watchdog.start(handle)
             if self.on_driver_handle is not None:
                 self.on_driver_handle(handle)
 
         try:
-            return driver.run_turn(
-                request, on_event=observe,
-                on_handle=start_monitor if watchdog is not None else self.on_driver_handle,
-            )
+            return driver.run_turn(request, on_event=observe, on_handle=register_handle)
         finally:
             if watchdog is not None:
                 watchdog.stop()
+            if on_handle_finished is not None and active_handle:
+                on_handle_finished(active_handle[-1])
             if activity is not None:
                 activity.clear(run_id, task.task_id, task.attempt)
 
@@ -859,6 +861,9 @@ class OrchestrateStage:
         interrupted: Event,
         design: DesignSpec | None = None,
         handoff_context: str = "",
+        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
+        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
+        on_run_paused: Callable[[], None] | None = None,
     ) -> TaskNode:
         leased = self.store.acquire_task_lease(run_id, task_id, actor="chronos")
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
@@ -870,7 +875,7 @@ class OrchestrateStage:
         )
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
-        retain_sandbox = False
+        archive_failed = False
         try:
             worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
@@ -945,14 +950,22 @@ class OrchestrateStage:
                 )
             worker_error = None
             try:
-                loop_res = self._run_worker_turn(run_id, leased, driver, request, watchdog)
+                loop_res = self._run_worker_turn(
+                    run_id,
+                    leased,
+                    driver,
+                    request,
+                    watchdog,
+                    on_handle_registered=on_handle_registered,
+                    on_handle_finished=on_handle_finished,
+                )
             except Exception as exc:
                 if watchdog is None or watchdog.pause_diagnosis is None:
                     raise
                 worker_error = type(exc).__name__
 
             if watchdog is not None and watchdog.pause_diagnosis is not None:
-                retain_sandbox = True
+                archive_failed = True
                 diagnosis = dict(watchdog.pause_diagnosis)
                 if worker_error is not None:
                     diagnosis["worker_error"] = worker_error
@@ -965,11 +978,18 @@ class OrchestrateStage:
                 except (OSError, subprocess.SubprocessError) as exc:
                     diagnosis["archive_error"] = type(exc).__name__
                 else:
-                    retain_sandbox = False
-                return RunControl(self.store).pause_for_watchdog(
+                    archive_failed = False
+                paused_task = RunControl(self.store).pause_for_watchdog(
                     run_id, task=leased, diagnosis=diagnosis,
-                    retained_sandbox=str(sandbox.workspace_path) if retain_sandbox else None,
+                    retained_sandbox=str(sandbox.workspace_path) if archive_failed else None,
                 )
+                if on_run_paused is not None:
+                    on_run_paused()
+                return paused_task
+
+            if self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                interrupted.set()
+                return self._return_interrupted_task(run_id, leased)
 
             # Transition lease to VERIFYING before running checks/review
             verifying = self.store.update_task_with_lease(
@@ -1011,8 +1031,6 @@ class OrchestrateStage:
                     reason=f"Paused due to budget limit: {loop_res.stop_reason}",
                 )
 
-            # Deterministic unbypassable boundary: reject any out-of-scope sandbox mutation
-            # before command checks, Argus review, or overlay promotion.
             gate = run_diff_gate(
                 sandbox,
                 worker_baseline,
@@ -1154,14 +1172,6 @@ class OrchestrateStage:
                     checks=updated_checks,
                 )
 
-            # Always snapshot accepted outputs to run overlay for downstream DAG tasks
-            _copy_matching_scope(sandbox.workspace_path, overlay_dir, verifying.write_scope)
-            # Sync files to host workspace only in EXECUTION mode when explicitly requested
-            if mode == RunMode.EXECUTION and apply_to_workspace:
-                _copy_matching_scope(
-                    sandbox.workspace_path, self.workspace_root, verifying.write_scope
-                )
-
             verdict_path = str(art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json")
             final_checks = [
                 c.model_copy(update={"passed": True, "evidence_ref": verdict_path})
@@ -1169,21 +1179,37 @@ class OrchestrateStage:
                 else c
                 for c in updated_checks
             ]
-            accepted = self.store.update_task_with_lease(
-                run_id,
-                verifying.task_id,
-                expected_lease_generation=verifying.lease_generation,
-                mutator=lambda t: t.model_copy(
-                    update={
-                        "status": TaskStatus.ACCEPTED,
-                        "acceptance_checks": final_checks,
-                        "last_error": None,
-                        "worktree_path": None,
-                    }
-                ),
-                actor="chronos",
-                event_type="task.accepted",
-            )
+            try:
+                accepted = self.store.update_task_with_lease(
+                    run_id,
+                    verifying.task_id,
+                    expected_lease_generation=verifying.lease_generation,
+                    mutator=lambda t: t.model_copy(
+                        update={
+                            "status": TaskStatus.ACCEPTED,
+                            "acceptance_checks": final_checks,
+                            "last_error": None,
+                            "worktree_path": None,
+                        }
+                    ),
+                    actor="chronos",
+                    event_type="task.accepted",
+                    reject_if_run_inactive=True,
+                )
+            except ConcurrencyConflictError:
+                if self.store.get_run(run_id)["status"] in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                ):
+                    interrupted.set()
+                    return self._return_interrupted_task(run_id, verifying)
+                raise
+
+            _copy_matching_scope(sandbox.workspace_path, overlay_dir, verifying.write_scope)
+            if mode == RunMode.EXECUTION and apply_to_workspace:
+                _copy_matching_scope(
+                    sandbox.workspace_path, self.workspace_root, verifying.write_scope
+                )
             _write_manifest_md(
                 art_dir=art_dir,
                 task=accepted,
@@ -1194,7 +1220,7 @@ class OrchestrateStage:
             )
             return accepted
         finally:
-            if not retain_sandbox:
+            if not archive_failed:
                 remove_sandbox(sandbox)
 
     def _fail_or_requeue(
@@ -1343,6 +1369,23 @@ class OrchestrateStage:
             except ConcurrencyConflictError:
                 continue
 
+        wave_lock = Lock()
+        wave_handles: set[ActiveTurnHandle] = set()
+
+        def register_wave_handle(handle: ActiveTurnHandle) -> None:
+            with wave_lock:
+                wave_handles.add(handle)
+
+        def unregister_wave_handle(handle: ActiveTurnHandle) -> None:
+            with wave_lock:
+                wave_handles.discard(handle)
+
+        def cancel_wave_peers() -> None:
+            with wave_lock:
+                peers = list(wave_handles)
+            for peer in peers:
+                peer.cancel(reason="run_paused")
+
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
@@ -1487,6 +1530,9 @@ class OrchestrateStage:
                             reviewer=reviewer,
                             interrupted=interrupted,
                             design=design,
+                            on_handle_registered=register_wave_handle,
+                            on_handle_finished=unregister_wave_handle,
+                            on_run_paused=cancel_wave_peers,
                         )
                         for t in ready
                     ]

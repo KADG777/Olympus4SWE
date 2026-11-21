@@ -1,7 +1,8 @@
 # ADR-0002: Meta-Harness AgentDriver Seam, Post-Flight Diff Gate, and Two-Tier Watchdog
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-11-21
+- **Tracking**: #61 (`Diff Gate`), #62 (`AgentDriver` seam & config), #63 (Live milestone observability), #64 (`PiDriver` & heterogeneous `Argus`), #65 (Two-tier `Watchdog`)
 - **Phasing**: Phase 1 (`AgentDriver` seam + live milestone observability + `Diff Gate`) → Phase 2 (`PiDriver` + `Watchdog`, with `ACPDriver` seam reserved)
 
 ## Context

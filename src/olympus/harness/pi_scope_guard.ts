@@ -112,9 +112,7 @@ export default function (pi: ExtensionAPI) {
         reason: "Olympus scope guard: target path escapes the sandbox workspace.",
       };
     }
-    const forbidden = forbiddenGlobs.find(
-      (pattern) => contains(relative, pattern) || matches(relative, pattern),
-    );
+    const forbidden = forbiddenGlobs.find((pattern) => matches(relative, pattern));
     if (forbidden !== undefined) {
       return {
         block: true,

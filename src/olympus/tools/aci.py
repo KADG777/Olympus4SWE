@@ -194,7 +194,8 @@ class WorkspacePolicy:
         """Return True when a repo-relative path is inside the allowed write scope."""
         if self.allowed_write_scope is None:
             return True
-        norm_rel = self._strip_dot_prefix(str(rel).replace("\\", "/")).lstrip("/")
+        raw = str(rel) if os.sep == "/" else str(rel).replace(os.sep, "/")
+        norm_rel = self._strip_dot_prefix(raw).lstrip("/")
         return any(self._scope_contains(norm_rel, pattern) for pattern in self.allowed_write_scope)
 
     def authorize_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[bool, str]:

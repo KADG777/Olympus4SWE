@@ -36,6 +36,7 @@ from olympus.core.store import RunStore
 from olympus.harness.driver import (
     ActiveTurnHandle,
     DriverRegistry,
+    DriverTurnRequest,
     ExecutionDriversConfig,
     TurnOutcome,
 )
@@ -1290,13 +1291,6 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
 
 
 def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Path) -> None:
-    from olympus.harness.driver import (
-        DriverRegistry,
-        DriverTurnRequest,
-        ExecutionDriversConfig,
-        TurnOutcome,
-    )
-
     _init_repo(tmp_path)
     store, run_id = _confirmed_run(tmp_path)
     spec = store.get_run(run_id)["spec"]
@@ -1338,14 +1332,14 @@ def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Pat
                     "output": "PRIVATE_STDOUT\nPRIVATE_STDERR",
                     "prompt": request.user_prompt,
                 }
-                on_event("tool_start", raw)
+                on_event("agent.tool_started", raw)
                 trace = [{"event": "text_delta", "text": "PRIVATE_DELTA"}] * 45
                 for line in trace:
                     on_event("text_delta", line)
                 finished = {
                     **raw, "is_error": True, "duration_ms": 9, "error_signature": raw["output"],
                 }
-                on_event("tool_end", finished)
+                on_event("agent.tool_finished", finished)
                 on_event("agent.steered", {"source": "watchdog", "reason": "PRIVATE_GUIDANCE"})
                 trace.append({"event": "tool_end", **finished})
                 request.trace_path.write_text(
@@ -1917,3 +1911,255 @@ def test_watchdog_timers_fail_open_through_stage(
     assert [event.payload["trigger"] for event in watchdog_events] == expected_triggers
     assert all("secret" not in json.dumps(event.payload) for event in watchdog_events)
     assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+
+
+
+def test_diff_gate_rejects_tracked_ignored_dir_and_posix_backslash_filename(
+    tmp_path: Path,
+) -> None:
+    for rel, tracked in [("__pycache__/tracked.txt", True), (r"src\rogue.py", False)]:
+        ws = tmp_path / ("case_tracked" if tracked else "case_backslash")
+        ws.mkdir()
+        _init_repo(ws)
+        if tracked:
+            (ws / rel).parent.mkdir()
+            (ws / rel).write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-f", rel], cwd=ws, check=True)
+            subprocess.run(["git", "commit", "-qm", "track ignored file"], cwd=ws, check=True)
+        store, run_id = _confirmed_run(ws)
+        plan = _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["src/"],
+            checks=[_marker_command_check()],
+        )
+        _approve_plan(
+            store,
+            run_id,
+            plan.model_copy(update={"tasks": [plan.tasks[0].model_copy(update={"max_cycles": 1})]}),
+        )
+
+        class OutOfScopeDriver:
+            name = "audit"
+
+            def __init__(self, target_rel: str) -> None:
+                self._target_rel = target_rel
+
+            def run_turn(
+                self,
+                request: DriverTurnRequest,
+                *,
+                on_event: Any = None,
+                on_handle: Any = None,
+            ) -> TurnOutcome:
+                del on_event, on_handle
+                target = request.workspace_path / self._target_rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("mutated\n", encoding="utf-8")
+                return TurnOutcome(
+                    completed=True,
+                    stop_reason="final_response",
+                    final_content="done",
+                    steps_taken=1,
+                    driver_name="audit",
+                )
+
+        stage = OrchestrateStage(
+            store=store,
+            provider=MockLLMProvider(),
+            workspace_root=ws,
+            execution_drivers=ExecutionDriversConfig(worker_driver="audit"),
+            driver_registry=DriverRegistry({"audit": OutOfScopeDriver(rel)}),
+        )
+        out = stage.run_execution(run_id=run_id)
+        assert out["plan"].tasks[0].status == TaskStatus.BLOCKED
+        rejections = [
+            e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"
+        ]
+        assert len(rejections) == 1
+        assert rel in rejections[0].payload["violating_paths"]
+        assert not (ws / ".olympus" / "runs" / run_id / "accepted_overlay" / rel).exists()
+
+
+def test_watchdog_slow_monitor_never_stalls_completed_worker(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    entered, release, finished = Event(), Event(), Event()
+
+    class FastDriver:
+        name = "fast"
+        supports_steer = False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            del on_event
+            if on_handle is not None:
+                on_handle(self)
+            assert entered.wait(3.0)
+            (request.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            finished.set()
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="fast",
+            )
+
+    class SlowMonitor(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args, kwargs
+            entered.set()
+            release.wait(5.0)
+            return LLMResponse(
+                content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Too late"})
+            )
+
+    verdict = json.dumps(
+        {
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": True,
+            "summary": "ok",
+            "findings": [],
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        monitor_provider=SlowMonitor(),
+        watchdog_config=WatchdogConfig(interval_seconds=0.01, stop_join_timeout_seconds=0.05),
+        execution_drivers=ExecutionDriversConfig(worker_driver="fast"),
+        driver_registry=DriverRegistry({"fast": FastDriver()}),
+    )
+    runner = Thread(target=lambda: stage.run_execution(run_id=run_id))
+    runner.start()
+    try:
+        assert finished.wait(3.0)
+        runner.join(1.5)
+        assert not runner.is_alive()
+        assert store.get_run(run_id)["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    finally:
+        release.set()
+        runner.join(5.0)
+
+
+def test_watchdog_pause_blocks_concurrent_sibling_acceptance_and_overlay(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    t1 = plan.tasks[0]
+    t2 = t1.model_copy(
+        update={"task_id": "T2", "objective": "Second worker", "write_scope": ["other.py"]}
+    )
+    _approve_plan(store, run_id, plan.model_copy(update={"tasks": [t1, t2]}))
+    peer_running, t1_cancelled = Event(), Event()
+
+    class PeerHandle:
+        supports_steer = False
+
+        def __init__(self, flag: Event) -> None:
+            self._flag = flag
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            self._flag.set()
+
+    class ConcurrentDriver:
+        name = "concurrent"
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            handle = PeerHandle(t1_cancelled if request.task_id == "T1" else Event())
+            if on_handle is not None:
+                on_handle(handle)
+            if request.task_id == "T1":
+                assert peer_running.wait(3.0)
+                if on_event is not None:
+                    on_event(
+                        "agent.tool_finished",
+                        {
+                            "tool": "run_bash",
+                            "step": 1,
+                            "status": "error",
+                            "error_signature": "sha256:" + "a" * 64,
+                        },
+                    )
+                assert t1_cancelled.wait(3.0)
+                return TurnOutcome(
+                    completed=False,
+                    stop_reason="cancelled",
+                    final_content="",
+                    steps_taken=1,
+                    driver_name="concurrent",
+                )
+            peer_running.set()
+            deadline = time.monotonic() + 3.0
+            while (
+                store.get_run(run_id)["status"] != RunStatus.PAUSED
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert store.get_run(run_id)["status"] == RunStatus.PAUSED
+            (request.workspace_path / "other.py").write_text("late write\n", encoding="utf-8")
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="concurrent",
+            )
+
+    verdict = json.dumps(
+        {"task_id": "T2", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Needs operator"})
+                )
+            ]
+        ),
+        watchdog_config=WatchdogConfig(repeat_error_threshold=1),
+        execution_drivers=ExecutionDriversConfig(worker_driver="concurrent"),
+        driver_registry=DriverRegistry({"concurrent": ConcurrentDriver()}),
+    )
+    out = stage.run_execution(run_id=run_id)
+    assert out["status"] == RunStatus.PAUSED
+    assert not [e for e in store.list_events(run_id) if e.event_type == "task.accepted"]
+    assert not (tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay" / "other.py").exists()

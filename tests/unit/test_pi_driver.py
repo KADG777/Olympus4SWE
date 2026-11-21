@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -356,7 +357,6 @@ def _wait_for_pids(path: Path) -> dict[str, int]:
     return {"pid": int(data["pid"]), "pgid": int(data["pgid"]), "child": int(data["child"])}
 
 
-# --------------------------------------------------------------------- driver seams
 
 
 def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
@@ -380,7 +380,7 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
 
     def on_event(kind: str, payload: dict[str, Any]) -> None:
         events.append((kind, payload))
-        if kind == "tool_end" and not steered:
+        if kind == "agent.tool_finished" and not steered:
             steered.append(handles[0].steer("Prefer smaller edits", source="human"))
 
     def on_handle(handle: ActiveTurnHandle) -> None:
@@ -404,7 +404,11 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
     assert "Prefer smaller edits" not in json.dumps(outcome.receipt)
 
     kinds = [kind for kind, _ in events]
-    assert kinds.index("tool_start") < kinds.index("tool_end") < kinds.index("agent.steered")
+    assert (
+        kinds.index("agent.tool_started")
+        < kinds.index("agent.tool_finished")
+        < kinds.index("agent.steered")
+    )
     steered_payloads = [payload for kind, payload in events if kind == "agent.steered"]
     assert steered_payloads == [
         {"actor": "hephaestus:T1", "task_id": "T1", "step": 2, "source": "human"}
@@ -503,7 +507,7 @@ def test_pi_driver_falls_back_to_json_mode_without_rpc_support(
 
     assert outcome.completed and outcome.final_content == "Documented change."
     assert outcome.receipt["llm"] == {"calls": 2, "input_tokens": 18, "output_tokens": 8}
-    assert "tool_start" in events and "tool_end" in events
+    assert "agent.tool_started" in events and "agent.tool_finished" in events
     assert not handles[0].supports_steer
     assert handles[0].steer("too late", source="human") is False
 
@@ -542,7 +546,6 @@ def test_pi_driver_read_only_turn_restricts_pi_tools(
     assert "--extension" not in argv
 
 
-# ----------------------------------------------------------- Stage 2 integration
 
 
 def _init_repo(root: Path) -> None:
@@ -817,3 +820,145 @@ def test_missing_pi_binary_fails_before_task_lease_or_review(
         for e in store.list_events(run_id)
         if e.event_type in ("task.verifying", "review.verdict_recorded", "task.diff_gate_rejected")
     ]
+
+
+def _proc_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_pi_driver_cancel_reclaims_process_group_under_stdin_backpressure(tmp_path: Path) -> None:
+    fake = tmp_path / "pi-backpressure"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time\n"
+        "if '--help' in sys.argv:\n"
+        "    print('--mode json rpc')\n"
+        "else:\n"
+        "    print('pid', os.getpid(), flush=True)\n"
+        "    time.sleep(20)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    ready, finished, cancelled = Event(), Event(), Event()
+    handles: list[ActiveTurnHandle] = []
+    driver = PiDriver(binary=str(fake), cancel_grace_seconds=0.1, term_grace_seconds=0.1)
+    trace_path = tmp_path / "trace.jsonl"
+    req = DriverTurnRequest(
+        workspace_path=tmp_path,
+        env_root=tmp_path,
+        system_prompt="",
+        user_prompt="x" * 1_048_576,
+        actor="worker",
+        trace_path=trace_path,
+    )
+
+    def register(handle: ActiveTurnHandle) -> None:
+        handles.append(handle)
+        ready.set()
+
+    worker = Thread(
+        target=lambda: (driver.run_turn(req, on_handle=register), finished.set()),
+        daemon=True,
+    )
+    worker.start()
+    assert ready.wait(3.0)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and (
+        not trace_path.exists() or "pi.unparsed" not in trace_path.read_text(encoding="utf-8")
+    ):
+        time.sleep(0.01)
+    pid = next(
+        int(entry["line"].split()[1])
+        for entry in (
+            json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+        )
+        if entry.get("source") == "pi.unparsed"
+    )
+    stopper = Thread(
+        target=lambda: (handles[0].cancel(reason="watchdog_paused"), cancelled.set()),
+        daemon=True,
+    )
+    stopper.start()
+    try:
+        assert cancelled.wait(2.0)
+        assert finished.wait(2.0)
+        assert not _proc_alive(pid)
+    finally:
+        if _proc_alive(pid):
+            os.killpg(pid, signal.SIGKILL)
+        worker.join(2.0)
+
+
+def test_pi_driver_help_probe_reaps_helper_child_process(tmp_path: Path) -> None:
+    fake = tmp_path / "pi-help-helper"
+    msg_end = json.dumps({"type": "message_end", "message": {"role": "assistant", "content": "ok"}})
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, subprocess, sys\n"
+        "if '--help' in sys.argv:\n"
+        "    child = subprocess.Popen(['sleep', '20'], stdin=subprocess.DEVNULL,\n"
+        "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    pathlib.Path(__file__).with_name('helper.pid').write_text(str(child.pid))\n"
+        "    print('--mode json rpc')\n"
+        "else:\n"
+        "    sys.stdin.readline()\n"
+        f"    print({msg_end!r})\n"
+        "    print('{\"type\":\"agent_settled\"}', flush=True)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    req = DriverTurnRequest(
+        workspace_path=tmp_path,
+        env_root=tmp_path,
+        system_prompt="",
+        user_prompt="test",
+        actor="worker",
+    )
+    outcome = PiDriver(binary=str(fake)).run_turn(req)
+    helper_pid = int((tmp_path / "helper.pid").read_text(encoding="utf-8"))
+    time.sleep(0.05)
+    try:
+        assert outcome.completed
+        assert not _proc_alive(helper_pid)
+    finally:
+        if _proc_alive(helper_pid):
+            os.kill(helper_pid, signal.SIGKILL)
+
+
+def test_pi_driver_enforces_budget_and_max_steps_with_honest_ledger(tmp_path: Path) -> None:
+    from olympus.core.contracts import BudgetPolicy, RunMode
+
+    store = RunStore(tmp_path / "run.db")
+    run_id = store.create_run(
+        title="budget-cap",
+        mode=RunMode.SIMULATION,
+        budget_policy=BudgetPolicy(max_llm_calls=1),
+    )
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    outcome = PiDriver(binary=str(fake), store=store, run_id=run_id).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            max_steps=1,
+            trace_path=trace_path,
+        )
+    )
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert not outcome.completed
+    assert outcome.stop_reason.startswith("budget_exhausted")
+    assert ledger.llm_calls_used == outcome.steps_taken
+    assert ledger.input_tokens == outcome.total_input_tokens
+    assert ledger.output_tokens == outcome.total_output_tokens
+    assert not any(
+        "usage.settle_error" in line for line in trace_path.read_text(encoding="utf-8").splitlines()
+    )

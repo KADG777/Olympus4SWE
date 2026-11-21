@@ -818,6 +818,57 @@ class RunStore:
             )
             return updated
 
+    def record_external_llm_usage(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+        purpose: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> bool:
+        """Record external-harness LLM usage monotonically; return True if budget was exceeded."""
+        with self._tx() as conn:
+            row = self._get_run_row(conn, run_id)
+            policy = BudgetPolicy.model_validate_json(row["budget_policy_json"])
+            ledger = BudgetLedger.model_validate_json(row["budget_ledger_json"])
+            over_budget = not ledger.can_reserve(policy)
+            updated = ledger.model_copy(
+                update={
+                    "llm_calls_used": ledger.llm_calls_used + 1,
+                    "input_tokens": ledger.input_tokens + max(0, input_tokens),
+                    "output_tokens": ledger.output_tokens + max(0, output_tokens),
+                }
+            )
+            if (
+                policy.max_total_tokens is not None
+                and updated.total_tokens > policy.max_total_tokens
+            ):
+                over_budget = True
+            new_rev = self._bump_run_field(
+                conn,
+                run_id=run_id,
+                column="budget_ledger_json",
+                value=updated.model_dump_json(),
+                cur_rev=int(row["state_revision"]),
+            )
+            self._insert_event(
+                conn,
+                run_id=run_id,
+                stage="budget",
+                event_type="budget.settled",
+                actor=actor,
+                payload={
+                    "purpose": purpose,
+                    "used": updated.llm_calls_used,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "over_budget": over_budget,
+                },
+                state_revision=new_rev,
+            )
+            return over_budget
+
     def acquire_task_lease(self, run_id: str, task_id: str, *, actor: str = "chronos") -> TaskNode:
         """Atomically transition a task to RUNNING with an incremented lease_generation."""
         with self._tx() as conn:
@@ -877,10 +928,18 @@ class RunStore:
         mutator: Callable[[TaskNode], TaskNode],
         actor: str,
         event_type: str,
+        reject_if_run_inactive: bool = False,
     ) -> TaskNode:
         """Update task state only if the caller still holds the active lease_generation."""
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
+            if reject_if_run_inactive and row["status"] in (
+                RunStatus.PAUSED.value,
+                RunStatus.CANCELLED.value,
+            ):
+                raise ConcurrencyConflictError(
+                    f"Run {run_id} is {row['status']}; refusing {event_type} for {task_id}"
+                )
             if not row["plan_json"]:
                 raise NotFoundError(f"Run {run_id} has no TaskPlan")
             plan = TaskPlan.model_validate_json(row["plan_json"])

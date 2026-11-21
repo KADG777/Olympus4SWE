@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -62,21 +63,30 @@ def _probe_rpc_support(binary: str, env: dict[str, str]) -> bool:
         cached = _help_cache.get(binary)
     if cached is not None:
         return cached
+    proc: subprocess.Popen[str] | None = None
     try:
-        probe = subprocess.run(
+        proc = subprocess.Popen(
             [binary, "--help"],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_HELP_PROBE_TIMEOUT_SECONDS,
             env=env,
-            check=False,
+            start_new_session=True,
         )
+        stdout, stderr = proc.communicate(timeout=_HELP_PROBE_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PiNotAvailableError(
             f"PiDriver could not run {binary!r} --help: {exc}. {_INSTALL_HINT}"
         ) from exc
+    finally:
+        if proc is not None:
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=2)
     mode_lines = [
-        line for line in f"{probe.stdout}\n{probe.stderr}".splitlines() if "--mode" in line
+        line for line in f"{stdout}\n{stderr}".splitlines() if "--mode" in line
     ]
     mode_help = " ".join(mode_lines)
     if "json" not in mode_help:
@@ -189,8 +199,6 @@ class _TraceWriter:
 
 
 class _PiTurn:
-    """One live Pi subprocess plus its reader threads, counters, and control handle."""
-
     def __init__(
         self,
         *,
@@ -215,10 +223,14 @@ class _PiTurn:
         self._emit_callback = emit
         self._trace = _TraceWriter(request.trace_path)
         self._lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._closed = threading.Event()
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
+        self._prompt_thread: threading.Thread | None = None
         self._cancel_requested = False
+        self._budget_exhausted_reason = ""
+        self._max_steps_exceeded = False
         self._stdin_closed = False
         self._steps = 0
         self._tool_started_at: dict[str, float] = {}
@@ -231,8 +243,6 @@ class _PiTurn:
         self._prompt_error = ""
         self._saw_error_message = False
         self._returncode: int | None = None
-
-    # ------------------------------------------------------------ ActiveTurnHandle
 
     @property
     def supports_steer(self) -> bool:
@@ -254,8 +264,9 @@ class _PiTurn:
                 or self._cancel_requested
             ):
                 return False
-            if not self._write_command_locked({"type": "steer", "message": text}):
-                return False
+        if not self._write_command({"type": "steer", "message": text}):
+            return False
+        with self._lock:
             step = self._steps + 1
             self._trace.append({"event": "agent.steered", "step": step, "source": source})
         self._emit(
@@ -275,10 +286,11 @@ class _PiTurn:
                 return
             self._cancel_requested = True
             self._trace.append({"event": "agent.cancelled", "reason": reason})
-            if self._supports_rpc:
-                with suppress(Exception):
-                    self._write_command_locked({"type": "abort"})
-            self._close_stdin_locked()
+            supports_rpc = self._supports_rpc
+        if supports_rpc:
+            with suppress(Exception):
+                self._write_command({"type": "abort"}, nonblocking=True)
+        self._close_stdin(nonblocking=True)
         if threading.current_thread() is self._reader:
             # Never block the stdout pump on its own pipe closing.
             threading.Thread(
@@ -286,8 +298,6 @@ class _PiTurn:
             ).start()
             return
         self._escalate_cancel()
-
-    # --------------------------------------------------------------------- lifecycle
 
     def execute(
         self, on_handle: Callable[[ActiveTurnHandle], None] | None = None
@@ -300,7 +310,12 @@ class _PiTurn:
             threading.Thread(target=self._pump_stderr, name="pi-stderr", daemon=True).start()
             if on_handle is not None:
                 on_handle(self)
-            self._send_prompt()
+            if self._supports_rpc:
+                prompt_thread = threading.Thread(
+                    target=self._send_prompt, name="pi-stdin-prompt", daemon=True
+                )
+                self._prompt_thread = prompt_thread
+                prompt_thread.start()
             self._await_stdout_close()
         finally:
             self._reap()
@@ -368,6 +383,10 @@ class _PiTurn:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
         elif self._scope_guard_path.is_file():
             command += ["--extension", str(self._scope_guard_path)]
+        else:
+            self._trace.append(
+                {"event": "pi.scope_guard_missing", "path": str(self._scope_guard_path)}
+            )
         if not self._supports_rpc:
             command += ["--", request.user_prompt]
         return command
@@ -375,18 +394,18 @@ class _PiTurn:
     def _send_prompt(self) -> None:
         if not self._supports_rpc:
             return
-        with self._lock:
-            delivered = self._write_command_locked(
-                {
-                    "id": "olympus-prompt",
-                    "type": "prompt",
-                    "message": self._request.user_prompt,
-                }
-            )
+        delivered = self._write_command(
+            {
+                "id": "olympus-prompt",
+                "type": "prompt",
+                "message": self._request.user_prompt,
+            }
+        )
         if not delivered:
             with self._lock:
-                self._prompt_error = "failed to deliver the prompt to pi"
-                self._close_stdin_locked()
+                if not self._cancel_requested:
+                    self._prompt_error = "failed to deliver the prompt to pi"
+            self._close_stdin()
 
     def _await_stdout_close(self) -> None:
         process = self._process
@@ -411,12 +430,12 @@ class _PiTurn:
             self._signal_group(signal.SIGKILL)
             with suppress(subprocess.TimeoutExpired):
                 self._returncode = process.wait(timeout=5)
-        # Terminate any background grandchildren left in the turn's process group.
         self._signal_group(signal.SIGKILL)
         if self._reader is not None:
             self._reader.join(timeout=5.0)
-        with self._lock:
-            self._close_stdin_locked()
+        if self._prompt_thread is not None:
+            self._prompt_thread.join(timeout=2.0)
+        self._close_stdin(nonblocking=True)
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 with suppress(Exception):
@@ -441,28 +460,50 @@ class _PiTurn:
             with suppress(ProcessLookupError, PermissionError):
                 process.send_signal(sig)
 
-    # ------------------------------------------------------------------ stdin helpers
-
-    def _write_command_locked(self, command: dict[str, Any]) -> bool:
-        process = self._process
-        if process is None or process.stdin is None or self._stdin_closed:
+    def _write_command(self, command: dict[str, Any], *, nonblocking: bool = False) -> bool:
+        if not self._stdin_lock.acquire(blocking=not nonblocking):
             return False
         try:
-            process.stdin.write((json.dumps(command, ensure_ascii=False) + "\n").encode("utf-8"))
-            process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
+            process = self._process
+            with self._lock:
+                closed = self._stdin_closed
+            if process is None or process.stdin is None or closed:
+                return False
+            if nonblocking:
+                try:
+                    _, writable, _ = select.select([], [process.stdin.fileno()], [], 0.05)
+                except (OSError, ValueError):
+                    return False
+                if not writable:
+                    return False
+            payload = (json.dumps(command, ensure_ascii=False) + "\n").encode("utf-8")
+            try:
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                self._close_stdin_locked()
+                return False
+            return True
+        finally:
+            self._stdin_lock.release()
+
+    def _close_stdin(self, *, nonblocking: bool = False) -> None:
+        with self._lock:
+            self._stdin_closed = True
+        if not self._stdin_lock.acquire(blocking=not nonblocking):
+            return
+        try:
             self._close_stdin_locked()
-            return False
-        return True
+        finally:
+            self._stdin_lock.release()
 
     def _close_stdin_locked(self) -> None:
         process = self._process
-        self._stdin_closed = True
+        with self._lock:
+            self._stdin_closed = True
         if process is not None and process.stdin is not None:
             with suppress(Exception):
                 process.stdin.close()
-
-    # ------------------------------------------------------------------ reader pumps
 
     def _pump_stderr(self) -> None:
         process = self._process
@@ -497,8 +538,7 @@ class _PiTurn:
         except (OSError, ValueError) as exc:
             self._trace.append({"event": "pi.reader_error", "error": str(exc)[:300]})
         finally:
-            with self._lock:
-                self._close_stdin_locked()
+            self._close_stdin(nonblocking=True)
             self._closed.set()
 
     def _handle_record(self, record: dict[str, Any]) -> None:
@@ -520,7 +560,7 @@ class _PiTurn:
         elif record_type == "agent_settled":
             with self._lock:
                 self._aborted = bool(record.get("aborted"))
-                self._close_stdin_locked()
+            self._close_stdin(nonblocking=True)
         elif record_type == "response":
             self._on_response(record)
         elif record_type == "extension_error":
@@ -541,7 +581,7 @@ class _PiTurn:
             {"event": "tool_call", "step": step, "tool": tool, "target": target, "status": "ok"}
         )
         self._emit(
-            "tool_start",
+            "agent.tool_started",
             {
                 "actor": self._request.actor,
                 "task_id": self._request.task_id,
@@ -590,7 +630,7 @@ class _PiTurn:
             }
         )
         self._emit(
-            "tool_end",
+            "agent.tool_finished",
             {
                 "actor": self._request.actor,
                 "task_id": self._request.task_id,
@@ -636,7 +676,7 @@ class _PiTurn:
                 "output_tokens": output_tokens,
             }
         )
-        self._settle_usage(step, input_tokens, output_tokens)
+        over_budget = self._settle_usage(step, input_tokens, output_tokens)
         self._emit(
             "llm",
             {
@@ -647,6 +687,14 @@ class _PiTurn:
                 "output_tokens": output_tokens,
             },
         )
+        if over_budget:
+            with self._lock:
+                self._budget_exhausted_reason = "budget_exhausted: Pi exceeded configured budget"
+            self.cancel(reason="budget_exhausted")
+        elif step > self._request.max_steps:
+            with self._lock:
+                self._max_steps_exceeded = True
+            self.cancel(reason="max_steps_exceeded")
 
     def _on_response(self, record: dict[str, Any]) -> None:
         if bool(record.get("success")):
@@ -659,18 +707,16 @@ class _PiTurn:
         if command == "prompt":
             with self._lock:
                 self._prompt_error = error[:500]
-                self._close_stdin_locked()
+            self._close_stdin(nonblocking=True)
 
-    def _settle_usage(self, step: int, input_tokens: int, output_tokens: int) -> None:
+    def _settle_usage(self, step: int, input_tokens: int, output_tokens: int) -> bool:
         if self._store is None or self._run_id is None:
-            return
+            return False
         try:
-            self._store.reserve_llm_call(
-                self._run_id, actor=self._request.actor, purpose=f"pi_step_{step}"
-            )
-            self._store.settle_llm_call(
+            return self._store.record_external_llm_usage(
                 self._run_id,
                 actor=self._request.actor,
+                purpose=f"pi_step_{step}",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
@@ -678,10 +724,13 @@ class _PiTurn:
             self._trace.append(
                 {"event": "usage.settle_error", "step": step, "error": str(exc)[:300]}
             )
-
-    # ------------------------------------------------------------------- result plumbing
+            return False
 
     def _classify_outcome(self) -> tuple[bool, str, str]:
+        if self._budget_exhausted_reason:
+            return False, self._budget_exhausted_reason, ""
+        if self._max_steps_exceeded:
+            return False, "max_steps_exceeded", ""
         if self._prompt_error:
             return False, "pi_error", ""
         if self._cancel_requested:
@@ -699,13 +748,17 @@ class _PiTurn:
     def _persist_receipt(self, receipt: dict[str, Any]) -> None:
         if self._store is None or self._run_id is None:
             return
-        with suppress(Exception):
+        try:
             self._store.append_event(
                 run_id=self._run_id,
                 stage="orchestrate",
                 event_type="turn.receipt",
                 actor=self._request.actor,
                 payload=receipt,
+            )
+        except Exception as exc:  # noqa: BLE001 - receipt persistence must not fail a completed turn
+            self._trace.append(
+                {"event": "receipt.persist_error", "error": str(exc)[:300]}
             )
 
     def _emit(self, kind: str, payload: dict[str, Any]) -> None:
@@ -748,11 +801,6 @@ class PiDriver:
         on_event: DriverEvent | None = None,
         on_handle: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
-        if shutil.which(self._binary) is None:
-            raise PiNotAvailableError(
-                f"PiDriver requires the Pi coding agent CLI but {self._binary!r} was not found. "
-                + _INSTALL_HINT
-            )
         env = build_sandbox_env(request.workspace_path, host_root=request.env_root)
         supports_rpc = _probe_rpc_support(self._binary, env)
         turn = _PiTurn(

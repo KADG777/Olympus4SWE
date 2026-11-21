@@ -146,7 +146,6 @@ def _is_ignored_rel(rel: str) -> bool:
 
 
 def _file_fingerprint(path: Path) -> str | None:
-    """Fingerprint one file by type/mode and content without following symlinks."""
     try:
         info = os.lstat(path)
     except OSError:
@@ -169,7 +168,6 @@ def _file_fingerprint(path: Path) -> str | None:
 
 
 def _workspace_fingerprints(root: Path) -> dict[str, str | None]:
-    """Fingerprint every non-ignored file below ``root`` keyed by relative posix path."""
     fingerprints: dict[str, str | None] = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIR_NAMES)
@@ -183,7 +181,6 @@ def _workspace_fingerprints(root: Path) -> dict[str, str | None]:
 
 
 def _git_changed_fingerprints(ws: Path, base_commit: str) -> dict[str, str | None]:
-    """Fingerprint every path that differs from ``base_commit`` (tracked, renamed, untracked)."""
     proc = _run_git(ws, "diff", "--name-status", "-z", "-M", base_commit)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -200,15 +197,15 @@ def _git_changed_fingerprints(ws: Path, base_commit: str) -> dict[str, str | Non
         if status[0] in ("R", "C"):
             old_path, new_path = tokens[index], tokens[index + 1]
             index += 2
-            if status[0] == "R" and not _is_ignored_rel(old_path):
+            if status[0] == "R" and old_path:
                 # The rename deletes the old path; the deletion is itself a mutation.
                 entries[old_path] = _file_fingerprint(ws / old_path)
-            if not _is_ignored_rel(new_path):
+            if new_path:
                 entries[new_path] = _file_fingerprint(ws / new_path)
             continue
         rel = tokens[index]
         index += 1
-        if rel and not _is_ignored_rel(rel):
+        if rel:
             entries[rel] = _file_fingerprint(ws / rel)
 
     untracked = _run_git(ws, "ls-files", "--others", "--exclude-standard", "-z")

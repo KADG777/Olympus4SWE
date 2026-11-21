@@ -34,13 +34,18 @@ class WatchdogConfig:
     silence_seconds: float = 180
     interval_seconds: float = 300
     max_steers_per_attempt: int = 2
+    stop_join_timeout_seconds: float = 0.25
     clock: Callable[[], float] = monotonic
     wait: Callable[[Condition, float], object] = Condition.wait
 
     def __post_init__(self) -> None:
         if self.repeat_error_threshold < 1 or self.max_steers_per_attempt < 0:
             raise ValueError("Expected a positive error threshold and nonnegative steer cap")
-        intervals = (self.silence_seconds, self.interval_seconds)
+        intervals = (
+            self.silence_seconds,
+            self.interval_seconds,
+            self.stop_join_timeout_seconds,
+        )
         if any(not math.isfinite(t) or t <= 0 for t in intervals):
             raise ValueError("Watchdog time thresholds must be positive and finite")
 
@@ -64,7 +69,8 @@ class WatchdogVerdict(StrictModel):
 class Watchdog:
     """Own L1 deadlines, L2 evaluation and intervention for one active handle.
 
-    The monitor provider must bound its own I/O. Stopping joins any in-flight call.
+    Runs on a daemon thread and joins with a bounded timeout on ``stop()`` so a slow
+    monitor call never stalls a finished worker; late verdicts are discarded.
     """
 
     def __init__(
@@ -95,7 +101,9 @@ class Watchdog:
 
     def start(self, handle: ActiveTurnHandle) -> None:
         self._started_at = self._last_milestone = self._config.clock()
-        self._thread = Thread(target=self._monitor, args=(handle,), name="olympus-watchdog")
+        self._thread = Thread(
+            target=self._monitor, args=(handle,), name="olympus-watchdog", daemon=True
+        )
         self._thread.start()
 
     def observe(self, kind: str, fields: dict[str, Any]) -> None:
@@ -119,7 +127,7 @@ class Watchdog:
             self._stopped = True
             self._condition.notify()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=self._config.stop_join_timeout_seconds)
 
     def _monitor(self, handle: ActiveTurnHandle) -> None:
         provider: LLMProvider | None = None
@@ -157,6 +165,9 @@ class Watchdog:
                     provider = self._provider_factory()
                 verdict = self._evaluate(provider, tail)
             except Exception as exc:  # noqa: BLE001 - isolate the optional evaluator
+                with self._condition:
+                    if self._stopped:
+                        return
                 self._emit("watchdog.error", {"error": type(exc).__name__, "trigger": trigger})
                 continue
             finally:
