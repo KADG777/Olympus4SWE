@@ -10,7 +10,21 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from olympus.core.contracts import CheckKind, GoalSpec, RunMode, RunStatus, TaskStatus
+from olympus.core.contracts import (
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalTarget,
+    CheckKind,
+    DesignSpec,
+    ExecutionStrategy,
+    GoalSpec,
+    RunMode,
+    RunStatus,
+    SpecStatus,
+    TaskKind,
+    TaskPlan,
+    TaskStatus,
+)
 from olympus.core.store import RunStore
 from olympus.providers.base import (
     ChatMessage,
@@ -768,3 +782,493 @@ def test_failed_timeout_retry_blocks_only_its_dependency_chain(tmp_path: Path) -
     # A ready task on an awaiting run now surfaces the resume banner (Issue #54).
     assert after_manual_retry["hitl_banner"]["kind"] == "ready_to_resume"
     assert after_manual_retry["hitl_banner"]["actions"] == ["retry_workflow"]
+
+
+def _approve_plan(
+    store: RunStore,
+    run_id: str,
+    plan: TaskPlan,
+    *,
+    design: DesignSpec | None = None,
+) -> None:
+    """Persist and approve a hand-built plan (optionally pinning an approved design)."""
+    if design is not None:
+        store.save_design(run_id, design, actor="design")
+        store.record_approval(
+            ApprovalRecord(
+                run_id=run_id,
+                target=ApprovalTarget.DESIGN_SPEC,
+                target_id=design.design_id,
+                target_hash=design.content_hash,
+                approver="zeus",
+                decision=ApprovalDecision.APPROVED,
+            )
+        )
+    store.save_plan(run_id, plan, actor="orchestrate")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+
+def _contract_design(spec: GoalSpec, *, shared_paths: list[str]) -> DesignSpec:
+    return DesignSpec.model_validate(
+        {
+            "design_id": "design-diff-gate",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "Shared contracts pin cross-task boundaries.",
+            "shared_contract_paths": shared_paths,
+            "execution_strategy": ExecutionStrategy.CONTRACT_FIRST_PARALLEL.value,
+            "strategy_rationale": "Wave 0 contract task locks shared paths before implement.",
+            "modules": [
+                {
+                    "id": "M1",
+                    "name": "Core",
+                    "responsibility": "Feature flag core",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["src/"],
+                }
+            ],
+            "status": SpecStatus.CONFIRMED.value,
+        }
+    )
+
+
+def _single_task_plan(
+    *,
+    spec: GoalSpec,
+    write_scope: list[str],
+    checks: list[dict[str, Any]],
+    max_cycles: int = 3,
+    kind: TaskKind = TaskKind.IMPLEMENT,
+) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-diff-gate",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Implement the flag module",
+                    "objective": "Implement the assigned flag module",
+                    "requirement_refs": ["R1"],
+                    "kind": kind.value,
+                    "write_scope": write_scope,
+                    "max_cycles": max_cycles,
+                    "acceptance_checks": checks,
+                }
+            ],
+        }
+    )
+
+
+def _marker_command_check() -> dict[str, Any]:
+    return {
+        "id": "CHK-1",
+        "kind": CheckKind.COMMAND.value,
+        "description": "Write a marker proving acceptance checks ran",
+        "command": (
+            "python3 -c 'from pathlib import Path; "
+            'Path("check-ran.txt").write_text("ran")\''
+        ),
+    }
+
+
+def _bash_action(command: str) -> Callable[[Path], ToolCall]:
+    return lambda sandbox: ToolCall(  # noqa: ARG005 - action bound to one sandbox
+        id="bash-1",
+        name="run_bash",
+        arguments={"command": command},
+    )
+
+
+def _write_action(file_name: str, content: str) -> Callable[[Path], ToolCall]:
+    return lambda sandbox: ToolCall(
+        id="write-1",
+        name="write_file",
+        arguments={"path": str(sandbox / file_name), "content": content},
+    )
+
+
+def _scope_gate_responder(
+    actions: Sequence[Callable[[Path], ToolCall]],
+) -> tuple[Responder, dict[str, int]]:
+    """Replay one worker action per attempt; the last action repeats if needed.
+
+    Review verdicts always pass so a requeue can only come from the Diff Gate.
+    """
+    state = {"attempts": 0, "reviews": 0}
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system_message = messages[0].content
+        user_message = messages[1].content if len(messages) > 1 else ""
+        if "Independent Verifier" in system_message:
+            state["reviews"] += 1
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T1",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "Scope-clean implementation verified.",
+                        "findings": [],
+                    }
+                )
+            )
+        if "Execution Engineer" not in system_message:
+            raise AssertionError(f"Unexpected system prompt: {system_message[:80]}")
+        match = re.search(r"Sandbox workspace root: (.+)", user_message)
+        assert match is not None
+        sandbox = Path(match.group(1).strip())
+        if not any(msg.role == "tool" for msg in messages):
+            action = actions[min(state["attempts"], len(actions) - 1)]
+            state["attempts"] += 1
+            return LLMResponse(content="acting", tool_calls=(action(sandbox),))
+        return LLMResponse(content="finished")
+
+    return responder, state
+
+
+def _gate_rejections(store: RunStore, run_id: str) -> list[Any]:
+    return [e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"]
+
+
+def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    notes = tmp_path / "docs" / "notes.md"
+    notes.parent.mkdir()
+    notes.write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "docs/notes.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=2,
+        checks=[
+            _marker_command_check(),
+            {
+                "id": "CHK-REV-1",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Cold-start independent review",
+            },
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action("printf 'tampered\\n' >> docs/notes.md"),
+            _write_action("feature.py", "FLAG = True\n"),
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 2
+    assert state["attempts"] == 2
+    assert state["reviews"] == 1
+
+    events = store.list_events(run_id)
+    rejections = [e for e in events if e.event_type == "task.diff_gate_rejected"]
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["task_id"] == "T1"
+    assert payload["attempt"] == 1
+    assert payload["violating_paths"] == ["docs/notes.md"]
+    assert payload["allowed_write_scope"] == ["feature.py"]
+    assert payload["forbidden_globs"] == []
+
+    # Gate rejection precedes every check and review event; the retry is the only review.
+    check_events = [e for e in events if e.event_type == "check.command_completed"]
+    assert check_events
+    assert all(e.event_seq > rejections[0].event_seq for e in check_events)
+    review_events = [e for e in events if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["attempt"] for e in review_events] == [2]
+    assert len([e for e in events if e.event_type == "task.requeued"]) == 1
+
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert (attempt_dir / "diff.patch").is_file()
+    assert (attempt_dir / "MANIFEST.md").is_file()
+    assert not list(attempt_dir.glob("check-*.log"))
+    assert not list(attempt_dir.glob("verdict-cycle-*.json"))
+
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "feature.py").is_file()
+    assert not (overlay / "docs" / "notes.md").exists()
+    assert notes.read_text(encoding="utf-8") == "original\n"
+
+
+def test_diff_gate_rejects_untracked_file_outside_write_scope(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mkdir -p stray && printf 'x\\n' > stray/notes.txt")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 1
+    assert task.last_error is not None
+    assert "Diff Gate" in task.last_error
+    assert "stray/notes.txt" in task.last_error
+    assert "feature.py" in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["violating_paths"] == ["stray/notes.txt"]
+    assert payload["allowed_write_scope"] == ["feature.py"]
+
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert not list(attempt_dir.glob("check-*.log"))
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert not overlay.exists() or not any(overlay.iterdir())
+
+
+def test_diff_gate_rejects_forbidden_contract_path_even_when_write_scope_matches(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    design = _contract_design(spec, shared_paths=["src/contracts/"])
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["src/"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan, design=design)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mkdir -p src/contracts && printf 'x\\n' > src/contracts/api.py")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.last_error is not None
+    assert "forbidden" in task.last_error
+    assert "src/contracts/api.py" in task.last_error
+    assert "src/contracts/" in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["violating_paths"] == ["src/contracts/api.py"]
+    assert payload["allowed_write_scope"] == ["src/"]
+    assert payload["forbidden_globs"] == ["src/contracts/"]
+    assert payload["violations"][0]["reason"] == "forbidden"
+
+
+def test_diff_gate_allows_contract_task_to_edit_shared_contract_paths(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    design = _contract_design(spec, shared_paths=["contracts/"])
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["contracts/"],
+        kind=TaskKind.CONTRACT,
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Contract file exists with pinned content",
+                "command": (
+                    "python3 -c 'from pathlib import Path; "
+                    'assert Path("contracts/api.py").read_text() == "PINNED = 1\\n"\''
+                ),
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan, design=design)
+    responder, state = _scope_gate_responder([_write_action("contracts/api.py", "PINNED = 1\n")])
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert state["reviews"] == 1
+    assert _gate_rejections(store, run_id) == []
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "contracts" / "api.py").read_text(encoding="utf-8") == "PINNED = 1\n"
+
+
+def test_diff_gate_passes_tracked_and_untracked_changes_inside_write_scope(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    app = tmp_path / "app.py"
+    app.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "app"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["app.py", "pkg/"],
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Tracked edit and new module are both present",
+                "command": (
+                    "python3 -c 'from pathlib import Path; "
+                    'assert "VALUE = 2" in Path("app.py").read_text(); '
+                    'assert Path("pkg/util.py").is_file()\''
+                ),
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action(
+                "printf 'VALUE = 2\\n' > app.py && mkdir -p pkg && printf 'X = 1\\n' > pkg/util.py"
+            )
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert state["reviews"] == 1
+    assert _gate_rejections(store, run_id) == []
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (overlay / "pkg" / "util.py").read_text(encoding="utf-8") == "X = 1\n"
+    # SIMULATION mode with apply_to_workspace=False never touches the host checkout.
+    assert app.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_diff_gate_validates_non_git_sandbox_without_crashing(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Sample\n", encoding="utf-8")
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=2,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action("printf 'x\\n' > stray.py"),
+            _write_action("feature.py", "FLAG = True\n"),
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert state["attempts"] == 2
+    assert state["reviews"] == 1
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    assert rejections[0].payload["violating_paths"] == ["stray.py"]
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "feature.py").is_file()
+    assert not (overlay / "stray.py").exists()
+
+
+def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "notes.md").write_text("original\n", encoding="utf-8")
+    (docs / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "docs/"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mv docs/notes.md docs/notes-renamed.md && rm docs/legacy.txt")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.last_error is not None
+    for path in ("docs/legacy.txt", "docs/notes-renamed.md", "docs/notes.md"):
+        assert path in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    assert rejections[0].payload["violating_paths"] == [
+        "docs/legacy.txt",
+        "docs/notes-renamed.md",
+        "docs/notes.md",
+    ]
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert not list(attempt_dir.glob("check-*.log"))
+    # The host checkout keeps both documents intact: nothing is auto-reverted or promoted.
+    assert (docs / "notes.md").is_file()
+    assert (docs / "legacy.txt").is_file()
+    assert not (docs / "notes-renamed.md").exists()

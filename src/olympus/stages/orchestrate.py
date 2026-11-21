@@ -35,6 +35,7 @@ from olympus.core.dag import (
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
+from olympus.harness.diff_gate import run_diff_gate
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError
 from olympus.harness.worktree import (
     SandboxHandle,
@@ -42,6 +43,7 @@ from olympus.harness.worktree import (
     capture_sandbox_diff,
     create_sandbox,
     remove_sandbox,
+    snapshot_sandbox_state,
 )
 from olympus.providers.base import LLMProvider
 from olympus.stages.common import format_workspace_inventory
@@ -717,6 +719,7 @@ class OrchestrateStage:
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
         try:
+            worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
@@ -794,6 +797,52 @@ class OrchestrateStage:
             diff_text = capture_sandbox_diff(sandbox)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
+
+            # Deterministic unbypassable boundary: reject any out-of-scope sandbox mutation
+            # before command checks, Argus review, or overlay promotion.
+            gate = run_diff_gate(
+                sandbox,
+                worker_baseline,
+                allowed_write_scope=verifying.write_scope,
+                forbidden_globs=forbidden_contracts,
+            )
+            if gate.rejected:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type="task.diff_gate_rejected",
+                    actor="chronos",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "violating_paths": [v.path for v in gate.violations],
+                        "violations": [
+                            {
+                                "path": v.path,
+                                "reason": v.reason,
+                                "matched_pattern": v.matched_pattern,
+                            }
+                            for v in gate.violations
+                        ],
+                        "allowed_write_scope": list(gate.allowed_write_scope),
+                        "forbidden_globs": list(gate.forbidden_globs),
+                        "changed_paths": list(gate.changed_paths),
+                    },
+                )
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=verifying.acceptance_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
+                return self._fail_or_requeue(
+                    run_id=run_id,
+                    task=verifying,
+                    reason=gate.rejection_message(),
+                    checks=verifying.acceptance_checks,
+                )
 
             if not loop_res.completed:
                 _write_manifest_md(

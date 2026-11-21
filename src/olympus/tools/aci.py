@@ -183,7 +183,8 @@ class WorkspacePolicy:
             return True
         return norm_rel == norm_pattern or norm_rel.startswith(f"{norm_pattern}/")
 
-    def _forbidden_match(self, rel: str) -> str | None:
+    def forbidden_match(self, rel: str) -> str | None:
+        """Return the forbidden pattern matching ``rel``, or None when the path is allowed."""
         for pattern in self.forbidden_write_scope:
             if self._scope_contains(rel, pattern) or self._scope_matches(rel, pattern):
                 return pattern
@@ -213,7 +214,7 @@ class WorkspacePolicy:
             rel = self._relative_target(raw_path)
         except ValueError as exc:
             return False, str(exc)
-        if self._forbidden_match(rel) is not None:
+        if self.forbidden_match(rel) is not None:
             return (
                 False,
                 f"Target path '{rel}' is a read-only shared contract path "
@@ -242,7 +243,7 @@ class WorkspacePolicy:
                 raise PermissionError(
                     f"Path '{resolved}' escapes workspace root '{self.workspace_root}'."
                 ) from exc
-        if self._forbidden_match(rel) is not None:
+        if self.forbidden_match(rel) is not None:
             raise PermissionError(
                 f"Target path '{rel}' is a read-only shared contract path "
                 f"({list(self.forbidden_write_scope)}): only contract tasks may modify it."
