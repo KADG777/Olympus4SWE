@@ -71,7 +71,10 @@ Rules:
 8. Language Mirroring: Write all human-facing prose (`goal`, `description`,
    `acceptance_criteria`, `out_of_scope`, `constraints`, `question`, `impact`, `options`,
    `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
-   `Raw user goal` is Chinese), keeping IDs and enum values in ASCII."""
+   `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
+9. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
+   copy the exact text from `assumptions` into `agent_high_impact_assumptions`. Do not mark user
+   decisions or confirmed clarifications as Agent assumptions. Ask about genuine blockers."""
 
 _CRITIQUE_SYSTEM_TEMPLATE = """You are a cold-start read-only {perspective} reviewer.
 Inspect the draft GoalSpec (and repository files if needed) and report ONLY real omissions,
@@ -323,9 +326,10 @@ class AlignStage:
         accept_risk: bool = False,
         reason: str = "",
         commit_sha: str | None = None,
+        expected_revision: int | None = None,
     ) -> GoalSpec:
         """Freeze and approve the current GoalSpec once all blocking ambiguities are resolved."""
-        snap = self.store.get_run(run_id)
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
         spec: GoalSpec | None = snap["spec"]
         if spec is None:
             raise ValueError(f"Run {run_id} has no GoalSpec to confirm")
@@ -339,9 +343,12 @@ class AlignStage:
 
         decision = ApprovalDecision.ACCEPT_RISK if accept_risk else ApprovalDecision.APPROVED
         confirmed = spec.model_copy(update={"status": SpecStatus.CONFIRMED})
-        self.store.save_spec(run_id, confirmed, actor=approver)
-        self.store.record_approval(
-            ApprovalRecord(
+        self.store.save_spec(
+            run_id,
+            confirmed,
+            actor=approver,
+            expected_revision=expected_revision,
+            approval=ApprovalRecord(
                 run_id=run_id,
                 target=ApprovalTarget.GOAL_SPEC,
                 target_id=confirmed.spec_id,
@@ -350,6 +357,6 @@ class AlignStage:
                 approver=approver,
                 decision=decision,
                 reason=reason,
-            )
+            ),
         )
         return confirmed

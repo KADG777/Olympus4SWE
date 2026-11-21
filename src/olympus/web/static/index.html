@@ -48,6 +48,7 @@
           <div class="stage-title-group">
             <h1 class="stage-title" id="run-title">Ariadne 研发编排控制台</h1>
             <span class="badge" data-variant="muted" id="run-kicker">准备就绪</span>
+            <span class="badge" data-variant="warn" id="run-connection" role="status" hidden></span>
           </div>
           <nav class="view-switcher" aria-label="视图切换">
             <a class="rail-link" href="#topology" data-view="topology" aria-current="page">
@@ -88,13 +89,16 @@
             <button type="button" class="btn btn-danger hitl-risk-sep" id="btn-banner-accept-risk">接受风险</button>
           </div>
           <div class="hitl-actions" id="hitl-gate-actions">
-            <button type="button" class="btn btn-primary" id="btn-approve-spec" hidden>批准 GoalSpec 进入架构设计</button>
-            <button type="button" class="btn btn-primary" id="btn-approve-design" hidden>批准 DesignSpec 启动任务分解</button>
-            <button type="button" class="btn btn-primary" id="btn-approve-plan" hidden>批准任务计划</button>
             <button type="button" class="btn btn-primary" id="btn-promote-execute" hidden>转入沙盒执行 (full_sdlc_tdd)</button>
             <button type="button" class="btn btn-primary" id="btn-retry-workflow" hidden>从断点重试</button>
             <button type="button" class="btn" id="btn-inspect-failure" hidden>查看节点日志</button>
           </div>
+          <section id="hitl-approval-reviews" class="approval-reviews" aria-label="审批候选版本" hidden></section>
+          <template id="hitl-approval-buttons">
+            <button type="button" class="btn btn-primary" id="btn-approve-spec" data-approve="approve_spec">批准 GoalSpec 进入架构设计</button>
+            <button type="button" class="btn btn-primary" id="btn-approve-design" data-approve="approve_design">批准 DesignSpec 启动任务分解</button>
+            <button type="button" class="btn btn-primary" id="btn-approve-plan" data-approve="approve_plan">批准任务计划</button>
+          </template>
         </section>
 
         <section class="intent-card" id="intent-card" hidden aria-label="需求输入与分级">
@@ -121,6 +125,29 @@
       </div>
 
       <section class="view" data-pane="topology" id="view-topology" aria-labelledby="workflow-title">
+        <section class="stage-live-panel card" id="stage-live-panel" hidden aria-labelledby="run-progress-title">
+          <div class="card-head">
+            <h2 class="card-title" id="run-progress-title">运行进展</h2>
+            <details class="run-detail">
+              <summary>运行详情</summary>
+              <div id="run-detail-stats" class="stat-band"></div>
+            </details>
+          </div>
+          <p id="run-current-stage" class="stage-activity-item" role="status"></p>
+          <p class="run-progress-note">
+            <span id="run-recent-progress"></span>
+            <time id="run-progress-time"></time>
+          </p>
+          <div id="run-key-output" class="stage-activity-item" hidden>
+            <p id="run-output-summary" role="status"></p>
+            <button id="run-output-detail" type="button" class="btn" hidden></button>
+          </div>
+          <details id="run-output-history" class="run-detail" hidden>
+            <summary>产物历史</summary>
+            <ol id="run-output-versions"></ol>
+          </details>
+        </section>
+
         <section class="workflow-section" aria-labelledby="workflow-title">
           <header class="view-head">
             <div class="view-head-meta">
@@ -140,11 +167,9 @@
           </div>
         </section>
 
-        <section class="stage-live-panel" id="stage-live-panel" hidden aria-label="阶段执行进展"></section>
-
         <section class="task-dag-section" id="task-dag-section" aria-labelledby="topology-title" hidden>
           <header class="view-head">
-            <h2 class="view-title" id="topology-title">任务依赖图</h2>
+            <h2 class="view-title" id="topology-title" tabindex="-1">任务依赖图</h2>
             <div class="dag-legend" aria-label="任务图例">
               <span class="legend-item">✓ 已验收</span>
               <span class="legend-item">▶ 运行中</span>
@@ -157,6 +182,21 @@
           <div class="dag-frame scroller">
             <svg class="dag-svg" id="dag-svg" role="img" aria-label="任务依赖有向无环图" width="760" height="216" viewBox="0 0 760 216"></svg>
           </div>
+          <details id="run-plan-detail" class="run-detail" hidden>
+            <summary>查看完整任务计划</summary>
+            <pre class="code-block scroller" tabindex="0"></pre>
+          </details>
+        </section>
+
+        <section class="delivery-acceptance" id="delivery-acceptance" aria-labelledby="delivery-title" hidden>
+          <header class="view-head">
+            <div class="view-head-meta">
+              <h2 class="view-title" id="delivery-title">交付验收</h2>
+              <span class="card-note" id="delivery-spec"></span>
+            </div>
+            <div class="stage-pills" id="delivery-counts" aria-label="验收状态汇总"></div>
+          </header>
+          <ul class="delivery-criteria card" id="delivery-criteria" aria-label="逐条验收条件"></ul>
         </section>
 
         <section class="lane-section" id="lane-section" aria-labelledby="lane-title" hidden>
@@ -217,7 +257,7 @@
       <header class="dock-head">
         <div>
           <span class="dock-kicker">检查器</span>
-          <h2 class="dock-title" id="dock-title">节点执行详情</h2>
+          <h2 class="dock-title" id="dock-title" tabindex="-1">节点执行详情</h2>
         </div>
         <button type="button" class="btn btn-quiet" id="btn-dock-close" aria-label="收起检查器">⇥</button>
       </header>

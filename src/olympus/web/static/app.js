@@ -12,15 +12,19 @@
     view: VIEWS.includes(params.get("view")) ? params.get("view") : "topology",
     selectedTaskId: params.get("task") || null,
     workflowNode: null,
+    deliveryEvidence: null,
+    deliveryRowsHtml: "",
     activeTab: TABS.includes(params.get("tab")) ? params.get("tab") : "overview",
     pendingAction: null,
+    approvalSnapshot: null,
+    openedPlanGraphHash: null,
     optionsLoaded: false,
     workflows: [],
     demos: [],
     clarifySig: "",
     userOpenedDock: false,
-    sse: null,
-    reconnectTimer: null,
+    transport: null,
+    submitting: false,
   };
 
   const el = {
@@ -52,6 +56,10 @@
     laneBadge: document.getElementById("lane-badge"),
     frStrip: document.getElementById("fr-strip"),
     matrixBody: document.getElementById("matrix-tbody"),
+    deliverySection: document.getElementById("delivery-acceptance"),
+    deliverySpec: document.getElementById("delivery-spec"),
+    deliveryCounts: document.getElementById("delivery-counts"),
+    deliveryCriteria: document.getElementById("delivery-criteria"),
     waterfall: document.getElementById("waterfall-list"),
     waterfallCount: document.getElementById("waterfall-count"),
     footNote: document.getElementById("foot-note"),
@@ -88,9 +96,8 @@
     taskActions: document.getElementById("hitl-task-actions"),
     gateActions: document.getElementById("hitl-gate-actions"),
     bannerDetail: document.getElementById("hitl-detail"),
-    approveSpec: document.getElementById("btn-approve-spec"),
-    approveDesign: document.getElementById("btn-approve-design"),
-    approvePlan: document.getElementById("btn-approve-plan"),
+    approvalReviews: document.getElementById("hitl-approval-reviews"),
+    approvalButtons: document.getElementById("hitl-approval-buttons"),
     promoteExecute: document.getElementById("btn-promote-execute"),
     retryWorkflow: document.getElementById("btn-retry-workflow"),
     inspectFailure: document.getElementById("btn-inspect-failure"),
@@ -98,6 +105,7 @@
     intentText: document.getElementById("intent-text"),
     stageLivePanel: document.getElementById("stage-live-panel"),
     taskDagSection: document.getElementById("task-dag-section"),
+    approvedPlanDetail: document.getElementById("run-plan-detail"),
     laneSection: document.getElementById("lane-section"),
   };
 
@@ -106,6 +114,9 @@
     goal_spec_ready: "GoalSpec 就绪",
     design_spec_ready: "DesignSpec 就绪",
   };
+
+  const RETRY_MESSAGE = "调用超时，正在自动重试";
+  const RETRY_NEXT_STEP = "等待本次调用返回";
 
   const WORKFLOW_LABELS = {
     product_blueprint: "产品蓝图",
@@ -140,18 +151,6 @@
     validate_plan: "计划校验",
     gate_plan: "计划确认",
     execute: "并发执行",
-  };
-
-  const STAGE_EVENT_LABELS = {
-    "intake.triaged": "完成输入成熟度分级与入口路由",
-    "spec.drafted": "已生成 GoalSpec 需求草案",
-    "spec.clarified": "已合并澄清回答并更新 GoalSpec",
-    "spec.confirmed": "已批准并冻结 GoalSpec",
-    "design.generated": "已生成 DesignSpec 白盒架构草案",
-    "design.approved": "已批准并冻结 DesignSpec",
-    "plan.generated": "已生成 TaskPlan 任务依赖图",
-    "plan.approved": "已批准任务计划",
-    "run.workflow_promoted": "已升级为全流程执行（full_sdlc_tdd）",
   };
 
   function localizeTriageReason(text) {
@@ -290,7 +289,7 @@
   function renderStage(projection) {
     const runMeta = statusMeta(projection.status, null);
     el.runTitle.textContent = projection.title || "Ariadne 研发编排控制台";
-    el.runKicker.textContent = `${runMeta.glyph} ${runMeta.label} · r${projection.state_revision}`;
+    el.runKicker.textContent = `${runMeta.glyph} ${runMeta.label}`;
     el.runKicker.setAttribute("data-variant", runMeta.variant);
 
     el.pipeline.innerHTML = (projection.stage_pipeline || [])
@@ -313,15 +312,10 @@
       })
       .join("");
 
-    el.statBand.innerHTML = uiStatBand([
-      { label: "任务", value: projection.progress.ratio_text },
-      {
-        label: "LLM",
-        value: `${projection.budget.calls_used} / ${projection.budget.max_calls}`,
-      },
-      { label: "Token", value: formatTokens(projection.budget.total_tokens) },
-      { label: "修订", value: `r${projection.state_revision}` },
-    ]);
+    const { verified_tasks: done, total_tasks: total } = projection.progress;
+    el.statBand.innerHTML = total > 0
+      ? uiStatBand([{ label: "已验收任务", value: `${done} / ${total} · ${Math.floor(done * 100 / total)}%` }])
+      : "";
 
     const paused = projection.status === "paused";
     const hasTasks = (projection.dag && projection.dag.nodes && projection.dag.nodes.length > 0);
@@ -339,27 +333,167 @@
     );
   }
 
+  const approvalLabels = {
+    approve_spec: "GoalSpec",
+    approve_design: "DesignSpec",
+    approve_plan: "任务计划",
+  };
+
+  function renderApprovalSections(sections) {
+    const changeLabels = {
+      changed: ["变更", "warn"],
+      added: ["新增", "ok"],
+      removed: ["移除", "warn"],
+      affected: ["需复核", "warn"],
+    };
+    return sections
+      .filter((section) => section.entries.length || section.empty_text)
+      .map(({ title, entries, empty_text }) => `
+        <section class="approval-section">
+          <h4>${esc(title)}</h4>
+          <ul class="spec-list">${entries.map((entry, index) => {
+            const { label, ref, change, previous, related } = entry;
+            const provenance = entry.provenance === "agent_high_impact"
+              ? uiBadge("Agent 补充 · 高影响", "warn")
+              : entry.provenance === "unknown" ? uiBadge("来源未记录", "muted") : "";
+            const status = change ? uiBadge(...changeLabels[change]) : "";
+            const entryName = label || (entries.length > 1 ? `${title} ${index + 1}` : title);
+            const content = ({ text, cost }) => cost === undefined
+              ? `<span>${esc(text)}</span>`
+              : `<br>${renderDesignTradeoff(text, cost)}`;
+            const origin = (pointer, baseline) => `
+              <button type="button" class="approval-ref" data-review-ref="${esc(pointer)}"
+                ${baseline ? "data-review-old-ref" : ""}
+                aria-label="定位 ${baseline ? "上次批准的 " : ""}${esc(entryName)}">
+                ${baseline ? "上次原条目" : "原条目"}</button>`;
+            return `<li>${status} ${label ? `<strong>${esc(label)}</strong> ` : ""}
+              ${previous ? `<div><small>上次批准</small> ${previous.label && previous.label !== label
+                ? `<strong>${esc(previous.label)}</strong> ` : ""}${content(previous)}
+                ${origin(previous.ref, true)}</div><small>本次候选</small> ` : ""}
+              ${content(entry)} ${provenance}
+              ${related ? "" : origin(ref, change === "removed")}</li>`;
+          }).join("") || `<li>${esc(empty_text)}</li>`}</ul>
+        </section>`)
+      .join("");
+  }
+
+  function renderApprovalReview(action, review, artifact) {
+    const title = approvalLabels[action];
+    const approveButton = el.approvalButtons.content.querySelector(`[data-approve="${action}"]`);
+    const sections = renderApprovalSections(review.sections);
+    const unchanged = renderApprovalSections(review.unchanged_sections || []);
+    const baseline = review.baseline;
+    return `
+      <article class="approval-review" data-review-action="${action}" aria-labelledby="review-${action}">
+        <h3 id="review-${action}" tabindex="-1">${esc(title)}${artifact.version ? ` · v${esc(artifact.version)}` : ""}</h3>
+        ${review.comparison_gap ? `<p>${esc(review.comparison_gap)}</p>` : ""}
+        ${sections ? `<div class="approval-sections">${sections}</div>`
+          : baseline ? "<p>已核对的关键承诺一致。</p>" : ""}
+        ${unchanged ? `<details data-review-disclosure="unchanged">
+          <summary>查看已确认未变的条目</summary>
+          <div class="approval-sections">${unchanged}</div>
+        </details>` : ""}
+        <div class="approval-controls">
+          ${review.artifact === "design" ? `<details data-review-disclosure="structure">
+            <summary>查看模块、数据模型与接口</summary>
+            ${renderDesignStructure(artifact)}
+          </details>` : ""}
+          ${action === "approve_plan"
+            ? '<button type="button" class="btn" data-review-plan-graph>查看任务依赖图</button>' : ""}
+          <details data-review-disclosure="candidate">
+            <summary>查看完整 ${esc(title)}</summary>
+            <div class="approval-origin" hidden></div>
+            <pre tabindex="0">${esc(JSON.stringify(artifact, null, 2))}</pre>
+          </details>
+          ${baseline ? `<details data-review-disclosure="baseline" data-review-baseline>
+            <summary>查看上次批准的 ${esc(title)}</summary>
+            <div class="approval-origin" hidden></div>
+            <pre tabindex="0">${esc(JSON.stringify(baseline, null, 2))}</pre>
+          </details>` : ""}
+          ${approveButton.outerHTML}
+        </div>
+      </article>`;
+  }
+
+  function renderApprovalReviews(projection) {
+    const runId = projection.run_id;
+    const previous = state.approvalSnapshot;
+    if (previous?.runId === runId && previous.revision > projection.state_revision) {
+      return previous.reviews.size > 0;
+    }
+    const reviews = new Map();
+    for (const [action, review] of Object.entries(projection.approval_reviews || {})) {
+      const artifact = projection[review.artifact];
+      if (approvalLabels[action] && artifact?.content_hash === review.target_hash) {
+        reviews.set(action, {
+          artifact,
+          baseline: review.baseline,
+          reviewKey: JSON.stringify([
+            review.target_hash, review.baseline?.content_hash, review.comparison_gap,
+            review.sections, review.unchanged_sections,
+          ]),
+          command: {
+            action,
+            target_hash: review.target_hash,
+            expected_state_revision: projection.state_revision,
+          },
+        });
+      }
+    }
+    state.approvalSnapshot = { runId, revision: projection.state_revision, reviews };
+    const sameRun = previous?.runId === runId;
+    for (const action of Object.keys(approvalLabels)) {
+      const binding = reviews.get(action);
+      const existing = el.approvalReviews.querySelector(`[data-review-action="${action}"]`);
+      if (!binding) {
+        existing?.remove();
+        continue;
+      }
+      if (existing && sameRun &&
+          previous.reviews.get(action)?.reviewKey === binding.reviewKey) {
+        continue;
+      }
+      const html = renderApprovalReview(action, projection.approval_reviews[action], binding.artifact);
+      const hadFocus = existing?.contains(document.activeElement);
+      if (existing) existing.outerHTML = html;
+      else el.approvalReviews.insertAdjacentHTML("beforeend", html);
+      if (hadFocus) document.getElementById(`review-${action}`).focus();
+    }
+    el.approvalReviews.hidden = !reviews.size;
+    return reviews.size > 0;
+  }
+
+  function showApprovalOrigin(card, artifact, ref, version) {
+    const parts = ref.slice(1).split("/").map((key) => key.replaceAll("~1", "/").replaceAll("~0", "~"));
+    const value = parts.reduce((item, key) => item?.[key], artifact);
+    if (value === undefined) return;
+    const source = parts[0] === "requirements" ? artifact.requirements?.[parts[1]]?.source_ref : null;
+    const origin = card.querySelector(`[data-review-disclosure="${version}"] .approval-origin`);
+    origin.innerHTML = `<code tabindex="-1">${esc(ref)}</code>
+      <p>${esc(typeof value === "string" ? value : JSON.stringify(value))}</p>
+      ${source ? `<p>规格引用 · ${esc(source)}</p>` : ""}`;
+    origin.hidden = false;
+    origin.closest("details").open = true;
+    origin.querySelector("code").focus();
+  }
+
   function renderGateActions(projection) {
     const banner = projection.hitl_banner;
-    const specGate = Boolean(projection.spec && !projection.spec_approved);
-    const designGate = Boolean(projection.design && !projection.design_approved);
-    const planGate = Boolean(projection.plan && !projection.plan_approved);
+    const hasReview = renderApprovalReviews(projection);
     const promoteGate = Boolean(banner && banner.kind === "blueprint_completed");
     const runFailed = Boolean(banner && banner.kind === "run_failed");
-    el.approveSpec.hidden = !specGate;
-    el.approveDesign.hidden = !designGate;
-    el.approvePlan.hidden = !planGate;
     if (el.promoteExecute) el.promoteExecute.hidden = !promoteGate;
     el.retryWorkflow.hidden = !runFailed;
     el.inspectFailure.hidden = !runFailed;
-    el.gateActions.hidden = !(specGate || designGate || planGate || promoteGate || runFailed);
-    return specGate || designGate || planGate || promoteGate || runFailed;
+    el.gateActions.hidden = !(promoteGate || runFailed);
+    return hasReview || promoteGate || runFailed;
   }
 
   function renderBanner(projection) {
-    const banner = projection.hitl_banner;
+    const blocker = taskBlocker(projection);
+    const banner = blocker || projection.hitl_banner;
     const hasGate = renderGateActions(projection);
-    el.taskActions.hidden = !(banner && banner.kind === "task_blocked");
+    el.taskActions.hidden = !blocker;
     if (!banner && !hasGate) {
       el.banner.hidden = true;
       return;
@@ -369,13 +503,19 @@
     const tone = el.banner.dataset.tone;
     const glyph =
       tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
-    const headline = banner
-      ? banner.headline
-      : "关口待批准：当前产物已冻结，等待真人确认后继续推进";
-    const cleanDetail = String(banner ? banner.detail || "" : "")
+    const headline = banner?.headline || "候选版本待批准";
+    const reviews = state.approvalSnapshot.reviews;
+    const detailAlreadyShown =
+      (reviews.has("approve_spec") && banner?.detail === projection.spec?.goal)
+      || (reviews.has("approve_design") && banner?.detail === projection.design?.architecture_summary);
+    let detail = detailAlreadyShown ? "" : banner?.detail;
+    if (blocker) {
+      detail = `受影响任务：${blocker.affected_task_ids.join("、")}。原因：${blocker.detail}`;
+    }
+    const cleanDetail = String(detail || "")
       .replace(/\s*\n+\s*/g, "，")
       .trim();
-    const localized = cleanDetail ? localizeError(cleanDetail) : "";
+    const localized = blocker ? cleanDetail : localizeError(cleanDetail);
     el.bannerHeadline.innerHTML = `<span aria-hidden="true">${glyph}</span><span>${esc(
       headline
     )}</span>`;
@@ -701,6 +841,7 @@
       uiCard("约束", `<ul class="spec-list">${constraints || "<li>（无）</li>"}</ul>`),
     ].join("");
     return uiCard("GoalSpec · 需求冻结", `<div class="kv">${body}</div>${extras}`, {
+      id: "run-spec-detail",
       note: "目标与验收标准",
     });
   }
@@ -716,37 +857,30 @@
       .join(", ");
   }
 
-  function renderDesignSpecCard(design, projection) {
-    const invariants = design.shared_invariants || [];
-    const invariantBlock = invariants.length
-      ? uiTable({
-          className: "matrix-table",
-          caption: "全局不变量（防跨模块隐性漂移）",
-          columns: ["编号", "类别", "全局规则", "适用范围 / 提示"],
-          rows: invariants.map((inv) => [
-            `<span class="mono">${esc(inv.id)}</span>`,
-            uiBadge(inv.category || "rule", "muted"),
-            esc(inv.rule),
-            `${esc((inv.applies_to || []).join(", ") || "全局")}${
-              inv.enforcement_hint ? ` · <span class="card-note">${esc(inv.enforcement_hint)}</span>` : ""
-            }`,
-          ]),
-        })
-      : uiCard(
-          "全局不变量",
-          '<p class="view-note">v1 规格未声明结构化全局不变量（DesignSpec v2 新建架构将强制校验）。</p>'
-        );
+  function renderDesignTradeoff(choice, cost) {
+    return `<span>选择：${esc(choice)}</span><br><span>代价：${esc(cost)}</span>`;
+  }
+
+  function renderDesignStructure(design) {
+    const contracts = design.interfaces || [];
     const moduleTable = uiTable({
       className: "matrix-table",
-      caption: "模块边界与独占写入路径",
-      columns: ["模块", "名称", "职责", "关联需求", "目标路径"],
-      rows: (design.modules || []).map((module) => [
-        `<span class="mono">${esc(module.id)}</span>`,
-        esc(module.name),
-        esc(module.responsibility),
-        `<span class="mono">${esc((module.requirement_refs || []).join(", "))}</span>`,
-        `<span class="mono">${esc((module.target_paths || []).join(", "))}</span>`,
-      ]),
+      label: "模块图",
+      caption: "模块图 · 模块边界与独占写入路径",
+      columns: ["模块", "名称", "职责", "关联需求", "目标路径", "依赖模块"],
+      rows: (design.modules || []).map((module) => {
+        const providers = new Set(contracts
+          .filter((iface) => (iface.consumer_module_ids || []).includes(module.id))
+          .map((iface) => iface.provider_module_id));
+        return [
+          `<span class="mono">${esc(module.id)}</span>`,
+          esc(module.name),
+          esc(module.responsibility),
+          `<span class="mono">${esc((module.requirement_refs || []).join(", "))}</span>`,
+          `<span class="mono">${esc((module.target_paths || []).join(", "))}</span>`,
+          `<span class="mono">${esc([...providers].join(", ") || "—")}</span>`,
+        ];
+      }),
     });
     const dataModels = (design.data_models || [])
       .map(
@@ -758,7 +892,7 @@
           }</li>`
       )
       .join("");
-    const interfaces = (design.interfaces || [])
+    const interfaces = contracts
       .map((iface) => {
         const inText = formatSchemaFields(iface.input_schema);
         const outText = formatSchemaFields(iface.output_schema);
@@ -787,7 +921,40 @@
         }</li>`;
       })
       .join("");
-    const risks = (design.risks_and_tradeoffs || [])
+    return `${moduleTable}${uiCard(
+      "数据模型",
+      `<ul class="spec-list">${dataModels || "<li>（无）</li>"}</ul>`
+    )}${uiCard(
+      "接口契约",
+      `<ul class="spec-list">${interfaces || "<li>（无）</li>"}</ul>`
+    )}`;
+  }
+
+  function renderDesignSpecCard(design, projection) {
+    const invariants = design.shared_invariants || [];
+    const invariantBlock = invariants.length
+      ? uiTable({
+          className: "matrix-table",
+          caption: "全局不变量（防跨模块隐性漂移）",
+          columns: ["编号", "类别", "全局规则", "适用范围 / 提示"],
+          rows: invariants.map((inv) => [
+            `<span class="mono">${esc(inv.id)}</span>`,
+            uiBadge(inv.category || "rule", "muted"),
+            esc(inv.rule),
+            `${esc((inv.applies_to || []).join(", ") || "全局")}${
+              inv.enforcement_hint ? ` · <span class="card-note">${esc(inv.enforcement_hint)}</span>` : ""
+            }`,
+          ]),
+        })
+      : uiCard(
+          "全局不变量",
+          '<p class="view-note">v1 规格未声明结构化全局不变量（DesignSpec v2 新建架构将强制校验）。</p>'
+        );
+    const impacts = { existing_system: "现有系统", deployment: "部署", rollback: "回滚" };
+    const tradeoffs = (design.design_tradeoffs || []).map(({ impact, choice, cost }) =>
+      `<li><strong>${esc(impacts[impact])}</strong><br>${renderDesignTradeoff(choice, cost)}</li>`
+    ).join("");
+    const risks = tradeoffs + (design.risks_and_tradeoffs || [])
       .map((risk) => `<li>${esc(risk)}</li>`)
       .join("");
     const strategy = design.execution_strategy;
@@ -839,14 +1006,11 @@
     const body = bodyRows.join("");
     return uiCard(
       "DesignSpec · 白盒设计",
-      `<div class="kv">${body}</div>${invariantBlock}${moduleTable}${uiCard(
-        "数据模型",
-        `<ul class="spec-list">${dataModels || "<li>（无）</li>"}</ul>`
-      )}${uiCard(
-        "接口契约",
-        `<ul class="spec-list">${interfaces || "<li>（无）</li>"}</ul>`
-      )}${uiCard("风险与取舍", `<ul class="spec-list">${risks || "<li>（无）</li>"}</ul>`)}`,
-      { note: `${(design.modules || []).length} 个模块` }
+      `<div class="kv">${body}</div>${invariantBlock}${renderDesignStructure(design)}${uiCard(
+        "风险与取舍",
+        `<ul class="spec-list">${risks || "<li>（无）</li>"}</ul>`
+      )}`,
+      { id: "run-design-detail", note: `${(design.modules || []).length} 个模块` }
     );
   }
 
@@ -907,67 +1071,150 @@
     return data;
   }
 
-  function renderStageLivePanel(projection) {
-    const nodes = (projection.dag && projection.dag.nodes) || [];
-    const hasDag = nodes.length > 0;
-    el.taskDagSection.hidden = !hasDag;
-    el.laneSection.hidden = !hasDag;
-    if (hasDag) {
-      el.stageLivePanel.hidden = true;
-      el.stageLivePanel.innerHTML = "";
-      return;
+  function writeText(element, value) {
+    if (element.textContent !== value) element.textContent = value;
+  }
+
+  function progressText(event) {
+    if (!event) return "等待首条运行记录";
+    if (event.summary) return event.summary;
+    const node = NODE_LABELS[event.node] || event.node || "工作流";
+    return {
+      "run.created": "已接收编排请求",
+      "intake.triaged": "输入分流完成",
+      "spec.clarified": "已记录澄清回答",
+      "approval.recorded": "已记录人工决定",
+      "graph.node_started": `开始${node}`,
+      "graph.node_finished": `${node}完成`,
+      "graph.paused": `${node}等待继续`,
+      "graph.failed": `${node}执行中断`,
+      "graph.finished": "工作流完成",
+      "run.status_changed": `运行状态更新为${statusMeta(event.to).label}`,
+      "run.workflow_promoted": "已切换为全流程执行",
+      "task.requeued": `${event.task_id} 已重新排队`,
+      "task.blocked": `${event.task_id} 受阻`,
+      "task.accepted": `${event.task_id} 已验收`,
+      "task.accepted_with_risk": `${event.task_id} 保留未验证状态，已人工接受风险`,
+    }[event.event_type] || "已记录运行更新";
+  }
+
+  function currentStage(projection) {
+    const workflow = projection.workflow || {};
+    if (projection.status === "completed" || projection.status === "cancelled") {
+      return { key: projection.status, label: statusMeta(projection.status).label };
+    }
+    const node = workflow.current_node || workflow.paused?.node || workflow.failed_node;
+    const stages = projection.stage_pipeline || [];
+    const stage = stages.find(({ status }) => status === "blocked") ||
+      stages.findLast(({ status }) => status === "active");
+    const name = NODE_LABELS[node] || node || stage?.label || statusMeta(projection.status).label;
+    const label = projection.hitl_banner?.kind === "task_blocked" ? `${name} · 有任务受阻`
+      : projection.status === "failed" ? `${name} · 执行中断` : name;
+    return { key: node || stage?.id || projection.status, label };
+  }
+
+  function highlightProgress(element) {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !element.getClientRects().length) return;
+    element.getAnimations().forEach((animation) => animation.cancel());
+    element.animate(
+      [{ backgroundColor: "var(--accent-soft)" }, { backgroundColor: "var(--surface-raised)" }],
+      { duration: 240, easing: "cubic-bezier(0.23, 1, 0.32, 1)" }
+    );
+  }
+
+  const outputActions = {
+    spec: "查看 GoalSpec",
+    design: "查看 DesignSpec",
+    plan: "查看任务依赖图",
+    execution: "查看代码变更",
+    verification: "查看验收证据",
+  };
+
+  function renderOutputHistory(outputs) {
+    const history = document.getElementById("run-output-history");
+    const list = document.getElementById("run-output-versions");
+    history.hidden = !outputs.length;
+    const existing = new Map(Array.from(list.children, (row) => [row.dataset.outputKey, row]));
+    let next = list.firstElementChild;
+    for (const output of outputs) {
+      const row = existing.get(output.key) || document.createElement("li");
+      existing.delete(output.key);
+      row.dataset.outputKey = output.key;
+      row.tabIndex = -1;
+      const description = output.content_hash
+        ? `${output.artifact_id} · ${output.content_hash}`
+        : new Date(output.created_at).toLocaleString();
+      const action = output.current || output.detail_available
+        ? `<button type="button" class="btn" data-history-output="${esc(output.key)}">${esc(outputActions[output.kind])}</button>`
+        : "";
+      const markup = `<span>${esc(output.summary)}</span><code>${esc(description)}</code>${action}`;
+      if (row.dataset.markup !== markup) {
+        row.innerHTML = markup;
+        row.dataset.markup = markup;
+      }
+      if (row !== next) list.insertBefore(row, next);
+      next = row.nextElementSibling;
+    }
+    existing.forEach((row) => row.remove());
+  }
+
+  function renderStageLivePanel(projection, previous) {
+    const hasDag = Boolean(projection.dag.nodes.length);
+    const awaitingPlanApproval = projection.hitl_banner?.kind === "plan_gate";
+    el.taskDagSection.hidden = !hasDag || (
+      awaitingPlanApproval && state.openedPlanGraphHash !== projection.plan?.content_hash
+    );
+    el.laneSection.hidden = !hasDag || awaitingPlanApproval;
+    const approvedPlan = projection.plan_approved ? projection.plan : null;
+    el.approvedPlanDetail.hidden = !approvedPlan;
+    if (!approvedPlan || !previous?.plan_approved ||
+        approvedPlan.content_hash !== previous.plan?.content_hash) {
+      el.approvedPlanDetail.open = false;
+      if (approvedPlan) {
+        writeText(el.approvedPlanDetail.querySelector("summary"), `查看完整任务计划 · v${approvedPlan.version}`);
+      }
+      writeText(el.approvedPlanDetail.querySelector("pre"), approvedPlan ? JSON.stringify(approvedPlan, null, 2) : "");
     }
     el.stageLivePanel.hidden = false;
-    const activity = (projection.stage_activity || []).slice(-8).reverse();
-    const activityHtml = activity.length
-      ? activity
-          .map((item) => {
-            const isFailed = item.event_type === "graph.failed";
-            const summaryText = isFailed
-              ? "当前阶段节点调用中断（详见上方提示栏，可直接点击“从断点重试”）"
-              : STAGE_EVENT_LABELS[item.summary] || item.summary;
-            return `<div class="stage-activity-item" data-tone="normal"><div class="stage-activity-main"><span class="mono">#${esc(
-              item.event_seq
-            )}</span>${uiBadge(item.stage || "stage", isFailed ? "warn" : "muted")}<span class="mono">${esc(
-              item.actor
-            )}</span><span class="stage-activity-summary">${esc(
-              summaryText
-            )}</span></div></div>`;
-          })
-          .join("")
-      : '<p class="view-note">工作流准备就绪，等待节点执行事件。</p>';
+    const stage = currentStage(projection);
+    const stageText = document.getElementById("run-current-stage");
+    writeText(stageText, `当前阶段 · ${stage.label}`);
+    if (previous && currentStage(previous).key !== stage.key) highlightProgress(stageText);
 
-    const artifactSummary = [];
-    if (projection.spec) {
-      artifactSummary.push(
-        uiCard(
-          "GoalSpec 草案",
-          `<p class="spec-list">${esc(projection.spec.goal)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="spec">在架构规格查看完整 GoalSpec →</button></div>`,
-          { note: `v${projection.spec.version || 1} · ${(projection.spec.requirements || []).length} 条需求` }
-        )
-      );
+    const recent = projection.recent_progress;
+    writeText(document.getElementById("run-recent-progress"), `最近确认 · ${progressText(recent)}`);
+    const time = document.getElementById("run-progress-time");
+    const stamp = recent?.created_at || projection.created_at;
+    if (time.dateTime !== stamp) {
+      time.dateTime = stamp;
+      writeText(time, stamp ? new Date(stamp).toLocaleString("zh-CN") : "");
     }
-    if (projection.design) {
-      artifactSummary.push(
-        uiCard(
-          "DesignSpec 白盒架构",
-          `<p class="spec-list">${esc(projection.design.architecture_summary)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="design">查看模块边界与接口契约 →</button></div>`,
-          { note: `${(projection.design.modules || []).length} 个模块` }
-        )
-      );
-    }
+    const stats = document.getElementById("run-detail-stats");
+    stats.innerHTML = uiStatBand([
+      { label: "LLM", value: `${projection.budget.calls_used} / ${projection.budget.max_calls}` },
+      { label: "Token", value: formatTokens(projection.budget.total_tokens) },
+      { label: "修订", value: `r${projection.state_revision}` },
+      { label: "最近事件", value: `#${projection.latest_event_seq}` },
+    ]);
 
-    el.stageLivePanel.innerHTML = [
-      uiCard(
-        "当前阶段执行动态",
-        `<div class="stage-activity-list">${activityHtml}</div>`,
-        { note: `r${projection.state_revision} · 任务分解尚未启动` }
-      ),
-      ...artifactSummary,
-    ].join("");
+    const outputs = projection.key_outputs || [];
+    renderOutputHistory(outputs);
+    const latest = outputs[0];
+    const outputPanel = document.getElementById("run-key-output");
+    const outputButton = document.getElementById("run-output-detail");
+    outputPanel.hidden = !latest;
+    outputButton.hidden = !latest;
+    if (latest) {
+      writeText(document.getElementById("run-output-summary"), latest.summary);
+      writeText(outputButton, (latest.current || latest.detail_available) ? outputActions[latest.kind] : "查看版本记录");
+      if (previous && previous.key_outputs?.[0]?.key !== latest.key) highlightProgress(outputPanel);
+    }
   }
 
   function renderDag(projection) {
+    const focusedTaskId = el.dag.contains(document.activeElement)
+      ? document.activeElement.dataset.taskId
+      : null;
     const nodes = projection.dag.nodes || [];
     const edges = projection.dag.edges || [];
     if (!nodes.length) {
@@ -1039,23 +1286,36 @@
         const meta = statusMeta(displayStatus, node.accepted_risk_reason);
         const selected = node.task_id === state.selectedTaskId ? "true" : "false";
         const centerX = pos.x + nodeWidth / 2;
+        const dependencyBlocked = Boolean(node.blocked_by?.length);
+        const issue = node.provider_retry ? "retry" : dependencyBlocked ? "dependency" : "";
+        const context = node.provider_retry
+          ? RETRY_MESSAGE
+          : `${node.role || "engineer"} · ${node.kind || "implement"}`;
+        const status = node.provider_retry
+          ? RETRY_NEXT_STEP
+          : dependencyBlocked ? "依赖受阻" : `${meta.glyph} ${meta.label}`;
+        const accessibleStatus = node.provider_retry ? `${context}，${status}` : status;
         return `<g class="dag-node" data-task-id="${esc(node.task_id)}" data-status="${esc(
           displayStatus
-        )}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
+        )}" data-issue="${issue}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
           node.task_id
-        )} ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
+        )} ${esc(accessibleStatus)}"><rect class="dag-node-box" x="${pos.x}" y="${
           pos.y
         }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
           pos.y + 22
         }" text-anchor="middle">${esc(node.task_id)}</text><text class="dag-node-kind" x="${centerX}" y="${
           pos.y + 38
-        }" text-anchor="middle">${esc(node.role || "engineer")} · ${esc(node.kind || "implement")}</text><text class="dag-node-meta" x="${centerX}" y="${
+        }" text-anchor="middle">${esc(context)}</text><text class="dag-node-meta" x="${centerX}" y="${
           pos.y + 54
-        }" text-anchor="middle">${meta.glyph} ${esc(meta.label)}</text></g>`;
+        }" text-anchor="middle">${esc(status)}</text></g>`;
       })
       .join("");
 
     el.dag.innerHTML = defs + paths + shapes;
+    if (focusedTaskId) {
+      el.dag.querySelector(`[data-task-id="${CSS.escape(focusedTaskId)}"]`)
+        ?.focus({ preventScroll: true });
+    }
   }
 
   function renderLanes(projection) {
@@ -1079,6 +1339,43 @@
           .join("")}</div></div>`
       )
       .join("");
+  }
+
+  const DELIVERY_STATUS = {
+    passed: ["✓ 通过", "ok"],
+    failed: ["✕ 失败", "bad"],
+    unverified: ["◷ 未验证", "muted"],
+  };
+
+  function renderDeliveryAcceptance(review) {
+    el.deliverySection.hidden = !review || !review.criteria.length;
+    if (el.deliverySection.hidden) return;
+
+    el.deliverySpec.textContent = `GoalSpec v${review.spec_version}`;
+    el.deliveryCounts.innerHTML = Object.entries(DELIVERY_STATUS)
+      .map(([status, [label, variant]]) => uiBadge(`${label} ${review.counts[status]}`, variant))
+      .join("");
+    const html = review.criteria.map((row, index) => {
+      const [label, variant] = DELIVERY_STATUS[row.status];
+      const ref = `${row.requirement_id} · 条件 ${row.criterion_index}`;
+      const evidenceButton = row.evidence
+        ? `<button type="button" class="btn btn-quiet" data-delivery-evidence="${index}" aria-controls="dock" aria-label="${esc(`查看证据 · ${ref}`)}">查看证据</button>`
+        : "";
+      return `<li class="delivery-criterion">
+        <div><span class="card-note">${esc(ref)}</span><p>${esc(row.text)}</p>${
+          row.reason ? `<p class="card-note">${esc(row.reason)}</p>` : ""
+        }</div>
+        <div class="delivery-result">${uiBadge(label, row.risk_accepted ? "warn" : variant)}${evidenceButton}</div>
+      </li>`;
+    }).join("");
+    if (html !== state.deliveryRowsHtml) {
+      const focusedIndex = document.activeElement?.dataset.deliveryEvidence;
+      el.deliveryCriteria.innerHTML = html;
+      state.deliveryRowsHtml = html;
+      if (focusedIndex !== undefined) {
+        el.deliveryCriteria.querySelector(`[data-delivery-evidence="${focusedIndex}"]`)?.focus();
+      }
+    }
   }
 
   function renderMatrix(projection) {
@@ -1184,28 +1481,41 @@
     return `<pre class="code-block code-diff scroller">${rows}</pre>`;
   }
 
+  function recordedArtifactCards(artifacts, manifest, showEmpty = true) {
+    const verdicts = (artifacts.verdicts || [])
+      .map((verdict) => JSON.stringify(verdict, null, 2))
+      .join("\n\n");
+    const logs = Object.entries(artifacts.check_logs || {}).map(([id, log]) =>
+      uiCard(`检查日志 · ${id}`, `<pre class="code-block scroller">${esc(log)}</pre>`)
+    );
+    const cards = [
+      showEmpty || artifacts.diff_patch
+        ? uiCard("diff.patch", diffBlock(artifacts.diff_patch), { note: "隔离沙盒产物" }) : "",
+      showEmpty || manifest ? uiCard(
+        "MANIFEST.md",
+        `<pre class="code-block scroller">${esc(manifest || "（暂无 MANIFEST.md）")}</pre>`,
+        { note: "完整性清单" }
+      ) : "",
+      showEmpty || verdicts ? uiCard(
+        "Argus 独立复核",
+        `<pre class="code-block scroller">${esc(verdicts || "（暂无复核记录）")}</pre>`,
+        { note: "冷启动审查" }
+      ) : "",
+      ...logs,
+    ].join("");
+    return cards || uiNotice("info", "此版本的执行文件不可用");
+  }
+
   function renderDockBody(projection, task) {
     if (state.activeTab === "artifacts") {
-      const artifacts = task.artifacts || {};
-      const verdicts = (artifacts.verdicts || [])
-        .map((verdict) => JSON.stringify(verdict, null, 2))
-        .join("\n\n");
-      return [
-        uiCard("diff.patch", diffBlock(artifacts.diff_patch), { note: "隔离沙盒产物" }),
-        uiCard(
-          "MANIFEST.md",
-          `<pre class="code-block scroller">${esc(task.manifest_md || "（暂无 MANIFEST.md）")}</pre>`,
-          { note: "完整性清单" }
-        ),
-        uiCard(
-          "Argus 独立复核",
-          `<pre class="code-block scroller">${esc(verdicts || "（暂无复核记录）")}</pre>`,
-          { note: "冷启动审查" }
-        ),
-      ].join("");
+      return recordedArtifactCards(task.artifacts || {}, task.manifest_md);
     }
 
     if (state.activeTab === "events") {
+      const retryLabels = { started: RETRY_MESSAGE, recovered: "重试成功，调用已恢复", failed: "本次自动重试失败" };
+      const retryRows = (task.provider_retry_history || []).slice().reverse().map((event) =>
+        uiRow(`#${event.event_seq} · ${event.actor}`, esc(retryLabels[event.phase]))
+      ).join("");
       const rows = (projection.events || [])
         .slice()
         .reverse()
@@ -1218,7 +1528,8 @@
             )}</span></div>`
         )
         .join("");
-      return `<div class="event-log scroller">${rows || uiNotice("info", "暂无事件")}</div>`;
+      const retryHistory = retryRows ? uiCard("调用重试记录", `<div class="kv">${retryRows}</div>`) : "";
+      return `${retryHistory}<div class="event-log scroller">${rows || uiNotice("info", "暂无事件")}</div>`;
     }
 
     const checks = (task.acceptance_checks || [])
@@ -1231,12 +1542,23 @@
         mono: true,
       }),
       uiRow("交付物", esc((task.deliverables || []).join(", ") || "（未声明）")),
+      uiRow("前置任务", esc((task.depends_on || []).join(", ") || "（无）"), { mono: true }),
       uiRow("写入范围", esc((task.write_scope || []).join(", ") || "（只读）"), { mono: true }),
       uiRow("诊断", `${esc(task.diagnostic_tool)} → ${esc(task.diagnostic_output)}`, { mono: true }),
       uiRow("归因", esc(task.diagnostic_attribution)),
     ].join("");
 
     return [
+      task.provider_retry ? uiNotice("warn", `${RETRY_MESSAGE}。下一步：${RETRY_NEXT_STEP}。`) : "",
+      task.blocker
+        ? uiNotice("bad", `受影响任务：${esc(task.blocker.affected_task_ids.join("、"))}。原因：${esc(task.blocker.detail)}`)
+        : "",
+      ...(task.blocked_by || []).map((taskId) => {
+        const blocker = projection.dag.nodes.find((node) => node.task_id === taskId)?.blocker;
+        if (!blocker) return "";
+        return uiNotice("bad", `依赖任务 ${esc(taskId)} 受阻：${esc(blocker.detail)}`,
+          `<button type="button" class="btn" data-blocker-task-id="${esc(taskId)}">查看 ${esc(taskId)} 的处理操作</button>`);
+      }),
       uiCard("执行概览", `<div class="kv">${rows}</div>`),
       task.accepted_risk_reason
         ? uiNotice("warn", `未验证 · 人工接受：${esc(task.accepted_risk_reason)}`)
@@ -1319,7 +1641,42 @@
     el.dockReceipt.innerHTML = "";
   }
 
+  function renderDeliveryDock(review, row) {
+    const evidence = row.evidence;
+    const runId = encodeURIComponent(state.projection.run_id);
+    const logUrl = `/api/runs/${runId}/delivery-log/${evidence.event_seq}/${evidence.check_position}`;
+    if (el.dockBody.dataset.deliveryLog === logUrl) return;
+    el.dockBody.dataset.deliveryLog = logUrl;
+    const [label, variant] = DELIVERY_STATUS[row.status];
+    el.dockTitle.textContent = `${row.requirement_id} · 条件 ${row.criterion_index}`;
+    el.dockStages.innerHTML = uiBadge(label, variant);
+    el.dockSubpane.innerHTML = "";
+    el.dockTools.innerHTML = "";
+    el.dockTabs.innerHTML = "";
+    el.dockReceipt.innerHTML = "";
+    const meta = [
+      uiRow("验收条件", esc(row.text)),
+      uiRow(`GoalSpec v${review.spec_version}`, esc(review.spec_hash), { mono: true }),
+      uiRow("交付版本", esc(evidence.delivery_version), { mono: true }),
+      uiRow("执行记录", `#${esc(evidence.event_seq)} · 退出码 ${esc(evidence.exit_code)}`),
+    ].join("");
+    el.dockBody.innerHTML = uiCard("证据引用", `<div class="kv">${meta}</div>`) +
+      uiCard("执行日志", `<pre class="code-block scroller">${esc(evidence.log)}</pre>
+        <a class="btn btn-quiet" href="${esc(logUrl)}" target="_blank" rel="noopener">打开完整日志</a>`);
+  }
+
   function renderDock(projection) {
+    const review = projection.delivery_acceptance;
+    const selection = state.deliveryEvidence;
+    if (selection && selection.runId === projection.run_id && selection.specHash === review?.spec_hash) {
+      const row = review.criteria[selection.index];
+      if (row?.evidence) {
+        renderDeliveryDock(review, row);
+        return;
+      }
+    }
+    state.deliveryEvidence = null;
+    delete el.dockBody.dataset.deliveryLog;
     if (state.workflowNode) {
       renderWorkflowDock(projection, state.workflowNode);
       return;
@@ -1381,8 +1738,84 @@
     el.dockOpen.hidden = Boolean(open);
   }
 
+  function renderedElement(element) {
+    const root = element.closest("[id]");
+    if (!root) return () => null;
+    if (root === element) return () => document.getElementById(root.id);
+    const keys = ["data-output-key", "data-task-id", "data-workflow-node", "data-tab",
+      "data-run-id", "data-amb-input", "data-jump-task", "data-history-output",
+      "data-review-disclosure", "aria-label"];
+    const key = keys.find((attribute) => element.hasAttribute(attribute));
+    const tag = element.localName;
+    const selector = key ? `${tag}[${key}="${CSS.escape(element.getAttribute(key))}"]` : tag;
+    const index = Array.from(root.querySelectorAll(selector)).indexOf(element);
+    return () => document.getElementById(root.id)?.querySelectorAll(selector)[index];
+  }
+
+  function captureReadingPosition() {
+    const active = document.activeElement || document.body;
+    const findActive = renderedElement(active);
+    const activeRow = active.closest("[data-output-key]");
+    const findActiveRow = activeRow && renderedElement(activeRow);
+    const scrollers = Array.from(document.querySelectorAll(".scroller"))
+      .filter((element) => element.scrollTop || element.scrollLeft)
+      .map((element) => ({
+        find: renderedElement(element), top: element.scrollTop, left: element.scrollLeft,
+      }));
+    const openDetails = Array.from(document.querySelectorAll("details[open]"), renderedElement);
+    const stage = document.getElementById("stage");
+    const header = stage.querySelector(".stage-head");
+    const documentScroll = getComputedStyle(header).position !== "sticky";
+    const scrollRoot = documentScroll ? document.scrollingElement : stage;
+    const pageTop = scrollRoot.scrollTop;
+    const readingLine = Math.max(0, header.getBoundingClientRect().bottom);
+    const anchors = pageTop ? Array.from(stage.querySelectorAll(
+      "[data-output-key], section[id], h2[id]"
+    )).filter((element) => {
+      const box = element.getBoundingClientRect();
+      return box.height && box.bottom > readingLine && box.top < window.innerHeight;
+    }) : [];
+    const anchor = anchors.reduce((closest, element) =>
+      Math.abs(element.getBoundingClientRect().top - readingLine) <
+      Math.abs(closest.getBoundingClientRect().top - readingLine) ? element : closest, anchors[0]);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const findAnchor = anchor && renderedElement(anchor);
+
+    return () => {
+      openDetails.forEach((find) => {
+        const details = find();
+        if (details) details.open = true;
+      });
+      if (!active.isConnected && document.activeElement === document.body) {
+        (findActive() || findActiveRow?.())?.focus({ preventScroll: true });
+      }
+      for (const { find, top, left } of scrollers) {
+        const element = find();
+        if (!element) continue;
+        element.scrollTo({ top, left, behavior: "instant" });
+      }
+      const target = findAnchor?.();
+      if (documentScroll) scrollRoot.scrollTop = pageTop;
+      if (target?.getClientRects().length) {
+        scrollRoot.scrollTop += target.getBoundingClientRect().top - anchorTop;
+      }
+    };
+  }
+
   function renderAll(projection) {
-    const switchedRun = !state.projection || state.projection.run_id !== projection.run_id;
+    if (projection.run_id !== state.runId) return;
+    const switchedRun = state.projection?.run_id !== projection.run_id;
+    const previous = switchedRun ? null : state.projection;
+    if (previous && (
+      projection.state_revision < previous.state_revision ||
+      projection.latest_event_seq < previous.latest_event_seq ||
+      (projection.state_revision === previous.state_revision &&
+       projection.latest_event_seq === previous.latest_event_seq)
+    )) return;
+    const restore = switchedRun ? null : captureReadingPosition();
+    if (previous?.plan?.content_hash !== projection.plan?.content_hash) {
+      state.openedPlanGraphHash = null;
+    }
     state.projection = projection;
     const nodes = projection.dag.nodes || [];
     if (
@@ -1410,21 +1843,25 @@
     renderTriage(projection);
     renderClarify(projection);
     renderWorkflow(projection);
-    renderStageLivePanel(projection);
+    renderStageLivePanel(projection, previous);
     renderDag(projection);
+    renderDeliveryAcceptance(projection.delivery_acceptance);
     renderLanes(projection);
     renderMatrix(projection);
     renderDesign(projection);
     renderWaterfall(projection);
     renderThreads();
     renderDock(projection);
+    restore?.();
   }
 
   function selectTask(taskId) {
     if (!state.projection || !taskId) return;
+    state.deliveryEvidence = null;
     state.workflowNode = null;
     state.selectedTaskId = taskId;
     state.userOpenedDock = true;
+    renderBanner(state.projection);
     renderWorkflow(state.projection);
     renderDag(state.projection);
     renderLanes(state.projection);
@@ -1434,6 +1871,7 @@
 
   function selectWorkflowNode(name) {
     if (!state.projection || !name) return;
+    state.deliveryEvidence = null;
     state.workflowNode = name;
     state.userOpenedDock = true;
     renderWorkflow(state.projection);
@@ -1572,18 +2010,27 @@
         payload.constraints = selectedDemo.constraints;
       }
     }
-    const response = await fetch("/api/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!data.ok || !data.run_id) {
-      toast(`创建失败：${data.error || "未知错误"}`);
+    if (state.submitting) return;
+    state.submitting = true;
+    document.getElementById("new-run-submit").disabled = true;
+    renderConnection();
+    let data;
+    try {
+      const response = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      data = await response.json();
+      if (!data.ok || !data.run_id) throw new Error(data.error || "未知错误");
+    } catch (error) {
+      toast(`创建请求失败：${error.message}`);
       return;
+    } finally {
+      state.submitting = false;
+      document.getElementById("new-run-submit").disabled = false;
+      renderConnection();
     }
-    await refreshRuns();
-    el.runSelector.value = data.run_id;
     if (el.newRunDemo) el.newRunDemo.value = "";
     applyDemoSelection();
     el.newRunInput.value = "";
@@ -1592,96 +2039,140 @@
     el.newRunFileNote.textContent = "支持 .md / .txt / .json / .yaml / .yml";
     state.selectedTaskId = null;
     state.workflowNode = null;
-    await loadRun(data.run_id);
-    toast(`已创建编排 ${data.run_id} · ${data.workflow || payload.workflow_name}`);
+    toast(`已接收编排 ${data.run_id}`);
+    const loading = loadRun(data.run_id);
+    refreshRuns().catch(() => {});
+    await loading;
   }
 
-  async function loadRun(runId) {
+  function renderConnection() {
+    const badge = document.getElementById("run-connection");
+    const text = state.submitting ? "正在提交…" : ({
+      loading: "正在加载快照…",
+      missing: "找不到运行",
+      reconnecting: "正在重连 · 保留上次确认",
+    }[state.transport?.phase] || "");
+    if (badge.textContent === text) return;
+    const restore = state.projection && captureReadingPosition();
+    badge.hidden = !text;
+    writeText(badge, text);
+    restore?.();
+  }
+
+  function setConnection(transport, phase) {
+    transport.phase = phase;
+    renderConnection();
+  }
+
+  function snapshotUrl(runId) {
+    return `/api/runs/${encodeURIComponent(runId)}`;
+  }
+
+  async function fetchSnapshot(runId) {
+    const response = await fetch(snapshotUrl(runId), { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || !data.ok || data.projection?.run_id !== runId) {
+      throw new Error(data.error || "加载运行快照失败", { cause: response.status });
+    }
+    return data.projection;
+  }
+
+  function applySnapshot(transport, projection) {
+    if (state.transport !== transport || projection.run_id !== transport.runId) return;
+    renderAll(projection);
+  }
+
+  function scheduleReconnect(transport) {
+    transport.source?.close();
+    transport.source = null;
+    setConnection(transport, "reconnecting");
+    if (transport.timer) return;
+    transport.timer = window.setTimeout(() => {
+      transport.timer = null;
+      if (state.transport === transport) syncAndConnect(transport);
+    }, 1200);
+  }
+
+  async function syncAndConnect(transport) {
+    try {
+      const projection = await fetchSnapshot(transport.runId);
+      if (state.transport !== transport) return;
+      applySnapshot(transport, projection);
+      connectStream(transport, state.projection.latest_event_seq);
+    } catch (error) {
+      if (state.transport !== transport) return;
+      if (error.cause === 404) {
+        setConnection(transport, "missing");
+        toast(error.message);
+      } else {
+        scheduleReconnect(transport);
+      }
+    }
+  }
+
+  function loadRun(runId) {
+    const previous = state.transport;
+    previous?.source?.close();
+    window.clearTimeout(previous?.timer);
+    const transport = { runId, source: null, timer: null };
+    state.transport = transport;
     state.runId = runId;
     state.userOpenedDock = false;
-    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-    const data = await response.json();
-    if (state.runId !== runId) return;
-    if (!data.ok) {
-      toast(data.error || "加载运行实例失败");
+    setConnection(transport, "loading");
+    return syncAndConnect(transport);
+  }
+
+  function connectStream(transport, afterSeq) {
+    if (typeof EventSource === "undefined" || params.get("nosse") === "1") {
+      setConnection(transport, "online");
       return;
     }
-    renderAll(data.projection);
-    connectStream(runId, data.projection.latest_event_seq || 0);
-  }
-
-  function connectStream(runId, afterSeq) {
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-    if (state.sse) {
-      state.sse.close();
-      state.sse = null;
-    }
-    if (typeof EventSource === "undefined" || params.get("nosse") === "1") return;
-    const source = new EventSource(
-      `/api/runs/${encodeURIComponent(runId)}/stream?after_seq=${afterSeq}`
-    );
+    const source = new EventSource(`${snapshotUrl(transport.runId)}/stream?after_seq=${afterSeq}`);
+    transport.source = source;
+    const isCurrent = () => state.transport === transport && transport.source === source;
+    let requestedRevision = -1;
+    let requestedSeq = afterSeq;
     source.addEventListener("state", async (event) => {
+      if (!isCurrent()) return;
+      let request;
       try {
-        if (state.runId !== runId) return;
         const payload = JSON.parse(event.data);
-        const hasNewEvents =
-          Array.isArray(payload.events) &&
-          payload.events.some(
-            (ev) => (ev.event_seq || 0) > ((state.projection && state.projection.latest_event_seq) || 0)
-          );
-        if (
-          state.projection &&
-          (payload.state_revision !== state.projection.state_revision || hasNewEvents)
-        ) {
-          const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-          const data = await response.json();
-          if (state.runId !== runId) return;
-          if (data.ok) {
-            renderAll(data.projection);
-            refreshRuns().catch(() => {});
+        if (payload.run_id !== transport.runId) return;
+        const revision = payload.state_revision;
+        const seq = payload.events.at(-1)?.event_seq ?? afterSeq;
+        const current = state.projection;
+        if (revision <= current.state_revision && seq <= current.latest_event_seq) {
+          if (requestedRevision <= current.state_revision && requestedSeq <= current.latest_event_seq) {
+            setConnection(transport, "online");
           }
+          return;
         }
+        if (revision <= requestedRevision && seq <= requestedSeq) return;
+        requestedRevision = Math.max(requestedRevision, revision);
+        requestedSeq = Math.max(requestedSeq, seq);
+        request = [requestedRevision, requestedSeq];
+        const projection = await fetchSnapshot(transport.runId);
+        if (!isCurrent()) return;
+        applySnapshot(transport, projection);
+        if (state.projection.state_revision >= requestedRevision &&
+            state.projection.latest_event_seq >= requestedSeq) {
+          setConnection(transport, "online");
+          return;
+        }
+        if (request[0] !== requestedRevision || request[1] !== requestedSeq) return;
       } catch (error) {
-        return;
+        if (!isCurrent() || (request &&
+          (request[0] !== requestedRevision || request[1] !== requestedSeq))) return;
       }
+      if (isCurrent()) scheduleReconnect(transport);
     });
     source.addEventListener("error", () => {
-      if (state.runId === runId && source.readyState === EventSource.CLOSED) {
-        source.close();
-        if (state.sse === source) state.sse = null;
-        if (!state.reconnectTimer) {
-          state.reconnectTimer = window.setTimeout(() => {
-            state.reconnectTimer = null;
-            if (state.runId === runId) loadRun(runId);
-          }, 1500);
-        }
-      }
+      if (isCurrent()) scheduleReconnect(transport);
     });
-    state.sse = source;
   }
 
-  function gateContentHash(projection, action) {
-    if (!projection) return null;
-    if (action === "approve_spec") {
-      return !projection.spec_approved && projection.spec ? projection.spec.content_hash : null;
-    }
-    if (action === "approve_design") {
-      return !projection.design_approved && projection.design
-        ? projection.design.content_hash
-        : null;
-    }
-    if (action === "approve_plan") {
-      return !projection.plan_approved && projection.plan ? projection.plan.content_hash : null;
-    }
-    return null;
-  }
-
-  async function sendCommand(body, successMessage, isRetry = false) {
-    if (!state.runId || !state.projection) return;
-    const priorGateHash = gateContentHash(state.projection, body.action);
+  async function sendCommand(body, successMessage, runId = state.runId) {
+    if (!runId || runId !== state.runId || state.projection?.run_id !== runId) return;
     const payload = Object.assign(
       {
         operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1690,31 +2181,29 @@
       },
       body
     );
-    const response = await fetch(`/api/runs/${encodeURIComponent(state.runId)}/command`, {
+    const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/command`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const data = await response.json();
+    if (state.runId !== runId) return;
     if (!data.ok) {
       if (response.status === 409 || data.conflict) {
         let fresh = data.projection || null;
         if (!fresh) {
           try {
-            const latestRes = await fetch(`/api/runs/${encodeURIComponent(state.runId)}`);
+            const latestRes = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
             const latestData = await latestRes.json();
             if (latestData.ok) fresh = latestData.projection;
           } catch (error) {
             fresh = null;
           }
         }
+        if (state.runId !== runId) return;
         if (fresh) {
           renderAll(fresh);
           refreshRuns().catch(() => {});
-        }
-        const nextGateHash = gateContentHash(fresh, body.action);
-        if (!isRetry && priorGateHash && nextGateHash && priorGateHash === nextGateHash) {
-          return sendCommand(body, successMessage, true);
         }
         toast(`状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`);
         return;
@@ -1737,12 +2226,79 @@
     el.dialog.showModal();
   }
 
+  function taskBlocker(projection) {
+    const banner = projection?.hitl_banner;
+    if (banner?.kind !== "task_blocked") return null;
+    const selected = projection.dag.nodes.find((node) => node.task_id === state.selectedTaskId);
+    return selected?.blocker || banner;
+  }
+
   function bannerTaskId() {
-    const banner = state.projection ? state.projection.hitl_banner : null;
-    return (banner && banner.task_id) || state.selectedTaskId;
+    return taskBlocker(state.projection)?.task_id;
+  }
+
+  function openTaskGraph(planHash) {
+    if (!planHash || state.projection?.plan?.content_hash !== planHash) return;
+    state.openedPlanGraphHash = planHash;
+    setView("topology");
+    el.taskDagSection.hidden = false;
+    document.getElementById("topology-title").focus();
+  }
+
+  async function openOutput(output) {
+    if (!output) return;
+    if (output.current && (output.kind === "spec" || output.kind === "design")) {
+      setView("design");
+      const detail = document.getElementById(`run-${output.kind}-detail`);
+      if (detail) {
+        detail.tabIndex = -1;
+        detail.focus();
+      }
+    } else if (output.kind === "plan" && output.current) {
+      openTaskGraph(state.projection.plan?.content_hash);
+    } else if (output.current) {
+      state.activeTab = "artifacts";
+      selectTask(output.artifact_id);
+      el.dockTitle.focus();
+    } else {
+      const history = document.getElementById("run-output-history");
+      history.open = true;
+      if (!output.detail_available) {
+        history.querySelector("summary").focus();
+        return;
+      }
+      const row = history.querySelector(`[data-output-key="${CSS.escape(output.key)}"]`);
+      if (!row) return;
+      const loaded = row.querySelector(".run-attempt-detail");
+      if (loaded) {
+        loaded.focus();
+        return;
+      }
+      const detail = document.createElement("section");
+      detail.className = "run-attempt-detail";
+      detail.tabIndex = -1;
+      detail.setAttribute("aria-label", output.summary);
+      detail.textContent = "正在读取执行产物…";
+      row.append(detail);
+      detail.focus();
+      try {
+        const url = `${snapshotUrl(state.runId)}/task-artifacts/${encodeURIComponent(output.artifact_id)}/${output.version}`;
+        const response = await fetch(url);
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error);
+        detail.innerHTML = recordedArtifactCards(data.artifacts, data.artifacts.manifest_md, false);
+      } catch (error) {
+        detail.remove();
+        toast("读取执行产物失败，可重新打开");
+      }
+    }
   }
 
   function wireEvents() {
+    window.addEventListener("offline", () => {
+      const transport = state.transport;
+      if (transport?.source) scheduleReconnect(transport);
+    });
     el.runSelector.addEventListener("change", () => {
       state.selectedTaskId = null;
       state.workflowNode = null;
@@ -1816,11 +2372,30 @@
     el.dockClose.addEventListener("click", () => {
       state.userOpenedDock = false;
       setDockOpen(false);
+      if (state.deliveryEvidence) {
+        const { index } = state.deliveryEvidence;
+        el.deliveryCriteria.querySelector(`[data-delivery-evidence="${index}"]`)?.focus();
+      }
     });
 
     el.dockOpen.addEventListener("click", () => {
       state.userOpenedDock = true;
       setDockOpen(true);
+    });
+
+    el.deliveryCriteria.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-delivery-evidence]");
+      const review = state.projection?.delivery_acceptance;
+      if (!button || !review) return;
+      state.deliveryEvidence = {
+        index: Number(button.dataset.deliveryEvidence),
+        specHash: review.spec_hash,
+        runId: state.projection.run_id,
+      };
+      state.userOpenedDock = true;
+      renderDock(state.projection);
+      setDockOpen(true);
+      el.dockTitle.focus();
     });
 
     el.dag.addEventListener("click", (event) => {
@@ -1885,46 +2460,59 @@
       );
     });
 
-    el.approveSpec.addEventListener("click", async () => {
-      if (!state.projection) return;
-      const blockers = unresolvedAmbiguities(state.projection);
-      if (blockers.length) {
-        openDialog({
-          title: "GoalSpec 仍有未决阻断项",
-          description:
-            "先在上方澄清卡片回答阻断歧义；若必须带风险冻结，请填写接受风险理由，审批会记录为 accept_risk。",
-          label: "接受风险理由（必填）",
-          defaultValue: "首期范围已与业务确认，接受未决歧义风险先行冻结规格。",
-          requireNonEmpty: true,
-          onConfirm: async (reason) => {
-            await sendCommand(
-              { action: "approve_spec", accept_risk: true, reason },
-              "已带风险批准 GoalSpec，进入架构设计"
-            );
-          },
-        });
+    el.approvalReviews.addEventListener("click", async (event) => {
+      const card = event.target.closest("[data-review-action]");
+      const snapshot = state.approvalSnapshot;
+      if (!card || snapshot?.runId !== state.runId) return;
+      const binding = snapshot.reviews.get(card.dataset.reviewAction);
+      if (!binding) return;
+      const { artifact, command } = binding;
+      const origin = event.target.closest("[data-review-ref]");
+      if (origin) {
+        const old = origin.hasAttribute("data-review-old-ref");
+        showApprovalOrigin(card, old ? binding.baseline : artifact,
+          origin.dataset.reviewRef, old ? "baseline" : "candidate");
         return;
       }
-      await sendCommand(
-        { action: "approve_spec" },
-        "已批准 GoalSpec，进入架构设计"
-      );
-    });
+      if (event.target.closest("[data-review-plan-graph]")) {
+        openTaskGraph(command.target_hash);
+        return;
+      }
+      if (!event.target.closest("[data-approve]")) return;
 
-    el.approveDesign.addEventListener("click", async () => {
-      await sendCommand(
-        { action: "approve_design" },
-        "已批准 DesignSpec，启动任务分解"
-      );
-    });
-
-    el.approvePlan.addEventListener("click", async () => {
-      const stopAfter =
-        state.projection && state.projection.workflow && state.projection.workflow.stop_after;
-      await sendCommand(
-        { action: "approve_plan" },
-        stopAfter === "plan" ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行"
-      );
+      const { runId } = snapshot;
+      if (command.action === "approve_spec") {
+        const blockers = unresolvedAmbiguities({ spec: artifact });
+        const blockingCritique = (artifact.minority_notes || []).some(
+          (note) => note.severity === "blocking" && !note.resolved
+        );
+        if (blockers.length || blockingCritique) {
+          openDialog({
+            title: `GoalSpec v${artifact.version} 仍有未决阻断项`,
+            description:
+              "请先处理阻断项。若要批准此版本，请填写接受风险的理由。",
+            label: "接受风险理由（必填）",
+            defaultValue: "首期范围已与业务确认，接受未决歧义风险先行冻结规格。",
+            requireNonEmpty: true,
+            onConfirm: async (reason) => {
+              await sendCommand(
+                { ...command, accept_risk: true, reason },
+                "已带风险批准 GoalSpec，进入架构设计",
+                runId
+              );
+            },
+          });
+          return;
+        }
+        await sendCommand(command, "已批准 GoalSpec，进入架构设计", runId);
+      } else if (command.action === "approve_design") {
+        await sendCommand(command, "已批准 DesignSpec，启动任务分解", runId);
+      } else {
+        const stopAfter = state.projection?.workflow?.stop_after;
+        const message = stopAfter === "plan"
+          ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行";
+        await sendCommand(command, message, runId);
+      }
     });
 
     if (el.promoteExecute) {
@@ -1945,9 +2533,12 @@
       selectWorkflowNode(workflow.failed_node || workflow.current_node || "align");
     });
 
-    el.stageLivePanel.addEventListener("click", (event) => {
-      const jump = event.target.closest("[data-jump-design]");
-      if (jump) setView("design");
+    document.getElementById("run-output-detail").addEventListener("click", () => {
+      openOutput(state.projection?.key_outputs?.[0]);
+    });
+    document.getElementById("run-output-history").addEventListener("click", (event) => {
+      const key = event.target.closest("[data-history-output]")?.dataset.historyOutput;
+      if (key) openOutput(state.projection?.key_outputs?.find((item) => item.key === key));
     });
 
     el.lanes.addEventListener("click", (event) => {
@@ -1966,6 +2557,12 @@
     });
 
     el.dock.addEventListener("click", (event) => {
+      const blockerButton = event.target.closest("[data-blocker-task-id]");
+      if (blockerButton) {
+        selectTask(blockerButton.dataset.blockerTaskId);
+        document.getElementById("btn-banner-retry").focus();
+        return;
+      }
       const tab = event.target.closest("[data-tab]");
       if (!tab || !state.projection) return;
       state.activeTab = tab.dataset.tab;

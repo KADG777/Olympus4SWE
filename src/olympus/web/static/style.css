@@ -630,6 +630,86 @@ button {
   margin-inline-start: auto;
 }
 
+.approval-reviews {
+  display: grid;
+  flex: 1 1 100%;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.approval-review {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-paper);
+  overflow-wrap: anywhere;
+}
+
+.approval-review h3 {
+  font-size: var(--text-sm);
+}
+
+.approval-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  gap: var(--space-3);
+}
+
+.approval-section h4 {
+  margin-block-end: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.approval-ref {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.approval-controls {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.approval-controls details {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  font-size: var(--text-sm);
+}
+
+.approval-controls details[open] {
+  flex-basis: 100%;
+}
+
+.approval-controls summary {
+  padding-block: var(--space-1);
+  cursor: pointer;
+}
+
+.approval-controls pre,
+.approval-origin {
+  margin-block: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  font-size: var(--text-xs);
+}
+
+.approval-controls pre {
+  max-block-size: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 /* ---------------------------------------------------------------------------
  * Views
  * ------------------------------------------------------------------------ */
@@ -910,12 +990,14 @@ button {
 
 .dag-node[data-status="blocked"] .dag-node-box,
 .dag-node[data-status="failed"] .dag-node-box,
-.dag-node[data-status="error"] .dag-node-box {
+.dag-node[data-status="error"] .dag-node-box,
+.dag-node[data-issue="dependency"] .dag-node-box {
   fill: var(--bad-soft);
   stroke: var(--bad);
 }
 
-.dag-node[data-status="paused"] .dag-node-box {
+.dag-node[data-status="paused"] .dag-node-box,
+.dag-node[data-issue="retry"] .dag-node-box {
   fill: var(--warn-soft);
   stroke: var(--warn);
 }
@@ -1910,17 +1992,12 @@ body[data-rail="collapsed"] .thread-list,
   min-inline-size: 0;
 }
 
-.stage-activity-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
 .stage-activity-item {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
+  margin: 0;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
@@ -1928,22 +2005,43 @@ body[data-rail="collapsed"] .thread-list,
   font-size: var(--text-sm);
 }
 
-.stage-activity-item[data-tone="bad"] {
-  border-color: var(--bad);
-  background: var(--bad-soft);
-}
-
-.stage-activity-main {
+.run-progress-note {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-inline-size: 0;
   flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
 }
 
-.stage-activity-summary {
-  color: var(--text-ink);
+#run-output-summary {
+  margin: 0;
   overflow-wrap: anywhere;
+}
+
+.run-detail {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.run-detail > summary {
+  color: var(--accent-fg);
+  cursor: pointer;
+}
+
+.run-detail ol {
+  margin: var(--space-2) 0 0;
+  padding-inline-start: var(--space-6);
+}
+
+.run-detail li + li {
+  margin-block-start: var(--space-2);
+}
+
+.run-detail li code {
+  display: block;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
 }
 
 .clarify-panel {
@@ -2238,4 +2336,43 @@ body[data-rail="collapsed"] .thread-list,
   .hitl-risk-sep {
     margin-inline-start: 0;
   }
+}
+
+.delivery-acceptance {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.delivery-acceptance[hidden] {
+  display: none;
+}
+
+.delivery-criteria {
+  list-style: none;
+}
+
+.delivery-criterion {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: start;
+  gap: var(--space-2) var(--space-4);
+  padding-block: var(--space-2);
+  overflow-wrap: anywhere;
+}
+
+.delivery-criterion + .delivery-criterion {
+  border-block-start: 1px solid var(--rule);
+}
+
+.delivery-criterion p {
+  margin: 0;
+}
+
+.delivery-result {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }

@@ -34,7 +34,8 @@ from olympus.core.dag import (
     paths_overlap,
     validate_plan,
 )
-from olympus.core.store import RunStore
+from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.hooks import default_write_scope_hook
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
@@ -478,6 +479,10 @@ class OrchestrateStage:
             f"Remember: acceptance_checks[*].kind MUST be one of "
             f"'command', 'independent_review', or 'human' (never 'review'), and every "
             f"kind='command' check MUST include a non-empty 'command' string.\n"
+            "When a GoalSpec is supplied, optional delivery_checks bind one specific end-to-end "
+            "command per verifiable criterion by requirement_id and 1-based criterion_index. "
+            "Run these commands against the composed delivery after task execution. "
+            "Omit conditions without a reliable executable check. Task checks are separate.\n"
             f"{context_block}"
             f"{modular_block}"
             f"{chr(10).join(binding_lines)}\n"
@@ -533,9 +538,10 @@ class OrchestrateStage:
         run_id: str,
         approver: str = "zeus",
         reason: str = "",
+        expected_revision: int | None = None,
     ) -> ApprovalRecord:
         """Record human approval bound to the current TaskPlan content_hash."""
-        snap = self.store.get_run(run_id)
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
         plan: TaskPlan | None = snap["plan"]
         if plan is None:
             raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
@@ -583,7 +589,7 @@ class OrchestrateStage:
             decision=ApprovalDecision.APPROVED,
             reason=reason,
         )
-        self.store.record_approval(record)
+        self.store.record_approval(record, expected_revision=expected_revision)
         return record
 
     def _run_command_checks(
@@ -666,6 +672,8 @@ class OrchestrateStage:
             actor=f"argus:{task.task_id}",
             max_steps=8,
             trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
+            lease_generation=task.lease_generation,
+            task_id=task.task_id,
         )
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
@@ -777,6 +785,7 @@ class OrchestrateStage:
                 trace_path=art_dir / "worker.jsonl",
                 synthesize_on_max_steps=True,
                 task_id=leased.task_id,
+                lease_generation=leased.lease_generation,
                 pre_tool_hook=default_write_scope_hook(
                     leased.write_scope,
                     forbidden_globs=forbidden_contracts,
@@ -1034,6 +1043,45 @@ class OrchestrateStage:
                 all_done = all(
                     t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for t in plan.tasks
                 )
+                if (
+                    all_done
+                    and plan.delivery_checks
+                    and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
+                    and snap["spec"] is not None
+                    and snap["spec"].content_hash == spec.content_hash
+                    and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
+                    and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
+                    and self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.GOAL_SPEC,
+                        target_id=spec.spec_id,
+                        target_hash=spec.content_hash,
+                    )
+                    and self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.TASK_PLAN,
+                        target_id=plan.plan_id,
+                        target_hash=plan.content_hash,
+                    )
+                ):
+                    run_dir = self._run_dir(run_id)
+                    receipt = run_delivery_checks(
+                        plan,
+                        workspace_root=self.workspace_root,
+                        overlay_dir=run_dir / "accepted_overlay",
+                        run_dir=run_dir,
+                    )
+                    try:
+                        self.store.append_event(
+                            run_id=run_id,
+                            stage="verify",
+                            event_type=DELIVERY_EVENT,
+                            actor="chronos",
+                            payload=receipt,
+                            expected_state_revision=snap["state_revision"],
+                        )
+                    except ConcurrencyConflictError:
+                        continue
                 target_status = RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
                 self.store.set_run_status(
                     run_id,

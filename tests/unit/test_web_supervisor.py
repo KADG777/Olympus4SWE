@@ -57,6 +57,13 @@ GOAL_SPEC: dict[str, object] = {
 
 DESIGN_SPEC: dict[str, object] = {
     "architecture_summary": "Thin HTTP edge over a storage core",
+    "design_tradeoffs": [
+        {
+            "impact": "deployment",
+            "choice": "Ship the API and storage core in one process",
+            "cost": "API scaling also duplicates the storage adapter",
+        }
+    ],
     "spec_id": "spec-inventory",
     "spec_hash": "sha256:placeholder",
     "shared_invariants": [
@@ -208,6 +215,7 @@ def _responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LL
     if "Requirements Alignment Architect" in system:
         return LLMResponse(content=json.dumps(GOAL_SPEC))
     if "White-Box Solution Architect" in system:
+        assert "`design_tradeoffs`" in system
         return LLMResponse(content=json.dumps(DESIGN_SPEC))
     if "Stage 2 Task Planner" in system:
         return LLMResponse(content=json.dumps(TASK_PLAN))
@@ -336,6 +344,12 @@ def test_full_product_blueprint_flow_over_http(
         assert proj["design"] is not None
         assert proj["design_approved"] is False
         assert proj["design"]["modules"]
+        assert proj["design"]["design_tradeoffs"] == DESIGN_SPEC["design_tradeoffs"]
+        review = proj["approval_reviews"]["approve_design"]
+        assert review["target_hash"] == proj["design"]["content_hash"]
+        assert review["sections"][1]["entries"][0]["cost"] == (
+            "API scaling also duplicates the storage adapter"
+        )
 
         # Gate 1.5: approve the design, planner decomposes the modules.
         approved_design = client.post(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from olympus.providers.base import (
 )
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.web.projection import build_run_projection
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
@@ -34,7 +36,9 @@ def _init_repo(root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
 
 
-def _confirmed_run(tmp_path: Path) -> tuple[RunStore, str]:
+def _confirmed_run(
+    tmp_path: Path, *, criteria: list[str] | None = None
+) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
     run_id = store.create_run(title="Manifest run", mode=RunMode.SIMULATION)
     spec = GoalSpec(
@@ -44,7 +48,7 @@ def _confirmed_run(tmp_path: Path) -> tuple[RunStore, str]:
             {
                 "id": "R1",
                 "description": "Provide feature.py with FLAG = True",
-                "acceptance_criteria": ["feature.FLAG is True"],
+                "acceptance_criteria": criteria or ["feature.FLAG is True"],
             }
         ],
     )
@@ -145,6 +149,113 @@ def _stage_responder(
         raise AssertionError(f"Unexpected system prompt: {system_message[:80]}")
 
     return responder
+
+
+def test_delivery_acceptance_uses_executed_checks_on_the_composed_output(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, criteria=["feature.FLAG is True", "feature.AUDIT is True", "UI exposes FLAG"]
+    )
+    spec = store.get_run(run_id)["spec"]
+    checks = [
+        {
+            "id": "CHK-1",
+            "kind": "command",
+            "description": "Verify the flag module imports",
+            "command": "python3 -c 'import feature; assert feature.FLAG'",
+        }
+    ]
+    plan = _plan_payload(
+        spec_id=spec.spec_id, spec_hash=spec.content_hash, file_name="feature.py", checks=checks
+    )
+    plan["delivery_checks"] = [
+        {
+            "requirement_id": "R1",
+            "criterion_index": 1,
+            "command": "python3 -c 'import feature; assert feature.FLAG; print(\"tested FLAG\")'",
+        },
+        {
+            "requirement_id": "R1",
+            "criterion_index": 2,
+            "command": "python3 -c 'import feature; assert feature.AUDIT'",
+        },
+    ]
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+        ),
+        workspace_root=tmp_path,
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    pending = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert pending["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+
+    orch.run_execution(run_id=run_id)
+    review = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert review["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
+    passed, failed, unverified = review["criteria"]
+    assert [row["text"] for row in review["criteria"]] == [
+        "feature.FLAG is True", "feature.AUDIT is True", "UI exposes FLAG"
+    ]
+    assert "tested FLAG" in passed["evidence"]["log"]
+    assert failed["evidence"]["delivery_version"] == passed["evidence"]["delivery_version"]
+    assert failed["reason"] and unverified["reason"]
+    assert unverified["evidence"] is None
+    assert not (tmp_path / "feature.py").exists()
+
+    executed = next(
+        event
+        for event in store.list_events(run_id)
+        if event.event_seq == passed["evidence"]["event_seq"]
+    )
+    wrong_version = {"delivery_version": "sha256:" + "0" * 64}
+    store.append_event(
+        run_id=run_id,
+        stage=executed.stage,
+        event_type=executed.event_type,
+        actor=executed.actor,
+        payload=executed.payload | wrong_version,
+    )
+    stale = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert stale["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+    assert "交付版本" in stale["criteria"][0]["reason"]
+
+    store.append_event(
+        run_id=run_id,
+        stage=executed.stage,
+        event_type=executed.event_type,
+        actor=executed.actor,
+        payload=executed.payload,
+    )
+    artifact = tmp_path / ".olympus" / "runs" / run_id / "artifacts"
+    check_log = artifact / passed["evidence"]["receipt_id"] / "check-1.log"
+    check_log.write_text("different run output", encoding="utf-8")
+    tampered = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert tampered["counts"] == {"passed": 0, "failed": 1, "unverified": 2}
+    assert "指纹不一致" in tampered["criteria"][0]["reason"]
+
+    store.save_plan(run_id, store.get_run(run_id)["plan"])
+    replaced = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert replaced["counts"] == {"passed": 0, "failed": 0, "unverified": 3}
+
+    revised = spec.model_copy(
+        update={
+            "version": spec.version + 1,
+            "requirements": [
+                spec.requirements[0].model_copy(update={"acceptance_criteria": ["FLAG is false"]})
+            ],
+        }
+    )
+    store.save_spec(run_id, revised)
+    assert build_run_projection(store, tmp_path, run_id)["delivery_acceptance"] is None
+    AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path).confirm_spec(
+        run_id=run_id
+    )
+    new_review = build_run_projection(store, tmp_path, run_id)["delivery_acceptance"]
+    assert new_review["spec_hash"] == revised.content_hash
+    assert new_review["counts"] == {"passed": 0, "failed": 0, "unverified": 1}
+    assert new_review["criteria"][0]["text"] == "FLAG is false"
 
 
 def test_orchestrate_writes_manifest_for_rejected_then_accepted_attempts(
@@ -483,3 +594,175 @@ def test_propose_plan_repairs_broken_inline_python_check_via_validation_loop(
     assert "[PLAN VALIDATION FAILED]" in calls[1]
     assert "invalid Python syntax" in calls[1]
     assert plan.tasks[0].acceptance_checks[0].command == "python -m pytest -q"
+
+
+def test_timeout_retry_is_visible_while_an_independent_task_completes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[
+            {"id": "review", "kind": CheckKind.INDEPENDENT_REVIEW.value, "description": "Review"}
+        ],
+    )
+    plan["tasks"].append({**plan["tasks"][0], "task_id": "T2", "write_scope": ["other.py"]})
+    plan["tasks"].append(
+        {**plan["tasks"][0], "task_id": "T3", "depends_on": ["T1"], "write_scope": ["child.py"]}
+    )
+    feature = _stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+    other = _stage_responder(plan=plan, file_name="other.py", review_passes=[True])
+    child = _stage_responder(plan=plan, file_name="child.py", review_passes=[True])
+    timed_out = False
+    during_retry = None
+    after_recovery = None
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal timed_out, during_retry, after_recovery
+        prompt = messages[1].content
+        if "Task T1:" in prompt and not any(msg.role == "tool" for msg in messages):
+            if not timed_out:
+                timed_out = True
+                raise TimeoutError("test call timed out")
+            deadline = time.monotonic() + 5
+            while not any(
+                event.event_type == "task.accepted" and event.payload["task_id"] == "T2"
+                for event in store.list_events(run_id)
+            ):
+                assert time.monotonic() < deadline, "Independent task did not finish during retry"
+                time.sleep(0.01)
+            during_retry = build_run_projection(store, tmp_path, run_id)
+        elif "Task T1:" in prompt:
+            after_recovery = build_run_projection(store, tmp_path, run_id)
+        if "Task T2:" in prompt or '"task_id":"T2"' in prompt:
+            return other(messages, tools)
+        if "Task T3:" in prompt or '"task_id":"T3"' in prompt:
+            return child(messages, tools)
+        return feature(messages, tools)
+
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=respond), workspace_root=tmp_path
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    assert orch.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+
+    assert during_retry is not None
+    active = {node["task_id"]: node for node in during_retry["dag"]["nodes"]}
+    assert active["T1"]["status"] == "running"
+    assert active["T1"]["provider_retry"]["phase"] == "started"
+    assert active["T2"]["status"] == "accepted"
+    assert active["T3"]["status"] == "waiting"
+    assert active["T3"]["blocked_by"] == []
+    assert during_retry["progress"]["accepted_tasks"] == 1
+    assert during_retry["hitl_banner"] is None
+
+    assert after_recovery is not None
+    running = after_recovery["dag"]["nodes"][0]
+    assert running["status"] == "running"
+    assert running["provider_retry"] is None
+    assert running["provider_retry_history"][-1]["phase"] == "recovered"
+
+    final = build_run_projection(store, tmp_path, run_id)
+    task = final["dag"]["nodes"][0]
+    assert task["status"] == "accepted"
+    assert task["attempt"] == 1
+    assert task["provider_retry"] is None
+    history = task["provider_retry_history"]
+    assert [event["phase"] for event in history] == ["started", "recovered"]
+    assert history[0]["retry_id"] == history[1]["retry_id"]
+    assert history[0]["event_seq"] < history[1]["event_seq"]
+
+
+def test_failed_timeout_retry_blocks_only_its_dependency_chain(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        max_cycles=1,
+        checks=[
+            {"id": "review", "kind": CheckKind.INDEPENDENT_REVIEW.value, "description": "Review"}
+        ],
+    )
+    root = plan["tasks"][0]
+    root["deliverables"] = ["feature.py"]
+    plan["tasks"].extend(
+        {
+            **root,
+            "task_id": task_id,
+            "depends_on": deps,
+            "write_scope": [path],
+            "deliverables": [path],
+        }
+        for task_id, deps, path in [
+            ("T2", [], "other.py"),
+            ("T3", ["T1", "T2"], "child.py"),
+            ("T4", ["T3"], "release.py"),
+        ]
+    )
+    other = _stage_responder(plan=plan, file_name="other.py", review_passes=[True])
+    while_blocked = None
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal while_blocked
+        prompt = messages[1].content
+        if "Task T1:" in prompt:
+            raise TimeoutError("flag service timed out")
+        if "Task T2:" in prompt and not any(msg.role == "tool" for msg in messages):
+            deadline = time.monotonic() + 5
+            while not any(
+                event.event_type == "task.blocked" for event in store.list_events(run_id)
+            ):
+                assert time.monotonic() < deadline, "Expected T1 to reach its task cycle limit"
+                time.sleep(0.01)
+            while_blocked = build_run_projection(store, tmp_path, run_id)
+        return other(messages, tools)
+
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=respond), workspace_root=tmp_path
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    snap = orch.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+
+    assert while_blocked is not None
+    nodes = {node["task_id"]: node for node in while_blocked["dag"]["nodes"]}
+    assert nodes["T1"]["status"] == "blocked"
+    assert nodes["T1"]["provider_retry"] is None
+    assert [row["phase"] for row in nodes["T1"]["provider_retry_history"]] == ["started", "failed"]
+    assert nodes["T2"]["status"] == "running"
+    assert nodes["T2"]["blocked_by"] == []
+    assert nodes["T3"]["blocked_by"] == ["T1"]
+    assert nodes["T4"]["blocked_by"] == ["T1"]
+    banner = while_blocked["hitl_banner"]
+    assert banner["task_id"] == "T1"
+    assert banner["affected_task_ids"] == ["T1", "T3", "T4"]
+    assert "flag service timed out" in banner["detail"]
+    assert "retry" in banner["actions"]
+    assert {s["id"]: s["status"] for s in while_blocked["stage_pipeline"]}["execute"] == "active"
+    assert {(e["from"], e["to"]) for e in while_blocked["dag"]["edges"] if e["blocked_edge"]} == {
+        ("T1", "T3"),
+        ("T3", "T4"),
+    }
+
+    final = build_run_projection(store, tmp_path, run_id)
+    assert final["progress"]["accepted_tasks"] == 1
+    assert {s["id"]: s["status"] for s in final["stage_pipeline"]}["execute"] == "blocked"
+    orch.retry_blocked_task(
+        operation_id="retry-t1",
+        run_id=run_id,
+        task_id="T1",
+        expected_state_revision=snap["state_revision"],
+    )
+    after_manual_retry = build_run_projection(store, tmp_path, run_id)
+    nodes = {node["task_id"]: node for node in after_manual_retry["dag"]["nodes"]}
+    assert nodes["T1"]["status"] == "ready"
+    assert "flag service timed out" in nodes["T1"]["last_error"]
+    assert nodes["T1"]["diagnostic_output"] == "就绪待调度"
+    assert nodes["T1"]["provider_retry"] is None
+    assert nodes["T3"]["blocked_by"] == []
+    assert after_manual_retry["hitl_banner"] is None

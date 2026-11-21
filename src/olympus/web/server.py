@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+import olympus.web.acceptance as delivery_review
 from olympus.core.contracts import (
     ApprovalTarget,
     BudgetLedger,
@@ -25,8 +26,9 @@ from olympus.graph.loader import load_workflow
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.web.approval_review import APPROVAL_ARTIFACTS
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
-from olympus.web.projection import build_run_projection, seed_demo_runs
+from olympus.web.projection import build_run_projection, read_recorded_attempt, seed_demo_runs
 from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -101,6 +103,13 @@ class AriadneApp:
             "events": events,
         }
 
+    def get_attempt_payload(self, run_id: str, task_id: str, attempt: int) -> dict[str, Any]:
+        plan = self.store.get_run(run_id)["plan"]
+        artifacts = read_recorded_attempt(self.artifacts_root / run_id, plan, task_id, attempt)
+        if artifacts is None:
+            raise NotFoundError("Recorded task attempt not found")
+        return {"ok": True, "artifacts": artifacts}
+
     def execute_command(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Execute an idempotent HITL command and return updated projection."""
         action = str(body.get("action", "")).strip()
@@ -115,6 +124,17 @@ class AriadneApp:
         expected_rev = (
             int(expected_rev_raw) if expected_rev_raw is not None else int(snap["state_revision"])
         )
+        if action in APPROVAL_ARTIFACTS:
+            if snap["state_revision"] != expected_rev:
+                raise ConcurrencyConflictError(
+                    f"State revision mismatch: expected {expected_rev}, "
+                    f"got {snap['state_revision']}"
+                )
+            artifact = snap[APPROVAL_ARTIFACTS[action]]
+            if "target_hash" in body and (
+                artifact is None or body["target_hash"] != artifact.content_hash
+            ):
+                raise ConcurrencyConflictError("Approval target hash no longer matches")
 
         if action in ("pause", "resume"):
             target_status = RunStatus.PAUSED if action == "pause" else RunStatus.RUNNING
@@ -152,11 +172,6 @@ class AriadneApp:
                 handler=_toggle_status,
             )
         elif action == "approve_spec":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             align = AlignStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
@@ -168,6 +183,7 @@ class AriadneApp:
                 approver=actor,
                 accept_risk=bool(body.get("accept_risk", False)),
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = {
                 "run_id": run_id,
@@ -176,11 +192,6 @@ class AriadneApp:
                 "status": spec.status.value,
             }
         elif action == "approve_design":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             design_stage = DesignStage(
                 self.store,
                 self.supervisor.resolve_provider(run_id),
@@ -191,14 +202,10 @@ class AriadneApp:
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = record.model_dump(mode="json")
         elif action == "approve_plan":
-            if snap["state_revision"] != expected_rev:
-                raise ConcurrencyConflictError(
-                    f"State revision mismatch: expected {expected_rev}, "
-                    f"got {snap['state_revision']}"
-                )
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
@@ -209,6 +216,7 @@ class AriadneApp:
                 run_id=run_id,
                 approver=actor,
                 reason=str(body.get("reason", "")),
+                expected_revision=expected_rev,
             )
             cmd_result = rec.model_dump(mode="json")
         elif action == "clarify":
@@ -582,11 +590,35 @@ def create_http_server(
                             app.get_events_payload(run_id, after_seq=after_seq),
                         )
                         return
+                    if len(parts) == 6 and parts[3] == "delivery-log":
+                        run_id, event_seq, position = parts[2], parts[4], parts[5]
+                        projection = app.get_run_payload(run_id)["projection"]
+                        review = projection["delivery_acceptance"] or {}
+                        for row in review.get("criteria", []):
+                            evidence = row["evidence"]
+                            if (
+                                evidence
+                                and str(evidence["event_seq"]) == event_seq
+                                and str(evidence["check_position"]) == position
+                            ):
+                                log = delivery_review.read_delivery_log(
+                                    app.artifacts_root / run_id, evidence
+                                )
+                                if log is not None:
+                                    self._send_bytes("text/plain; charset=utf-8", log)
+                                    return
+                        raise NotFoundError("No matching current delivery evidence")
                     if len(parts) == 4 and parts[3] == "stream":
                         run_id = parts[2]
                         after_seq = int(qs.get("after_seq", ["0"])[0])
                         once = qs.get("once", ["0"])[0] == "1"
                         self._handle_sse(run_id, after_seq=after_seq, once=once)
+                        return
+                    if len(parts) == 6 and parts[3] == "task-artifacts" and parts[5].isdigit():
+                        self._send_json(
+                            HTTPStatus.OK,
+                            app.get_attempt_payload(parts[2], unquote(parts[4]), int(parts[5])),
+                        )
                         return
 
                 self._send_json(

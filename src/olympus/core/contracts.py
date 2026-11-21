@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from olympus.core.fingerprint import content_hash
 
@@ -163,6 +163,10 @@ class GoalSpec(FingerprintedModel):
     out_of_scope: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    agent_high_impact_assumptions: list[str] = Field(
+        default_factory=list,
+        description="Agent-added assumptions affecting scope or acceptance, quoted verbatim.",
+    )
     open_ambiguities: list[AmbiguityItem] = Field(default_factory=list)
     minority_notes: list[CritiqueNote] = Field(default_factory=list)
     status: SpecStatus = SpecStatus.DRAFT
@@ -171,7 +175,17 @@ class GoalSpec(FingerprintedModel):
     actors: list[str] = Field(default_factory=list)
 
     def _hash_payload(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        """Keep existing approvals valid when provenance is absent."""
+        payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        if not self.agent_high_impact_assumptions:
+            del payload["agent_high_impact_assumptions"]
+        return payload
+
+    @model_validator(mode="after")
+    def _validate_assumption_provenance(self) -> Self:
+        if not set(self.agent_high_impact_assumptions).issubset(self.assumptions):
+            raise ValueError("Agent assumption provenance must reference existing assumption text")
+        return self
 
     def to_markdown(self) -> str:
         kind = self.deliverable_kind.value if self.deliverable_kind else "(unspecified)"
@@ -289,6 +303,14 @@ class InterfaceContract(StrictModel):
     error_cases: list[str] = Field(default_factory=list)
 
 
+class DesignTradeoff(StrictModel):
+    """A selected design decision and its concrete cost at an approval boundary."""
+
+    impact: Literal["existing_system", "deployment", "rollback"]
+    choice: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    cost: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class DesignSpec(FingerprintedModel):
     """White-box design: invariants, contract seams, modules, data ownership, and strategy."""
 
@@ -305,6 +327,10 @@ class DesignSpec(FingerprintedModel):
     execution_strategy: ExecutionStrategy | None = None
     strategy_rationale: str = ""
     risks_and_tradeoffs: list[str] = Field(default_factory=list)
+    design_tradeoffs: list[DesignTradeoff] = Field(
+        default_factory=list,
+        description="Choices and costs affecting the existing system, deployment or rollback.",
+    )
     status: SpecStatus = SpecStatus.DRAFT
 
     def _hash_payload(self) -> dict[str, Any]:
@@ -320,6 +346,8 @@ class DesignSpec(FingerprintedModel):
             payload["execution_strategy"] = self.execution_strategy.value
         if not payload.get("strategy_rationale"):
             payload.pop("strategy_rationale", None)
+        if not self.design_tradeoffs:
+            del payload["design_tradeoffs"]
         for iface in payload.get("interfaces", []):
             if not iface.get("input_schema"):
                 iface.pop("input_schema", None)
@@ -407,6 +435,13 @@ class DesignSpec(FingerprintedModel):
                     lines.append(f"  - Data entities: {', '.join(iface.data_entity_refs)}")
                 if iface.error_cases:
                     lines.append(f"  - Errors: {', '.join(iface.error_cases)}")
+            lines.append("")
+        if self.design_tradeoffs:
+            lines.extend(["## Design tradeoffs", ""])
+            lines.extend(
+                f"- {item.impact.replace('_', ' ').capitalize()}: {item.choice} — cost: {item.cost}"
+                for item in self.design_tradeoffs
+            )
             lines.append("")
         if self.risks_and_tradeoffs:
             lines.extend(["## Risks and tradeoffs", ""])
@@ -524,6 +559,30 @@ class TaskNode(StrictModel):
     kind: TaskKind = TaskKind.IMPLEMENT
     deliverables: list[str] = Field(default_factory=list)
 
+    def definition(self) -> dict[str, Any]:
+        """Return approval-bound task fields, excluding execution state."""
+        return self.model_dump(
+            include={
+                "task_id", "title", "objective", "requirement_refs", "depends_on",
+                "write_scope", "read_scope", "max_cycles", "design_refs", "role",
+                "kind", "deliverables",
+            },
+            mode="python",
+        ) | {
+            "acceptance_checks": [
+                check.model_dump(include={"id", "kind", "description", "command"}, mode="python")
+                for check in self.acceptance_checks
+            ]
+        }
+
+
+class DeliveryCheck(StrictModel):
+    """Executable check for a 1-based criterion in the plan's bound GoalSpec."""
+
+    requirement_id: str = Field(min_length=1)
+    criterion_index: int = Field(ge=1)
+    command: str = Field(pattern=r"\S")
+
 
 class TaskPlan(FingerprintedModel):
     plan_id: str = Field(default_factory=lambda: new_id("plan"))
@@ -533,6 +592,7 @@ class TaskPlan(FingerprintedModel):
     design_hash: str | None = None
     version: int = Field(default=1, ge=1)
     tasks: list[TaskNode] = Field(min_length=1)
+    delivery_checks: list[DeliveryCheck] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_upstream_binding(self) -> TaskPlan:
@@ -547,41 +607,18 @@ class TaskPlan(FingerprintedModel):
 
     def _hash_payload(self) -> dict[str, Any]:
         # Hash structural plan definition (not mutable runtime execution counters)
-        structural_tasks = [
-            t.model_dump(
-                include={
-                    "task_id",
-                    "title",
-                    "objective",
-                    "requirement_refs",
-                    "depends_on",
-                    "write_scope",
-                    "read_scope",
-                    "max_cycles",
-                    "design_refs",
-                    "role",
-                    "kind",
-                    "deliverables",
-                },
-                mode="python",
-            )
-            | {
-                "acceptance_checks": [
-                    c.model_dump(include={"id", "kind", "description", "command"}, mode="python")
-                    for c in t.acceptance_checks
-                ]
-            }
-            for t in self.tasks
-        ]
-        return {
+        payload = {
             "plan_id": self.plan_id,
             "spec_id": self.spec_id,
             "spec_hash": self.spec_hash,
             "design_id": self.design_id,
             "design_hash": self.design_hash,
             "version": self.version,
-            "tasks": structural_tasks,
+            "tasks": [task.definition() for task in self.tasks],
         }
+        if self.delivery_checks:
+            payload["delivery_checks"] = [check.model_dump() for check in self.delivery_checks]
+        return payload
 
 
 class RunMode(StrEnum):
@@ -682,6 +719,15 @@ class ApprovalRecord(StrictModel):
         if self.decision == ApprovalDecision.ACCEPT_RISK and not self.reason.strip():
             raise ValueError("ACCEPT_RISK requires an explicit non-empty reason")
         return self
+
+
+class ProviderTimeoutRetry(StrictModel):
+    event_type: ClassVar[str] = "task.provider_timeout_retry"
+
+    retry_id: str
+    task_id: str
+    lease_generation: int = Field(ge=1)
+    phase: Literal["started", "recovered", "failed"]
 
 
 class RunEvent(StrictModel):

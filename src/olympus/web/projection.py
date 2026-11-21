@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
+import olympus.web.acceptance as delivery_review
+import olympus.web.demos as demo_runs
 from olympus.core.contracts import (
     AcceptanceCheck,
     AmbiguityItem,
@@ -21,6 +23,7 @@ from olympus.core.contracts import (
     CritiqueSeverity,
     DesignSpec,
     GoalSpec,
+    ProviderTimeoutRetry,
     RequirementItem,
     ReviewFinding,
     ReviewSeverity,
@@ -36,6 +39,16 @@ from olympus.core.contracts import (
 from olympus.core.store import RunStore
 from olympus.graph import build_graph, load_workflow
 from olympus.harness.receipt import build_turn_receipt
+from olympus.web.approval_review import (
+    APPROVAL_ARTIFACTS,
+    ApprovalReview,
+    ReviewSection,
+    compare_approval_review,
+    design_review_sections,
+    expand_candidate_review,
+    goal_review_sections,
+    plan_review_sections,
+)
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
 _NOISE_LINE = re.compile(r"[=\-_*·~]{4,}(?:.*[=\-_*·~]{4,})?")
@@ -52,6 +65,14 @@ _WF_FAN_OUT = 2.0
 _WF_MIN_WIDTH = 8.0
 _WF_MAX_OFFSET = 90.0
 _WF_REVIEW_WIDTH = 8.0
+
+
+class TaskBlocker(TypedDict):
+    task_id: str
+    headline: str
+    detail: str
+    affected_task_ids: list[str]
+    actions: list[str]
 
 
 def _compute_dag_layers_and_critical_path(
@@ -139,29 +160,36 @@ def _parse_tool_trace_line(raw_line: str) -> dict[str, Any] | None:
 def _read_task_artifacts(
     run_dir: Path,
     task: TaskNode,
+    *,
+    attempt: int | None = None,
 ) -> dict[str, Any]:
     """Load recorded diff, command check logs, review verdicts, manifest and worker trace."""
     task_art_root = run_dir / "artifacts" / task.task_id
-    attempt_idx = max(1, task.attempt)
+    attempt_idx = attempt if attempt is not None else max(1, task.attempt)
     art_dir = task_art_root / f"attempt-{attempt_idx}"
-    if not art_dir.exists() and task_art_root.exists():
+    if attempt is None and not art_dir.exists() and task_art_root.exists():
         candidates = sorted(task_art_root.glob("attempt-*"))
         if candidates:
             art_dir = candidates[-1]
 
+    def readable(path: Path) -> bool:
+        return path.is_file() and (attempt is None or not path.is_symlink())
+
     diff_text = ""
     diff_path = art_dir / "diff.patch"
-    if diff_path.exists():
+    if readable(diff_path):
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace")[:8000]
 
     manifest_md = ""
     manifest_path = art_dir / "MANIFEST.md"
-    if manifest_path.exists():
+    if readable(manifest_path):
         manifest_md = manifest_path.read_text(encoding="utf-8", errors="replace")[:12000]
 
     check_logs: dict[str, str] = {}
     if art_dir.exists():
         for log_file in sorted(art_dir.glob("check-*.log")):
+            if not readable(log_file):
+                continue
             check_logs[log_file.stem.removeprefix("check-")] = log_file.read_text(
                 encoding="utf-8", errors="replace"
             )[:4000]
@@ -169,6 +197,8 @@ def _read_task_artifacts(
     verdicts: list[dict[str, Any]] = []
     if art_dir.exists():
         for v_file in sorted(art_dir.glob("verdict-cycle-*.json")):
+            if not readable(v_file):
+                continue
             try:
                 verdicts.append(json.loads(v_file.read_text(encoding="utf-8")))
             except Exception:
@@ -176,7 +206,7 @@ def _read_task_artifacts(
 
     tool_calls: list[dict[str, Any]] = []
     trace_file = art_dir / "worker.jsonl"
-    if trace_file.exists():
+    if attempt is None and readable(trace_file):
         for raw_line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
             step = _parse_tool_trace_line(raw_line)
             if step is not None:
@@ -460,7 +490,11 @@ def _build_stage_pipeline(
         exec_state = "skipped"
         verify_state = "skipped"
     elif plan_approved:
-        exec_state = "blocked" if any_blocked else "active"
+        executing = status == RunStatus.RUNNING or (
+            status == RunStatus.PAUSED
+            and any(t.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING) for t in tasks)
+        )
+        exec_state = "blocked" if any_blocked and not executing else "active"
         verify_state = (
             "active" if any(t.status == TaskStatus.ACCEPTED for t in tasks) else "pending"
         )
@@ -546,6 +580,8 @@ def _build_traceability_matrix(
     spec: GoalSpec | None,
     tasks: list[TaskNode],
     design: DesignSpec | None = None,
+    *,
+    delivery_acceptance: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build Requirement x DesignModule x Task x Verification Status rows."""
     if spec is None and design is None:
@@ -587,7 +623,21 @@ def _build_traceability_matrix(
             for module in (design.modules if design is not None else [])
             if req_id in module.requirement_refs
         ]
-        if not covering:
+        if spec is not None:
+            criteria = [
+                row for row in (delivery_acceptance or {}).get("criteria", [])
+                if row["requirement_id"] == req_id
+            ]
+            if any(row["status"] == "failed" for row in criteria):
+                v_status, v_label, evidence_note = "failed", "失败", "有验收条件失败"
+            elif any(row["risk_accepted"] for row in criteria):
+                v_status, v_label = "unverified_risk_accepted", "未验证 · 人工接受"
+                evidence_note = next(row["reason"] for row in criteria if row["risk_accepted"])
+            elif criteria and all(row["status"] == "passed" for row in criteria):
+                v_status, v_label, evidence_note = "verified", "通过", "所有验收条件均已通过"
+            else:
+                v_status, v_label, evidence_note = "pending", "未验证", "缺少可核验的逐条验收结果"
+        elif not covering:
             v_status = "pending"
             v_label = "待验证"
             evidence_note = "尚未分配执行任务"
@@ -961,6 +1011,128 @@ def _build_workflow_view(
     }
 
 
+def read_recorded_attempt(
+    run_dir: Path, plan: TaskPlan | None, task_id: str, attempt: int
+) -> dict[str, Any] | None:
+    task = next((task for task in plan.tasks if task.task_id == task_id), None) if plan else None
+    root = (run_dir / "artifacts").resolve()
+    target = (root / task_id / f"attempt-{attempt}").resolve()
+    if task is None or attempt < 1 or not target.is_relative_to(root) or not target.is_dir():
+        return None
+    art = _read_task_artifacts(run_dir, task, attempt=attempt)
+    return {name: art[name] for name in ("diff_patch", "manifest_md", "check_logs", "verdicts")}
+
+
+def _build_run_progress(
+    snap: dict[str, Any], events: list[RunEvent], dag_nodes: list[dict[str, Any]], run_dir: Path
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    publications = {
+        "spec.saved": ("spec", "GoalSpec", "spec_id"),
+        "design.saved": ("design", "DesignSpec", "design_id"),
+        "plan.saved": ("plan", "任务计划", "plan_id"),
+    }
+    milestones = {
+        "run.created", "intake.triaged", "spec.clarified", "approval.recorded",
+        "graph.node_started", "graph.node_finished", "graph.paused", "graph.failed",
+        "graph.finished", "run.status_changed", "run.workflow_promoted", "task.requeued",
+        "task.blocked", "task.accepted", "task.accepted_with_risk",
+    }
+    tasks = {node["task_id"]: node for node in dag_nodes}
+    attempts: dict[str, tuple[int, int]] = {}
+    last_publication: dict[str, str] = {}
+    outputs: dict[str, dict[str, Any]] = {}
+    recent = None
+    for event in events:
+        kind = event.event_type
+        payload = event.payload
+        entry = {
+            "event_seq": event.event_seq,
+            "created_at": event.created_at.isoformat(),
+            "event_type": kind,
+            "node": payload.get("node"),
+            "task_id": payload.get("task_id"),
+            "to": payload.get("to"),
+        }
+        output = None
+        if kind in publications:
+            category, label, id_field = publications[kind]
+            version = payload.get("version")
+            fingerprint = payload.get("content_hash")
+            artifact_id = payload.get(id_field)
+            if not fingerprint or not artifact_id or version is None:
+                continue
+            key = f"{category}:{artifact_id}:{version}:{fingerprint}"
+            if last_publication.get(category) == key:
+                continue
+            last_publication[category] = key
+            outputs.pop(key, None)
+            artifact = snap[category]
+            current = artifact is not None and artifact.content_hash == fingerprint
+            summary = f"{label} v{version} 已就绪"
+            if category == "spec" and current:
+                summary += f"，{artifact.goal}"
+            elif category == "plan" and isinstance(payload.get("task_count"), int):
+                summary += f"，包含 {payload['task_count']} 个任务"
+            elif category == "design" and isinstance(payload.get("module_count"), int):
+                summary += f"，包含 {payload['module_count']} 个模块"
+            output = {
+                "key": key, "kind": category, "artifact_id": artifact_id,
+                "version": version, "content_hash": fingerprint, "current": current,
+                "summary": summary,
+            }
+        elif kind == "task.leased":
+            task_id, lease, attempt = (
+                payload.get("task_id"), payload.get("lease_generation"), payload.get("attempt")
+            )
+            if isinstance(task_id, str) and isinstance(lease, int) and isinstance(attempt, int):
+                attempts[task_id] = (lease, attempt)
+        elif kind in {"task.verifying", "review.verdict_recorded", "check.command_completed"}:
+            task_id = payload.get("task_id")
+            if not isinstance(task_id, str) or task_id not in tasks:
+                continue
+            task = tasks[task_id]
+            category = "execution" if kind == "task.verifying" else "verification"
+            lease, leased_attempt = attempts.get(task_id, (None, None))
+            attempt = payload.get("attempt")
+            if attempt is None and lease == payload.get("lease_generation"):
+                attempt = leased_attempt
+            folder = run_dir / "artifacts" / task_id / f"attempt-{attempt}"
+            detail_available = False
+            if kind == "task.verifying":
+                diff = folder / "diff.patch"
+                if not attempt or not diff.is_file() or not diff.stat().st_size:
+                    continue
+                key = f"execution:{task_id}:{attempt}"
+                summary = f"{task_id} 第 {attempt} 次执行的代码变更已就绪"
+                detail_available = True
+            else:
+                key = f"verification:{event.event_seq}"
+                name = "独立复核" if kind == "review.verdict_recorded" else payload.get("check_id")
+                if not name or not isinstance(payload.get("passed"), bool):
+                    continue
+                result = "通过" if payload.get("passed") is True else "未通过"
+                summary = f"{task_id} · {name} · {result}"
+                if attempt and folder.is_dir():
+                    detail_available = (
+                        any(folder.glob("verdict-cycle-*.json"))
+                        if kind == "review.verdict_recorded"
+                        else (folder / f"check-{name}.log").is_file()
+                    )
+            output = {
+                "key": key, "kind": category, "artifact_id": task_id,
+                "version": attempt, "current": detail_available and attempt == task["attempt"],
+                "detail_available": detail_available, "summary": summary,
+            }
+        if output and output["key"] not in outputs:
+            outputs[output["key"]] = entry | output
+            recent = entry | {"summary": output["summary"]}
+        elif not output and kind in milestones:
+            if kind == "run.status_changed" and payload.get("from") == payload.get("to"):
+                continue
+            recent = entry
+    return recent, list(reversed(outputs.values()))
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
@@ -969,52 +1141,109 @@ def build_run_projection(
     artifacts_root: Path | None = None,
 ) -> dict[str, Any]:
     """Derive a complete read-only Ariadne console view from SQLite events and run artifacts."""
-    snap = store.get_run(run_id)
+    snap = store.get_run(run_id, include_approval_baselines=True)
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
     design: DesignSpec | None = snap.get("design")
-    events = store.list_events(run_id, after_seq=0)
+    events = [
+        event for event in store.list_events(run_id, after_seq=0)
+        if event.state_revision <= snap["state_revision"]
+    ]
     run_dir = (
         artifacts_root
         if artifacts_root is not None
         else Path(workspace_root).resolve() / ".olympus" / "runs"
     ) / run_id
 
-    spec_approved = bool(
-        spec
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.GOAL_SPEC,
-            target_id=spec.spec_id,
-            target_hash=spec.content_hash,
-        )
-    )
-    plan_approved = bool(
-        plan
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
-        )
-    )
-    design_approved = bool(
-        design
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=design.design_id,
-            target_hash=design.content_hash,
-        )
-    )
+    approved = snap["artifact_approved"]
+    spec_approved = approved[ApprovalTarget.GOAL_SPEC]
+    design_approved = approved[ApprovalTarget.DESIGN_SPEC]
+    plan_approved = approved[ApprovalTarget.TASK_PLAN]
 
+    approval_reviews: dict[str, ApprovalReview] = {}
+    targets = {
+        "spec": ApprovalTarget.GOAL_SPEC, "design": ApprovalTarget.DESIGN_SPEC,
+        "plan": ApprovalTarget.TASK_PLAN,
+    }
+    baselines = snap["approval_baselines"]
     tasks = plan.tasks if plan else []
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
+    for action, key in APPROVAL_ARTIFACTS.items():
+        artifact = snap[key]
+        target = targets[key]
+        if artifact and not approved[target]:
+            sections: list[ReviewSection]
+            if key == "spec":
+                sections = goal_review_sections(artifact)
+            elif key == "design":
+                sections = design_review_sections(artifact)
+            else:
+                sections = plan_review_sections(artifact, layers)
+            review: ApprovalReview = {
+                "artifact": key,
+                "target_hash": artifact.content_hash,
+                "sections": sections,
+            }
+            baseline = baselines.get(target)
+            if baseline is not None:
+                compare_approval_review(
+                    review, artifact, baseline,
+                    plan_layers=lambda tasks: _compute_dag_layers_and_critical_path(tasks)[0],
+                    goals=[item for item in (spec, baselines.get(ApprovalTarget.GOAL_SPEC))
+                           if item is not None],
+                    designs=[item for item in (design, baselines.get(ApprovalTarget.DESIGN_SPEC))
+                             if item is not None],
+                )
+            elif target in baselines:
+                review["comparison_gap"] = (
+                    "缺少上次批准版本的可靠原文。以下展示本次候选的全部关键承诺。"
+                )
+                expand_candidate_review(review, artifact)
+            else:
+                review["comparison_gap"] = "暂无已批准版本可供对照。"
+            approval_reviews[action] = review
+
     task_by_id = {t.task_id: t for t in tasks}
+    blocked_by: dict[str, list[str]] = {}
+    for task in sorted(tasks, key=lambda task: layers[task.task_id]):
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED):
+            blocked_by[task.task_id] = [task.task_id]
+        elif task.status in (TaskStatus.WAITING, TaskStatus.READY):
+            blocked_by[task.task_id] = sorted(
+                {blocker for dep in task.depends_on for blocker in blocked_by.get(dep, [])}
+            )
+    task_blockers: dict[str, TaskBlocker] = {
+        task.task_id: {
+            "task_id": task.task_id,
+            "headline": f"阻塞：{task.task_id} 需要人工处理",
+            "detail": (task.last_error or "").strip() or "任务当前无法继续，等待人工处理",
+            "affected_task_ids": [
+                affected.task_id
+                for affected in tasks
+                if task.task_id in blocked_by.get(affected.task_id, [])
+            ],
+            "actions": ["inspect", "retry", "hint", "reassign", "accept_risk"],
+        }
+        for task in tasks
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
+    }
+
+    delivery_acceptance = delivery_review.build_delivery_acceptance(
+        spec if spec_approved else None,
+        plan if plan_approved else None,
+        [event for event in events if event.state_revision <= snap["state_revision"]],
+        run_dir,
+    )
 
     receipt_by_task: dict[str, dict[str, Any]] = {}
     receipt_by_actor: dict[str, dict[str, Any]] = {}
+    retries_by_task: dict[str, list[dict[str, Any]]] = {}
     for ev in events:
+        if ev.event_type == ProviderTimeoutRetry.event_type:
+            retry = ProviderTimeoutRetry.model_validate(ev.payload)
+            retries_by_task.setdefault(retry.task_id, []).append(
+                {**retry.model_dump(mode="json"), "event_seq": ev.event_seq, "actor": ev.actor}
+            )
         if ev.event_type != "turn.receipt":
             continue
         payload = dict(ev.payload)
@@ -1046,6 +1275,17 @@ def build_run_projection(
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
     for order, t in enumerate(tasks):
+        blocker = task_blockers.get(t.task_id)
+        dependency_blockers = [] if blocker else blocked_by.get(t.task_id, [])
+        retry_history = retries_by_task.get(t.task_id, [])
+        provider_retry = retry_history[-1] if retry_history else None
+        if provider_retry is not None and (
+            provider_retry["phase"] != "started"
+            or provider_retry["lease_generation"] != t.lease_generation
+            or t.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING)
+            or snap["status"] not in (RunStatus.RUNNING, RunStatus.PAUSED)
+        ):
+            provider_retry = None
         art = _read_task_artifacts(run_dir, t)
         stream = _build_subagent_stream(t, art)
         receipt = receipt_by_task.get(t.task_id) or _build_receipt(t, stream, art, order=order)
@@ -1055,18 +1295,16 @@ def build_run_projection(
             for dep in t.depends_on
             if not (task_by_id.get(dep) and task_by_id[dep].status == TaskStatus.ACCEPTED)
         ]
-        # Extract structured diagnostic fields if present in last_error or events
         diag_tool = ""
         diag_output = ""
         diag_attribution = ""
         for c in t.acceptance_checks:
             if c.command and not diag_tool:
                 diag_tool = f"{c.command} → {'通过' if c.passed else '失败'}"
-        if t.last_error:
-            parts = [line.strip() for line in t.last_error.splitlines() if line.strip()]
-            diag_output = parts[0] if parts else t.last_error
-            if len(parts) > 1:
-                diag_attribution = "；".join(parts[1:])
+        if blocker:
+            parts = blocker["detail"].splitlines()
+            diag_output = parts[0]
+            diag_attribution = "；".join(parts[1:]) or "等待人工处理"
         if not diag_attribution and t.accepted_risk_reason:
             diag_attribution = f"未验证 · 人工接受：{t.accepted_risk_reason}"
 
@@ -1079,6 +1317,10 @@ def build_run_projection(
                 t.status == TaskStatus.WAITING and not unmet_deps
             ):
                 diag_output = "就绪待调度"
+            elif t.status == TaskStatus.RUNNING:
+                diag_output = "正在执行"
+            elif t.status == TaskStatus.VERIFYING:
+                diag_output = "正在验收"
             else:
                 diag_output = "等待执行"
 
@@ -1093,6 +1335,8 @@ def build_run_projection(
                 t.status == TaskStatus.WAITING and not unmet_deps
             ):
                 diag_attribution = "无阻塞前置依赖，等待调度器认领执行"
+            elif t.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                diag_attribution = "调度器已认领任务"
             elif unmet_deps:
                 diag_attribution = f"等待前置产物解锁（{', '.join(unmet_deps)}）"
             else:
@@ -1118,6 +1362,10 @@ def build_run_projection(
                 "write_scope": t.write_scope,
                 "read_scope": t.read_scope,
                 "last_error": t.last_error,
+                "provider_retry": provider_retry,
+                "provider_retry_history": retry_history,
+                "blocked_by": dependency_blockers,
+                "blocker": blocker,
                 "accepted_risk_reason": t.accepted_risk_reason,
                 "executor": "Hephaestus-1"
                 if t.task_id.endswith(("1", "2", "3"))
@@ -1139,30 +1387,22 @@ def build_run_projection(
             }
         )
         for dep in t.depends_on:
-            dep_node = task_by_id.get(dep)
-            blocked_edge = bool(
-                dep_node and dep_node.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
-            )
             dag_edges.append(
                 {
                     "from": dep,
                     "to": t.task_id,
                     "critical": (dep, t.task_id) in crit_edges,
-                    "blocked_edge": blocked_edge,
+                    "blocked_edge": bool(dependency_blockers and blocked_by.get(dep)),
                 }
             )
 
-    blocked_tasks = [t for t in tasks if t.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     hitl_banner: dict[str, Any] | None = None
-    if blocked_tasks:
-        bt = blocked_tasks[0]
+    if task_blockers:
+        first_blocker = next(iter(task_blockers.values()))
         hitl_banner = {
+            **first_blocker,
             "kind": "task_blocked",
             "tone": "danger",
-            "task_id": bt.task_id,
-            "headline": f"阻塞：{bt.task_id} 重试 {max(1, bt.review_cycle)} 次仍失败，需要人工处理",
-            "detail": bt.last_error or "验收未通过且重试额度已用尽",
-            "actions": ["inspect", "retry", "hint", "reassign", "accept_risk"],
         }
     elif snap["status"] == RunStatus.FAILED:
         f_node = workflow_view.get("failed_node") or "workflow"
@@ -1239,6 +1479,9 @@ def build_run_projection(
         }
 
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
+    verified_count = sum(
+        1 for t in tasks if t.status == TaskStatus.ACCEPTED and not t.accepted_risk_reason
+    )
     ledger: BudgetLedger = snap["budget_ledger"]
     policy: BudgetPolicy = snap["budget_policy"]
     raw_input = spec.goal if spec is not None else str(snap["title"])
@@ -1280,6 +1523,7 @@ def build_run_projection(
                 }
             )
 
+    recent_progress, key_outputs = _build_run_progress(snap, events, dag_nodes, run_dir)
     return {
         "run_id": snap["run_id"],
         "title": snap["title"],
@@ -1295,6 +1539,8 @@ def build_run_projection(
         "blueprint_completed": blueprint_completed,
         "triage": triage_payload,
         "stage_activity": stage_activity[-12:],
+        "recent_progress": recent_progress,
+        "key_outputs": key_outputs,
         "spec_approved": spec_approved,
         "design_approved": design_approved,
         "plan_approved": plan_approved,
@@ -1317,10 +1563,12 @@ def build_run_projection(
         },
         "progress": {
             "accepted_tasks": accepted_count,
+            "verified_tasks": verified_count,
             "total_tasks": len(tasks),
             "ratio_text": f"{accepted_count} / {len(tasks)}",
         },
         "hitl_banner": hitl_banner,
+        "approval_reviews": approval_reviews,
         "spec": spec.model_dump(mode="json") if spec else None,
         "design": design.model_dump(mode="json") if design else None,
         "plan": plan.model_dump(mode="json") if plan else None,
@@ -1336,7 +1584,10 @@ def build_run_projection(
             receipt_by_actor,
             spec_approved=spec_approved,
         ),
-        "traceability_matrix": _build_traceability_matrix(spec, tasks, design),
+        "traceability_matrix": _build_traceability_matrix(
+            spec, tasks, design, delivery_acceptance=delivery_acceptance
+        ),
+        "delivery_acceptance": delivery_acceptance,
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }
@@ -1348,7 +1599,7 @@ def seed_demo_runs(
     *,
     artifacts_root: Path | None = None,
 ) -> list[str]:
-    """Seed deterministic walkthrough runs (Campus Activity Waitlist & cattrs) if missing."""
+    """Seed the delivery acceptance and campus waitlist walkthroughs if missing."""
     existing_ids = {r["run_id"] for r in store.list_runs(limit=100)}
     seeded: list[str] = []
     art_base = (
@@ -1356,6 +1607,10 @@ def seed_demo_runs(
         if artifacts_root is not None
         else Path(workspace_root).resolve() / ".olympus" / "runs"
     )
+
+    if demo_runs.DELIVERY_DEMO_ID not in existing_ids:
+        demo_runs.seed_delivery_acceptance_demo(store, art_base)
+        seeded.append(demo_runs.DELIVERY_DEMO_ID)
 
     demo_id = "run-campus-waitlist"
     if demo_id not in existing_ids:
