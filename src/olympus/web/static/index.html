@@ -19,6 +19,7 @@
   </script>
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/graph/ariadne-graph.css">
 </head>
 <body data-dock="closed">
   <div class="cockpit">
@@ -177,11 +178,11 @@
               <span class="legend-item">⚠ 人工接受</span>
               <span class="legend-item"><span class="legend-swatch" data-tone="critical" aria-hidden="true"></span> 关键路径</span>
               <span class="legend-item"><span class="legend-swatch" data-tone="blocked" aria-hidden="true"></span> 阻塞传递</span>
+              <span class="legend-item"><span class="legend-swatch" data-tone="running" aria-hidden="true"></span> 执行中</span>
+              <span class="legend-item"><span class="legend-ring" aria-hidden="true"></span> 当前选中</span>
             </div>
           </header>
-          <div class="dag-frame scroller">
-            <svg class="dag-svg" id="dag-svg" role="img" aria-label="任务依赖有向无环图" width="760" height="216" viewBox="0 0 760 216"></svg>
-          </div>
+          <div class="graph-host" id="dag-graph" data-graph-host="dag"></div>
           <details id="run-plan-detail" class="run-detail" hidden>
             <summary>查看完整任务计划</summary>
             <pre class="code-block scroller" tabindex="0"></pre>
@@ -334,6 +335,7 @@
   <div class="toast" id="toast-bar" role="status" aria-live="polite" hidden></div>
 
   <script src="/static/ui.js"></script>
+  <script src="/static/graph/ariadne-graph.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

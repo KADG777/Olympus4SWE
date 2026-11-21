@@ -18,3 +18,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Graph Island build tooling (bundle is committed under src/olympus/web/static/graph/)
+web-graph/node_modules/

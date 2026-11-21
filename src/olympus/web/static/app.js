@@ -25,6 +25,7 @@
     userOpenedDock: false,
     transport: null,
     submitting: false,
+    dagIsland: null,
   };
 
   const el = {
@@ -51,7 +52,7 @@
     dockReceipt: document.getElementById("dock-receipt"),
     banner: document.getElementById("hitl-banner"),
     bannerHeadline: document.getElementById("hitl-headline"),
-    dag: document.getElementById("dag-svg"),
+    dagGraph: document.getElementById("dag-graph"),
     lanes: document.getElementById("swimlanes"),
     laneBadge: document.getElementById("lane-badge"),
     frStrip: document.getElementById("fr-strip"),
@@ -1211,110 +1212,85 @@
     }
   }
 
-  function renderDag(projection) {
-    const focusedTaskId = el.dag.contains(document.activeElement)
-      ? document.activeElement.dataset.taskId
-      : null;
+  const LIVE_TASK_STATUSES = new Set(["running", "verifying"]);
+
+  /** Plain JSON view model for the Graph Island; the host owns every label and status word. */
+  function dagGraphProps(projection) {
     const nodes = projection.dag.nodes || [];
     const edges = projection.dag.edges || [];
-    if (!nodes.length) {
-      el.dag.setAttribute("width", "760");
-      el.dag.setAttribute("height", "120");
-      el.dag.setAttribute("viewBox", "0 0 760 120");
-      el.dag.innerHTML =
-        '<text class="dag-empty" x="32" y="64">当前运行尚未生成任务 DAG</text>';
-      return;
-    }
-
-    const byLayer = new Map();
-    nodes.forEach((node) => {
-      const layer = node.layer || 0;
-      if (!byLayer.has(layer)) byLayer.set(layer, []);
-      byLayer.get(layer).push(node);
-    });
-    const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
-    const nodeWidth = 152;
-    const nodeHeight = 62;
-    const rowGap = 12;
-    const columnGap = 196;
-    const tallest = Math.max(...layers.map((layer) => byLayer.get(layer).length));
-    const canvasWidth = Math.max(760, layers.length * columnGap + 40);
-    const canvasHeight = Math.max(216, tallest * (nodeHeight + rowGap) + 32);
-    el.dag.setAttribute("width", String(canvasWidth));
-    el.dag.setAttribute("height", String(canvasHeight));
-    el.dag.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
-
-    const coords = new Map();
-    layers.forEach((layer, column) => {
-      const columnNodes = byLayer.get(layer);
-      const totalHeight = columnNodes.length * nodeHeight + (columnNodes.length - 1) * rowGap;
-      const startY = Math.max(12, Math.round((canvasHeight - totalHeight) / 2));
-      columnNodes.forEach((node, row) => {
-        const x = 24 + column * columnGap;
-        const y = startY + row * (nodeHeight + rowGap);
-        coords.set(node.task_id, { x, y, node });
-      });
-    });
-
-    const defs = `<defs>
-      <marker id="dag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
-      <marker id="dag-arrow-blocked" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow-blocked" d="M0,0 L10,5 L0,10 z"></path></marker>
-    </defs>`;
-
-    const paths = edges
-      .map((edge) => {
-        const source = coords.get(edge.from);
-        const target = coords.get(edge.to);
-        if (!source || !target) return "";
-        const x1 = source.x + nodeWidth;
-        const y1 = source.y + nodeHeight / 2;
-        const x2 = target.x;
-        const y2 = target.y + nodeHeight / 2;
-        const mid = (x1 + x2) / 2;
-        const marker = edge.blocked_edge ? "dag-arrow-blocked" : "dag-arrow";
-        return `<path class="dag-edge" data-critical="${edge.critical ? "true" : "false"}" data-blocked="${
-          edge.blocked_edge ? "true" : "false"
-        }" d="M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}" marker-end="url(#${marker})"></path>`;
-      })
-      .join("");
-
-    const shapes = nodes
-      .map((node) => {
-        const pos = coords.get(node.task_id);
-        if (!pos) return "";
-        const displayStatus = taskDisplayStatus(node, projection);
-        const meta = statusMeta(displayStatus, node.accepted_risk_reason);
-        const selected = node.task_id === state.selectedTaskId ? "true" : "false";
-        const centerX = pos.x + nodeWidth / 2;
+    const displayStatus = new Map(
+      nodes.map((node) => [node.task_id, taskDisplayStatus(node, projection)])
+    );
+    return {
+      runId: projection.run_id,
+      selectedId: state.selectedTaskId,
+      onSelect: selectTask,
+      ariaLabel: "任务依赖有向无环图",
+      emptyMessage: "当前运行尚未生成任务 DAG",
+      nodes: nodes.map((node) => {
+        const status = displayStatus.get(node.task_id);
+        const meta = statusMeta(status, node.accepted_risk_reason);
         const dependencyBlocked = Boolean(node.blocked_by?.length);
-        const issue = node.provider_retry ? "retry" : dependencyBlocked ? "dependency" : "";
-        const context = node.provider_retry
+        const retrying = Boolean(node.provider_retry);
+        const context = retrying
           ? RETRY_MESSAGE
           : `${node.role || "engineer"} · ${node.kind || "implement"}`;
-        const status = node.provider_retry
+        const statusText = retrying
           ? RETRY_NEXT_STEP
           : dependencyBlocked ? "依赖受阻" : `${meta.glyph} ${meta.label}`;
-        const accessibleStatus = node.provider_retry ? `${context}，${status}` : status;
-        return `<g class="dag-node" data-task-id="${esc(node.task_id)}" data-status="${esc(
-          displayStatus
-        )}" data-issue="${issue}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
-          node.task_id
-        )} ${esc(accessibleStatus)}"><rect class="dag-node-box" x="${pos.x}" y="${
-          pos.y
-        }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
-          pos.y + 22
-        }" text-anchor="middle">${esc(node.task_id)}</text><text class="dag-node-kind" x="${centerX}" y="${
-          pos.y + 38
-        }" text-anchor="middle">${esc(context)}</text><text class="dag-node-meta" x="${centerX}" y="${
-          pos.y + 54
-        }" text-anchor="middle">${esc(status)}</text></g>`;
-      })
-      .join("");
+        const tone = retrying
+          ? "warn"
+          : dependencyBlocked ? "bad" : status === "planned" ? "planned" : meta.variant;
+        const pill = retrying
+          ? { text: "重试中", tone: "warn" }
+          : node.accepted_risk_reason
+            ? { text: "⚠ 风险", tone: "warn" }
+            : node.attempt > 1 ? { text: `×${node.attempt}`, tone: "muted" } : null;
+        return {
+          id: node.task_id,
+          layer: node.layer || 0,
+          status,
+          tone,
+          meta: context,
+          statusText,
+          pill,
+          title: node.title || "",
+          issue: retrying ? "retry" : dependencyBlocked ? "dependency" : "",
+          risk: Boolean(node.accepted_risk_reason),
+          ariaLabel: `任务 ${node.task_id} ${retrying ? `${context}，${statusText}` : statusText}`,
+        };
+      }),
+      edges: edges.map((edge) => ({
+        source: edge.from,
+        target: edge.to,
+        critical: Boolean(edge.critical),
+        blocked: Boolean(edge.blocked_edge),
+        running: !edge.blocked_edge && LIVE_TASK_STATUSES.has(displayStatus.get(edge.to)),
+      })),
+    };
+  }
 
-    el.dag.innerHTML = defs + paths + shapes;
-    if (focusedTaskId) {
-      el.dag.querySelector(`[data-task-id="${CSS.escape(focusedTaskId)}"]`)
-        ?.focus({ preventScroll: true });
+  function renderDag(projection) {
+    const graph = window.AriadneGraph;
+    if (!graph) {
+      if (!el.dagGraph.dataset.graphUnavailable) {
+        el.dagGraph.dataset.graphUnavailable = "true";
+        el.dagGraph.innerHTML = uiNotice(
+          "warn",
+          "任务依赖图组件未能加载（/static/graph/ariadne-graph.js），其余控制台功能不受影响。"
+        );
+      }
+      return;
+    }
+    const props = dagGraphProps(projection);
+    if (state.dagIsland) {
+      state.dagIsland.update(props);
+      return;
+    }
+    try {
+      state.dagIsland = graph.mountDag(el.dagGraph, props);
+    } catch (error) {
+      el.dagGraph.innerHTML = uiNotice("warn", `任务依赖图渲染失败：${esc(error.message)}`);
     }
   }
 
@@ -2396,19 +2372,6 @@
       renderDock(state.projection);
       setDockOpen(true);
       el.dockTitle.focus();
-    });
-
-    el.dag.addEventListener("click", (event) => {
-      const node = event.target.closest(".dag-node");
-      if (node) selectTask(node.dataset.taskId);
-    });
-
-    el.dag.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      const node = event.target.closest(".dag-node");
-      if (!node) return;
-      event.preventDefault();
-      selectTask(node.dataset.taskId);
     });
 
     el.workflowSvg.addEventListener("click", (event) => {

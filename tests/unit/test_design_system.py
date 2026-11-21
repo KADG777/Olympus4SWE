@@ -80,6 +80,22 @@ def test_no_colour_literals() -> None:
     assert not found_decls, f"raw colours in declarations: {found_decls[:8]}"
 
 
+GRAPH_SOURCES = Path(__file__).resolve().parents[2] / "web-graph" / "src"
+
+
+def test_graph_island_reads_tokens_only() -> None:
+    """The Graph Island stylesheet and components name no colour; tokens.css drives both themes."""
+    sources = [*GRAPH_SOURCES.rglob("*.css"), *GRAPH_SOURCES.rglob("*.tsx"),
+               *GRAPH_SOURCES.rglob("*.ts")]
+    assert sources, "web-graph/src is missing"
+    for path in sources:
+        found = COLOUR.findall(path.read_text(encoding="utf-8"))
+        assert not found, f"{path.name} holds raw colours — use var(--token): {found[:8]}"
+    css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
+    sizes = [v for _s, body in _blocks(css) for p, v in _decls(body) if p == "font-size"]
+    assert sizes and set(sizes) <= SIZES, f"graph font-size must be a --text-* token: {sizes}"
+
+
 def test_no_shadows_except_floating() -> None:
     allowed = (".floating-menu", "dialog[open]")
     found = [
