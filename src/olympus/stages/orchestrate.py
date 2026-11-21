@@ -109,10 +109,13 @@ Inspect the GoalSpec requirements, out_of_scope boundaries, TaskNode objective, 
 command check outputs (plus read-only workspace inspection if needed).
 Rules:
 1. Check for spec drift, out_of_scope additions, stub code, edge-case bugs, and security risks.
-2. Classify each finding strictly as 'important' (blocks pass), 'nit', or 'pre_existing'.
-3. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
+2. Respect TaskNode.write_scope as a hard boundary: judge ONLY work achievable within this
+   TaskNode's objective and write_scope. Never reject a task for missing deliverables or test files
+   outside its write_scope (those belong to other tasks in the DAG).
+3. Classify each finding strictly as 'important' (blocks pass), 'nit', or 'pre_existing'.
+4. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
    genuinely satisfies the task and no 'important' defects remain.
-4. Output ONLY a single JSON object conforming to ReviewVerdict."""
+5. Output ONLY a single JSON object conforming to ReviewVerdict."""
 
 
 def _plan_binding(
@@ -698,6 +701,8 @@ class OrchestrateStage:
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
             f"TaskNode: {task_summary}\n"
+            f"Hard write_scope boundary (do NOT require edits to files outside these paths): "
+            f"{json.dumps(task.write_scope, ensure_ascii=False)}\n"
             f"Relevant requirements: {reqs_json}\n"
             f"{spec_ctx}\n"
             f"{design_ctx}"

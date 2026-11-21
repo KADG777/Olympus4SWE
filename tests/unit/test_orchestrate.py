@@ -2163,3 +2163,171 @@ def test_watchdog_pause_blocks_concurrent_sibling_acceptance_and_overlay(tmp_pat
     assert out["status"] == RunStatus.PAUSED
     assert not [e for e in store.list_events(run_id) if e.event_type == "task.accepted"]
     assert not (tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay" / "other.py").exists()
+
+
+
+def test_watchdog_buckets_error_signatures_and_parses_fenced_json(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    seen_payloads: list[dict[str, Any]] = []
+    checked = Event()
+
+    class ErrorThenFinishDriver:
+        name = "err"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            if on_handle is not None:
+                on_handle(self)
+            assert on_event is not None
+            on_event(
+                "agent.tool_finished",
+                {
+                    "tool": "write",
+                    "step": 1,
+                    "status": "error",
+                    "error_signature": "sha256:" + "9" * 64,
+                },
+            )
+            assert checked.wait(3.0)
+            (request.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="err",
+            )
+
+    class FencedMonitor(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args
+            messages = kwargs["messages"]
+            seen_payloads.append(json.loads(messages[-1].content))
+            return LLMResponse(
+                content='```json\n{"verdict":"HEALTHY","summary":"Recovered from first error"}\n```'
+            )
+
+    def on_event(kind: str, payload: dict[str, Any]) -> None:
+        del payload
+        if kind == "watchdog.checked":
+            checked.set()
+
+    verdict = json.dumps(
+        {"task_id": "T1", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        monitor_provider=FencedMonitor(),
+        watchdog_config=WatchdogConfig(repeat_error_threshold=1),
+        execution_drivers=ExecutionDriversConfig(worker_driver="err"),
+        driver_registry=DriverRegistry({"err": ErrorThenFinishDriver()}),
+        on_driver_event=on_event,
+    )
+    out = stage.run_execution(run_id=run_id)
+    assert out["status"] == RunStatus.COMPLETED
+    assert seen_payloads
+    raw_snapshot = json.dumps(seen_payloads[0])
+    assert "sha256:" not in raw_snapshot
+    assert seen_payloads[0]["milestones"][0]["error_bucket"] == "err#1"
+    watchdog_events = [e for e in store.list_events(run_id) if e.event_type == "watchdog.checked"]
+    assert len(watchdog_events) == 1
+    assert watchdog_events[0].payload["verdict"] == "HEALTHY"
+
+
+def test_argus_prompt_enforces_hard_write_scope_boundary(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    seen_messages: list[tuple[str, str]] = []
+
+    class CapturingReviewer(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args
+            messages = kwargs["messages"]
+            seen_messages.append((messages[0].content, messages[1].content))
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T1",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "ok",
+                        "findings": [],
+                    }
+                )
+            )
+
+    class ScopedWorker:
+        name = "scoped"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            del on_event, on_handle
+            (request.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="scoped",
+            )
+
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=CapturingReviewer(),
+        execution_drivers=ExecutionDriversConfig(worker_driver="scoped"),
+        driver_registry=DriverRegistry({"scoped": ScopedWorker()}),
+    )
+    out = stage.run_execution(run_id=run_id)
+    assert out["status"] == RunStatus.COMPLETED
+    assert len(seen_messages) == 1
+    sys_prompt, user_prompt = seen_messages[0]
+    assert "TaskNode.write_scope as a hard boundary" in sys_prompt
+    assert "outside its write_scope" in sys_prompt
+    expected_scope_line = (
+        "Hard write_scope boundary (do NOT require edits to files outside these paths): "
+        '["feature.py"]'
+    )
+    assert expected_scope_line in user_prompt
+

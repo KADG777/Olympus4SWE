@@ -374,7 +374,14 @@ class _PiTurn:
             command += ["--mode", "rpc"]
         else:
             command += ["-p", "--mode", "json"]
-        command += ["--no-session", "--no-mcp", "--no-approve", "--no-extensions"]
+        command += [
+            "--no-session",
+            "--no-mcp",
+            "--no-approve",
+            "--no-extensions",
+            "--no-context-files",
+            "--no-skills",
+        ]
         if request.system_prompt.strip():
             command += ["--system-prompt", request.system_prompt]
         if request.model:
