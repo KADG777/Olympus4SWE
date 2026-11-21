@@ -22,7 +22,12 @@ from olympus.graph import (
 )
 from olympus.graph.loader import WorkflowRuntime
 from olympus.graph.progress import resolve_resume_node
-from olympus.harness.driver import ActiveTurnHandle, DriverRegistry, ExecutionDriversConfig
+from olympus.harness.driver import (
+    ActiveTurnHandle,
+    DriverRegistry,
+    ExecutionDriversConfig,
+    default_driver_factories,
+)
 from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
@@ -352,7 +357,9 @@ class RunSupervisor:
                 auto_approve=auto_approve,
                 topology=definition.topology,
                 execution_drivers=driver_config,
-                driver_registry=self.driver_registry,
+                driver_registry=self.driver_registry.with_factories(
+                    default_driver_factories(store=self.store, run_id=run_id)
+                ),
                 model_provider=lambda model: self._builder({**provider_config, "model": model}),
                 on_driver_handle=lambda handle: self._register_turn(run_id, handle),
             )

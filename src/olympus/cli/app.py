@@ -282,10 +282,12 @@ def cmd_run(
     model: ModelOpt = None,
     base_url: BaseUrlOpt = None,
     worker_driver: Annotated[
-        str | None, typer.Option(help="Stage 2 worker driver (optionally driver@model).")
+        str | None,
+        typer.Option(help="Stage 2 worker driver: native|pi (optionally driver@model)."),
     ] = None,
     reviewer_driver: Annotated[
-        str | None, typer.Option(help="Stage 2 reviewer driver (optionally driver@model).")
+        str | None,
+        typer.Option(help="Stage 2 reviewer driver: native|pi (optionally driver@model)."),
     ] = None,
     monitor_model: Annotated[str | None, typer.Option(help="Monitor model.")] = None,
 ) -> None:

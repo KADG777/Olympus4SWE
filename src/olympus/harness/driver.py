@@ -6,13 +6,17 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Protocol
+from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
 from pydantic import Field, StringConstraints
 
 from olympus.core.contracts import StrictModel
 
+if TYPE_CHECKING:
+    from olympus.core.store import RunStore
+
 DriverEvent = Callable[[str, dict[str, Any]], None]
+DriverFactory = Callable[[], "AgentDriver"]
 NonEmptySetting = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
@@ -95,10 +99,23 @@ class ExecutionDriversConfig(StrictModel):
 
 
 class DriverRegistry:
-    """Resolve driver specs against the native factory and injected drivers."""
+    """Resolve driver specs against explicit drivers, lazy factories, and the native factory."""
 
-    def __init__(self, drivers: Mapping[str, AgentDriver] | None = None) -> None:
+    def __init__(
+        self,
+        drivers: Mapping[str, AgentDriver] | None = None,
+        *,
+        factories: Mapping[str, DriverFactory] | None = None,
+    ) -> None:
         self._drivers = dict(drivers or {})
+        self._factories = dict(factories or {})
+        self._built: dict[str, AgentDriver] = {}
+
+    def with_factories(self, factories: Mapping[str, DriverFactory]) -> DriverRegistry:
+        """Return a registry that keeps explicit drivers and adds lazy default drivers."""
+        merged = dict(self._factories)
+        merged.update(factories)
+        return DriverRegistry(self._drivers, factories=merged)
 
     def resolve(
         self, spec: str, *, native_factory: Callable[[str | None], AgentDriver]
@@ -109,12 +126,29 @@ class DriverRegistry:
             raise ValueError(f"Missing model override in driver spec {spec!r}")
         if name == "native":
             driver = native_factory(model)
+        elif name in self._drivers:
+            driver = self._drivers[name]
+        elif name in self._factories:
+            built = self._built.get(name)
+            if built is None:
+                built = self._factories[name]()
+                self._built[name] = built
+            driver = built
         else:
-            try:
-                driver = self._drivers[name]
-            except KeyError:
-                raise ValueError(
-                    f"Unknown agent driver {name!r}; registered drivers: "
-                    f"{', '.join(['native', *sorted(self._drivers)])}"
-                ) from None
+            registered = sorted({"native", *self._drivers, *self._factories})
+            raise ValueError(
+                f"Unknown agent driver {name!r}; registered drivers: "
+                f"{', '.join(registered)}"
+            )
         return driver, model
+
+
+def default_driver_factories(
+    *,
+    store: RunStore | None,
+    run_id: str | None,
+) -> dict[str, DriverFactory]:
+    """Lazily build the external drivers shipped with Olympus (never at import time)."""
+    from olympus.harness.pi import PiDriver
+
+    return {"pi": lambda: PiDriver(store=store, run_id=run_id)}

@@ -46,6 +46,7 @@ from olympus.harness.driver import (
     DriverRegistry,
     DriverTurnRequest,
     ExecutionDriversConfig,
+    default_driver_factories,
 )
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
@@ -1154,11 +1155,14 @@ class OrchestrateStage:
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
-        worker = self.driver_registry.resolve(
+        registry = self.driver_registry.with_factories(
+            default_driver_factories(store=self.store, run_id=run_id)
+        )
+        worker = registry.resolve(
             self.execution_drivers.worker_driver,
             native_factory=lambda model: self._native_driver(run_id, model),
         )
-        reviewer = self.driver_registry.resolve(
+        reviewer = registry.resolve(
             self.execution_drivers.reviewer_driver,
             native_factory=lambda model: self._native_driver(run_id, model, review=True),
         )
