@@ -26,6 +26,7 @@ from olympus.core.dag import compute_dispatchable_tasks
 from olympus.core.store import RunStore
 from olympus.graph import load_workflow
 from olympus.graph.progress import build_workflow_view, is_blueprint_completed
+from olympus.harness.activity import tool_output_status
 from olympus.harness.receipt import build_turn_receipt
 from olympus.web.approval_review import (
     APPROVAL_ARTIFACTS,
@@ -124,7 +125,10 @@ def _parse_tool_trace_line(raw_line: str) -> dict[str, Any] | None:
         return None
     if not isinstance(entry, dict) or entry.get("event") not in ("tool_call", "tool_end"):
         return None
+    return _tool_trace_step(entry)
 
+
+def _tool_trace_step(entry: dict[str, Any]) -> dict[str, Any]:
     status = str(entry.get("status") or "")
     if status not in _TOOL_STATUSES:
         if entry.get("denied"):
@@ -133,16 +137,55 @@ def _parse_tool_trace_line(raw_line: str) -> dict[str, Any] | None:
             status = "error"
         else:
             status = "ok"
-    target = entry.get("target") or entry.get("path") or entry.get("command") or ""
+    arguments = entry.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    target = (
+        entry.get("target") or entry.get("path") or entry.get("command")
+        or arguments.get("path") or arguments.get("command") or arguments.get("pattern") or ""
+    )
+    step = entry.get("step")
+    duration = entry.get("duration_ms")
     return {
-        "step": int(entry.get("step") or 0),
+        "step": step if type(step) is int else 0,
         "tool": str(entry.get("tool") or "unknown"),
         "target": str(target)[:160],
         "status": status,
         "is_error": status != "ok",
-        "duration_ms": int(entry.get("duration_ms") or 0),
+        "duration_ms": duration if type(duration) is int else 0,
         "output_preview": str(entry.get("output") or "")[:240],
     }
+
+
+def _legacy_tool_trace_steps(raw_line: str) -> list[dict[str, Any]]:
+    try:
+        entry = json.loads(raw_line)
+    except ValueError:
+        return []
+    if not isinstance(entry, dict):
+        return []
+    calls, outputs = entry.get("tool_calls"), entry.get("tool_outputs")
+    if not isinstance(calls, list) or not isinstance(outputs, list):
+        return []
+    calls_by_id = {
+        call["id"]: call for call in calls
+        if isinstance(call, dict) and isinstance(call.get("id"), str)
+    }
+    steps = []
+    for result in outputs:
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str):
+            continue
+        call = calls_by_id.get(result["id"], {})
+        tool = str(call.get("name") or result.get("name") or "unknown")
+        output = str(result.get("output") or "")
+        steps.append(_tool_trace_step({
+            "step": entry.get("step"),
+            "tool": tool,
+            "arguments": call.get("arguments"),
+            "status": tool_output_status(tool, output),
+            "output": output,
+        }))
+    return steps
 
 
 def _read_task_artifacts(
@@ -195,17 +238,22 @@ def _read_task_artifacts(
     tool_calls: list[dict[str, Any]] = []
     trace_file = art_dir / "worker.jsonl"
     if attempt is None and readable(trace_file):
-        for raw_line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
-            step = _parse_tool_trace_line(raw_line)
-            if step is not None:
-                tool_calls.append(step)
+        with trace_file.open(encoding="utf-8", errors="replace") as trace:
+            for raw_line in trace:
+                step = _parse_tool_trace_line(raw_line)
+                if step is not None:
+                    tool_calls.append(step)
+                elif '"tool_outputs"' in raw_line:
+                    tool_calls.extend(_legacy_tool_trace_steps(raw_line))
+                if len(tool_calls) >= 40:
+                    break
 
     return {
         "attempt_dir": str(art_dir) if art_dir.exists() else None,
         "diff_patch": diff_text,
         "check_logs": check_logs,
         "verdicts": verdicts,
-        "tool_calls": tool_calls,
+        "tool_calls": tool_calls[:40],
         "manifest_md": manifest_md,
     }
 
@@ -1018,6 +1066,65 @@ def _build_run_progress(
     return recent, list(reversed(outputs.values()))
 
 
+def _live_task_progress(
+    tasks: list[TaskNode], events: list[RunEvent]
+) -> dict[str, dict[str, Any]]:
+    attempts = {task.task_id: task.attempt for task in tasks}
+    progress: dict[str, dict[str, Any]] = {
+        task.task_id: {
+            "driver_name": None,
+            "current_tool": None,
+            "last_event_at": None,
+            "recent_tools": [],
+            "steer_count": 0,
+            "watchdog_verdict": None,
+            "watchdog_summary": None,
+        }
+        for task in tasks
+    }
+    configured_driver = None
+    for event in events:
+        payload = event.payload
+        if event.event_type == "run.status_changed" and "execution_drivers" in payload:
+            configured_driver = payload["execution_drivers"]["worker_driver"].split("@", 1)[0]
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or task_id not in progress:
+            continue
+        if payload.get("attempt") != attempts[task_id]:
+            continue
+        entry = progress[task_id]
+        kind = event.event_type
+        if kind in ("agent.tool_started", "agent.tool_finished"):
+            entry["driver_name"] = payload["driver"]
+            tool = {"step": payload["step"], "tool": payload["tool"]}
+            if kind == "agent.tool_started":
+                entry["current_tool"] = {**tool, "target_hint": payload["target_hint"]}
+            else:
+                current = entry["current_tool"]
+                if current and all(current[key] == value for key, value in tool.items()):
+                    entry["current_tool"] = None
+                entry["recent_tools"] = [
+                    *entry["recent_tools"][-4:],
+                    {**tool, "status": payload["status"], "duration_ms": payload["duration_ms"]},
+                ]
+        elif kind == "agent.steered":
+            entry["steer_count"] += 1
+        elif kind in ("watchdog.checked", "watchdog.paused"):
+            entry["watchdog_verdict"] = payload.get("verdict")
+            entry["watchdog_summary"] = payload.get("summary")
+        elif kind != "watchdog.error":
+            continue
+        entry["last_event_at"] = event.created_at.isoformat()
+
+    for task in tasks:
+        entry = progress[task.task_id]
+        if task.status == TaskStatus.RUNNING:
+            entry["driver_name"] = entry["driver_name"] or configured_driver
+        else:
+            entry["current_tool"] = None
+    return progress
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
@@ -1153,6 +1260,7 @@ def build_run_projection(
         stop_after=workflow_view.get("stop_after"),
     )
 
+    live_progress = _live_task_progress(tasks, events)
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
     for order, t in enumerate(tasks):
@@ -1245,6 +1353,7 @@ def build_run_projection(
                 "last_error": t.last_error,
                 "provider_retry": provider_retry,
                 "provider_retry_history": retry_history,
+                "live_progress": live_progress[t.task_id],
                 "blocked_by": dependency_blockers,
                 "blocker": blocker,
                 "accepted_risk_reason": t.accepted_risk_reason,

@@ -16,6 +16,7 @@ from pydantic import BaseModel, ValidationError
 from olympus.core.contracts import ProviderTimeoutRetry, new_id, utc_now
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
+from olympus.harness.activity import tool_output_status
 from olympus.harness.hooks import PreToolUseHook
 from olympus.harness.receipt import build_turn_receipt
 from olympus.harness.turn_control import NativeTurnControl
@@ -288,6 +289,7 @@ class AgentLoop:
         task_id: str | None = None,
         lease_generation: int | None = None,
         control: NativeTurnControl | None = None,
+        normalized_trace: bool = False,
     ) -> None:
         self.provider = provider
         self.toolkit = toolkit
@@ -303,6 +305,7 @@ class AgentLoop:
         self.task_id = task_id
         self.lease_generation = lease_generation
         self.control = control
+        self.normalized_trace = normalized_trace
 
     def _record_timeout_retry(
         self, retry_id: str, phase: Literal["started", "recovered", "failed"]
@@ -802,6 +805,25 @@ class AgentLoop:
                 )
             )
 
+            if self.normalized_trace:
+                text_record = {"text": resp.content, "replace": True}
+                self._append_trace(
+                    {
+                        "event": "text_delta",
+                        "timestamp": utc_now().isoformat(),
+                        "actor": self.actor,
+                        "step": step,
+                        "prefix_hash": prefix_hash,
+                        "usage": {
+                            "input_tokens": resp.usage.input_tokens,
+                            "output_tokens": resp.usage.output_tokens,
+                        },
+                        **text_record,
+                    }
+                )
+                if resp.content and self.observer is not None:
+                    self.observer("text_delta", text_record)
+
             tool_outputs: list[dict[str, str]] = []
             if resp.tool_calls:
                 for tc in resp.tool_calls:
@@ -812,45 +834,50 @@ class AgentLoop:
                         allowed, reason = self.pre_tool_hook(tc.name, tc.arguments)
                         if not allowed:
                             denied_reason = reason
-                    if denied_reason is not None:
-                        out = f"Error: [PRE_TOOL_HOOK DENIED] {denied_reason}"
-                        _emit(
-                            "pre_tool_blocked",
-                            {
-                                "actor": self.actor,
-                                "task_id": self.task_id,
-                                "step": step,
-                                "tool": tc.name,
-                                "reason": denied_reason,
-                            },
-                        )
-                    else:
-                        _emit(
-                            "tool_start",
-                            {
-                                "actor": self.actor,
-                                "task_id": self.task_id,
-                                "step": step,
-                                "tool": tc.name,
-                            },
-                        )
+                    activity = {
+                        "actor": self.actor,
+                        "task_id": self.task_id,
+                        "step": step,
+                        "tool": tc.name,
+                    }
+                    if denied_reason is None or self.normalized_trace:
+                        _emit("tool_start", activity)
                         if self._cancelled():
                             break
-                        started = time.monotonic()
+                    started = time.monotonic()
+                    if denied_reason is not None:
+                        out = f"Error: [PRE_TOOL_HOOK DENIED] {denied_reason}"
+                    else:
                         if self.toolkit is None:
                             out = f"Error: no toolkit attached to execute tool '{tc.name}'."
                         else:
                             out = self.toolkit.execute(tc.name, tc.arguments)
-                        elapsed_ms = int((time.monotonic() - started) * 1000)
-                        _emit(
-                            "tool_end",
+                    status = tool_output_status(tc.name, out)
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    finished = {**activity, "status": status, "duration_ms": elapsed_ms}
+                    if self.normalized_trace:
+                        self._append_trace(
                             {
-                                "actor": self.actor,
-                                "task_id": self.task_id,
-                                "step": step,
-                                "tool": tc.name,
-                                "is_error": out.startswith("Error:"),
-                                "duration_ms": elapsed_ms,
+                                "event": "tool_end",
+                                "timestamp": utc_now().isoformat(),
+                                **finished,
+                                "id": tc.id,
+                                "arguments": tc.arguments,
+                                "output": out,
+                            }
+                        )
+                    if denied_reason is not None:
+                        _emit(
+                            "pre_tool_blocked", {**finished, "reason": denied_reason}
+                        )
+                    else:
+                        _emit(
+                            "tool_end", {
+                                **finished,
+                                "is_error": status == "error",
+                                "error_signature": (
+                                    content_hash(out) if status == "error" else ""
+                                ),
                             },
                         )
                     tool_outputs.append({"id": tc.id, "name": tc.name, "output": out})
@@ -863,25 +890,26 @@ class AgentLoop:
                         )
                     )
 
-            self._append_trace(
-                {
-                    "timestamp": utc_now().isoformat(),
-                    "actor": self.actor,
-                    "step": step,
-                    "prefix_hash": prefix_hash,
-                    "message_count": len(messages),
-                    "assistant_content": resp.content,
-                    "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in resp.tool_calls
-                    ],
-                    "tool_outputs": tool_outputs,
-                    "usage": {
-                        "input_tokens": resp.usage.input_tokens,
-                        "output_tokens": resp.usage.output_tokens,
-                    },
-                }
-            )
+            if not self.normalized_trace:
+                self._append_trace(
+                    {
+                        "timestamp": utc_now().isoformat(),
+                        "actor": self.actor,
+                        "step": step,
+                        "prefix_hash": prefix_hash,
+                        "message_count": len(messages),
+                        "assistant_content": resp.content,
+                        "tool_calls": [
+                            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                            for tc in resp.tool_calls
+                        ],
+                        "tool_outputs": tool_outputs,
+                        "usage": {
+                            "input_tokens": resp.usage.input_tokens,
+                            "output_tokens": resp.usage.output_tokens,
+                        },
+                    }
+                )
 
             if not resp.tool_calls:
                 return _finalize_result(

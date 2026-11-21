@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -37,6 +38,20 @@ class NativeDriver:
         on_handle: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
         control = NativeTurnControl()
+
+        def observe(kind: str, payload: dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            if kind == "tool_start":
+                on_event("agent.tool_started", payload)
+            elif kind in ("tool_end", "pre_tool_blocked"):
+                fields = ("actor", "task_id", "step", "tool", "status", "duration_ms")
+                finished = {key: payload[key] for key in fields}
+                finished["error_signature"] = payload.get("error_signature", "")
+                on_event("agent.tool_finished", finished)
+            else:
+                on_event(kind, payload)
+
         try:
             if on_handle is not None:
                 on_handle(control)
@@ -56,11 +71,12 @@ class NativeDriver:
                 max_steps=request.max_steps,
                 trace_path=request.trace_path,
                 synthesize_on_max_steps=True,
-                observer=compose_observers(on_event),
+                observer=compose_observers(observe),
                 pre_tool_hook=None if request.read_only else toolkit.as_pre_tool_hook(),
                 task_id=request.task_id,
                 lease_generation=request.lease_generation,
                 control=control,
+                normalized_trace=True,
             )
             result = loop.run(system_prompt=request.system_prompt, user_prompt=request.user_prompt)
             content = result.final_content

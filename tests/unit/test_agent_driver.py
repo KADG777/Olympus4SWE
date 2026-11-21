@@ -26,7 +26,7 @@ def test_native_steer_preserves_exploration_and_emits_milestone(tmp_path: Path) 
     steered: list[dict[str, object]] = []
 
     def on_event(kind: str, payload: dict[str, object]) -> None:
-        if kind == "tool_end":
+        if kind == "agent.tool_finished":
 
             def steer() -> None:
                 assert handles[0].steer("Use the fact you just read", source="human")

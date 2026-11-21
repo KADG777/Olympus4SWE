@@ -850,6 +850,20 @@ def test_task_dag_island_preserves_viewport_on_live_updates(workbench, browser):
     assert panned != before
     card = host.locator("[data-task-id='T05']").element_handle()
 
+    task = next(task for task in store.get_run(run_id)["plan"].tasks if task.task_id == "T05")
+    store.append_event(
+        run_id=run_id, stage="orchestrate", event_type="agent.tool_started", actor="hephaestus:T05",
+        payload={
+            "task_id": "T05", "attempt": task.attempt, "actor": "hephaestus:T05",
+            "driver": "native", "step": 2, "tool": "read_file", "target_hint": "workspace file",
+        },
+    )
+    playwright.expect(host.locator("[data-task-id='T05']")).to_contain_text("native · read_file")
+    assert viewport.evaluate("node => getComputedStyle(node).transform") == panned
+    host.locator("[data-task-id='T05']").click()
+    playwright.expect(page.locator("#dock")).to_contain_text("当前工具")
+    playwright.expect(page.locator("#dock")).to_contain_text("read_file")
+
     plan = store.get_run(run_id)["plan"]
     store.save_plan(run_id, plan.model_copy(update={"version": 2}))
     playwright.expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2")

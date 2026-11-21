@@ -58,7 +58,16 @@ class ActiveTurnHandle(Protocol):
 
 
 class AgentDriver(Protocol):
-    """Block until the turn ends, publishing its handle synchronously before execution."""
+    """Publish a handle before execution and emit callbacks during the turn.
+
+    Tool milestones use agent.tool_started / agent.tool_finished, with step,
+    tool and (for completion) status, duration_ms and error_signature.
+    agent.steered carries the source of guidance. text_delta carries text,
+    with replace=True when a driver supplies a complete message.
+    Drivers own local JSONL traces. Finished tools use event="tool_end" with
+    the milestone's tool fields plus arguments and output. Text records use
+    event="text_delta" with the corresponding text payload.
+    """
 
     name: str
 

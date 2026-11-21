@@ -7,8 +7,12 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
+
+import httpx
 
 from olympus.core.contracts import (
     ApprovalDecision,
@@ -26,6 +30,7 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.harness.driver import ActiveTurnHandle
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -36,6 +41,7 @@ from olympus.providers.base import (
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection
+from olympus.web.server import AriadneApp, create_http_server
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
@@ -1309,6 +1315,33 @@ def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Pat
             self.requests.append(request)
             if self.name == "writer":
                 (request.workspace_path / "feature.py").write_text("FLAG = True\n")
+                assert on_event is not None
+                assert request.trace_path is not None
+                raw = {
+                    "task_id": "spoofed",
+                    "attempt": 99,
+                    "actor": "spoofed",
+                    "driver": "spoofed",
+                    "step": 1,
+                    "tool": "run_bash",
+                    "target_hint": "PRIVATE_COMMAND",
+                    "arguments": {"command": "PRIVATE_COMMAND"},
+                    "output": "PRIVATE_STDOUT\nPRIVATE_STDERR",
+                    "prompt": request.user_prompt,
+                }
+                on_event("tool_start", raw)
+                trace = [{"event": "text_delta", "text": "PRIVATE_DELTA"}] * 45
+                for line in trace:
+                    on_event("text_delta", line)
+                finished = {
+                    **raw, "is_error": True, "duration_ms": 9, "error_signature": raw["output"],
+                }
+                on_event("tool_end", finished)
+                on_event("agent.steered", {"source": "watchdog", "reason": "PRIVATE_GUIDANCE"})
+                trace.append({"event": "tool_end", **finished})
+                request.trace_path.write_text(
+                    "".join(json.dumps(line) + "\n" for line in trace), encoding="utf-8"
+                )
             return TurnOutcome(
                 True, "final_response", next(self.responses), 1, driver_name=self.name
             )
@@ -1342,6 +1375,22 @@ def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Pat
     assert all(req.read_only and req.model == "different-model" for req in verifier.requests)
     assert "worker-only content" not in verifier.requests[0].user_prompt
     assert "VALIDATION" in verifier.requests[1].user_prompt
+    events = store.list_events(run_id)
+    milestones = [event.payload for event in events if event.event_type.startswith("agent.")]
+    assert milestones[0] == {
+        "task_id": "T1", "attempt": 1, "actor": "hephaestus:T1", "driver": "writer",
+        "step": 1, "tool": "run_bash", "target_hint": "shell command",
+    }
+    assert milestones[1]["status"] == "error"
+    assert milestones[1]["error_signature"].startswith("sha256:")
+    assert milestones[2] == {
+        "task_id": "T1", "attempt": 1, "actor": "hephaestus:T1", "source": "watchdog",
+        "reason": "Watchdog guidance",
+    }
+    assert "PRIVATE_" not in json.dumps(milestones)
+    assert not any(event.event_type == "text_delta" for event in events)
+    node = build_run_projection(store, tmp_path, run_id)["dag"]["nodes"][0]
+    assert node["artifacts"]["tool_calls"][0]["output_preview"] == "PRIVATE_STDOUT\nPRIVATE_STDERR"
     verdict = json.loads(
         (
             tmp_path
@@ -1355,6 +1404,124 @@ def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Pat
         ).read_text()
     )
     assert verdict["task_id"] == "T1" and verdict["attempt"] == 1
+
+
+def test_live_worker_milestones_reach_ariadne_before_receipt(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id, spec_hash=spec.content_hash, file_name="feature.py",
+        checks=[{"id": "CHK-REV", "kind": "independent_review", "description": "Audit the diff"}],
+    )
+    handles: list[ActiveTurnHandle] = []
+    started, steered, release_tool, release_turn = (Event() for _ in range(4))
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "agent.tool_started":
+            started.set()
+            release_tool.wait(5)
+        elif kind == "agent.tool_finished":
+            handles[0].steer("PRIVATE_STEERING_BODY", source="human")
+        elif kind == "agent.steered":
+            steered.set()
+            release_turn.wait(5)
+
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+        ),
+        workspace_root=tmp_path,
+        on_driver_event=observe,
+        on_driver_handle=handles.append,
+        live_activity=app.supervisor.live_activity,
+    )
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+
+    def task(payload: dict[str, Any]) -> dict[str, Any]:
+        return payload["projection"]["dag"]["nodes"][0]
+
+    with ThreadPoolExecutor() as pool:
+        result = pool.submit(stage.run_execution, run_id=run_id)
+        try:
+            assert started.wait(3)
+            initial = task(app.get_run_payload(run_id))["live_progress"]
+            assert initial["driver_name"] == "native"
+            assert initial["current_tool"]["tool"] == "write_file"
+            assert initial["last_event_at"]
+            assert initial["preview"] == "writing feature.py"
+            release_tool.set()
+            assert steered.wait(3)
+            events = app.get_events_payload(run_id)["events"]
+            worker_events = [e for e in events if e["actor"] == "hephaestus:T1"]
+            milestones = [e for e in worker_events if e["event_type"].startswith("agent.")]
+            assert [e["event_type"] for e in milestones] == [
+                "agent.tool_started", "agent.tool_finished", "agent.steered",
+            ]
+            assert not any(e["event_type"] == "turn.receipt" for e in worker_events)
+            assert not result.done()
+            assert "PRIVATE_STEERING_BODY" not in json.dumps(milestones)
+            assert "FLAG = True" not in json.dumps(milestones)
+            assert str(tmp_path) not in json.dumps(milestones)
+
+            node = task(app.get_run_payload(run_id))
+            progress = node["live_progress"]
+            assert progress["current_tool"] is None
+            assert progress["recent_tools"][0]["status"] == "ok"
+            assert progress["steer_count"] == 1
+            assert progress["watchdog_verdict"] is None
+            assert progress["watchdog_summary"] is None
+            reopened = RunStore(store.db_path)
+            durable = build_run_projection(reopened, tmp_path, run_id)["dag"]["nodes"][0][
+                "live_progress"
+            ]
+            assert durable == {key: value for key, value in progress.items() if key != "preview"}
+            assert not any(e["event_type"] == "text_delta" for e in worker_events)
+            assert node["artifacts"]["tool_calls"][0]["tool"] == "write_file"
+            assert node["artifacts"]["tool_calls"][0]["duration_ms"] >= 0
+            worker_trace = Path(node["artifacts"]["attempt_dir"]) / "worker.jsonl"
+            assert '"event": "text_delta"' in worker_trace.read_text(encoding="utf-8")
+
+            httpd = create_http_server(app, host="127.0.0.1", port=0)
+            thread = Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                response = httpx.get(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+                    f"?once=1&after_seq={milestones[0]['event_seq']}",
+                    timeout=3,
+                )
+                assert response.status_code == 200
+                sse = json.loads(response.text.split("data: ", 1)[1])
+                assert [e for e in sse["events"] if e["event_type"].startswith("agent.")] == (
+                    milestones[1:]
+                )
+                with httpx.stream(
+                    "GET",
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+                    f"?after_seq={milestones[-1]['event_seq']}",
+                    timeout=3,
+                ) as stream:
+                    lines = stream.iter_lines()
+                    for line in lines:
+                        if line == "event: activity":
+                            activity = json.loads(next(lines).removeprefix("data: "))
+                            break
+                    else:
+                        raise AssertionError("Expected an activity-only SSE event")
+                assert activity["previews"]["T1"] == {"attempt": 1, "preview": "writing feature.py"}
+            finally:
+                httpd.shutdown()
+                thread.join()
+                httpd.server_close()
+        finally:
+            release_tool.set()
+            release_turn.set()
+        assert result.result()["status"] == RunStatus.COMPLETED
+        assert "preview" not in task(app.get_run_payload(run_id))["live_progress"]
+        assert app.supervisor.live_activity.snapshot(run_id) == {}
 
 
 def test_cli_run_combines_flags_and_env_for_role_models(tmp_path: Path, monkeypatch) -> None:

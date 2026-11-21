@@ -1131,9 +1131,14 @@
         const meta = statusMeta(status, node.accepted_risk_reason);
         const dependencyBlocked = Boolean(node.blocked_by?.length);
         const retrying = Boolean(node.provider_retry);
+        const live = status === "running" ? node.live_progress : null;
+        const recent = live?.recent_tools.at(-1);
+        const mark = { ok: "✓", error: "✕", denied: "⊘" };
+        const tool = live?.current_tool?.tool || (recent && `${mark[recent.status]} ${recent.tool}`);
+        const activity = [live?.driver_name, tool].filter(Boolean).join(" · ");
         const context = retrying
           ? RETRY_MESSAGE
-          : `${node.role || "engineer"} · ${node.kind || "implement"}`;
+          : activity || `${node.role || "engineer"} · ${node.kind || "implement"}`;
         const statusText = retrying
           ? RETRY_NEXT_STEP
           : dependencyBlocked ? "依赖受阻" : `${meta.glyph} ${meta.label}`;
@@ -1156,7 +1161,7 @@
           title: node.title || "",
           issue: retrying ? "retry" : dependencyBlocked ? "dependency" : "",
           risk: Boolean(node.accepted_risk_reason),
-          ariaLabel: `任务 ${node.task_id} ${retrying ? `${context}，${statusText}` : statusText}`,
+          ariaLabel: `任务 ${node.task_id} ${retrying || activity ? `${context}，${statusText}` : statusText}`,
         };
       }),
       edges: edges.map((edge) => ({
@@ -1385,6 +1390,32 @@
     return cards || uiNotice("info", "此版本的执行文件不可用");
   }
 
+  function taskActivityPreview(projection, task) {
+    if (projection.status !== "running" || task?.status !== "running") return "";
+    const previews = state.transport?.activity;
+    if (!previews) return task.live_progress?.preview || "";
+    const entry = previews[task.task_id];
+    return entry?.attempt === task.attempt ? entry.preview : "";
+  }
+
+  function renderLiveProgress(projection, task) {
+    const progress = task.live_progress;
+    if (!progress?.driver_name && !progress?.last_event_at) return "";
+    const current = progress.current_tool;
+    const rows = [
+      progress.driver_name ? uiRow("驱动", esc(progress.driver_name), { mono: true }) : "",
+      current ? uiRow("当前工具", esc(`${current.tool} · ${current.target_hint}`), { mono: true }) : "",
+      ...progress.recent_tools.slice().reverse().map((entry) => {
+        const labels = { ok: "成功", error: "出错", denied: "已拦截" };
+        return uiRow(entry.tool, esc(`${labels[entry.status]} · ${entry.duration_ms} ms`), { mono: true });
+      }),
+      progress.watchdog_summary ? uiRow("Watchdog", esc(progress.watchdog_summary)) : "",
+    ].join("");
+    const preview = taskActivityPreview(projection, task);
+    return uiCard(task.status === "running" ? "实时执行" : "最近执行",
+      `<div class="kv">${rows}</div><p class="card-note" data-live-preview${preview ? "" : " hidden"}>${esc(preview)}</p>`);
+  }
+
   function renderDockBody(projection, task) {
     if (state.activeTab === "artifacts") {
       return recordedArtifactCards(task.artifacts || {}, task.manifest_md);
@@ -1438,6 +1469,7 @@
         return uiNotice("bad", `依赖任务 ${esc(taskId)} 受阻：${esc(blocker.detail)}`,
           `<button type="button" class="btn" data-blocker-task-id="${esc(taskId)}">查看 ${esc(taskId)} 的处理操作</button>`);
       }),
+      renderLiveProgress(projection, task),
       uiCard("执行概览", `<div class="kv">${rows}</div>`),
       task.accepted_risk_reason
         ? uiNotice("warn", `未验证 · 人工接受：${esc(task.accepted_risk_reason)}`)
@@ -1972,6 +2004,7 @@
   function scheduleReconnect(transport) {
     transport.source?.close();
     transport.source = null;
+    delete transport.activity;
     setConnection(transport, "reconnecting");
     if (transport.timer) return;
     transport.timer = window.setTimeout(() => {
@@ -2052,6 +2085,18 @@
           (request[0] !== requestedRevision || request[1] !== requestedSeq))) return;
       }
       if (isCurrent()) scheduleReconnect(transport);
+    });
+    source.addEventListener("activity", (event) => {
+      if (!isCurrent()) return;
+      const payload = JSON.parse(event.data);
+      if (payload.run_id !== transport.runId) return;
+      transport.activity = payload.previews;
+      const preview = document.querySelector("[data-live-preview]");
+      if (!preview) return;
+      const projection = state.projection;
+      const task = projection.dag.nodes.find((node) => node.task_id === state.selectedTaskId);
+      preview.textContent = taskActivityPreview(projection, task);
+      preview.hidden = !preview.textContent;
     });
     source.addEventListener("error", () => {
       if (isCurrent()) scheduleReconnect(transport);

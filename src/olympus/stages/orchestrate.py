@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -37,6 +37,7 @@ from olympus.core.dag import (
     validate_plan,
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.harness.activity import LiveActivity, milestone_fields
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.diff_gate import run_diff_gate
 from olympus.harness.driver import (
@@ -61,6 +62,9 @@ from olympus.harness.worktree import (
 from olympus.providers.base import LLMProvider
 from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
+
+if TYPE_CHECKING:
+    from olympus.harness.driver import TurnOutcome
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
@@ -372,6 +376,7 @@ class OrchestrateStage:
         model_provider: Callable[[str], LLMProvider] | None = None,
         on_driver_event: DriverEvent | None = None,
         on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None,
+        live_activity: LiveActivity | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
@@ -380,6 +385,7 @@ class OrchestrateStage:
         self.model_provider = model_provider
         self.on_driver_event = on_driver_event
         self.on_driver_handle = on_driver_handle
+        self.live_activity = live_activity
         self.workspace_root = Path(workspace_root).resolve()
         self.artifacts_root = (
             artifacts_root
@@ -772,6 +778,51 @@ class OrchestrateStage:
         )
         return verdict
 
+    def _run_worker_turn(
+        self,
+        run_id: str,
+        task: TaskNode,
+        driver: AgentDriver,
+        request: DriverTurnRequest,
+    ) -> TurnOutcome:
+        activity = self.live_activity
+
+        def observe(kind: str, payload: dict[str, Any]) -> None:
+            kind = {
+                "tool_start": "agent.tool_started",
+                "tool_end": "agent.tool_finished",
+            }.get(kind, kind)
+            fields = milestone_fields(kind, payload)
+            if fields is not None:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="orchestrate",
+                    event_type=kind,
+                    actor=request.actor,
+                    payload={
+                        "task_id": task.task_id,
+                        "attempt": task.attempt,
+                        "actor": request.actor,
+                        **({"driver": driver.name} if kind != "agent.steered" else {}),
+                        **fields,
+                    },
+                )
+            if kind == "text_delta" and activity is not None:
+                text = payload.get("text")
+                if isinstance(text, str) and text:
+                    activity.update(
+                        run_id, task.task_id, task.attempt, text,
+                        replace=payload.get("replace") is True,
+                    )
+            if self.on_driver_event is not None:
+                self.on_driver_event(kind, payload)
+
+        try:
+            return driver.run_turn(request, on_event=observe, on_handle=self.on_driver_handle)
+        finally:
+            if activity is not None:
+                activity.clear(run_id, task.task_id, task.attempt)
+
     def _execute_single_task(
         self,
         *,
@@ -834,24 +885,21 @@ class OrchestrateStage:
                 f"{rework_ctx}"
             )
             driver, model = worker
-            loop_res = driver.run_turn(
-                DriverTurnRequest(
-                    workspace_path=sandbox.workspace_path,
-                    env_root=self.workspace_root,
-                    system_prompt=_WORKER_SYSTEM_PROMPT,
-                    user_prompt=worker_prompt,
-                    actor=f"hephaestus:{leased.task_id}",
-                    task_id=leased.task_id,
-                    lease_generation=leased.lease_generation,
-                    write_scope=leased.write_scope,
-                    forbidden_globs=list(forbidden_contracts),
-                    max_steps=worker_max_steps,
-                    trace_path=art_dir / "worker.jsonl",
-                    model=model,
-                ),
-                on_event=self.on_driver_event,
-                on_handle=self.on_driver_handle,
+            request = DriverTurnRequest(
+                workspace_path=sandbox.workspace_path,
+                env_root=self.workspace_root,
+                system_prompt=_WORKER_SYSTEM_PROMPT,
+                user_prompt=worker_prompt,
+                actor=f"hephaestus:{leased.task_id}",
+                task_id=leased.task_id,
+                lease_generation=leased.lease_generation,
+                write_scope=leased.write_scope,
+                forbidden_globs=list(forbidden_contracts),
+                max_steps=worker_max_steps,
+                trace_path=art_dir / "worker.jsonl",
+                model=model,
             )
+            loop_res = self._run_worker_turn(run_id, leased, driver, request)
 
             # Transition lease to VERIFYING before running checks/review
             verifying = self.store.update_task_with_lease(

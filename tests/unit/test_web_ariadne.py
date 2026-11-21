@@ -710,6 +710,33 @@ def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:
         assert turn["duration_ms"] > 0
 
 
+def test_projection_reads_tool_calls_from_legacy_worker_trace(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    seed_demo_runs(store, tmp_path)
+    run_id = "run-campus-waitlist"
+    node = next(
+        node for node in build_run_projection(store, tmp_path, run_id)["dag"]["nodes"]
+        if node["task_id"] == "T03-R1"
+    )
+    trace = Path(node["artifacts"]["attempt_dir"]) / "worker.jsonl"
+    trace.write_text(
+        json.dumps({
+            "step": 3,
+            "tool_calls": [
+                {"id": "read", "name": "read_file", "arguments": {"path": "source.py"}},
+            ],
+            "tool_outputs": [{"id": "read", "name": "read_file", "output": "VALUE = 1"}],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    node = next(
+        node for node in build_run_projection(store, tmp_path, run_id)["dag"]["nodes"]
+        if node["task_id"] == "T03-R1"
+    )
+    assert node["artifacts"]["tool_calls"][0]["target"] == "source.py"
+    assert node["artifacts"]["tool_calls"][0]["output_preview"] == "VALUE = 1"
+
+
 def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
     db_path = tmp_path / ".olympus" / "olympus.db"
     store = RunStore(db_path)

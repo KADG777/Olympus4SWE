@@ -23,6 +23,7 @@ from olympus.core.dag import validate_design_spec, validate_plan
 from olympus.core.store import RunStore
 from olympus.graph.engine import END, Graph, GraphPaused, Node
 from olympus.graph.progress import GATE_SPECS, is_artifact_approved
+from olympus.harness.activity import LiveActivity
 from olympus.harness.driver import ActiveTurnHandle, DriverRegistry, ExecutionDriversConfig
 from olympus.providers.base import LLMProvider
 from olympus.stages.align import AlignStage
@@ -100,6 +101,7 @@ class WorkflowRuntime:
     driver_registry: DriverRegistry = field(default_factory=DriverRegistry)
     model_provider: Callable[[str], LLMProvider] | None = None
     on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None
+    live_activity: LiveActivity | None = None
 
 
 def _runtime(state: Mapping[str, Any]) -> WorkflowRuntime:
@@ -144,6 +146,7 @@ def _orchestrate_stage(runtime: WorkflowRuntime) -> OrchestrateStage:
         driver_registry=runtime.driver_registry,
         model_provider=runtime.model_provider,
         on_driver_handle=runtime.on_driver_handle,
+        live_activity=runtime.live_activity,
     )
 
 

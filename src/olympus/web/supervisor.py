@@ -9,6 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import olympus.harness.activity as activity
 from olympus.core.contracts import RunStatus
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph import (
@@ -71,6 +72,7 @@ class RunSupervisor:
         )
         self.provider_builder = provider_builder
         self.driver_registry = driver_registry or DriverRegistry()
+        self.live_activity = activity.LiveActivity()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._future_by_run: dict[str, Future[dict[str, Any]]] = {}
         self._run_locks: dict[str, threading.Lock] = {}
@@ -362,6 +364,7 @@ class RunSupervisor:
                 ),
                 model_provider=lambda model: self._builder({**provider_config, "model": model}),
                 on_driver_handle=lambda handle: self._register_turn(run_id, handle),
+                live_activity=self.live_activity,
             )
             state: dict[str, Any] = {
                 "run_id": run_id,
