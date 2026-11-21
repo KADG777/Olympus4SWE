@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
-from olympus.core.dag import paths_overlap
 from olympus.providers.base import ToolSpec
 
 IGNORED_DIR_NAMES = frozenset(
@@ -155,24 +154,21 @@ class WorkspacePolicy:
         return pattern
 
     def _scope_matches(self, rel: str, raw_pattern: str) -> bool:
-        """Symmetric overlap matcher (globs + ancestor/descendant) for forbidden scopes."""
+        """Exact glob match or symmetric ancestor/descendant match for forbidden scopes."""
         pattern = self._scope_pattern(raw_pattern)
         if pattern is None:
             return False
-        if rel != rel.strip() or pattern != pattern.strip():
-            norm_rel = self._strip_dot_prefix(rel).lstrip("/")
-            norm_pat = pattern.rstrip("/")
-            if any(char in pattern for char in _GLOB_CHARS):
-                return fnmatch.fnmatch(norm_rel, pattern)
-            return (
-                norm_rel == norm_pat
-                or norm_rel.startswith(f"{norm_pat}/")
-                or norm_pat.startswith(f"{norm_rel}/")
-            )
-        try:
-            return paths_overlap(rel, pattern)
-        except ValueError:
-            return False
+        norm_rel = self._strip_dot_prefix(rel).lstrip("/")
+        if any(char in pattern for char in _GLOB_CHARS):
+            return fnmatch.fnmatch(norm_rel, pattern)
+        norm_pat = pattern.rstrip("/")
+        if norm_pat in ("", "."):
+            return True
+        return (
+            norm_rel == norm_pat
+            or norm_rel.startswith(f"{norm_pat}/")
+            or norm_pat.startswith(f"{norm_rel}/")
+        )
 
     def _scope_contains(self, rel: str, raw_pattern: str) -> bool:
         """True when ``rel`` sits at or below an authorized scope; never grants ancestors."""

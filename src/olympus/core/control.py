@@ -117,6 +117,8 @@ def is_plan_bound_to_upstream(
             and plan.design_hash == design.content_hash
             and (plan.design_id is None or plan.design_id == design.design_id)
         )
+    if design is not None and plan.design_hash is not None and not design_bound:
+        return False
     return spec_bound or design_bound
 
 
@@ -238,17 +240,26 @@ class RunControl:
         *,
         operation_id: str,
         workflow: dict[str, Any],
+        pre_dispatch_revision: int,
         actor: str = "zeus",
         sync: bool = False,
     ) -> dict[str, Any]:
-        """Record a successfully dispatched workflow retry and clear FAILED status if needed."""
-        payload: dict[str, Any] = {"action": "retry_workflow", "sync": sync}
+        """Record a successfully dispatched workflow retry without clobbering newer run state."""
+        payload: dict[str, Any] = {"action": "retry_workflow"}
+        if sync:
+            payload["sync"] = True
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             snap = self.store.get_run_in_tx(conn, run_id)
             status: RunStatus = snap["status"]
             new_rev = cur_rev
-            if status == RunStatus.FAILED:
+            # Only clear FAILED -> RUNNING if nothing has transitioned the run since dispatch
+            # (e.g., an async worker that already wrote graph.failed must NOT be overwritten).
+            if (
+                status == RunStatus.FAILED
+                and cur_rev == pre_dispatch_revision
+                and workflow.get("status") != RunStatus.FAILED.value
+            ):
                 new_rev = self.store.update_status_in_tx(
                     conn,
                     run_id=run_id,

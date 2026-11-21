@@ -63,9 +63,9 @@ class AriadneApp:
         self._retry_guard = threading.Lock()
         self._retry_locks: dict[str, threading.Lock] = {}
 
-    def _retry_lock_for(self, run_id: str) -> threading.Lock:
+    def _retry_lock_for(self, operation_id: str) -> threading.Lock:
         with self._retry_guard:
-            return self._retry_locks.setdefault(run_id, threading.Lock())
+            return self._retry_locks.setdefault(operation_id, threading.Lock())
 
     def list_runs_payload(self, *, limit: int = 50) -> dict[str, Any]:
         runs = self.store.list_runs(limit=limit)
@@ -127,7 +127,13 @@ class AriadneApp:
             target_hash = str(raw_hash) if raw_hash is not None else ""
         auto_advance = bool(body.get("auto_advance", True))
         sync_flag = bool(body.get("sync", False))
-        dispatch_meta = {"auto_advance": auto_advance, "sync": sync_flag}
+        # Omit default flags so legacy command rows replay cleanly while non-default
+        # flag changes under the same operation_id still raise a payload conflict.
+        dispatch_meta: dict[str, Any] = {}
+        if not auto_advance:
+            dispatch_meta["auto_advance"] = False
+        if sync_flag:
+            dispatch_meta["sync"] = True
 
         if action in ("pause", "resume"):
             cmd_result = self.control.set_paused(
@@ -248,8 +254,10 @@ class AriadneApp:
                 actor=actor,
             )
         elif action == "retry_workflow":
-            retry_payload: dict[str, Any] = {"action": "retry_workflow", "sync": sync_flag}
-            with self._retry_lock_for(run_id):
+            retry_payload: dict[str, Any] = {"action": "retry_workflow"}
+            if sync_flag:
+                retry_payload["sync"] = True
+            with self._retry_lock_for(operation_id):
                 replay = self.store.lookup_command(
                     operation_id=operation_id,
                     run_id=run_id,
@@ -259,12 +267,14 @@ class AriadneApp:
                 if replay is not None:
                     cmd_result = replay
                 else:
-                    self.store.get_run(run_id, expected_revision=expected_rev)
+                    pre_snap = self.store.get_run(run_id, expected_revision=expected_rev)
+                    pre_rev = int(pre_snap["state_revision"])
                     workflow = self.supervisor.resume_run(run_id, sync=sync_flag)
                     cmd_result = self.control.complete_workflow_retry(
                         run_id,
                         operation_id=operation_id,
                         workflow=workflow,
+                        pre_dispatch_revision=pre_rev,
                         actor=actor,
                         sync=sync_flag,
                     )

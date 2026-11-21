@@ -8,6 +8,7 @@ parity, symlink escapes, upstream plan binding, demo seeding) or a review nit.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -545,8 +546,6 @@ def test_stale_plan_after_goal_spec_v2_is_rejected_everywhere(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match="stale"):
         stage.run_execution(run_id=run_id)
-
-
 # ---------------------------------------------- Finding 8: demo seeding
 
 
@@ -712,23 +711,33 @@ def test_concurrent_same_operation_id_replays_cleanly_inside_transaction(
 ) -> None:
     store, control, run_id, _, _ = _seeded(tmp_path)
     rev = store.get_run(run_id)["state_revision"]
+    barrier = threading.Barrier(2)
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
 
-    first = control.clarify_spec(
-        run_id,
-        answers={},
-        expected_revision=rev,
-        operation_id="op-concurrent-clarify",
-    )
-    assert first["deduplicated"] is False
-    # Second request carrying the stale pre-commit revision replays cleanly inside BEGIN IMMEDIATE.
-    second = control.clarify_spec(
-        run_id,
-        answers={},
-        expected_revision=rev,
-        operation_id="op-concurrent-clarify",
-    )
-    assert second["deduplicated"] is True
-    assert second["version"] == first["version"]
+    def worker() -> None:
+        barrier.wait()
+        try:
+            res = control.clarify_spec(
+                run_id,
+                answers={},
+                expected_revision=rev,
+                operation_id="op-concurrent-clarify",
+            )
+            results.append(res)
+        except BaseException as exc:  # noqa: BLE001 - capture worker error for test assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert errors == []
+    assert len(results) == 2
+    assert sorted(r["deduplicated"] for r in results) == [False, True]
+    assert results[0]["version"] == results[1]["version"] == 2
 
 
 def test_promote_to_execute_replays_legacy_payload_format(tmp_path: Path) -> None:
@@ -917,3 +926,195 @@ def test_plan_bound_to_stale_design_after_goal_spec_v2_is_rejected(tmp_path: Pat
     )
     with pytest.raises(ValueError, match="stale"):
         stage.run_execution(run_id=run_id)
+
+
+def test_dual_bound_plan_cannot_bypass_stale_design_after_goal_spec_v2(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "dual-bound-stale.db")
+    control = RunControl(store)
+    run_id = store.create_run(title="Dual bound stale", workflow_name="product_blueprint")
+    spec_v1 = _spec()
+    store.save_spec(run_id, spec_v1, actor="align")
+    control.confirm_spec(run_id)
+
+    design_v1 = DesignSpec(
+        spec_id=spec_v1.spec_id,
+        spec_hash=spec_v1.content_hash,
+        architecture_summary="v1 architecture",
+        modules=[
+            DesignModule(
+                id="M1",
+                name="core",
+                responsibility="Core logic",
+                target_paths=["src/app.py"],
+                requirement_refs=["R1"],
+            )
+        ],
+    )
+    store.save_design(run_id, design_v1, actor="design")
+    control.approve_design(run_id)
+
+    # Approve GoalSpec v2 without re-approving design_v1; plan binds BOTH spec_v2 and design_v1.
+    spec_v2 = control.clarify_spec(run_id, answers={}, extra_out_of_scope=["v2 boundary"])
+    control.confirm_spec(run_id)
+    dual_plan = TaskPlan(
+        spec_id=spec_v2.spec_id,
+        spec_hash=spec_v2.content_hash,
+        design_id=design_v1.design_id,
+        design_hash=design_v1.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1",
+                title="Implement M1",
+                objective="Implement M1",
+                requirement_refs=["R1"],
+                write_scope=["src/app.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="c1",
+                        kind=CheckKind.COMMAND,
+                        description="Run check",
+                        command="true",
+                    )
+                ],
+            )
+        ],
+    )
+    store.save_plan(run_id, dual_plan, actor="orchestrate")
+    snap = store.get_run(run_id)
+
+    assert is_plan_bound_to_upstream(store, run_id, snap) is False
+    with pytest.raises(ValueError, match="does not match"):
+        control.approve_plan(run_id)
+    assert resolve_resume_node(load_workflow("full_sdlc_tdd"), snap, store=store) == "design"
+
+
+def test_retry_workflow_does_not_overwrite_fast_background_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "retry-bg-fail.db")
+    run_id = store.create_run(title="Fast bg failure", workflow_name="product_blueprint")
+    store.set_run_status(run_id, RunStatus.FAILED, actor="supervisor", stage="graph")
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+
+    def failing_bg_resume(rid: str, *, sync: bool = False) -> dict[str, Any]:
+        del sync
+        store.append_event(
+            run_id=rid, stage="graph", event_type="graph.failed", actor="supervisor",
+            payload={"error": "provider crashed"},
+        )
+        store.set_run_status(rid, RunStatus.FAILED, actor="supervisor", stage="graph")
+        return {"run_id": rid, "status": "failed", "error": "provider crashed"}
+
+    monkeypatch.setattr(app.supervisor, "resume_run", failing_bg_resume)
+    rev = store.get_run(run_id)["state_revision"]
+    res = app.execute_command(
+        run_id,
+        {
+            "action": "retry_workflow",
+            "operation_id": "op-fast-bg-fail",
+            "expected_state_revision": rev,
+        },
+    )
+    assert res["command_result"]["status"] == RunStatus.FAILED.value
+    assert store.get_run(run_id)["status"] == RunStatus.FAILED
+
+
+def test_retry_workflow_concurrent_cross_run_same_operation_id_dispatches_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "retry-cross-run.db")
+    run_a = store.create_run(title="Run A", workflow_name="product_blueprint")
+    run_b = store.create_run(title="Run B", workflow_name="product_blueprint")
+    store.set_run_status(run_a, RunStatus.FAILED, actor="supervisor", stage="graph")
+    store.set_run_status(run_b, RunStatus.FAILED, actor="supervisor", stage="graph")
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+
+    dispatched: list[str] = []
+
+    def tracking_resume(rid: str, *, sync: bool = False) -> dict[str, Any]:
+        del sync
+        dispatched.append(rid)
+        return {"run_id": rid, "status": "queued"}
+
+    monkeypatch.setattr(app.supervisor, "resume_run", tracking_resume)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def caller(rid: str) -> None:
+        rev = store.get_run(rid)["state_revision"]
+        barrier.wait()
+        try:
+            app.execute_command(
+                rid,
+                {
+                    "action": "retry_workflow",
+                    "operation_id": "op-shared-cross-run",
+                    "expected_state_revision": rev,
+                },
+            )
+            outcomes.append("ok")
+        except ConcurrencyConflictError:
+            outcomes.append("conflict")
+
+    threads = [threading.Thread(target=caller, args=(r,)) for r in (run_a, run_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert sorted(outcomes) == ["conflict", "ok"]
+    assert len(dispatched) == 1
+
+
+def test_web_default_commands_replay_legacy_payload_without_meta_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "legacy-web-replay.db")
+    run_id = store.create_run(title="Legacy web", workflow_name="product_blueprint")
+    spec = _spec()
+    store.save_spec(run_id, spec, actor="align")
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    monkeypatch.setattr(app.supervisor, "is_supervised", lambda rid: False)
+
+    # Seed a legacy clarify command payload written before dispatch_meta existed.
+    legacy_payload = {"answers": {}, "resolutions": {}, "extra_out_of_scope": []}
+    with store._tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO commands (
+                operation_id, run_id, actor, action, payload_json, result_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "op-legacy-clarify",
+                run_id,
+                "zeus",
+                "clarify",
+                json.dumps(legacy_payload, sort_keys=True),
+                json.dumps({"run_id": run_id, "version": 2, "spec_hash": spec.content_hash}),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    replayed = app.execute_command(
+        run_id,
+        {
+            "action": "clarify",
+            "operation_id": "op-legacy-clarify",
+            "answers": {},
+            "expected_state_revision": store.get_run(run_id)["state_revision"],
+        },
+    )
+    assert replayed["command_result"]["deduplicated"] is True
+
+
+def test_forbidden_glob_does_not_reject_unrelated_file_in_allowed_dir(tmp_path: Path) -> None:
+    policy = WorkspacePolicy(
+        workspace_root=tmp_path,
+        allowed_write_scope=["src/"],
+        forbidden_write_scope=["*.md"],
+    )
+    ok_py, _ = policy.authorize_tool("write_file", {"path": str(tmp_path / "src/app.py")})
+    ok_md, _ = policy.authorize_tool("write_file", {"path": str(tmp_path / "src/README.md")})
+    assert ok_py is True
+    assert ok_md is False
