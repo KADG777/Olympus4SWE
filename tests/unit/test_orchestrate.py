@@ -765,4 +765,6 @@ def test_failed_timeout_retry_blocks_only_its_dependency_chain(tmp_path: Path) -
     assert nodes["T1"]["diagnostic_output"] == "就绪待调度"
     assert nodes["T1"]["provider_retry"] is None
     assert nodes["T3"]["blocked_by"] == []
-    assert after_manual_retry["hitl_banner"] is None
+    # A ready task on an awaiting run now surfaces the resume banner (Issue #54).
+    assert after_manual_retry["hitl_banner"]["kind"] == "ready_to_resume"
+    assert after_manual_retry["hitl_banner"]["actions"] == ["retry_workflow"]

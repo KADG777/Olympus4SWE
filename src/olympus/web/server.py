@@ -225,6 +225,7 @@ class AriadneApp:
                 expected_state_revision=expected_rev,
                 hint=str(body.get("hint", "")).strip(),
                 actor=actor,
+                command_meta=dispatch_meta,
             )
         elif action == "accept_risk":
             task_id = str(body.get("task_id", "")).strip()
@@ -305,7 +306,14 @@ class AriadneApp:
 
         if (
             action
-            in ("clarify", "approve_spec", "approve_design", "approve_plan", "promote_to_execute")
+            in (
+                "clarify",
+                "approve_spec",
+                "approve_design",
+                "approve_plan",
+                "promote_to_execute",
+                "retry_task",
+            )
             and auto_advance
             and not cmd_result.get("deduplicated")
             and (action == "promote_to_execute" or self.supervisor.is_supervised(run_id))

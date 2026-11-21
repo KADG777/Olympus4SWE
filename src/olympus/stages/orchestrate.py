@@ -35,7 +35,7 @@ from olympus.core.dag import (
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
-from olympus.harness.loop import AgentLoop
+from olympus.harness.loop import AgentLoop, BudgetExhaustedError
 from olympus.harness.worktree import (
     SandboxHandle,
     build_sandbox_env,
@@ -804,6 +804,12 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
+                if loop_res.stop_reason.startswith("budget_exhausted"):
+                    return self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -837,16 +843,23 @@ class OrchestrateStage:
             check_summary = "\n".join(
                 f"- {c.id} ({c.kind.value}): passed={c.passed}" for c in updated_checks
             )
-            verdict = self._run_independent_review(
-                run_id=run_id,
-                spec=spec,
-                task=verifying,
-                sandbox=sandbox,
-                diff_text=diff_text,
-                check_summary=check_summary,
-                art_dir=art_dir,
-                design=design,
-            )
+            try:
+                verdict = self._run_independent_review(
+                    run_id=run_id,
+                    spec=spec,
+                    task=verifying,
+                    sandbox=sandbox,
+                    diff_text=diff_text,
+                    check_summary=check_summary,
+                    art_dir=art_dir,
+                    design=design,
+                )
+            except BudgetExhaustedError as exc:
+                return self._pause_for_budget(
+                    run_id=run_id,
+                    task=verifying,
+                    reason=f"Paused due to budget limit: {exc}",
+                )
             if not verdict.passed:
                 important_lines = [
                     f"[{f.severity.value}] {f.file_path}:{f.line or '-'} {f.message}"
@@ -940,6 +953,29 @@ class OrchestrateStage:
             event_type=event_type,
         )
 
+    def _pause_for_budget(self, *, run_id: str, task: TaskNode, reason: str) -> TaskNode:
+        """Return a task to READY without burning a review cycle when budget is exhausted.
+
+        Preserves any existing non-empty ``last_error`` (such as an unconsumed human hint
+        or prior failure feedback) so a zero-call budget pause never wipes retry context.
+        """
+        return self.store.update_task_with_lease(
+            run_id,
+            task.task_id,
+            expected_lease_generation=task.lease_generation,
+            mutator=lambda t: t.model_copy(
+                update={
+                    "status": TaskStatus.READY,
+                    "worktree_path": None,
+                    "last_error": (
+                        t.last_error if (t.last_error and t.last_error.strip()) else reason
+                    ),
+                }
+            ),
+            actor="chronos",
+            event_type="task.budget_paused",
+        )
+
     def run_execution(
         self,
         *,
@@ -950,36 +986,44 @@ class OrchestrateStage:
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
-        snap = self.store.get_run(run_id)
-        design: DesignSpec | None = snap.get("design")
-        plan: TaskPlan | None = snap["plan"]
-        if plan is None:
-            raise ValueError(f"Run {run_id} has no TaskPlan; propose plan first.")
-        if not self.store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
-        ):
-            raise ValueError(
-                f"TaskPlan {plan.plan_id} ({plan.content_hash}) is not human-approved."
-            )
-        if not is_plan_bound_to_upstream(self.store, run_id, snap):
-            raise ValueError(
-                f"TaskPlan {plan.plan_id} is stale: its spec_hash/design_hash no longer "
-                "match the current approved upstream artifacts; regenerate the plan first."
-            )
+        while True:
+            snap = self.store.get_run(run_id)
+            if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                return snap
+            design: DesignSpec | None = snap.get("design")
+            plan: TaskPlan | None = snap["plan"]
+            if plan is None:
+                raise ValueError(f"Run {run_id} has no TaskPlan; propose plan first.")
+            if not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.TASK_PLAN,
+                target_id=plan.plan_id,
+                target_hash=plan.content_hash,
+            ):
+                raise ValueError(
+                    f"TaskPlan {plan.plan_id} ({plan.content_hash}) is not human-approved."
+                )
+            if not is_plan_bound_to_upstream(self.store, run_id, snap):
+                raise ValueError(
+                    f"TaskPlan {plan.plan_id} is stale: its spec_hash/design_hash no longer "
+                    "match the current approved upstream artifacts; regenerate the plan first."
+                )
 
-        effective_serial = serial_execution or (
-            design is not None and design.execution_strategy == ExecutionStrategy.SERIAL_HANDOFF
-        )
-        self.store.set_run_status(
-            run_id,
-            RunStatus.RUNNING,
-            actor="chronos",
-            stage="orchestrate",
-            detail={"serial_execution": effective_serial},
-        )
+            effective_serial = serial_execution or (
+                design is not None and design.execution_strategy == ExecutionStrategy.SERIAL_HANDOFF
+            )
+            try:
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="chronos",
+                    stage="orchestrate",
+                    detail={"serial_execution": effective_serial},
+                )
+                break
+            except ConcurrencyConflictError:
+                continue
 
         while True:
             snap = self.store.get_run(run_id)
@@ -1038,18 +1082,42 @@ class OrchestrateStage:
                     except ConcurrencyConflictError:
                         continue
                 target_status = RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
-                self.store.set_run_status(
-                    run_id,
-                    target_status,
-                    actor="chronos",
-                    stage="orchestrate",
-                    detail={
-                        "accepted": sum(
-                            1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                        ),
-                        "total": len(plan.tasks),
-                    },
-                )
+                try:
+                    self.store.set_run_status(
+                        run_id,
+                        target_status,
+                        expected_revision=int(snap["state_revision"]),
+                        actor="chronos",
+                        stage="orchestrate",
+                        detail={
+                            "accepted": sum(
+                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                            ),
+                            "total": len(plan.tasks),
+                        },
+                    )
+                except ConcurrencyConflictError:
+                    continue
+                return self.store.get_run(run_id)
+
+            if not snap["budget_ledger"].can_reserve(policy):
+                try:
+                    self.store.set_run_status(
+                        run_id,
+                        RunStatus.AWAITING_HUMAN,
+                        expected_revision=int(snap["state_revision"]),
+                        actor="chronos",
+                        stage="orchestrate",
+                        detail={
+                            "reason": "budget_exhausted",
+                            "accepted": sum(
+                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                            ),
+                            "total": len(plan.tasks),
+                        },
+                    )
+                except ConcurrencyConflictError:
+                    continue
                 return self.store.get_run(run_id)
 
             if len(ready) == 1:

@@ -640,8 +640,8 @@ class RunStatus(StrEnum):
 
 
 class BudgetPolicy(StrictModel):
-    max_llm_calls: int = Field(default=100, ge=1)
-    max_total_tokens: int = Field(default=2_000_000, ge=1)
+    max_llm_calls: int | None = Field(default=None, ge=1)
+    max_total_tokens: int | None = Field(default=None, ge=1)
     max_concurrent_tasks: int = Field(default=3, ge=1)
 
 
@@ -657,10 +657,14 @@ class BudgetLedger(StrictModel):
         return self.input_tokens + self.output_tokens
 
     def can_reserve(self, policy: BudgetPolicy) -> bool:
-        return (
-            self.llm_calls_used + self.llm_calls_reserved < policy.max_llm_calls
-            and self.total_tokens < policy.max_total_tokens
+        calls_ok = (
+            policy.max_llm_calls is None
+            or self.llm_calls_used + self.llm_calls_reserved < policy.max_llm_calls
         )
+        tokens_ok = (
+            policy.max_total_tokens is None or self.total_tokens < policy.max_total_tokens
+        )
+        return calls_ok and tokens_ok
 
     def reserve(self, policy: BudgetPolicy) -> BudgetLedger:
         if not self.can_reserve(policy):

@@ -768,6 +768,7 @@ class RunControl:
         expected_state_revision: int,
         hint: str = "",
         actor: str = "zeus",
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Idempotently reset a BLOCKED/FAILED task back to READY for another cycle."""
 
@@ -796,6 +797,7 @@ class RunControl:
             payload={"task_id": task_id, "hint": hint},
             task_mutator=mutate_retry,
             result_status=TaskStatus.READY.value,
+            command_meta=command_meta,
         )
 
     def accept_task_risk(
@@ -879,8 +881,10 @@ class RunControl:
         payload: dict[str, Any],
         task_mutator: Callable[[TaskNode], TaskNode],
         result_status: str,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Shared idempotent task-mutation command helper."""
+        payload = {**(command_meta or {}), **payload}
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             def mutate_plan(plan: TaskPlan) -> TaskPlan:
@@ -975,15 +979,20 @@ class RunControl:
 
             policy: BudgetPolicy = snap["budget_policy"]
             ledger: BudgetLedger = snap["budget_ledger"]
-            min_calls = ledger.llm_calls_used + max(60, len(plan.tasks) * 25)
-            new_max_calls = max(policy.max_llm_calls, min_calls)
-            if max_llm_calls is not None:
-                new_max_calls = max(new_max_calls, max_llm_calls)
-            min_tokens = ledger.total_tokens + max(500_000, len(plan.tasks) * 250_000)
+            if policy.max_llm_calls is None and max_llm_calls is None:
+                new_max_calls: int | None = None
+            else:
+                min_calls = ledger.llm_calls_used + max(60, len(plan.tasks) * 25)
+                new_max_calls = max(policy.max_llm_calls or 0, min_calls, max_llm_calls or 0)
+            if policy.max_total_tokens is None:
+                new_max_tokens: int | None = None
+            else:
+                min_tokens = ledger.total_tokens + max(500_000, len(plan.tasks) * 250_000)
+                new_max_tokens = max(policy.max_total_tokens, min_tokens)
             updated_policy = policy.model_copy(
                 update={
                     "max_llm_calls": new_max_calls,
-                    "max_total_tokens": max(policy.max_total_tokens, min_tokens),
+                    "max_total_tokens": new_max_tokens,
                 }
             )
             target_status = RunStatus.RUNNING if auto_advance else RunStatus.AWAITING_HUMAN

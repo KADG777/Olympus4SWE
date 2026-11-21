@@ -482,11 +482,14 @@
     const hasReview = renderApprovalReviews(projection);
     const promoteGate = Boolean(banner && banner.kind === "blueprint_completed");
     const runFailed = Boolean(banner && banner.kind === "run_failed");
+    const canRetry = Boolean(
+      banner && Array.isArray(banner.actions) && banner.actions.includes("retry_workflow")
+    );
     if (el.promoteExecute) el.promoteExecute.hidden = !promoteGate;
-    el.retryWorkflow.hidden = !runFailed;
+    el.retryWorkflow.hidden = !canRetry;
     el.inspectFailure.hidden = !runFailed;
-    el.gateActions.hidden = !(promoteGate || runFailed);
-    return hasReview || promoteGate || runFailed;
+    el.gateActions.hidden = !(promoteGate || runFailed || canRetry);
+    return hasReview || promoteGate || runFailed || canRetry;
   }
 
   function renderBanner(projection) {
@@ -1191,7 +1194,13 @@
     }
     const stats = document.getElementById("run-detail-stats");
     stats.innerHTML = uiStatBand([
-      { label: "LLM", value: `${projection.budget.calls_used} / ${projection.budget.max_calls}` },
+      {
+        label: "LLM",
+        value:
+          projection.budget.max_calls == null
+            ? `${projection.budget.calls_used} 次`
+            : `${projection.budget.calls_used} / ${projection.budget.max_calls}`,
+      },
       { label: "Token", value: formatTokens(projection.budget.total_tokens) },
       { label: "修订", value: `r${projection.state_revision}` },
       { label: "最近事件", value: `#${projection.latest_event_seq}` },
@@ -2604,8 +2613,8 @@
         description:
           "提示原文保留在审计事件中，随下次隔离沙盒执行一并注入 Worker 上下文，不直接篡改需求契约。",
         label: "注入提示内容",
-        defaultValue:
-          "在 BEGIN IMMEDIATE 事务内同时执行 SELECT WAITLISTED 与 UPDATE status='CONFIRMED'，避免并发取消重复递补。",
+        defaultValue: "",
+        placeholder: "输入要注入的人工提示，例如需修复的边界或重试思路。",
         requireNonEmpty: true,
         onConfirm: async (hint) => {
           await sendCommand(
@@ -2624,7 +2633,8 @@
         description:
           "改派后人工提交的产物仍须经过相同的程序门禁与 Argus 独立复核才能成为已验收状态。",
         label: "改派备注",
-        defaultValue: "由值班后端工程师接手修复事务锁边界，提交后走同等验收。",
+        defaultValue: "",
+        placeholder: "输入改派备注，例如接手人与需关注的验收要点。",
         requireNonEmpty: true,
         onConfirm: async (note) => {
           await sendCommand(
@@ -2643,8 +2653,8 @@
         description:
           "必须填写明确理由。该决定与 Agent 建议分开存储，追踪矩阵标记为“未验证 · 人工接受”，绝不显示为“已验证”。",
         label: "接受风险理由（必填）",
-        defaultValue:
-          "首期社团活动仅单管理员人工触发取消，并发取消概率极低，接受已知风险先行放行。",
+        defaultValue: "",
+        placeholder: "输入接受风险的明确理由，例如影响范围与缓解措施。",
         requireNonEmpty: true,
         onConfirm: async (reason) => {
           await sendCommand(

@@ -22,6 +22,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.dag import compute_dispatchable_tasks
 from olympus.core.store import RunStore
 from olympus.graph import load_workflow
 from olympus.graph.progress import build_workflow_view, is_blueprint_completed
@@ -1276,6 +1277,8 @@ def build_run_projection(
                 }
             )
 
+    ledger: BudgetLedger = snap["budget_ledger"]
+    policy: BudgetPolicy = snap["budget_policy"]
     hitl_banner: dict[str, Any] | None = None
     if task_blockers:
         first_blocker = next(iter(task_blockers.values()))
@@ -1357,13 +1360,35 @@ def build_run_projection(
             ),
             "actions": ["promote_to_execute"],
         }
+    elif (
+        snap["status"] == RunStatus.AWAITING_HUMAN
+        and plan is not None
+        and plan_approved
+        and not blueprint_completed
+    ):
+        if not ledger.can_reserve(policy):
+            hitl_banner = {
+                "kind": "budget_exhausted",
+                "tone": "warn",
+                "task_id": None,
+                "headline": "已达到本轮显式预算上限，任务派发已暂停",
+                "detail": "当前运行已耗尽显式配置的调用或 Token 上限，未继续消耗任务重试次数。",
+                "actions": [],
+            }
+        elif compute_dispatchable_tasks(plan, max_concurrent=1):
+            hitl_banner = {
+                "kind": "ready_to_resume",
+                "tone": "info",
+                "task_id": None,
+                "headline": "存在就绪任务待继续执行",
+                "detail": "点击「从断点重试」即可继续调度剩余就绪任务。",
+                "actions": ["retry_workflow"],
+            }
 
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
     verified_count = sum(
         1 for t in tasks if t.status == TaskStatus.ACCEPTED and not t.accepted_risk_reason
     )
-    ledger: BudgetLedger = snap["budget_ledger"]
-    policy: BudgetPolicy = snap["budget_policy"]
     raw_input = spec.goal if spec is not None else str(snap["title"])
     triage_payload: dict[str, Any] | None = None
     stage_activity: list[dict[str, Any]] = []

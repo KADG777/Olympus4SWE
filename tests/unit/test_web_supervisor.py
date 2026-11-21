@@ -597,7 +597,9 @@ def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Pat
             exec_proj = promoted.json()["projection"]
             assert exec_proj["workflow_name"] == "full_sdlc_tdd"
             assert exec_proj["status"] == "completed"
-            assert exec_proj["budget"]["max_calls"] >= 100
+            # Default budget is now unlimited (no implicit global cap).
+            assert exec_proj["budget"]["max_calls"] is None
+            assert exec_proj["budget"]["max_tokens"] is None
             assert [s["status"] for s in exec_proj["stage_pipeline"]] == ["done"] * 5
             assert all(n["status"] == "accepted" for n in exec_proj["dag"]["nodes"])
 
