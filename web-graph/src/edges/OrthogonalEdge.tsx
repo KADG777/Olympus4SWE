@@ -2,12 +2,14 @@ import { memo } from "react";
 import type { Edge, EdgeProps } from "@xyflow/react";
 
 import { roundedPolylinePath, type Point } from "../geometry";
+import type { EdgeLineage } from "../lineage";
 import type { EdgeTone } from "../types";
 
 export interface OrthogonalEdgeData extends Record<string, unknown> {
   points: Point[];
   tone: EdgeTone;
   markerId: string;
+  lineage?: EdgeLineage;
   /** Extra stable hooks rendered as `data-<key>` on the edge group (e.g. `traversed`). */
   attrs?: Record<string, string>;
 }
@@ -26,6 +28,7 @@ function OrthogonalEdgeComponent({ source, target, data }: EdgeProps<OrthogonalE
       data-tone={data.tone}
       data-edge-source={source}
       data-edge-target={target}
+      data-lineage={data.lineage || undefined}
       {...dataAttrs(data.attrs)}
     >
       <path

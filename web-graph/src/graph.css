@@ -64,8 +64,6 @@
   border: 0;
 }
 
-/* ---- Wave column headers (graph coordinate space) ---- */
-
 .ag-waves {
   position: absolute;
   inset: 0;
@@ -87,8 +85,6 @@
   white-space: nowrap;
 }
 
-/* ---- Cards: one physical frame shared by task and workflow nodes ---- */
-
 .ag-card {
   position: relative;
   box-sizing: border-box;
@@ -109,7 +105,12 @@
     outline-color var(--motion-fast),
     border-color var(--motion-fast),
     background-color var(--motion-fast),
+    opacity var(--motion-fast),
     transform var(--motion-fast);
+}
+
+.ag-card[data-lineage="dim"] {
+  opacity: 0.26;
 }
 
 .ag-card:active {
@@ -254,8 +255,6 @@
   color: var(--ok);
 }
 
-/* ---- Workflow node kinds: gate (warm accent bar + 关口), validator (double hairline + 校验) ---- */
-
 .ag-wf-card[data-node-kind="gate"]::before {
   content: "";
   position: absolute;
@@ -312,7 +311,9 @@
   opacity: 0.45;
 }
 
-/* ---- Edges + fixed-size, tone-matched arrowheads ---- */
+.ag-edge {
+  transition: opacity var(--motion-fast);
+}
 
 .ag-edge-path {
   fill: none;
@@ -352,10 +353,77 @@
   opacity: 0.7;
 }
 
+.ag-edge[data-lineage="dim"] {
+  opacity: 0.16;
+}
+
+.ag-edge[data-lineage="related"] {
+  opacity: 1;
+}
+
 .ag-edge[data-tone="conditional"] .ag-edge-path {
   stroke-width: 1.2;
   stroke-dasharray: 5 4;
   stroke-linecap: butt;
+}
+
+.ag-toolbar {
+  position: absolute;
+  inset-block-end: var(--space-2);
+  inset-inline-end: var(--space-2);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-paper);
+  pointer-events: all;
+}
+
+.ag-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 26px;
+  block-size: 24px;
+  padding-inline: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius) - 2px);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--face-mono);
+  font-size: var(--text-xs);
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--motion-fast),
+    border-color var(--motion-fast),
+    color var(--motion-fast);
+}
+
+.ag-tool-text {
+  padding-inline: var(--space-2);
+  font-family: var(--face-sans);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .ag-tool-btn:hover {
+    border-color: var(--rule);
+    background: var(--surface-raised);
+    color: var(--text-ink);
+  }
+}
+
+.ag-tool-btn:active {
+  background: var(--surface-sunk);
+}
+
+.ag-tool-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 @keyframes ag-edge-flow {

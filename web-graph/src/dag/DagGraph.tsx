@@ -4,6 +4,7 @@ import { Position, ViewportPortal, type EdgeTypes, type NodeHandle, type NodeTyp
 import { GraphCanvas, frameHeight, useMarkerPrefix } from "../canvas/GraphCanvas";
 import { OrthogonalEdge, edgeTone, type OrthogonalEdgeType } from "../edges/OrthogonalEdge";
 import { dispatchToHost, type IslandController } from "../island";
+import { computeLineage, edgeLineage, nodeLineage } from "../lineage";
 import type { DagGraphProps } from "../types";
 import {
   NODE_H,
@@ -44,9 +45,11 @@ export function DagGraph(props: DagGraphProps & { controller: IslandController }
   onSelectRef.current = onSelect;
 
   const [layout, setLayout] = useState<DagLayout | null>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
   const version = useRef(0);
 
   useEffect(() => {
+    setHoveredId(null);
     const ticket = ++version.current;
     const { nodes, edges } = latestGraph.current;
     if (!nodes.length) return undefined;
@@ -64,7 +67,12 @@ export function DagGraph(props: DagGraphProps & { controller: IslandController }
     if (handler) dispatchToHost(() => handler(id));
   }, []);
 
+  const hover = useCallback((id: string | null) => {
+    setHoveredId(id);
+  }, []);
+
   const current = layout && layout.signature === signature ? layout : null;
+  const lineage = useMemo(() => computeLineage(graph.edges, hoveredId), [graph.edges, hoveredId]);
 
   const nodes = useMemo<TaskCardNode[]>(() => {
     if (!current) return [];
@@ -79,14 +87,21 @@ export function DagGraph(props: DagGraphProps & { controller: IslandController }
       connectable: false,
       selectable: false,
       focusable: false,
-      data: { view, selected: view.id === selectedId, select },
+      data: {
+        view,
+        selected: view.id === selectedId,
+        lineage: nodeLineage(lineage, view.id),
+        select,
+        hover,
+      },
     }));
-  }, [current, graph, selectedId, select]);
+  }, [current, graph, lineage, selectedId, select, hover]);
 
   const edges = useMemo<OrthogonalEdgeType[]>(() => {
     if (!current) return [];
     return graph.edges.map((edge) => {
       const tone = edgeTone(edge);
+      const relation = edgeLineage(lineage, edge.source, edge.target);
       return {
         id: edge.id,
         source: edge.source,
@@ -94,11 +109,16 @@ export function DagGraph(props: DagGraphProps & { controller: IslandController }
         type: "orthogonal" as const,
         selectable: false,
         focusable: false,
-        zIndex: tone === "default" ? 0 : 1,
-        data: { points: current.routes.get(edge.id) || [], tone, markerId: `${markerPrefix}-${tone}` },
+        zIndex: relation === "related" ? 2 : tone === "default" ? 0 : 1,
+        data: {
+          points: current.routes.get(edge.id) || [],
+          tone,
+          markerId: `${markerPrefix}-${tone}`,
+          lineage: relation,
+        },
       };
     });
-  }, [current, graph, markerPrefix]);
+  }, [current, graph, lineage, markerPrefix]);
 
   const estimate = useMemo(
     () => (graph.nodes.length ? layeredFallback(graph.nodes, graph.edges, signature).height : 0),

@@ -20,6 +20,7 @@ from olympus.core.contracts import (
     RequirementItem,
     TaskNode,
     TaskPlan,
+    TaskStatus,
 )
 from olympus.core.store import RunStore
 from olympus.web.demos import seed_demo_runs
@@ -1229,4 +1230,238 @@ def test_workflow_island_empty_unmapped_and_retry_loop(workbench, browser):
     page.evaluate("() => window.loopHandle.destroy()")
     expect(page.locator("#graph-loop .ag-island")).to_have_count(0)
     assert not errors, errors
+    page.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph interactions: scroll-safe controls, lineage highlight & SSE viewport
+# ---------------------------------------------------------------------------
+
+VIEWPORT_MATRIX = """(host) => {
+  const raw = getComputedStyle(host.querySelector('.react-flow__viewport')).transform;
+  const match = raw.match(/matrix\\(([^)]+)\\)/);
+  if (!match) return { zoom: 1, x: 0, y: 0, raw };
+  const [a, , , , e, f] = match[1].split(',').map(Number);
+  return { zoom: a, x: e, y: f, raw };
+}"""
+
+
+def test_graph_islands_scroll_safe_controls_and_readonly_cards(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1200, "height": 720})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_workflow(page)
+    _wait_for_layout(page)
+
+    stage = page.locator("#stage")
+    wf_host = page.locator("#workflow-graph")
+    dag_host = page.locator("#dag-graph")
+
+    # Unmodified wheel over either graph scrolls #stage vertically without zooming the graph.
+    wf_host.scroll_into_view_if_needed()
+    wf_before = wf_host.evaluate(VIEWPORT_MATRIX)
+    wf_box = wf_host.bounding_box()
+    scroll_before = stage.evaluate("el => el.scrollTop")
+    page.mouse.move(wf_box["x"] + wf_box["width"] / 2, wf_box["y"] + wf_box["height"] / 2)
+    page.mouse.wheel(0, 260)
+    page.wait_for_function(
+        "(prev) => document.getElementById('stage').scrollTop > prev",
+        arg=scroll_before,
+    )
+    assert abs(wf_host.evaluate(VIEWPORT_MATRIX)["zoom"] - wf_before["zoom"]) < 0.001
+
+    dag_host.scroll_into_view_if_needed()
+    dag_before = dag_host.evaluate(VIEWPORT_MATRIX)
+    dag_box = dag_host.bounding_box()
+    scroll_mid = stage.evaluate("el => el.scrollTop")
+    page.mouse.move(dag_box["x"] + dag_box["width"] / 2, dag_box["y"] + dag_box["height"] / 2)
+    page.mouse.wheel(0, -180)
+    page.wait_for_function(
+        "(prev) => document.getElementById('stage').scrollTop < prev",
+        arg=scroll_mid,
+    )
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - dag_before["zoom"]) < 0.001
+
+    # Ctrl + Wheel zooms the graph smoothly around the pointer.
+    dag_host.locator(".ag-island").evaluate(
+        """el => el.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: -120, ctrlKey: true, bubbles: true, cancelable: true,
+          clientX: el.getBoundingClientRect().left + 120,
+          clientY: el.getBoundingClientRect().top + 80,
+        }))"""
+    )
+    assert dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] > dag_before["zoom"] + 0.05
+
+    # Corner toolbar (+, -, fit, 100%) drives both graphs cleanly.
+    dag_host.locator("[data-graph-control='reset']").click()
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+    dag_host.locator("[data-graph-control='zoom-in']").click()
+    zoomed_in = dag_host.evaluate(VIEWPORT_MATRIX)["zoom"]
+    assert zoomed_in > 1.1
+    dag_host.locator("[data-graph-control='zoom-out']").click()
+    assert abs(dag_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.02
+
+    # Wide workflow graph: "适应画布" scales down so all 11 cards fit inside the host frame.
+    wf_host.scroll_into_view_if_needed()
+    wf_host.locator("[data-graph-control='fit']").click()
+    wf_fit = wf_host.evaluate(VIEWPORT_MATRIX)
+    assert wf_fit["zoom"] < 0.95
+    wf_frame = wf_host.locator(".ag-island").bounding_box()
+    for card in wf_host.evaluate(WORKFLOW_GEOMETRY)["cards"]:
+        assert card["x"] >= wf_frame["x"] - 2
+        assert card["x"] + card["w"] <= wf_frame["x"] + wf_frame["width"] + 2
+    wf_host.locator("[data-graph-control='reset']").click()
+    assert abs(wf_host.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+
+    # Read-only semantic layout: dragging a node card does not displace its coordinates.
+    dag_host.scroll_into_view_if_needed()
+    node_wrap = dag_host.locator(".react-flow__node[data-id='T01']")
+    before_transform = node_wrap.evaluate("el => el.style.transform")
+    card = dag_host.locator("[data-task-id='T01']")
+    before_card = card.bounding_box()
+    page.mouse.move(
+        before_card["x"] + before_card["width"] / 2,
+        before_card["y"] + before_card["height"] / 2,
+    )
+    page.mouse.down()
+    page.mouse.move(before_card["x"] + 160, before_card["y"] + 80, steps=6)
+    page.mouse.up()
+    assert node_wrap.evaluate("el => el.style.transform") == before_transform
+    after_card = card.bounding_box()
+    assert abs(after_card["x"] - before_card["x"]) <= 4.0
+    assert abs(after_card["y"] - before_card["y"]) <= 4.0
+    assert not errors, errors
+    page.close()
+
+
+def test_graph_islands_hover_lineage_highlighting(skip_dag, browser):
+    _, run_id, url = skip_dag
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    _wait_for_workflow(page)
+    _wait_for_layout(page)
+
+    dag = page.locator("#dag-graph")
+
+    def card(tid):
+        return dag.locator(f"[data-task-id='{tid}']")
+
+    def edge(s, t):
+        return dag.locator(f".ag-edge[data-edge-source='{s}'][data-edge-target='{t}']")
+
+    # Select B first so we also prove hover lineage leaves selection ring untouched.
+    card("B").click()
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    # Hover C: ancestors={A}, focus={C}, descendants={E, G}; siblings B, D, F, H are dimmed.
+    card("C").hover()
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    for related in ("A", "E", "G"):
+        expect(card(related)).to_have_attribute("data-lineage", "related")
+    for dimmed in ("B", "D", "F", "H"):
+        expect(card(dimmed)).to_have_attribute("data-lineage", "dim")
+    expect(card("B")).to_have_css("opacity", "0.26")
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    for src, dst in (("A", "C"), ("C", "E"), ("E", "G")):
+        expect(edge(src, dst)).to_have_attribute("data-lineage", "related")
+    for src, dst in (("A", "E"), ("B", "D"), ("D", "F"), ("F", "H"), ("B", "G")):
+        expect(edge(src, dst)).to_have_attribute("data-lineage", "dim")
+
+    # Moving pointer off the card clears lineage dimming while keeping selection.
+    page.mouse.move(10, 10)
+    for tid in ("A", "B", "C", "D", "E", "F", "G", "H"):
+        expect(card(tid)).not_to_have_attribute("data-lineage", "dim")
+    expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    # Workflow hover: hovering critic highlights intake/align -> critic -> gate_spec..
+    # and dims the bypass edge align -> gate_spec.
+    wf = page.locator("#workflow-graph")
+    wf.locator("[data-graph-control='fit']").click()
+
+    def wf_node(nid):
+        return wf.locator(f"[data-workflow-node='{nid}']")
+
+    def wf_edge(s, t):
+        return wf.locator(f".ag-edge[data-edge-source='{s}'][data-edge-target='{t}']")
+    wf_node("critic").hover()
+    expect(wf_node("critic")).to_have_attribute("data-lineage", "focus")
+    expect(wf_node("align")).to_have_attribute("data-lineage", "related")
+    expect(wf_node("gate_spec")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("align", "critic")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("critic", "gate_spec")).to_have_attribute("data-lineage", "related")
+    expect(wf_edge("align", "gate_spec")).to_have_attribute("data-lineage", "dim")
+    page.mouse.move(10, 10)
+    expect(wf_edge("align", "gate_spec")).not_to_have_attribute("data-lineage", "dim")
+    assert not errors, errors
+    page.close()
+
+
+def test_task_dag_live_sse_status_update_preserves_zoom_and_pan_and_resets_on_run_switch(
+    workbench, browser
+):
+    store, run_id, url = workbench
+    second_id = store.create_run(title="第二个独立拓扑")
+    spec2 = GoalSpec(goal="独立拓扑", requirements=[RequirementItem(
+        id="R2", description="单任务", acceptance_criteria=["可切换"],
+    )])
+    store.save_spec(second_id, spec2)
+    store.record_approval(ApprovalRecord(
+        run_id=second_id, target=ApprovalTarget.GOAL_SPEC, target_id=spec2.spec_id,
+        target_hash=spec2.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    plan2 = TaskPlan(spec_id=spec2.spec_id, spec_hash=spec2.content_hash, tasks=[
+        TaskNode(
+            task_id="SOLO-1", title="单独任务", objective="验证切线程重置视口",
+            depends_on=[], write_scope=["solo.py"],
+            acceptance_checks=[
+                AcceptanceCheck(id="c1", kind=CheckKind.INDEPENDENT_REVIEW, description="ok")
+            ],
+        ),
+    ])
+    store.save_plan(second_id, plan2)
+    store.record_approval(ApprovalRecord(
+        run_id=second_id, target=ApprovalTarget.TASK_PLAN, target_id=plan2.plan_id,
+        target_hash=plan2.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    _wait_for_layout(page)
+    dag = page.locator("#dag-graph")
+    dag.scroll_into_view_if_needed()
+
+    # Manually zoom in AND drag-pan the Task DAG viewport.
+    dag.locator("[data-graph-control='zoom-in']").click()
+    box = dag.bounding_box()
+    page.mouse.move(box["x"] + 20, box["y"] + box["height"] - 20)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 90, box["y"] + box["height"] - 50, steps=6)
+    page.mouse.up()
+    pinned = dag.evaluate(VIEWPORT_MATRIX)
+    assert pinned["zoom"] > 1.1
+    card_handle = dag.locator("[data-task-id='T05']").element_handle()
+
+    # Live SSE mutation: update T05 status RUNNING -> ACCEPTED on the same topology.
+    plan = store.get_run(run_id)["plan"]
+    updated_tasks = [
+        t.model_copy(update={"status": TaskStatus.ACCEPTED}) if t.task_id == "T05" else t
+        for t in plan.tasks
+    ]
+    store.save_plan(run_id, plan.model_copy(update={"tasks": updated_tasks}))
+    expect(dag.locator("[data-task-id='T05']")).to_have_attribute("data-status", "accepted")
+    expect(dag.locator("[data-task-id='T05']")).to_contain_text("已验收")
+    assert dag.evaluate(VIEWPORT_MATRIX)["raw"] == pinned["raw"]
+    assert card_handle.evaluate("node => node.isConnected")
+
+    # Switching runs changes topology signature -> triggers fresh ELK layout and 1:1 auto-fit.
+    page.locator(f"#thread-list [data-run-id='{second_id}']").click()
+    expect(dag.locator("[data-task-id='SOLO-1']")).to_be_visible()
+    assert abs(dag.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
     page.close()

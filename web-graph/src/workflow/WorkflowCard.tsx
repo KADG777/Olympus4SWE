@@ -1,6 +1,7 @@
-import { memo, type KeyboardEvent } from "react";
+import { memo, type FocusEvent, type KeyboardEvent } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 
+import type { NodeLineage } from "../lineage";
 import type { WorkflowNodeKind, WorkflowNodeView } from "../types";
 import { WF_NODE_H, WF_NODE_W } from "./layout";
 
@@ -8,7 +9,9 @@ export interface WorkflowCardData extends Record<string, unknown> {
   view: WorkflowNodeView;
   kind: WorkflowNodeKind;
   selected: boolean;
+  lineage?: NodeLineage;
   select: (id: string) => void;
+  hover: (id: string | null) => void;
 }
 
 export type WorkflowCardNode = Node<WorkflowCardData, "workflow">;
@@ -36,12 +39,15 @@ export function workflowTone(status: string): string {
 
 /** Editorial three-row workflow card: title + kind badge | node name | status capsule. */
 function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
-  const { view, kind, selected, select } = data;
+  const { view, kind, selected, lineage, select, hover } = data;
   const badge = KIND_BADGE[kind];
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     select(view.id);
+  };
+  const onFocus = (event: FocusEvent<HTMLDivElement>) => {
+    if (event.currentTarget.matches(":focus-visible")) hover(view.id);
   };
   return (
     <div
@@ -51,6 +57,7 @@ function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
       data-status={view.status}
       data-tone={workflowTone(view.status)}
       data-node-kind={kind}
+      data-lineage={lineage || undefined}
       role="button"
       tabIndex={0}
       aria-selected={selected ? "true" : "false"}
@@ -58,6 +65,10 @@ function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
       title={view.title || undefined}
       onClick={() => select(view.id)}
       onKeyDown={onKeyDown}
+      onMouseEnter={() => hover(view.id)}
+      onMouseLeave={() => hover(null)}
+      onFocus={onFocus}
+      onBlur={() => hover(null)}
     >
       <Handle className="ag-handle" type="target" position={Position.Left} isConnectable={false} />
       <div className="ag-card-head">

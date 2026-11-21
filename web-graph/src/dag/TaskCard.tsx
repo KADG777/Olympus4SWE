@@ -1,24 +1,30 @@
-import { memo, type KeyboardEvent } from "react";
+import { memo, type FocusEvent, type KeyboardEvent } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 
+import type { NodeLineage } from "../lineage";
 import type { DagNodeView } from "../types";
 import { NODE_H, NODE_W } from "./layout";
 
 export interface TaskCardData extends Record<string, unknown> {
   view: DagNodeView;
   selected: boolean;
+  lineage?: NodeLineage;
   select: (id: string) => void;
+  hover: (id: string | null) => void;
 }
 
 export type TaskCardNode = Node<TaskCardData, "task">;
 
 /** Editorial three-row task card: id + pill | role · kind | status capsule. */
 function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
-  const { view, selected, select } = data;
+  const { view, selected, lineage, select, hover } = data;
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     select(view.id);
+  };
+  const onFocus = (event: FocusEvent<HTMLDivElement>) => {
+    if (event.currentTarget.matches(":focus-visible")) hover(view.id);
   };
   return (
     <div
@@ -29,6 +35,7 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
       data-tone={view.tone}
       data-issue={view.issue || ""}
       data-risk={view.risk ? "true" : "false"}
+      data-lineage={lineage || undefined}
       role="button"
       tabIndex={0}
       aria-selected={selected ? "true" : "false"}
@@ -36,6 +43,10 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
       title={view.title || undefined}
       onClick={() => select(view.id)}
       onKeyDown={onKeyDown}
+      onMouseEnter={() => hover(view.id)}
+      onMouseLeave={() => hover(null)}
+      onFocus={onFocus}
+      onBlur={() => hover(null)}
     >
       <Handle className="ag-handle" type="target" position={Position.Left} isConnectable={false} />
       <div className="ag-card-head">
