@@ -2332,13 +2332,93 @@ def test_argus_prompt_enforces_hard_write_scope_boundary(tmp_path: Path) -> None
     assert expected_scope_line in user_prompt
 
 
-def test_default_worker_max_steps_supports_multi_file_tasks() -> None:
+def test_default_worker_max_steps_is_unlimited() -> None:
     import inspect
 
     from olympus.graph.loader import WorkflowRuntime
 
     sig = inspect.signature(OrchestrateStage.run_execution)
-    assert sig.parameters["worker_max_steps"].default == 60
-    assert WorkflowRuntime.worker_max_steps == 60
+    assert sig.parameters["worker_max_steps"].default is None
+    assert WorkflowRuntime.worker_max_steps is None
+
+
+def test_max_steps_exceeded_with_valid_diff_still_verifies_and_accepts(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    seen_max_steps: list[int | None] = []
+
+    class StepCappedWorker:
+        name = "capped"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            del on_event, on_handle
+            seen_max_steps.append(request.max_steps)
+            (request.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            return TurnOutcome(
+                completed=False,
+                stop_reason="max_steps_exceeded",
+                final_content="",
+                steps_taken=5,
+                driver_name="capped",
+            )
+
+    verdict = json.dumps(
+        {"task_id": "T1", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        execution_drivers=ExecutionDriversConfig(worker_driver="capped"),
+        driver_registry=DriverRegistry({"capped": StepCappedWorker()}),
+    )
+    out = stage.run_execution(run_id=run_id, worker_max_steps=5)
+    assert out["status"] == RunStatus.COMPLETED
+    assert seen_max_steps == [5]
+    assert out["plan"].tasks[0].status == TaskStatus.ACCEPTED
+
+
+def test_agent_loop_supports_unlimited_max_steps() -> None:
+    from olympus.harness.loop import AgentLoop
+    from olympus.providers.base import ToolCall
+
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=(ToolCall(id=f"c{i}", name="unknown_tool", arguments={}),),
+        )
+        for i in range(25)
+    ] + [LLMResponse(content="finished after 26 steps")]
+    loop = AgentLoop(
+        provider=MockLLMProvider(responses=responses),
+        max_steps=None,
+    )
+    res = loop.run(system_prompt="sys", user_prompt="user")
+    assert res.completed is True
+    assert res.stop_reason == "final_response"
+    assert res.steps_taken == 26
+    assert res.final_content == "finished after 26 steps"
+
+
 
 

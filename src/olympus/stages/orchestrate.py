@@ -859,7 +859,7 @@ class OrchestrateStage:
         task_id: str,
         mode: RunMode,
         apply_to_workspace: bool,
-        worker_max_steps: int,
+        worker_max_steps: int | None,
         worker: tuple[AgentDriver, str | None],
         monitor_factory: Callable[[], LLMProvider] | None,
         reviewer: tuple[AgentDriver, str | None],
@@ -903,12 +903,18 @@ class OrchestrateStage:
             spec_ctx = _format_spec_context(spec)
             design_ctx = _format_design_context(design, task=leased)
             handoff_block = f"{handoff_context}\n" if handoff_context else ""
+            step_guidance = (
+                f"Step budget: {worker_max_steps} turns max (keep exploration focused <= 6 steps, "
+                "implement edits early, verify with targeted commands, and stop once passing).\n"
+                if worker_max_steps is not None
+                else "Execution discipline: keep exploration focused, implement edits early, "
+                "verify with targeted commands, and stop once all acceptance checks pass.\n"
+            )
             worker_prompt = (
                 f"Sandbox workspace root: {sandbox.workspace_path}\n"
                 f"Task {leased.task_id}: {leased.title}\n"
                 f"Objective: {leased.objective}\n"
-                f"Step budget: {worker_max_steps} turns max (keep exploration focused <= 6 steps, "
-                f"implement edits early, verify with targeted commands, and stop once passing).\n"
+                f"{step_guidance}"
                 f"Allowed write_scope (relative): {json.dumps(leased.write_scope)}\n"
                 f"{spec_ctx}\n"
                 f"{design_ctx}"
@@ -1080,7 +1086,9 @@ class OrchestrateStage:
                     checks=verifying.acceptance_checks,
                 )
 
-            if not loop_res.completed:
+            if not loop_res.completed and not (
+                loop_res.stop_reason == "max_steps_exceeded" and gate.changed_paths
+            ):
                 _write_manifest_md(
                     art_dir=art_dir,
                     task=verifying,
@@ -1314,7 +1322,7 @@ class OrchestrateStage:
         *,
         run_id: str,
         apply_to_workspace: bool = False,
-        worker_max_steps: int = 60,
+        worker_max_steps: int | None = None,
         serial_execution: bool = False,
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""

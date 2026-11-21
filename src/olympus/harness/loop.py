@@ -280,7 +280,7 @@ class AgentLoop:
         store: RunStore | None = None,
         run_id: str | None = None,
         actor: str = "agent",
-        max_steps: int = 20,
+        max_steps: int | None = 20,
         trace_path: Path | None = None,
         synthesize_on_max_steps: bool = False,
         observer: Observer | None = None,
@@ -724,7 +724,9 @@ class AgentLoop:
                 receipt=receipt,
             )
 
-        for step in range(1, self.max_steps + 1):
+        step = 0
+        while self.max_steps is None or step < self.max_steps:
+            step += 1
             if self._cancelled():
                 return _finalize_result(
                     completed=False,
@@ -746,6 +748,7 @@ class AgentLoop:
             if (
                 synthesize
                 and frozen_tools
+                and self.max_steps is not None
                 and step == self.max_steps
                 and self.max_steps > 1
                 and any(msg.role == "tool" for msg in messages)
@@ -928,7 +931,7 @@ class AgentLoop:
             completed=False,
             stop_reason="max_steps_exceeded",
             final_content=messages[-1].content if messages else "",
-            steps_taken=self.max_steps,
+            steps_taken=step,
             final_messages=messages,
             total_input_tokens=total_in,
             total_output_tokens=total_out,

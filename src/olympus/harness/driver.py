@@ -31,7 +31,7 @@ class DriverTurnRequest(StrictModel):
     read_only: bool = False
     write_scope: list[str] = Field(default_factory=list)
     forbidden_globs: list[str] = Field(default_factory=list)
-    max_steps: int = Field(default=20, ge=1)
+    max_steps: int | None = Field(default=None, ge=1)
     trace_path: Path | None = None
     model: str | None = None
 
