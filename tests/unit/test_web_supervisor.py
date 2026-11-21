@@ -13,6 +13,7 @@ import pytest
 
 from olympus.core.contracts import ApprovalDecision, ApprovalRecord, ApprovalTarget, TaskPlan
 from olympus.core.store import RunStore
+from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.web.server import AriadneApp, create_http_server
 from olympus.web.supervisor import RunSupervisor
@@ -905,4 +906,169 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
     finally:
         httpd.shutdown()
         httpd.server_close()
+        supervisor.shutdown()
+
+
+def test_create_run_resolves_role_drivers_from_api_and_environment(
+    supervisor_app: tuple[AriadneApp, RunSupervisor, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, supervisor, base_url = supervisor_app
+    monkeypatch.setenv("OLYMPUS_WORKER_DRIVER", "environment-worker")
+    monkeypatch.setenv("OLYMPUS_MONITOR_MODEL", "environment-monitor")
+    monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        form = client.get("/").text
+        assert all(
+            f'id="new-run-{field}"' in form
+            for field in (
+                "worker-driver",
+                "reviewer-driver",
+                "monitor-model",
+            )
+        )
+        response = client.post(
+            "/api/runs",
+            json={
+                "raw_input": "Build an inventory REST API",
+                "worker_driver": "native@custom-worker",
+                "sync": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        snap = app.store.get_run(response.json()["run_id"])
+        assert snap["execution_drivers"] == {
+            "worker_driver": "native@custom-worker",
+            "reviewer_driver": "native",
+            "monitor_model": "environment-monitor",
+        }
+        invalid = client.post("/api/runs", json={"raw_input": "Goal", "reviewer_driver": 42})
+        assert invalid.status_code == 400
+
+    started = supervisor.start_run(
+        title="Inventory",
+        raw_input="Build an inventory REST API",
+        reviewer_driver="native@custom-reviewer",
+        monitor_model="custom-monitor",
+        sync=True,
+    )
+    assert app.store.get_run(started["run_id"])["execution_drivers"] == {
+        "worker_driver": "environment-worker",
+        "reviewer_driver": "native@custom-reviewer",
+        "monitor_model": "custom-monitor",
+    }
+
+
+def test_ariadne_pause_cancels_worker_without_spending_a_review_cycle(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    worker_in_flight = threading.Event()
+    release_worker = threading.Event()
+    worker_models: list[str] = []
+    reviews: list[str] = []
+
+    def provider_builder(*, model: str = "primary", **kwargs: object) -> MockLLMProvider:
+        def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+            system = messages[0].content
+            if "Execution Engineer (Hephaestus)" in system:
+                worker_models.append(model)
+                worker_in_flight.set()
+                assert release_worker.wait(5)
+                return LLMResponse(content="Worker completed")
+            if "Independent Verifier (Argus)" in system:
+                reviews.append(model)
+                return LLMResponse(
+                    content='{"task_id":"T0","attempt":1,"passed":true,"summary":"OK"}'
+                )
+            return _responder(messages, tools)
+
+        return MockLLMProvider(model_name=model, responder=respond)
+
+    supervisor = RunSupervisor(
+        store=store, workspace_root=tmp_path, provider_builder=provider_builder
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    try:
+        started = supervisor.start_run(
+            title="Pause active worker",
+            raw_input="Build an inventory REST API",
+            workflow_name="full_sdlc_tdd",
+            provider_config={"provider": "mock"},
+            worker_driver="native@worker-role",
+            reviewer_driver="native@reviewer-role",
+            auto_approve=True,
+        )
+        run_id = started["run_id"]
+        assert worker_in_flight.wait(5)
+        paused = app.execute_command(run_id, {"action": "pause"})
+        assert paused["projection"]["status"] == "paused"
+        release_worker.set()
+        supervisor.wait(run_id, timeout=10)
+        snap = store.get_run(run_id)
+        task = snap["plan"].tasks[0]
+        assert snap["status"] == "paused"
+        assert task.status == "ready" and task.review_cycle == 0
+        assert worker_models == ["worker-role"] and not reviews
+
+        resumed = app.execute_command(run_id, {"action": "resume", "sync": True})
+        assert resumed["projection"]["status"] == "completed"
+        assert set(worker_models) == {"worker-role"} and set(reviews) == {"reviewer-role"}
+        assert all(task.review_cycle == 0 for task in store.get_run(run_id)["plan"].tasks)
+    finally:
+        release_worker.set()
+        supervisor.shutdown()
+
+
+def test_supervisor_resolves_configured_watchdog_provider(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    monitor = MockLLMProvider(responses=[LLMResponse(content=(
+        '{"verdict":"HEALTHY","summary":"Implementation is progressing.","suggested_steer":null}'
+    ))])
+    release_worker = threading.Event()
+    now = 0.0
+
+    def wait(condition: threading.Condition, timeout: float) -> None:
+        nonlocal now
+        if not now:
+            now += timeout
+            return
+        release_worker.set()
+        condition.wait()
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        system = messages[0].content
+        if "Execution Engineer (Hephaestus)" in system:
+            assert release_worker.wait(5)
+            return LLMResponse(content="Worker finished.")
+        if "Independent Verifier (Argus)" in system:
+            return LLMResponse(content='{"task_id":"T0","attempt":1,"passed":true,"summary":"OK"}')
+        return _responder(messages, tools)
+
+    def provider_builder(*, model: str = "primary", **kwargs: object) -> MockLLMProvider:
+        if model == "small-monitor":
+            return monitor
+        return MockLLMProvider(model_name=model, responder=respond)
+
+    supervisor = RunSupervisor(
+        store=store, workspace_root=tmp_path, provider_builder=provider_builder,
+        watchdog_config=WatchdogConfig(clock=lambda: now, wait=wait),
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    try:
+        started = supervisor.start_run(
+            title="Configured Watchdog", raw_input="Build an inventory REST API",
+            workflow_name="full_sdlc_tdd", provider_config={"provider": "mock"},
+            monitor_model="small-monitor", auto_approve=True,
+        )
+        run_id = started["run_id"]
+        supervisor.wait(run_id, timeout=10)
+        projection = app.get_run_payload(run_id)["projection"]
+        assert projection["status"] == "completed"
+        assert len(monitor.recorded_requests) == 1
+        progress = projection["dag"]["nodes"][0]["live_progress"]
+        assert progress["watchdog_verdict"] == "HEALTHY"
+        assert progress["watchdog_summary"] == "Implementation is progressing."
+    finally:
+        release_worker.set()
         supervisor.shutdown()

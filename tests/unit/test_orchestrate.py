@@ -7,11 +7,40 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import SimpleQueue
+from threading import Event, Thread
+from threading import enumerate as enumerate_threads
 from typing import Any
 
-from olympus.core.contracts import CheckKind, GoalSpec, RunMode, RunStatus, TaskStatus
+import httpx
+import pytest
+
+from olympus.core.contracts import (
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalTarget,
+    CheckKind,
+    DesignSpec,
+    ExecutionStrategy,
+    GoalSpec,
+    RunMode,
+    RunStatus,
+    SpecStatus,
+    TaskKind,
+    TaskPlan,
+    TaskStatus,
+)
 from olympus.core.store import RunStore
+from olympus.harness.driver import (
+    ActiveTurnHandle,
+    DriverRegistry,
+    DriverTurnRequest,
+    ExecutionDriversConfig,
+    TurnOutcome,
+)
+from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -22,6 +51,7 @@ from olympus.providers.base import (
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection
+from olympus.web.server import AriadneApp, create_http_server
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
@@ -768,3 +798,1368 @@ def test_failed_timeout_retry_blocks_only_its_dependency_chain(tmp_path: Path) -
     # A ready task on an awaiting run now surfaces the resume banner (Issue #54).
     assert after_manual_retry["hitl_banner"]["kind"] == "ready_to_resume"
     assert after_manual_retry["hitl_banner"]["actions"] == ["retry_workflow"]
+
+
+def _approve_plan(
+    store: RunStore,
+    run_id: str,
+    plan: TaskPlan,
+    *,
+    design: DesignSpec | None = None,
+) -> None:
+    """Persist and approve a hand-built plan (optionally pinning an approved design)."""
+    if design is not None:
+        store.save_design(run_id, design, actor="design")
+        store.record_approval(
+            ApprovalRecord(
+                run_id=run_id,
+                target=ApprovalTarget.DESIGN_SPEC,
+                target_id=design.design_id,
+                target_hash=design.content_hash,
+                approver="zeus",
+                decision=ApprovalDecision.APPROVED,
+            )
+        )
+    store.save_plan(run_id, plan, actor="orchestrate")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+
+def _contract_design(spec: GoalSpec, *, shared_paths: list[str]) -> DesignSpec:
+    return DesignSpec.model_validate(
+        {
+            "design_id": "design-diff-gate",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "Shared contracts pin cross-task boundaries.",
+            "shared_contract_paths": shared_paths,
+            "execution_strategy": ExecutionStrategy.CONTRACT_FIRST_PARALLEL.value,
+            "strategy_rationale": "Wave 0 contract task locks shared paths before implement.",
+            "modules": [
+                {
+                    "id": "M1",
+                    "name": "Core",
+                    "responsibility": "Feature flag core",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["src/"],
+                }
+            ],
+            "status": SpecStatus.CONFIRMED.value,
+        }
+    )
+
+
+def _single_task_plan(
+    *,
+    spec: GoalSpec,
+    write_scope: list[str],
+    checks: list[dict[str, Any]],
+    max_cycles: int = 3,
+    kind: TaskKind = TaskKind.IMPLEMENT,
+) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-diff-gate",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Implement the flag module",
+                    "objective": "Implement the assigned flag module",
+                    "requirement_refs": ["R1"],
+                    "kind": kind.value,
+                    "write_scope": write_scope,
+                    "max_cycles": max_cycles,
+                    "acceptance_checks": checks,
+                }
+            ],
+        }
+    )
+
+
+def _marker_command_check() -> dict[str, Any]:
+    return {
+        "id": "CHK-1",
+        "kind": CheckKind.COMMAND.value,
+        "description": "Write a marker proving acceptance checks ran",
+        "command": (
+            "python3 -c 'from pathlib import Path; "
+            'Path("check-ran.txt").write_text("ran")\''
+        ),
+    }
+
+
+def _bash_action(command: str) -> Callable[[Path], ToolCall]:
+    return lambda sandbox: ToolCall(  # noqa: ARG005 - action bound to one sandbox
+        id="bash-1",
+        name="run_bash",
+        arguments={"command": command},
+    )
+
+
+def _write_action(file_name: str, content: str) -> Callable[[Path], ToolCall]:
+    return lambda sandbox: ToolCall(
+        id="write-1",
+        name="write_file",
+        arguments={"path": str(sandbox / file_name), "content": content},
+    )
+
+
+def _scope_gate_responder(
+    actions: Sequence[Callable[[Path], ToolCall]],
+) -> tuple[Responder, dict[str, int]]:
+    """Replay one worker action per attempt; the last action repeats if needed.
+
+    Review verdicts always pass so a requeue can only come from the Diff Gate.
+    """
+    state = {"attempts": 0, "reviews": 0}
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system_message = messages[0].content
+        user_message = messages[1].content if len(messages) > 1 else ""
+        if "Independent Verifier" in system_message:
+            state["reviews"] += 1
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T1",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "Scope-clean implementation verified.",
+                        "findings": [],
+                    }
+                )
+            )
+        if "Execution Engineer" not in system_message:
+            raise AssertionError(f"Unexpected system prompt: {system_message[:80]}")
+        match = re.search(r"Sandbox workspace root: (.+)", user_message)
+        assert match is not None
+        sandbox = Path(match.group(1).strip())
+        if not any(msg.role == "tool" for msg in messages):
+            action = actions[min(state["attempts"], len(actions) - 1)]
+            state["attempts"] += 1
+            return LLMResponse(content="acting", tool_calls=(action(sandbox),))
+        return LLMResponse(content="finished")
+
+    return responder, state
+
+
+def _gate_rejections(store: RunStore, run_id: str) -> list[Any]:
+    return [e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"]
+
+
+def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    notes = tmp_path / "docs" / "notes.md"
+    notes.parent.mkdir()
+    notes.write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "docs/notes.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=2,
+        checks=[
+            _marker_command_check(),
+            {
+                "id": "CHK-REV-1",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Cold-start independent review",
+            },
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action("printf 'tampered\\n' >> docs/notes.md"),
+            _write_action("feature.py", "FLAG = True\n"),
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 2
+    assert state["attempts"] == 2
+    assert state["reviews"] == 1
+
+    events = store.list_events(run_id)
+    rejections = [e for e in events if e.event_type == "task.diff_gate_rejected"]
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["task_id"] == "T1"
+    assert payload["attempt"] == 1
+    assert payload["violating_paths"] == ["docs/notes.md"]
+    assert payload["allowed_write_scope"] == ["feature.py"]
+    assert payload["forbidden_globs"] == []
+
+    # Gate rejection precedes every check and review event; the retry is the only review.
+    check_events = [e for e in events if e.event_type == "check.command_completed"]
+    assert check_events
+    assert all(e.event_seq > rejections[0].event_seq for e in check_events)
+    review_events = [e for e in events if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["attempt"] for e in review_events] == [2]
+    assert len([e for e in events if e.event_type == "task.requeued"]) == 1
+
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert (attempt_dir / "diff.patch").is_file()
+    assert (attempt_dir / "MANIFEST.md").is_file()
+    assert not list(attempt_dir.glob("check-*.log"))
+    assert not list(attempt_dir.glob("verdict-cycle-*.json"))
+
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "feature.py").is_file()
+    assert not (overlay / "docs" / "notes.md").exists()
+    assert notes.read_text(encoding="utf-8") == "original\n"
+
+
+def test_diff_gate_rejects_untracked_file_outside_write_scope(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mkdir -p stray && printf 'x\\n' > stray/notes.txt")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 1
+    assert task.last_error is not None
+    assert "Diff Gate" in task.last_error
+    assert "stray/notes.txt" in task.last_error
+    assert "feature.py" in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["violating_paths"] == ["stray/notes.txt"]
+    assert payload["allowed_write_scope"] == ["feature.py"]
+
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert not list(attempt_dir.glob("check-*.log"))
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert not overlay.exists() or not any(overlay.iterdir())
+
+
+def test_diff_gate_rejects_forbidden_contract_path_even_when_write_scope_matches(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    design = _contract_design(spec, shared_paths=["src/contracts/"])
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["src/"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan, design=design)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mkdir -p src/contracts && printf 'x\\n' > src/contracts/api.py")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.last_error is not None
+    assert "forbidden" in task.last_error
+    assert "src/contracts/api.py" in task.last_error
+    assert "src/contracts/" in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["violating_paths"] == ["src/contracts/api.py"]
+    assert payload["allowed_write_scope"] == ["src/"]
+    assert payload["forbidden_globs"] == ["src/contracts/"]
+    assert payload["violations"][0]["reason"] == "forbidden"
+
+
+def test_diff_gate_allows_contract_task_to_edit_shared_contract_paths(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    design = _contract_design(spec, shared_paths=["contracts/"])
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["contracts/"],
+        kind=TaskKind.CONTRACT,
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Contract file exists with pinned content",
+                "command": (
+                    "python3 -c 'from pathlib import Path; "
+                    'assert Path("contracts/api.py").read_text() == "PINNED = 1\\n"\''
+                ),
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan, design=design)
+    responder, state = _scope_gate_responder([_write_action("contracts/api.py", "PINNED = 1\n")])
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert state["reviews"] == 1
+    assert _gate_rejections(store, run_id) == []
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "contracts" / "api.py").read_text(encoding="utf-8") == "PINNED = 1\n"
+
+
+def test_diff_gate_passes_tracked_and_untracked_changes_inside_write_scope(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    app = tmp_path / "app.py"
+    app.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "app"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["app.py", "pkg/"],
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Tracked edit and new module are both present",
+                "command": (
+                    "python3 -c 'from pathlib import Path; "
+                    'assert "VALUE = 2" in Path("app.py").read_text(); '
+                    'assert Path("pkg/util.py").is_file()\''
+                ),
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action(
+                "printf 'VALUE = 2\\n' > app.py && mkdir -p pkg && printf 'X = 1\\n' > pkg/util.py"
+            )
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert state["reviews"] == 1
+    assert _gate_rejections(store, run_id) == []
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (overlay / "pkg" / "util.py").read_text(encoding="utf-8") == "X = 1\n"
+    # SIMULATION mode with apply_to_workspace=False never touches the host checkout.
+    assert app.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_diff_gate_validates_non_git_sandbox_without_crashing(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Sample\n", encoding="utf-8")
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=2,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [
+            _bash_action("printf 'x\\n' > stray.py"),
+            _write_action("feature.py", "FLAG = True\n"),
+        ]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert state["attempts"] == 2
+    assert state["reviews"] == 1
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    assert rejections[0].payload["violating_paths"] == ["stray.py"]
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "feature.py").is_file()
+    assert not (overlay / "stray.py").exists()
+
+
+def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "notes.md").write_text("original\n", encoding="utf-8")
+    (docs / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "docs/"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    responder, state = _scope_gate_responder(
+        [_bash_action("mv docs/notes.md docs/notes-renamed.md && rm docs/legacy.txt")]
+    )
+    orch = OrchestrateStage(
+        store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
+    )
+    snap = orch.run_execution(run_id=run_id)
+
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.last_error is not None
+    for path in ("docs/legacy.txt", "docs/notes-renamed.md", "docs/notes.md"):
+        assert path in task.last_error
+    assert state["reviews"] == 0
+
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    assert rejections[0].payload["violating_paths"] == [
+        "docs/legacy.txt",
+        "docs/notes-renamed.md",
+        "docs/notes.md",
+    ]
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert not list(attempt_dir.glob("check-*.log"))
+    # The host checkout keeps both documents intact: nothing is auto-reverted or promoted.
+    assert (docs / "notes.md").is_file()
+    assert (docs / "legacy.txt").is_file()
+    assert not (docs / "notes-renamed.md").exists()
+
+
+def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[
+            {
+                "id": "CHK-REV",
+                "kind": "independent_review",
+                "description": "Audit the diff",
+            }
+        ],
+    )
+    provider = MockLLMProvider(responses=[LLMResponse(content=json.dumps(plan))])
+
+    class ScriptedDriver:
+        def __init__(self, name: str, responses: list[str]) -> None:
+            self.name = name
+            self.requests: list[DriverTurnRequest] = []
+            self.responses = iter(responses)
+
+        def run_turn(self, request: DriverTurnRequest, *, on_event=None, on_handle=None):
+            self.requests.append(request)
+            if self.name == "writer":
+                (request.workspace_path / "feature.py").write_text("FLAG = True\n")
+                assert on_event is not None
+                assert request.trace_path is not None
+                raw = {
+                    "task_id": "spoofed",
+                    "attempt": 99,
+                    "actor": "spoofed",
+                    "driver": "spoofed",
+                    "step": 1,
+                    "tool": "run_bash",
+                    "target_hint": "PRIVATE_COMMAND",
+                    "arguments": {"command": "PRIVATE_COMMAND"},
+                    "output": "PRIVATE_STDOUT\nPRIVATE_STDERR",
+                    "prompt": request.user_prompt,
+                }
+                on_event("agent.tool_started", raw)
+                trace = [{"event": "text_delta", "text": "PRIVATE_DELTA"}] * 45
+                for line in trace:
+                    on_event("text_delta", line)
+                finished = {
+                    **raw, "is_error": True, "duration_ms": 9, "error_signature": raw["output"],
+                }
+                on_event("agent.tool_finished", finished)
+                on_event("agent.steered", {"source": "watchdog", "reason": "PRIVATE_GUIDANCE"})
+                trace.append({"event": "tool_end", **finished})
+                request.trace_path.write_text(
+                    "".join(json.dumps(line) + "\n" for line in trace), encoding="utf-8"
+                )
+            return TurnOutcome(
+                True, "final_response", next(self.responses), 1, driver_name=self.name
+            )
+
+    writer = ScriptedDriver("writer", ["worker-only content"])
+    verifier = ScriptedDriver(
+        "verifier",
+        [
+            '{"task_id":"bad","attempt":1,"passed":true,"summary":"bad","extra":1}',
+            'Result:\n```json\n{"task_id":"wrong","attempt":99,"passed":true,"summary":"OK"}\n```',
+        ],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(
+            worker_driver="writer@worker-model",
+            reviewer_driver="verifier@different-model",
+        ),
+        driver_registry=DriverRegistry({"writer": writer, "verifier": verifier}),
+    )
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+    snap = stage.run_execution(run_id=run_id)
+
+    assert len(provider.recorded_requests) == 1
+    assert snap["status"] == RunStatus.COMPLETED
+    assert len(writer.requests) == 1 and len(verifier.requests) == 2
+    assert writer.requests[0].write_scope == ["feature.py"]
+    assert writer.requests[0].model == "worker-model" and not writer.requests[0].read_only
+    assert all(req.read_only and req.model == "different-model" for req in verifier.requests)
+    assert "worker-only content" not in verifier.requests[0].user_prompt
+    assert "VALIDATION" in verifier.requests[1].user_prompt
+    events = store.list_events(run_id)
+    milestones = [event.payload for event in events if event.event_type.startswith("agent.")]
+    assert milestones[0] == {
+        "task_id": "T1", "attempt": 1, "actor": "hephaestus:T1", "driver": "writer",
+        "step": 1, "tool": "run_bash", "target_hint": "shell command",
+    }
+    assert milestones[1]["status"] == "error"
+    assert milestones[1]["error_signature"].startswith("sha256:")
+    assert milestones[2] == {
+        "task_id": "T1", "attempt": 1, "actor": "hephaestus:T1", "source": "watchdog",
+        "reason": "Watchdog guidance",
+    }
+    assert "PRIVATE_" not in json.dumps(milestones)
+    assert not any(event.event_type == "text_delta" for event in events)
+    node = build_run_projection(store, tmp_path, run_id)["dag"]["nodes"][0]
+    assert node["artifacts"]["tool_calls"][0]["output_preview"] == "PRIVATE_STDOUT\nPRIVATE_STDERR"
+    verdict = json.loads(
+        (
+            tmp_path
+            / ".olympus"
+            / "runs"
+            / run_id
+            / "artifacts"
+            / "T1"
+            / "attempt-1"
+            / "verdict-cycle-1.json"
+        ).read_text()
+    )
+    assert verdict["task_id"] == "T1" and verdict["attempt"] == 1
+
+
+def test_live_worker_milestones_reach_ariadne_before_receipt(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id, spec_hash=spec.content_hash, file_name="feature.py",
+        checks=[{"id": "CHK-REV", "kind": "independent_review", "description": "Audit the diff"}],
+    )
+    handles: list[ActiveTurnHandle] = []
+    started, steered, release_tool, release_turn = (Event() for _ in range(4))
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "agent.tool_started":
+            started.set()
+            release_tool.wait(5)
+        elif kind == "agent.tool_finished":
+            handles[0].steer("PRIVATE_STEERING_BODY", source="human")
+        elif kind == "agent.steered":
+            steered.set()
+            release_turn.wait(5)
+
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True])
+        ),
+        workspace_root=tmp_path,
+        on_driver_event=observe,
+        on_driver_handle=handles.append,
+        live_activity=app.supervisor.live_activity,
+    )
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+
+    def task(payload: dict[str, Any]) -> dict[str, Any]:
+        return payload["projection"]["dag"]["nodes"][0]
+
+    with ThreadPoolExecutor() as pool:
+        result = pool.submit(stage.run_execution, run_id=run_id)
+        try:
+            assert started.wait(3)
+            initial = task(app.get_run_payload(run_id))["live_progress"]
+            assert initial["driver_name"] == "native"
+            assert initial["current_tool"]["tool"] == "write_file"
+            assert initial["last_event_at"]
+            assert initial["preview"] == "writing feature.py"
+            release_tool.set()
+            assert steered.wait(3)
+            events = app.get_events_payload(run_id)["events"]
+            worker_events = [e for e in events if e["actor"] == "hephaestus:T1"]
+            milestones = [e for e in worker_events if e["event_type"].startswith("agent.")]
+            assert [e["event_type"] for e in milestones] == [
+                "agent.tool_started", "agent.tool_finished", "agent.steered",
+            ]
+            assert not any(e["event_type"] == "turn.receipt" for e in worker_events)
+            assert not result.done()
+            assert "PRIVATE_STEERING_BODY" not in json.dumps(milestones)
+            assert "FLAG = True" not in json.dumps(milestones)
+            assert str(tmp_path) not in json.dumps(milestones)
+
+            node = task(app.get_run_payload(run_id))
+            progress = node["live_progress"]
+            assert progress["current_tool"] is None
+            assert progress["recent_tools"][0]["status"] == "ok"
+            assert progress["steer_count"] == 1
+            assert progress["watchdog_verdict"] is None
+            assert progress["watchdog_summary"] is None
+            reopened = RunStore(store.db_path)
+            durable = build_run_projection(reopened, tmp_path, run_id)["dag"]["nodes"][0][
+                "live_progress"
+            ]
+            assert durable == {key: value for key, value in progress.items() if key != "preview"}
+            assert not any(e["event_type"] == "text_delta" for e in worker_events)
+            assert node["artifacts"]["tool_calls"][0]["tool"] == "write_file"
+            assert node["artifacts"]["tool_calls"][0]["duration_ms"] >= 0
+            worker_trace = Path(node["artifacts"]["attempt_dir"]) / "worker.jsonl"
+            assert '"event": "text_delta"' in worker_trace.read_text(encoding="utf-8")
+
+            httpd = create_http_server(app, host="127.0.0.1", port=0)
+            thread = Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                response = httpx.get(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+                    f"?once=1&after_seq={milestones[0]['event_seq']}",
+                    timeout=3,
+                )
+                assert response.status_code == 200
+                sse = json.loads(response.text.split("data: ", 1)[1])
+                assert [e for e in sse["events"] if e["event_type"].startswith("agent.")] == (
+                    milestones[1:]
+                )
+                with httpx.stream(
+                    "GET",
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+                    f"?after_seq={milestones[-1]['event_seq']}",
+                    timeout=3,
+                ) as stream:
+                    lines = stream.iter_lines()
+                    for line in lines:
+                        if line == "event: activity":
+                            activity = json.loads(next(lines).removeprefix("data: "))
+                            break
+                    else:
+                        raise AssertionError("Expected an activity-only SSE event")
+                assert activity["previews"]["T1"] == {"attempt": 1, "preview": "writing feature.py"}
+            finally:
+                httpd.shutdown()
+                thread.join()
+                httpd.server_close()
+        finally:
+            release_tool.set()
+            release_turn.set()
+        assert result.result()["status"] == RunStatus.COMPLETED
+        assert "preview" not in task(app.get_run_payload(run_id))["live_progress"]
+        assert app.supervisor.live_activity.snapshot(run_id) == {}
+
+
+def test_cli_run_combines_flags_and_env_for_role_models(tmp_path: Path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from olympus.cli import app as cli_app
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    plan = _plan_payload(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        file_name="feature.py",
+        checks=[{"id": "review", "kind": "independent_review", "description": "Audit the diff"}],
+    )
+    planner = MockLLMProvider(responses=[LLMResponse(content=json.dumps(plan))])
+    stage = OrchestrateStage(store=store, provider=planner, workspace_root=tmp_path)
+    stage.propose_plan(run_id=run_id, auto_approve=True)
+    built_models: list[str | None] = []
+
+    def build_provider(*, model=None, **kwargs):
+        built_models.append(model)
+        return MockLLMProvider(
+            model_name=model or "primary",
+            responder=_stage_responder(plan=plan, file_name="feature.py", review_passes=[True]),
+        )
+
+    monkeypatch.setenv("OLYMPUS_WORKER_DRIVER", "native@ignored-worker-env")
+    monkeypatch.setenv("OLYMPUS_REVIEWER_DRIVER", "native@reviewer-env")
+    monkeypatch.setattr(cli_app, "build_provider", build_provider)
+    result = CliRunner().invoke(
+        cli_app.app,
+        [
+            "run",
+            run_id,
+            "--workspace",
+            str(tmp_path),
+            "--worker-driver",
+            "native@worker-flag",
+            "--monitor-model",
+            "monitor-flag",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["status"] == "completed"
+    assert set(built_models) == {None, "worker-flag", "reviewer-env"}
+    config_event = next(
+        event
+        for event in store.list_events(run_id)
+        if event.event_type == "run.status_changed" and "execution_drivers" in event.payload
+    )
+    assert config_event.payload["execution_drivers"]["monitor_model"] == "monitor-flag"
+
+
+def test_watchdog_repeated_native_errors_steer_and_reach_ariadne(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(
+        store, run_id, _single_task_plan(
+            spec=spec, write_scope=["feature.py"], checks=[{
+                "id": "CHK-REV", "kind": "independent_review", "description": "Audit",
+            }],
+        )
+    )
+    monitor_checked, monitor_idle = Event(), Event()
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "watchdog.checked":
+            monitor_checked.set()
+
+    def wait(condition, timeout):
+        if monitor_checked.is_set():
+            monitor_idle.set()
+        condition.wait(timeout)
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        if "Independent Verifier" in messages[0].content:
+            return LLMResponse(content=json.dumps({
+                "task_id": "T1", "attempt": 1, "passed": True, "summary": "Verified.",
+                "findings": [],
+            }))
+        count = sum(message.role == "tool" for message in messages)
+        if count < 3:
+            return LLMResponse(
+                content="PRIVATE_WORKER_TRANSCRIPT",
+                tool_calls=(
+                    ToolCall(str(count), "read_file", {"path": str(tmp_path / "private.txt")}),
+                ),
+            )
+        if count == 3 and not any("Use the scoped path." in m.content for m in messages):
+            assert monitor_idle.wait(3)
+            return LLMResponse(content="Waiting for the next step.", tool_calls=(
+                ToolCall("write", "glob_files", {"pattern": "*.py"}),
+            ))
+        assert any("Use the scoped path." in m.content for m in messages)
+        return LLMResponse(content="Finished.")
+
+    monitor = MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+        "verdict": "STUCK_LOOP", "summary": "Repeated file errors.",
+        "suggested_steer": "Use the scoped path.",
+    }))])
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=respond),
+        workspace_root=tmp_path,
+        monitor_provider=monitor,
+        watchdog_config=WatchdogConfig(wait=wait),
+        on_driver_event=observe,
+    )
+    assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    assert len(monitor.recorded_requests) == 1
+    (messages, tools), = monitor.recorded_requests
+    assert not tools
+    snapshot = json.loads(messages[-1].content)
+    assert set(snapshot) == {"objective", "write_scope", "milestones", "diff_stat"}
+    assert snapshot["write_scope"] == ["feature.py"]
+    assert "PRIVATE_WORKER_TRANSCRIPT" not in messages[-1].content
+    assert "private.txt" not in messages[-1].content
+    events = store.list_events(run_id)
+    assert any(
+        e.event_type == "agent.steered" and e.payload["source"] == "watchdog" for e in events
+    )
+    progress = app.get_run_payload(run_id)["projection"]["dag"]["nodes"][0]["live_progress"]
+    assert progress["watchdog_verdict"] == "STUCK_LOOP"
+    assert progress["watchdog_summary"] == "Repeated file errors."
+
+
+@pytest.mark.parametrize(("verdicts", "archive_fails"), [
+    (("SCOPE_DRIFT", "STUCK_LOOP"), False),
+    (("BLOCKED_EXTERNAL",), False),
+    (("BLOCKED_EXTERNAL",), True),
+])
+def test_watchdog_pause_preserves_work_and_skips_review(
+    tmp_path: Path, verdicts: tuple[str, ...], archive_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if archive_fails:
+        def fail_archive(*args):
+            raise PermissionError("Cannot write patch")
+
+        monkeypatch.setattr("olympus.stages.orchestrate.archive_sandbox_recovery", fail_archive)
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[_marker_command_check()],
+    ))
+    checked = Event()
+    cancelled = Event()
+    observer_events: list[tuple[str, dict[str, Any]]] = []
+
+    class JsonDriver:
+        name = "test-json"
+        supports_steer = False
+
+        def steer(self, guidance, *, source):
+            pytest.fail("JSON-only driver cannot steer")
+
+        def cancel(self, *, reason):
+            assert reason == "watchdog_paused"
+            cancelled.set()
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            (request.workspace_path / "feature.py").write_bytes(b"\x00unfinished\n")
+            (request.workspace_path / "README.md").write_text("PRIVATE_PATCH_BODY\n")
+            request.trace_path.write_text('{"event":"worker-progress"}\n', encoding="utf-8")
+            for i in range(len(verdicts)):
+                for step in range(3):
+                    on_event("agent.tool_finished", {
+                        "step": step, "tool": "write", "status": "error",
+                        "error_signature": "repeat",
+                    })
+                if i + 1 < len(verdicts):
+                    assert checked.wait(3)
+                    assert not cancelled.is_set()
+            assert cancelled.wait(3)
+            return TurnOutcome(False, "cancelled", "", 1)
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        observer_events.append((kind, payload))
+        if kind == "watchdog.checked":
+            checked.set()
+
+    monitor = MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+        "verdict": verdict, "summary": f"Diagnosis {verdict}.",
+        "suggested_steer": "Try the scoped implementation.",
+    })) for verdict in verdicts])
+    primary = MockLLMProvider()
+    stage = OrchestrateStage(
+        store=store, provider=primary, workspace_root=tmp_path,
+        monitor_provider=monitor, on_driver_event=observe,
+        execution_drivers=ExecutionDriversConfig(worker_driver="test-json"),
+        driver_registry=DriverRegistry({"test-json": JsonDriver()}),
+    )
+    result = stage.run_execution(run_id=run_id)
+    assert result["status"] == RunStatus.PAUSED
+    assert cancelled.is_set()
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+    assert not primary.recorded_requests
+    assert len(monitor.recorded_requests) == len(verdicts)
+    for messages, _ in monitor.recorded_requests:
+        assert "README.md" in json.loads(messages[-1].content)["diff_stat"]
+        assert "PRIVATE_PATCH_BODY" not in messages[-1].content
+    assert [payload["severity"] for kind, payload in observer_events
+            if kind == "watchdog.checked"] == ["warning"] * (len(verdicts) - 1)
+    task = result["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 0
+    assert task.last_error == f"Diagnosis {verdicts[-1]}."
+    attempt = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert (attempt / "worker.jsonl").is_file()
+    assert json.loads((attempt / "watchdog.json").read_text())["summary"] == task.last_error
+    events = store.list_events(run_id)
+    paused, = [event for event in events if event.event_type == "watchdog.paused"]
+    if archive_fails:
+        assert paused.payload["archive_error"] == "PermissionError"
+        assert task.worktree_path == paused.payload["retained_sandbox"]
+        assert (Path(task.worktree_path) / "feature.py").read_bytes() == b"\x00unfinished\n"
+    else:
+        assert not task.worktree_path
+        patch = attempt / "diff.patch"
+        assert "GIT binary patch" in patch.read_text(encoding="utf-8")
+        subprocess.run(["git", "apply", "--check", str(patch)], cwd=tmp_path, check=True)
+        assert not list((tmp_path / ".olympus" / "sandboxes").iterdir())
+    assert any(e.event_type == "run.paused" for e in events)
+    progress = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
+        "projection"
+    ]["dag"]["nodes"][0]["live_progress"]
+    assert progress["watchdog_verdict"] == verdicts[-1]
+    assert progress["watchdog_summary"] == task.last_error
+
+
+def test_watchdog_recovery_resets_streak_without_resetting_steer_cap(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[{
+            "id": "CHK-REV", "kind": "independent_review", "description": "Audit the change",
+        }],
+    ))
+    verdicts = ["STUCK_LOOP", "HEALTHY", "SCOPE_DRIFT", "HEALTHY", "STUCK_LOOP"]
+    checked = SimpleQueue()
+    steers = []
+
+    class RecoveringDriver:
+        name = "recovering"
+        supports_steer = True
+
+        def steer(self, guidance, *, source):
+            steers.append((guidance, source))
+            return True
+
+        def cancel(self, *, reason):
+            pytest.fail(f"Recovering task unexpectedly cancelled: {reason}")
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            for expected in verdicts:
+                on_event("agent.tool_finished", {
+                    "tool": "read", "step": 1, "status": "error", "error_signature": "retry",
+                })
+                assert checked.get(timeout=3) == expected
+            return TurnOutcome(True, "completed", "", 1)
+
+    stage = OrchestrateStage(
+        store=store, workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=(
+            '{"task_id":"T1","attempt":1,"passed":true,"summary":"Verified."}'
+        ))]),
+        driver_registry=DriverRegistry({"recovering": RecoveringDriver()}),
+        execution_drivers=ExecutionDriversConfig(worker_driver="recovering"),
+        monitor_provider=MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+            "verdict": verdict, "summary": f"Diagnosis {verdict}.",
+            "suggested_steer": "Review the scoped paths.",
+        })) for verdict in verdicts]),
+        watchdog_config=WatchdogConfig(repeat_error_threshold=1),
+        on_driver_event=lambda kind, fields: (
+            checked.put(fields["verdict"]) if kind == "watchdog.checked" else None
+        ),
+    )
+    assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    assert steers == [("Review the scoped paths.", "watchdog")] * 2
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+
+
+@pytest.mark.parametrize(("trigger", "provider_reply", "event_type"), [
+    (None, None, None),
+    ("worker_failure", None, None),
+    ("silence", TimeoutError("secret timeout detail"), "watchdog.error"),
+    ("interval", RuntimeError("secret provider detail"), "watchdog.error"),
+    ("silence", '{"verdict":"HEALTHY","summary":"two\\nlines"}', "watchdog.error"),
+    ("interval", '{"verdict":"HEALTHY","summary":"Progress is steady."}', "watchdog.checked"),
+    ("interval_then_silence", '{"verdict":"HEALTHY","summary":"OK"}', "watchdog.checked"),
+])
+def test_watchdog_timers_fail_open_through_stage(
+    tmp_path: Path, trigger: str | None, provider_reply: str | Exception | None,
+    event_type: str | None,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[{
+            "id": "CHK-REV", "kind": "independent_review", "description": "Audit the change",
+        }],
+    ))
+    observed = Event()
+    observed_triggers: list[str] = []
+    now = 0.0
+    pending = int(event_type is not None)
+    expected_triggers = [trigger] if pending else []
+    if trigger == "interval_then_silence":
+        expected_triggers = ["interval", "silence"]
+        pending = 2
+
+    def wait(condition, timeout):
+        nonlocal now, pending
+        if pending:
+            now += timeout
+            pending -= 1
+        else:
+            condition.wait()
+
+    def observe(kind, fields):
+        if kind == event_type:
+            observed_triggers.append(fields["trigger"])
+            if len(observed_triggers) == len(expected_triggers):
+                observed.set()
+
+    def monitor_response(messages, tools):
+        if isinstance(provider_reply, Exception):
+            raise provider_reply
+        assert provider_reply is not None, "A fast turn must leave L2 idle"
+        return LLMResponse(content=provider_reply)
+
+    class FastDriver:
+        name = "fast"
+        supports_steer = True
+
+        def steer(self, guidance, *, source):
+            pytest.fail("Unexpected steering")
+
+        def cancel(self, *, reason):
+            pytest.fail("Unexpected cancellation")
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            if trigger == "worker_failure":
+                raise ValueError("worker failed")
+            if provider_reply is not None:
+                assert observed.wait(3)
+            return TurnOutcome(True, "completed", "", 1)
+
+    monitor = MockLLMProvider(responder=monitor_response)
+    stage = OrchestrateStage(
+        store=store, workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=(
+            '{"task_id":"T1","attempt":1,"passed":true,"summary":"Verified."}'
+        ))]),
+        driver_registry=DriverRegistry({"fast": FastDriver()}),
+        execution_drivers=ExecutionDriversConfig(worker_driver="fast", monitor_model="monitor"),
+        model_provider=lambda model: {"monitor": monitor}[model],
+        watchdog_config=WatchdogConfig(
+            silence_seconds=15 if trigger and trigger.startswith("interval") else 10,
+            interval_seconds=20 if trigger == "silence" else 10,
+            clock=lambda: now, wait=wait,
+        ),
+        on_driver_event=observe,
+    )
+    if trigger == "worker_failure":
+        with pytest.raises(ValueError, match="worker failed"):
+            stage.run_execution(run_id=run_id)
+    else:
+        assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    watchdog_events = [e for e in store.list_events(run_id) if e.actor == "watchdog"]
+    assert len(monitor.recorded_requests) == len(expected_triggers)
+    assert [event.event_type for event in watchdog_events] == [event_type] * len(expected_triggers)
+    assert [event.payload["trigger"] for event in watchdog_events] == expected_triggers
+    assert all("secret" not in json.dumps(event.payload) for event in watchdog_events)
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+
+
+
+def test_diff_gate_rejects_tracked_ignored_dir_and_posix_backslash_filename(
+    tmp_path: Path,
+) -> None:
+    for rel, tracked in [("__pycache__/tracked.txt", True), (r"src\rogue.py", False)]:
+        ws = tmp_path / ("case_tracked" if tracked else "case_backslash")
+        ws.mkdir()
+        _init_repo(ws)
+        if tracked:
+            (ws / rel).parent.mkdir()
+            (ws / rel).write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-f", rel], cwd=ws, check=True)
+            subprocess.run(["git", "commit", "-qm", "track ignored file"], cwd=ws, check=True)
+        store, run_id = _confirmed_run(ws)
+        plan = _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["src/"],
+            checks=[_marker_command_check()],
+        )
+        _approve_plan(
+            store,
+            run_id,
+            plan.model_copy(update={"tasks": [plan.tasks[0].model_copy(update={"max_cycles": 1})]}),
+        )
+
+        class OutOfScopeDriver:
+            name = "audit"
+
+            def __init__(self, target_rel: str) -> None:
+                self._target_rel = target_rel
+
+            def run_turn(
+                self,
+                request: DriverTurnRequest,
+                *,
+                on_event: Any = None,
+                on_handle: Any = None,
+            ) -> TurnOutcome:
+                del on_event, on_handle
+                target = request.workspace_path / self._target_rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("mutated\n", encoding="utf-8")
+                return TurnOutcome(
+                    completed=True,
+                    stop_reason="final_response",
+                    final_content="done",
+                    steps_taken=1,
+                    driver_name="audit",
+                )
+
+        stage = OrchestrateStage(
+            store=store,
+            provider=MockLLMProvider(),
+            workspace_root=ws,
+            execution_drivers=ExecutionDriversConfig(worker_driver="audit"),
+            driver_registry=DriverRegistry({"audit": OutOfScopeDriver(rel)}),
+        )
+        out = stage.run_execution(run_id=run_id)
+        assert out["plan"].tasks[0].status == TaskStatus.BLOCKED
+        rejections = [
+            e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"
+        ]
+        assert len(rejections) == 1
+        assert rel in rejections[0].payload["violating_paths"]
+        assert not (ws / ".olympus" / "runs" / run_id / "accepted_overlay" / rel).exists()
+
+
+def test_watchdog_slow_monitor_never_stalls_completed_worker(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    _approve_plan(store, run_id, plan)
+    entered, release, finished = Event(), Event(), Event()
+
+    class FastDriver:
+        name = "fast"
+        supports_steer = False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            del on_event
+            if on_handle is not None:
+                on_handle(self)
+            assert entered.wait(3.0)
+            (request.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            finished.set()
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="fast",
+            )
+
+    class SlowMonitor(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args, kwargs
+            entered.set()
+            release.wait(5.0)
+            return LLMResponse(
+                content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Too late"})
+            )
+
+    verdict = json.dumps(
+        {
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": True,
+            "summary": "ok",
+            "findings": [],
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        monitor_provider=SlowMonitor(),
+        watchdog_config=WatchdogConfig(interval_seconds=0.01, stop_join_timeout_seconds=0.05),
+        execution_drivers=ExecutionDriversConfig(worker_driver="fast"),
+        driver_registry=DriverRegistry({"fast": FastDriver()}),
+    )
+    runner = Thread(target=lambda: stage.run_execution(run_id=run_id))
+    runner.start()
+    try:
+        assert finished.wait(3.0)
+        runner.join(1.5)
+        assert not runner.is_alive()
+        assert store.get_run(run_id)["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    finally:
+        release.set()
+        runner.join(5.0)
+
+
+def test_watchdog_pause_blocks_concurrent_sibling_acceptance_and_overlay(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["feature.py"],
+        checks=[_marker_command_check()],
+    )
+    t1 = plan.tasks[0]
+    t2 = t1.model_copy(
+        update={"task_id": "T2", "objective": "Second worker", "write_scope": ["other.py"]}
+    )
+    _approve_plan(store, run_id, plan.model_copy(update={"tasks": [t1, t2]}))
+    peer_running, t1_cancelled = Event(), Event()
+
+    class PeerHandle:
+        supports_steer = False
+
+        def __init__(self, flag: Event) -> None:
+            self._flag = flag
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            self._flag.set()
+
+    class ConcurrentDriver:
+        name = "concurrent"
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            handle = PeerHandle(t1_cancelled if request.task_id == "T1" else Event())
+            if on_handle is not None:
+                on_handle(handle)
+            if request.task_id == "T1":
+                assert peer_running.wait(3.0)
+                if on_event is not None:
+                    on_event(
+                        "agent.tool_finished",
+                        {
+                            "tool": "run_bash",
+                            "step": 1,
+                            "status": "error",
+                            "error_signature": "sha256:" + "a" * 64,
+                        },
+                    )
+                assert t1_cancelled.wait(3.0)
+                return TurnOutcome(
+                    completed=False,
+                    stop_reason="cancelled",
+                    final_content="",
+                    steps_taken=1,
+                    driver_name="concurrent",
+                )
+            peer_running.set()
+            deadline = time.monotonic() + 3.0
+            while (
+                store.get_run(run_id)["status"] != RunStatus.PAUSED
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert store.get_run(run_id)["status"] == RunStatus.PAUSED
+            (request.workspace_path / "other.py").write_text("late write\n", encoding="utf-8")
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="done",
+                steps_taken=1,
+                driver_name="concurrent",
+            )
+
+    verdict = json.dumps(
+        {"task_id": "T2", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=verdict)]),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Needs operator"})
+                )
+            ]
+        ),
+        watchdog_config=WatchdogConfig(repeat_error_threshold=1),
+        execution_drivers=ExecutionDriversConfig(worker_driver="concurrent"),
+        driver_registry=DriverRegistry({"concurrent": ConcurrentDriver()}),
+    )
+    out = stage.run_execution(run_id=run_id)
+    assert out["status"] == RunStatus.PAUSED
+    assert not [e for e in store.list_events(run_id) if e.event_type == "task.accepted"]
+    assert not (tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay" / "other.py").exists()

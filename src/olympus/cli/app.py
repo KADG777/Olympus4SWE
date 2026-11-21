@@ -11,6 +11,7 @@ import typer
 from olympus.core.contracts import RunMode, new_id
 from olympus.core.control import RunControl
 from olympus.core.store import NotFoundError, RunStore
+from olympus.harness.driver import ExecutionDriversConfig
 from olympus.providers.factory import build_provider
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage
@@ -280,12 +281,33 @@ def cmd_run(
     provider: ProviderOpt = "auto",
     model: ModelOpt = None,
     base_url: BaseUrlOpt = None,
+    worker_driver: Annotated[
+        str | None,
+        typer.Option(help="Stage 2 worker driver: native|pi (optionally driver@model)."),
+    ] = None,
+    reviewer_driver: Annotated[
+        str | None,
+        typer.Option(help="Stage 2 reviewer driver: native|pi (optionally driver@model)."),
+    ] = None,
+    monitor_model: Annotated[str | None, typer.Option(help="Monitor model.")] = None,
 ) -> None:
     """Stage 2: Execute approved TaskPlan with sandbox isolation and cold-start review."""
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
     llm = build_provider(provider=provider, model=model, base_url=base_url)
-    stage = OrchestrateStage(store=store, provider=llm, workspace_root=ws)
+    stage = OrchestrateStage(
+        store=store,
+        provider=llm,
+        workspace_root=ws,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            worker_driver=worker_driver,
+            reviewer_driver=reviewer_driver,
+            monitor_model=monitor_model,
+        ),
+        model_provider=lambda name: build_provider(
+            provider=provider, model=name, base_url=base_url
+        ),
+    )
     snap = stage.run_execution(run_id=run_id, apply_to_workspace=apply)
     typer.echo(
         json.dumps(

@@ -9,6 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import olympus.harness.activity as activity
 from olympus.core.contracts import RunStatus
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph import (
@@ -22,6 +23,13 @@ from olympus.graph import (
 )
 from olympus.graph.loader import WorkflowRuntime
 from olympus.graph.progress import resolve_resume_node
+from olympus.harness.driver import (
+    ActiveTurnHandle,
+    DriverRegistry,
+    ExecutionDriversConfig,
+    default_driver_factories,
+)
+from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
@@ -53,6 +61,9 @@ class RunSupervisor:
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
         provider_builder: ProviderBuilder | None = None,
+        driver_registry: DriverRegistry | None = None,
+        monitor_provider: LLMProvider | None = None,
+        watchdog_config: WatchdogConfig | None = None,
         max_workers: int = 4,
     ) -> None:
         self.store = store
@@ -63,6 +74,10 @@ class RunSupervisor:
             else self.workspace_root / ".olympus" / "runs"
         )
         self.provider_builder = provider_builder
+        self.monitor_provider = monitor_provider
+        self.watchdog_config = watchdog_config
+        self.driver_registry = driver_registry or DriverRegistry()
+        self.live_activity = activity.LiveActivity()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._future_by_run: dict[str, Future[dict[str, Any]]] = {}
         self._run_locks: dict[str, threading.Lock] = {}
@@ -72,6 +87,7 @@ class RunSupervisor:
         self._next_token: int = 0
         self._pending_resume: dict[str, int] = {}
         self._providers: dict[str, LLMProvider] = {}
+        self._active_turns: dict[str, list[ActiveTurnHandle]] = {}
         self.dotenv_loaded = self._load_dotenv()
 
     # ------------------------------------------------------------------ environment
@@ -159,8 +175,12 @@ class RunSupervisor:
 
     def _builder(self, config: dict[str, Any]) -> LLMProvider:
         requested = str(config.get("provider") or "").strip().lower()
-        if requested == "mock":
-            return MockLLMProvider()
+        if requested == "mock" and self.provider_builder is None:
+            return (
+                MockLLMProvider(model_name=str(config["model"]))
+                if config.get("model")
+                else MockLLMProvider()
+            )
         kwargs: dict[str, Any] = {
             key: value
             for key, value in config.items()
@@ -249,6 +269,18 @@ class RunSupervisor:
                 return candidate
         return self.workspace_root
 
+    def _register_turn(self, run_id: str, handle: ActiveTurnHandle) -> None:
+        with self._guard:
+            self._active_turns.setdefault(run_id, []).append(handle)
+        if self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            handle.cancel(reason="run_interrupted")
+
+    def cancel_active_turns(self, run_id: str, *, reason: str) -> None:
+        with self._guard:
+            handles = tuple(self._active_turns.get(run_id, ()))
+        for handle in handles:
+            handle.cancel(reason=reason)
+
     def _advance(
         self,
         run_id: str,
@@ -317,6 +349,13 @@ class RunSupervisor:
                 effective_start = resolved
 
             graph = build_graph(definition)
+            recorded_drivers = snap.get("execution_drivers")
+            driver_config = (
+                ExecutionDriversConfig.model_validate(recorded_drivers)
+                if recorded_drivers is not None
+                else ExecutionDriversConfig.resolve()
+            )
+            provider_config = snap.get("provider_config") or {"provider": "mock"}
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
@@ -324,6 +363,15 @@ class RunSupervisor:
                 provider=self.resolve_provider(run_id),
                 auto_approve=auto_approve,
                 topology=definition.topology,
+                execution_drivers=driver_config,
+                driver_registry=self.driver_registry.with_factories(
+                    default_driver_factories(store=self.store, run_id=run_id)
+                ),
+                model_provider=lambda model: self._builder({**provider_config, "model": model}),
+                monitor_provider=self.monitor_provider,
+                watchdog_config=self.watchdog_config,
+                on_driver_handle=lambda handle: self._register_turn(run_id, handle),
+                live_activity=self.live_activity,
             )
             state: dict[str, Any] = {
                 "run_id": run_id,
@@ -340,13 +388,17 @@ class RunSupervisor:
             if snap["plan"] is not None:
                 state["plan"] = snap["plan"].model_dump(mode="json")
 
-            result = run_graph(
-                graph,
-                state,
-                observer=self._observer(run_id),
-                max_steps=runtime.max_steps * 2,
-                start_from=effective_start,
-            )
+            try:
+                result = run_graph(
+                    graph,
+                    state,
+                    observer=self._observer(run_id),
+                    max_steps=runtime.max_steps * 2,
+                    start_from=effective_start,
+                )
+            finally:
+                with self._guard:
+                    self._active_turns.pop(run_id, None)
             paused_node = result.get("_paused_node")
             while True:
                 latest = self.store.get_run(run_id)
@@ -637,6 +689,9 @@ class RunSupervisor:
         raw_input: str,
         workflow_name: str = "product_blueprint",
         provider_config: dict[str, Any] | None = None,
+        worker_driver: str | None = None,
+        reviewer_driver: str | None = None,
+        monitor_model: str | None = None,
         auto_approve: bool = False,
         sync: bool = False,
         constraints: list[str] | None = None,
@@ -645,10 +700,16 @@ class RunSupervisor:
         """Create a run and drive its workflow until a human gate or completion."""
         definition = load_workflow(workflow_name)
         config = dict(provider_config) if provider_config else {"provider": "auto"}
+        driver_config = ExecutionDriversConfig.resolve(
+            worker_driver=worker_driver,
+            reviewer_driver=reviewer_driver,
+            monitor_model=monitor_model,
+        )
         run_id = self.store.create_run(
             title=title,
             workflow_name=definition.name,
             provider_config=config,
+            execution_drivers=driver_config.model_dump(mode="json"),
             workspace_root=workspace_root,
             actor="supervisor",
         )

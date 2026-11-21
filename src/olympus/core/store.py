@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS runs (
     design_json TEXT,
     workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch',
     provider_config_json TEXT,
+    execution_drivers_json TEXT,
     workspace_root TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -156,6 +157,7 @@ class RunStore:
             "design_json": "design_json TEXT",
             "workflow_name": "workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch'",
             "provider_config_json": "provider_config_json TEXT",
+            "execution_drivers_json": "execution_drivers_json TEXT",
             "workspace_root": "workspace_root TEXT",
         }
         for column, ddl in additions.items():
@@ -403,6 +405,7 @@ class RunStore:
         actor: str = "system",
         workflow_name: str = "product_blueprint",
         provider_config: dict[str, Any] | None = None,
+        execution_drivers: dict[str, Any] | None = None,
         workspace_root: Path | str | None = None,
     ) -> str:
         rid = run_id or new_id("run")
@@ -422,9 +425,9 @@ class RunStore:
                     run_id, title, mode, status, state_revision,
                     budget_policy_json, budget_ledger_json,
                     spec_json, plan_json, design_json,
-                    workflow_name, provider_config_json, workspace_root,
+                    workflow_name, provider_config_json, execution_drivers_json, workspace_root,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rid,
@@ -436,6 +439,7 @@ class RunStore:
                     ledger.model_dump_json(),
                     workflow_name,
                     provider_json,
+                    json.dumps(execution_drivers) if execution_drivers is not None else None,
                     ws_root,
                     now,
                     now,
@@ -542,6 +546,9 @@ class RunStore:
             "workflow_name": row["workflow_name"],
             "provider_config": (
                 json.loads(row["provider_config_json"]) if row["provider_config_json"] else None
+            ),
+            "execution_drivers": (
+                json.loads(row["execution_drivers_json"]) if row["execution_drivers_json"] else None
             ),
             "workspace_root": row["workspace_root"],
             "created_at": row["created_at"],
@@ -771,15 +778,73 @@ class RunStore:
         input_tokens: int = 0,
         output_tokens: int = 0,
         unknown: bool = False,
+        cancelled: bool = False,
     ) -> BudgetLedger:
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
             ledger = BudgetLedger.model_validate_json(row["budget_ledger_json"])
-            updated = ledger.settle(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                unknown=unknown,
+            if cancelled:
+                if ledger.llm_calls_reserved == 0:
+                    raise ValueError("Cannot release budget without an active reservation")
+                updated = ledger.model_copy(
+                    update={"llm_calls_reserved": ledger.llm_calls_reserved - 1}
+                )
+            else:
+                updated = ledger.settle(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    unknown=unknown,
+                )
+            new_rev = self._bump_run_field(
+                conn,
+                run_id=run_id,
+                column="budget_ledger_json",
+                value=updated.model_dump_json(),
+                cur_rev=int(row["state_revision"]),
             )
+            self._insert_event(
+                conn,
+                run_id=run_id,
+                stage="budget",
+                event_type="budget.released" if cancelled else "budget.settled",
+                actor=actor,
+                payload={
+                    "used": updated.llm_calls_used,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "unknown": unknown,
+                },
+                state_revision=new_rev,
+            )
+            return updated
+
+    def record_external_llm_usage(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+        purpose: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> bool:
+        """Record external-harness LLM usage monotonically; return True if budget was exceeded."""
+        with self._tx() as conn:
+            row = self._get_run_row(conn, run_id)
+            policy = BudgetPolicy.model_validate_json(row["budget_policy_json"])
+            ledger = BudgetLedger.model_validate_json(row["budget_ledger_json"])
+            over_budget = not ledger.can_reserve(policy)
+            updated = ledger.model_copy(
+                update={
+                    "llm_calls_used": ledger.llm_calls_used + 1,
+                    "input_tokens": ledger.input_tokens + max(0, input_tokens),
+                    "output_tokens": ledger.output_tokens + max(0, output_tokens),
+                }
+            )
+            if (
+                policy.max_total_tokens is not None
+                and updated.total_tokens > policy.max_total_tokens
+            ):
+                over_budget = True
             new_rev = self._bump_run_field(
                 conn,
                 run_id=run_id,
@@ -794,14 +859,15 @@ class RunStore:
                 event_type="budget.settled",
                 actor=actor,
                 payload={
+                    "purpose": purpose,
                     "used": updated.llm_calls_used,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
-                    "unknown": unknown,
+                    "over_budget": over_budget,
                 },
                 state_revision=new_rev,
             )
-            return updated
+            return over_budget
 
     def acquire_task_lease(self, run_id: str, task_id: str, *, actor: str = "chronos") -> TaskNode:
         """Atomically transition a task to RUNNING with an incremented lease_generation."""
@@ -862,10 +928,18 @@ class RunStore:
         mutator: Callable[[TaskNode], TaskNode],
         actor: str,
         event_type: str,
+        reject_if_run_inactive: bool = False,
     ) -> TaskNode:
         """Update task state only if the caller still holds the active lease_generation."""
         with self._tx() as conn:
             row = self._get_run_row(conn, run_id)
+            if reject_if_run_inactive and row["status"] in (
+                RunStatus.PAUSED.value,
+                RunStatus.CANCELLED.value,
+            ):
+                raise ConcurrencyConflictError(
+                    f"Run {run_id} is {row['status']}; refusing {event_type} for {task_id}"
+                )
             if not row["plan_json"]:
                 raise NotFoundError(f"Run {run_id} has no TaskPlan")
             plan = TaskPlan.model_validate_json(row["plan_json"])

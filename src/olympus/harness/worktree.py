@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from olympus.tools.aci import IGNORED_DIR_NAMES
 from olympus.tools.aci import build_sandbox_env as build_sandbox_env
 
 
@@ -16,6 +20,17 @@ class SandboxHandle:
     workspace_path: Path
     base_commit: str | None
     is_git_worktree: bool
+
+
+@dataclass(frozen=True)
+class SandboxBaseline:
+    """Fingerprints of the sandbox state handed to a worker before its turn."""
+
+    is_git: bool
+    entries: tuple[tuple[str, str | None], ...]
+
+    def mapping(self) -> dict[str, str | None]:
+        return dict(self.entries)
 
 
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -97,6 +112,148 @@ def capture_sandbox_diff(handle: SandboxHandle) -> str:
                 content = "<binary file>"
             parts.append(f"--- /dev/null\n+++ b/{rel}\n{content}")
     return "\n\n".join(parts) if parts else "(no changes)"
+
+
+def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
+    """Record recoverable binary and text changes from a paused attempt."""
+    patch = attempt_dir / "diff.patch"
+    if handle.base_commit is None:
+        patch.write_text("Non-git workspace preserved in sandbox/\n", encoding="utf-8")
+        shutil.move(handle.workspace_path, attempt_dir / "sandbox")
+        return
+
+    ws = handle.workspace_path
+    diff = ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv"]
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=ws, capture_output=True, check=True,
+    ).stdout
+    with patch.open("wb") as output:
+        subprocess.run([*diff, handle.base_commit, "--"], cwd=ws, stdout=output, check=True)
+        for raw_path in untracked.split(b"\0"):
+            if not raw_path:
+                continue
+            result = subprocess.run(
+                [*diff, "--no-index", "--", "/dev/null", os.fsdecode(raw_path)],
+                cwd=ws, stdout=output, check=False,
+            )
+            if result.returncode != 1:
+                result.check_returncode()
+
+
+def _is_ignored_rel(rel: str) -> bool:
+    return any(part in IGNORED_DIR_NAMES for part in PurePosixPath(rel).parts)
+
+
+def _file_fingerprint(path: Path) -> str | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            return f"link:{os.readlink(path)}"
+        except OSError:
+            return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return f"{info.st_mode & 0o777:o}:{digest.hexdigest()}"
+
+
+def _workspace_fingerprints(root: Path) -> dict[str, str | None]:
+    fingerprints: dict[str, str | None] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIR_NAMES)
+        for name in sorted(filenames):
+            candidate = Path(dirpath) / name
+            rel = candidate.relative_to(root).as_posix()
+            if _is_ignored_rel(rel):
+                continue
+            fingerprints[rel] = _file_fingerprint(candidate)
+    return fingerprints
+
+
+def _git_changed_fingerprints(ws: Path, base_commit: str) -> dict[str, str | None]:
+    proc = _run_git(ws, "diff", "--name-status", "-z", "-M", base_commit)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git diff against {base_commit} failed: {proc.stderr.strip()[:200]}"
+        )
+    entries: dict[str, str | None] = {}
+    tokens = proc.stdout.split("\0")
+    index = 0
+    while index < len(tokens):
+        status = tokens[index]
+        index += 1
+        if not status:
+            continue
+        if status[0] in ("R", "C"):
+            old_path, new_path = tokens[index], tokens[index + 1]
+            index += 2
+            if status[0] == "R" and old_path:
+                # The rename deletes the old path; the deletion is itself a mutation.
+                entries[old_path] = _file_fingerprint(ws / old_path)
+            if new_path:
+                entries[new_path] = _file_fingerprint(ws / new_path)
+            continue
+        rel = tokens[index]
+        index += 1
+        if rel:
+            entries[rel] = _file_fingerprint(ws / rel)
+
+    untracked = _run_git(ws, "ls-files", "--others", "--exclude-standard", "-z")
+    if untracked.returncode != 0:
+        raise RuntimeError(
+            f"git ls-files failed: {untracked.stderr.strip()[:200]}"
+        )
+    for rel in untracked.stdout.split("\0"):
+        if rel and not _is_ignored_rel(rel):
+            entries[rel] = _file_fingerprint(ws / rel)
+    return entries
+
+
+def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
+    """Capture the sandbox state before a worker runs so later mutations are attributable."""
+    ws = handle.workspace_path
+    if handle.is_git_worktree and handle.base_commit is not None and is_git_repo(ws):
+        try:
+            entries = _git_changed_fingerprints(ws, handle.base_commit)
+        except RuntimeError:
+            entries = _workspace_fingerprints(ws)
+            return SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
+        return SandboxBaseline(is_git=True, entries=tuple(sorted(entries.items())))
+    return SandboxBaseline(
+        is_git=False, entries=tuple(sorted(_workspace_fingerprints(ws).items()))
+    )
+
+
+def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
+    """Return repo-relative paths mutated since ``baseline`` (adds, edits, deletes, renames)."""
+    ws = handle.workspace_path
+    if baseline.is_git and handle.base_commit is not None and is_git_repo(ws):
+        try:
+            current = _git_changed_fingerprints(ws, handle.base_commit)
+        except RuntimeError:
+            # A tampered sandbox (e.g. deleted .git) fails closed: every file looks changed.
+            current = _workspace_fingerprints(ws)
+    else:
+        current = _workspace_fingerprints(ws)
+
+    before = baseline.mapping()
+    changed = {
+        rel
+        for rel, fingerprint in current.items()
+        if rel not in before or before[rel] != fingerprint
+    }
+    changed.update(rel for rel in before if rel not in current)
+    return sorted(changed)
 
 
 def remove_sandbox(handle: SandboxHandle) -> None:

@@ -850,6 +850,20 @@ def test_task_dag_island_preserves_viewport_on_live_updates(workbench, browser):
     assert panned != before
     card = host.locator("[data-task-id='T05']").element_handle()
 
+    task = next(task for task in store.get_run(run_id)["plan"].tasks if task.task_id == "T05")
+    store.append_event(
+        run_id=run_id, stage="orchestrate", event_type="agent.tool_started", actor="hephaestus:T05",
+        payload={
+            "task_id": "T05", "attempt": task.attempt, "actor": "hephaestus:T05",
+            "driver": "native", "step": 2, "tool": "read_file", "target_hint": "workspace file",
+        },
+    )
+    playwright.expect(host.locator("[data-task-id='T05']")).to_contain_text("native · read_file")
+    assert viewport.evaluate("node => getComputedStyle(node).transform") == panned
+    host.locator("[data-task-id='T05']").click()
+    playwright.expect(page.locator("#dock")).to_contain_text("当前工具")
+    playwright.expect(page.locator("#dock")).to_contain_text("read_file")
+
     plan = store.get_run(run_id)["plan"]
     store.save_plan(run_id, plan.model_copy(update={"version": 2}))
     playwright.expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2")
@@ -1561,4 +1575,32 @@ def test_task_dag_handles_arrow_ids_and_high_fanin_port_spacing(workbench, brows
     assert fanin["count"] == 12
     assert fanin["minGap"] >= fanin["arrowH"], fanin
     page.evaluate("() => window.faninHandle.destroy()")
+    page.close()
+
+
+def test_watchdog_diagnosis_surfaces_live_and_after_refresh(workbench, browser):
+    store, run_id, url = workbench
+    task = store.get_run(run_id)["plan"].tasks[0]
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}")
+    target = page.locator(f"#dag-graph [data-task-id='{task.task_id}']")
+    target.click()
+    store.append_event(
+        run_id=run_id, stage="orchestrate", event_type="watchdog.checked", actor="watchdog",
+        payload={"task_id": task.task_id, "attempt": task.attempt,
+                 "verdict": "STUCK_LOOP", "summary": "Repeated file errors."},
+    )
+    dock = page.locator("#dock")
+    playwright.expect(dock.get_by_text("疑似循环", exact=True)).to_be_visible()
+    playwright.expect(dock.get_by_text("Repeated file errors.", exact=True)).to_be_visible()
+
+    store.append_event(
+        run_id=run_id, stage="orchestrate", event_type="watchdog.paused", actor="watchdog",
+        payload={"task_id": task.task_id, "attempt": task.attempt,
+                 "verdict": "BLOCKED_EXTERNAL", "summary": "Credentials are missing."},
+    )
+    page.reload()
+    target.click()
+    playwright.expect(dock.get_by_text("外部阻塞", exact=True)).to_be_visible()
+    playwright.expect(dock.get_by_text("Credentials are missing.", exact=True)).to_be_visible()
     page.close()

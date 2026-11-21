@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from threading import Event, Lock
+from typing import TYPE_CHECKING, Any
+
+from pydantic import ValidationError
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -34,18 +37,37 @@ from olympus.core.dag import (
     validate_plan,
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.harness.activity import LiveActivity, milestone_fields
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
-from olympus.harness.loop import AgentLoop, BudgetExhaustedError
+from olympus.harness.diff_gate import run_diff_gate
+from olympus.harness.driver import (
+    ActiveTurnHandle,
+    AgentDriver,
+    DriverEvent,
+    DriverRegistry,
+    DriverTurnRequest,
+    ExecutionDriversConfig,
+    default_driver_factories,
+)
+from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
+from olympus.harness.native import NativeDriver
+from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
+    archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
     create_sandbox,
     remove_sandbox,
+    snapshot_sandbox_state,
 )
 from olympus.providers.base import LLMProvider
+from olympus.providers.factory import build_provider
 from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
+
+if TYPE_CHECKING:
+    from olympus.harness.driver import TurnOutcome
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
@@ -334,6 +356,14 @@ Modular product decomposition (topology={topology}):
 """
 
 
+class _ReviewOutputError(ValueError):
+    pass
+
+
+class _ReviewCancelled(Exception):
+    pass
+
+
 class OrchestrateStage:
     """Deterministic Chronos scheduler driving isolated Hephaestus execution & cold-start review."""
 
@@ -344,14 +374,45 @@ class OrchestrateStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
+        execution_drivers: ExecutionDriversConfig | None = None,
+        driver_registry: DriverRegistry | None = None,
+        model_provider: Callable[[str], LLMProvider] | None = None,
+        monitor_provider: LLMProvider | None = None,
+        watchdog_config: WatchdogConfig | None = None,
+        on_driver_event: DriverEvent | None = None,
+        on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None,
+        live_activity: LiveActivity | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
+        self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
+        self.driver_registry = driver_registry or DriverRegistry()
+        self.model_provider = model_provider
+        self.monitor_provider = monitor_provider
+        self.watchdog_config = watchdog_config
+        self.on_driver_event = on_driver_event
+        self.on_driver_handle = on_driver_handle
+        self.live_activity = live_activity
         self.workspace_root = Path(workspace_root).resolve()
         self.artifacts_root = (
             artifacts_root
             if artifacts_root is not None
             else self.workspace_root / ".olympus" / "runs"
+        )
+
+    def _native_driver(
+        self, run_id: str, model: str | None, *, review: bool = False
+    ) -> NativeDriver:
+        provider = self.provider
+        if model is not None and model != provider.model_name:
+            if self.model_provider is None:
+                raise ValueError("A native model override requires a provider factory")
+            provider = self.model_provider(model)
+        return NativeDriver(
+            provider=provider,
+            store=self.store,
+            run_id=run_id,
+            response_model=ReviewVerdict if review else None,
         )
 
     def _run_dir(self, run_id: str) -> Path:
@@ -614,20 +675,9 @@ class OrchestrateStage:
         diff_text: str,
         check_summary: str,
         art_dir: Path,
+        reviewer: tuple[AgentDriver, str | None],
         design: DesignSpec | None = None,
     ) -> ReviewVerdict:
-        ro_toolkit = WorkspaceToolkit(sandbox.workspace_path, read_only=True)
-        review_loop = AgentLoop(
-            provider=self.provider,
-            toolkit=ro_toolkit,
-            store=self.store,
-            run_id=run_id,
-            actor=f"argus:{task.task_id}",
-            max_steps=8,
-            trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
-            lease_generation=task.lease_generation,
-            task_id=task.task_id,
-        )
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
         incremental = task.review_cycle > 0
@@ -660,17 +710,58 @@ class OrchestrateStage:
             f"incremental_only={str(incremental).lower()}.\n"
             f"Return ReviewVerdict JSON matching schema:\n{schema_json}"
         )
-        verdict = review_loop.run_structured(
+        driver, model = reviewer
+        request = DriverTurnRequest(
+            workspace_path=sandbox.workspace_path,
+            env_root=sandbox.workspace_path,
             system_prompt=_REVIEWER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            model_cls=ReviewVerdict,
-            transform=lambda candidate: candidate.model_copy(
-                update={
-                    "task_id": task.task_id,
-                    "attempt": task.attempt,
-                    "incremental_only": incremental,
-                }
-            ),
+            actor=f"argus:{task.task_id}",
+            task_id=task.task_id,
+            lease_generation=task.lease_generation,
+            read_only=True,
+            max_steps=8,
+            trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
+            model=model,
+        )
+        for attempt in range(2):
+            outcome = driver.run_turn(
+                request, on_event=self.on_driver_event, on_handle=self.on_driver_handle
+            )
+            if outcome.stop_reason == "cancelled":
+                raise _ReviewCancelled
+            if outcome.stop_reason.startswith("budget_exhausted"):
+                raise BudgetExhaustedError(outcome.stop_reason)
+            if not outcome.completed:
+                raise _ReviewOutputError(f"Reviewer stopped early: {outcome.stop_reason}")
+            try:
+                verdict = parse_model_json(outcome.final_content, ReviewVerdict)
+            except (json.JSONDecodeError, ValidationError) as exc:
+                if attempt == 1:
+                    raise _ReviewOutputError(
+                        "Reviewer returned invalid ReviewVerdict JSON"
+                    ) from exc
+                request = request.model_copy(
+                    update={
+                        "user_prompt": (
+                            f"{user_prompt}\n\n[PREVIOUS OUTPUT FAILED VALIDATION]\n"
+                            "Your previous response did not match ReviewVerdict. "
+                            "Return only the corrected JSON object matching the schema above.\n"
+                            f"Previous response:\n{outcome.final_content}"
+                        ),
+                        "trace_path": art_dir
+                        / f"review-cycle-{task.review_cycle + 1}-repair.jsonl",
+                    }
+                )
+            else:
+                break
+
+        verdict = verdict.model_copy(
+            update={
+                "task_id": task.task_id,
+                "attempt": task.attempt,
+                "incremental_only": incremental,
+            }
         )
         (art_dir / f"verdict-cycle-{task.review_cycle + 1}.json").write_text(
             verdict.model_dump_json(indent=2), encoding="utf-8"
@@ -694,6 +785,67 @@ class OrchestrateStage:
         )
         return verdict
 
+    def _run_worker_turn(
+        self,
+        run_id: str,
+        task: TaskNode,
+        driver: AgentDriver,
+        request: DriverTurnRequest,
+        watchdog: Watchdog | None,
+        *,
+        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
+        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
+    ) -> TurnOutcome:
+        activity = self.live_activity
+        active_handle: list[ActiveTurnHandle] = []
+
+        def observe(kind: str, payload: dict[str, Any]) -> None:
+            fields = milestone_fields(kind, payload)
+            if fields is not None:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="orchestrate",
+                    event_type=kind,
+                    actor=request.actor,
+                    payload={
+                        "task_id": task.task_id,
+                        "attempt": task.attempt,
+                        "actor": request.actor,
+                        **({"driver": driver.name} if kind != "agent.steered" else {}),
+                        **fields,
+                    },
+                )
+                if watchdog is not None:
+                    watchdog.observe(kind, fields)
+            if kind == "text_delta" and activity is not None:
+                text = payload.get("text")
+                if isinstance(text, str) and text:
+                    activity.update(
+                        run_id, task.task_id, task.attempt, text,
+                        replace=payload.get("replace") is True,
+                    )
+            if self.on_driver_event is not None:
+                self.on_driver_event(kind, payload)
+
+        def register_handle(handle: ActiveTurnHandle) -> None:
+            active_handle.append(handle)
+            if on_handle_registered is not None:
+                on_handle_registered(handle)
+            if watchdog is not None:
+                watchdog.start(handle)
+            if self.on_driver_handle is not None:
+                self.on_driver_handle(handle)
+
+        try:
+            return driver.run_turn(request, on_event=observe, on_handle=register_handle)
+        finally:
+            if watchdog is not None:
+                watchdog.stop()
+            if on_handle_finished is not None and active_handle:
+                on_handle_finished(active_handle[-1])
+            if activity is not None:
+                activity.clear(run_id, task.task_id, task.attempt)
+
     def _execute_single_task(
         self,
         *,
@@ -703,8 +855,15 @@ class OrchestrateStage:
         mode: RunMode,
         apply_to_workspace: bool,
         worker_max_steps: int,
+        worker: tuple[AgentDriver, str | None],
+        monitor_factory: Callable[[], LLMProvider] | None,
+        reviewer: tuple[AgentDriver, str | None],
+        interrupted: Event,
         design: DesignSpec | None = None,
         handoff_context: str = "",
+        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
+        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
+        on_run_paused: Callable[[], None] | None = None,
     ) -> TaskNode:
         leased = self.store.acquire_task_lease(run_id, task_id, actor="chronos")
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
@@ -716,31 +875,13 @@ class OrchestrateStage:
         )
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
+        archive_failed = False
         try:
+            worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
                 else ()
-            )
-            toolkit = WorkspaceToolkit(
-                sandbox.workspace_path,
-                allowed_write_scope=leased.write_scope,
-                forbidden_write_scope=forbidden_contracts,
-                read_only=False,
-                env_root=self.workspace_root,
-            )
-            worker_loop = AgentLoop(
-                provider=self.provider,
-                toolkit=toolkit,
-                store=self.store,
-                run_id=run_id,
-                actor=f"hephaestus:{leased.task_id}",
-                max_steps=worker_max_steps,
-                trace_path=art_dir / "worker.jsonl",
-                synthesize_on_max_steps=True,
-                task_id=leased.task_id,
-                lease_generation=leased.lease_generation,
-                pre_tool_hook=toolkit.as_pre_tool_hook(),
             )
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"
@@ -771,10 +912,84 @@ class OrchestrateStage:
                 f"Acceptance checks: {checks_json}"
                 f"{rework_ctx}"
             )
-            loop_res = worker_loop.run(
+            driver, model = worker
+            request = DriverTurnRequest(
+                workspace_path=sandbox.workspace_path,
+                env_root=self.workspace_root,
                 system_prompt=_WORKER_SYSTEM_PROMPT,
                 user_prompt=worker_prompt,
+                actor=f"hephaestus:{leased.task_id}",
+                task_id=leased.task_id,
+                lease_generation=leased.lease_generation,
+                write_scope=leased.write_scope,
+                forbidden_globs=list(forbidden_contracts),
+                max_steps=worker_max_steps,
+                trace_path=art_dir / "worker.jsonl",
+                model=model,
             )
+            watchdog = None
+            if monitor_factory is not None:
+                def emit_watchdog(kind: str, payload: dict[str, Any]) -> None:
+                    self.store.append_event(
+                        run_id=run_id,
+                        stage="orchestrate",
+                        event_type=kind,
+                        actor="watchdog",
+                        payload={"task_id": leased.task_id, "attempt": leased.attempt, **payload},
+                    )
+                    if self.on_driver_event is not None:
+                        self.on_driver_event(kind, payload)
+
+                watchdog = Watchdog(
+                    config=self.watchdog_config or WatchdogConfig(),
+                    provider_factory=monitor_factory,
+                    sandbox=sandbox,
+                    objective=leased.objective,
+                    write_scope=leased.write_scope,
+                    emit=emit_watchdog,
+                )
+            worker_error = None
+            try:
+                loop_res = self._run_worker_turn(
+                    run_id,
+                    leased,
+                    driver,
+                    request,
+                    watchdog,
+                    on_handle_registered=on_handle_registered,
+                    on_handle_finished=on_handle_finished,
+                )
+            except Exception as exc:
+                if watchdog is None or watchdog.pause_diagnosis is None:
+                    raise
+                worker_error = type(exc).__name__
+
+            if watchdog is not None and watchdog.pause_diagnosis is not None:
+                archive_failed = True
+                diagnosis = dict(watchdog.pause_diagnosis)
+                if worker_error is not None:
+                    diagnosis["worker_error"] = worker_error
+                try:
+                    (art_dir / "watchdog.json").write_text(
+                        json.dumps(diagnosis, ensure_ascii=False), encoding="utf-8",
+                    )
+                    (art_dir / "worker.jsonl").touch(exist_ok=True)
+                    archive_sandbox_recovery(sandbox, art_dir)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    diagnosis["archive_error"] = type(exc).__name__
+                else:
+                    archive_failed = False
+                paused_task = RunControl(self.store).pause_for_watchdog(
+                    run_id, task=leased, diagnosis=diagnosis,
+                    retained_sandbox=str(sandbox.workspace_path) if archive_failed else None,
+                )
+                if on_run_paused is not None:
+                    on_run_paused()
+                return paused_task
+
+            if self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                interrupted.set()
+                return self._return_interrupted_task(run_id, leased)
 
             # Transition lease to VERIFYING before running checks/review
             verifying = self.store.update_task_with_lease(
@@ -795,6 +1010,71 @@ class OrchestrateStage:
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
 
+            if not loop_res.completed and (
+                loop_res.stop_reason == "cancelled"
+                or loop_res.stop_reason.startswith("budget_exhausted")
+            ):
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=verifying.acceptance_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
+                if loop_res.stop_reason == "cancelled":
+                    interrupted.set()
+                    return self._return_interrupted_task(run_id, verifying)
+                return self._pause_for_budget(
+                    run_id=run_id,
+                    task=verifying,
+                    reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                )
+
+            gate = run_diff_gate(
+                sandbox,
+                worker_baseline,
+                allowed_write_scope=verifying.write_scope,
+                forbidden_globs=forbidden_contracts,
+            )
+            if gate.rejected:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type="task.diff_gate_rejected",
+                    actor="chronos",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "violating_paths": [v.path for v in gate.violations],
+                        "violations": [
+                            {
+                                "path": v.path,
+                                "reason": v.reason,
+                                "matched_pattern": v.matched_pattern,
+                            }
+                            for v in gate.violations
+                        ],
+                        "allowed_write_scope": list(gate.allowed_write_scope),
+                        "forbidden_globs": list(gate.forbidden_globs),
+                        "changed_paths": list(gate.changed_paths),
+                    },
+                )
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=verifying.acceptance_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
+                return self._fail_or_requeue(
+                    run_id=run_id,
+                    task=verifying,
+                    reason=gate.rejection_message(),
+                    checks=verifying.acceptance_checks,
+                )
+
             if not loop_res.completed:
                 _write_manifest_md(
                     art_dir=art_dir,
@@ -804,12 +1084,6 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                if loop_res.stop_reason.startswith("budget_exhausted"):
-                    return self._pause_for_budget(
-                        run_id=run_id,
-                        task=verifying,
-                        reason=f"Paused due to budget limit: {loop_res.stop_reason}",
-                    )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -852,6 +1126,7 @@ class OrchestrateStage:
                     diff_text=diff_text,
                     check_summary=check_summary,
                     art_dir=art_dir,
+                    reviewer=reviewer,
                     design=design,
                 )
             except BudgetExhaustedError as exc:
@@ -859,6 +1134,21 @@ class OrchestrateStage:
                     run_id=run_id,
                     task=verifying,
                     reason=f"Paused due to budget limit: {exc}",
+                )
+            except (_ReviewCancelled, _ReviewOutputError) as exc:
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=updated_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
+                if isinstance(exc, _ReviewCancelled):
+                    interrupted.set()
+                    return self._return_interrupted_task(run_id, verifying)
+                return self._fail_or_requeue(
+                    run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
                 )
             if not verdict.passed:
                 important_lines = [
@@ -882,14 +1172,6 @@ class OrchestrateStage:
                     checks=updated_checks,
                 )
 
-            # Always snapshot accepted outputs to run overlay for downstream DAG tasks
-            _copy_matching_scope(sandbox.workspace_path, overlay_dir, verifying.write_scope)
-            # Sync files to host workspace only in EXECUTION mode when explicitly requested
-            if mode == RunMode.EXECUTION and apply_to_workspace:
-                _copy_matching_scope(
-                    sandbox.workspace_path, self.workspace_root, verifying.write_scope
-                )
-
             verdict_path = str(art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json")
             final_checks = [
                 c.model_copy(update={"passed": True, "evidence_ref": verdict_path})
@@ -897,21 +1179,37 @@ class OrchestrateStage:
                 else c
                 for c in updated_checks
             ]
-            accepted = self.store.update_task_with_lease(
-                run_id,
-                verifying.task_id,
-                expected_lease_generation=verifying.lease_generation,
-                mutator=lambda t: t.model_copy(
-                    update={
-                        "status": TaskStatus.ACCEPTED,
-                        "acceptance_checks": final_checks,
-                        "last_error": None,
-                        "worktree_path": None,
-                    }
-                ),
-                actor="chronos",
-                event_type="task.accepted",
-            )
+            try:
+                accepted = self.store.update_task_with_lease(
+                    run_id,
+                    verifying.task_id,
+                    expected_lease_generation=verifying.lease_generation,
+                    mutator=lambda t: t.model_copy(
+                        update={
+                            "status": TaskStatus.ACCEPTED,
+                            "acceptance_checks": final_checks,
+                            "last_error": None,
+                            "worktree_path": None,
+                        }
+                    ),
+                    actor="chronos",
+                    event_type="task.accepted",
+                    reject_if_run_inactive=True,
+                )
+            except ConcurrencyConflictError:
+                if self.store.get_run(run_id)["status"] in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                ):
+                    interrupted.set()
+                    return self._return_interrupted_task(run_id, verifying)
+                raise
+
+            _copy_matching_scope(sandbox.workspace_path, overlay_dir, verifying.write_scope)
+            if mode == RunMode.EXECUTION and apply_to_workspace:
+                _copy_matching_scope(
+                    sandbox.workspace_path, self.workspace_root, verifying.write_scope
+                )
             _write_manifest_md(
                 art_dir=art_dir,
                 task=accepted,
@@ -922,7 +1220,8 @@ class OrchestrateStage:
             )
             return accepted
         finally:
-            remove_sandbox(sandbox)
+            if not archive_failed:
+                remove_sandbox(sandbox)
 
     def _fail_or_requeue(
         self,
@@ -953,6 +1252,21 @@ class OrchestrateStage:
             event_type=event_type,
         )
 
+    def _return_interrupted_task(self, run_id: str, task: TaskNode) -> TaskNode:
+        return self.store.update_task_with_lease(
+            run_id,
+            task.task_id,
+            expected_lease_generation=task.lease_generation,
+            mutator=lambda t: t.model_copy(
+                update={
+                    "status": TaskStatus.READY,
+                    "worktree_path": None,
+                }
+            ),
+            actor="chronos",
+            event_type="task.turn_cancelled",
+        )
+
     def _pause_for_budget(self, *, run_id: str, task: TaskNode, reason: str) -> TaskNode:
         """Return a task to READY without burning a review cycle when budget is exhausted.
 
@@ -976,6 +1290,20 @@ class OrchestrateStage:
             event_type="task.budget_paused",
         )
 
+    def _monitor_factory(self) -> Callable[[], LLMProvider] | None:
+        if self.monitor_provider is not None:
+            provider = self.monitor_provider
+            return lambda: provider
+        model = self.execution_drivers.monitor_model
+        if model is None:
+            return None
+        if self.model_provider is not None:
+            factory = self.model_provider
+            return lambda: factory(model)
+        return lambda: build_provider(
+            model=model, project_providers_path=self.workspace_root / ".olympus" / "providers.json"
+        )
+
     def run_execution(
         self,
         *,
@@ -986,6 +1314,19 @@ class OrchestrateStage:
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
+        registry = self.driver_registry.with_factories(
+            default_driver_factories(store=self.store, run_id=run_id)
+        )
+        worker = registry.resolve(
+            self.execution_drivers.worker_driver,
+            native_factory=lambda model: self._native_driver(run_id, model),
+        )
+        reviewer = registry.resolve(
+            self.execution_drivers.reviewer_driver,
+            native_factory=lambda model: self._native_driver(run_id, model, review=True),
+        )
+        monitor_factory = self._monitor_factory()
+        interrupted = Event()
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
@@ -1019,16 +1360,49 @@ class OrchestrateStage:
                     expected_revision=int(snap["state_revision"]),
                     actor="chronos",
                     stage="orchestrate",
-                    detail={"serial_execution": effective_serial},
+                    detail={
+                        "serial_execution": effective_serial,
+                        "execution_drivers": self.execution_drivers.model_dump(mode="json"),
+                    },
                 )
                 break
             except ConcurrencyConflictError:
                 continue
 
+        wave_lock = Lock()
+        wave_handles: set[ActiveTurnHandle] = set()
+
+        def register_wave_handle(handle: ActiveTurnHandle) -> None:
+            with wave_lock:
+                wave_handles.add(handle)
+
+        def unregister_wave_handle(handle: ActiveTurnHandle) -> None:
+            with wave_lock:
+                wave_handles.discard(handle)
+
+        def cancel_wave_peers() -> None:
+            with wave_lock:
+                peers = list(wave_handles)
+            for peer in peers:
+                peer.cancel(reason="run_paused")
+
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 return snap
+            if interrupted.is_set():
+                try:
+                    self.store.set_run_status(
+                        run_id,
+                        RunStatus.AWAITING_HUMAN,
+                        expected_revision=int(snap["state_revision"]),
+                        actor="chronos",
+                        stage="orchestrate",
+                        detail={"reason": "turn_cancelled"},
+                    )
+                except ConcurrencyConflictError:
+                    continue
+                return self.store.get_run(run_id)
             design = snap.get("design")
             plan = snap["plan"]
             assert plan is not None
@@ -1133,6 +1507,10 @@ class OrchestrateStage:
                     mode=snap["mode"],
                     apply_to_workspace=apply_to_workspace,
                     worker_max_steps=worker_max_steps,
+                    worker=worker,
+                    monitor_factory=monitor_factory,
+                    reviewer=reviewer,
+                    interrupted=interrupted,
                     design=design,
                     handoff_context=handoff,
                 )
@@ -1147,7 +1525,14 @@ class OrchestrateStage:
                             mode=snap["mode"],
                             apply_to_workspace=apply_to_workspace,
                             worker_max_steps=worker_max_steps,
+                            worker=worker,
+                            monitor_factory=monitor_factory,
+                            reviewer=reviewer,
+                            interrupted=interrupted,
                             design=design,
+                            on_handle_registered=register_wave_handle,
+                            on_handle_finished=unregister_wave_handle,
+                            on_run_paused=cancel_wave_peers,
                         )
                         for t in ready
                     ]
