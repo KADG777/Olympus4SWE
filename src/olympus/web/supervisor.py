@@ -264,11 +264,7 @@ class RunSupervisor:
             definition = load_workflow(snap["workflow_name"])
             effective_start = start_from
             if recompute_entry:
-                if snap["status"] in (
-                    RunStatus.PAUSED,
-                    RunStatus.CANCELLED,
-                    RunStatus.COMPLETED,
-                ):
+                if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                     return {
                         "run_id": run_id,
                         "workflow": definition.name,
@@ -279,6 +275,21 @@ class RunSupervisor:
                         "paused": None,
                     }
                 resolved = self.resume_node(definition, snap)
+                if snap["status"] == RunStatus.COMPLETED and resolved in (
+                    None,
+                    "execute",
+                    "gate_plan",
+                ):
+                    return {
+                        "run_id": run_id,
+                        "workflow": definition.name,
+                        "topology": definition.topology,
+                        "stop_after": definition.stop_after,
+                        "status": snap["status"].value,
+                        "state_revision": snap["state_revision"],
+                        "paused": None,
+                        "complete": True,
+                    }
                 if resolved is None:
                     with suppress(ConcurrencyConflictError):
                         self.store.set_run_status(
@@ -452,10 +463,15 @@ class RunSupervisor:
                 and paused_node == entry
                 and int(snap["state_revision"]) <= int(result["state_revision"])
             )
+            still_completed = snap["status"] == RunStatus.COMPLETED and entry in (
+                None,
+                "execute",
+                "gate_plan",
+            )
             if (
                 entry is None
-                or snap["status"]
-                in (RunStatus.PAUSED, RunStatus.CANCELLED, RunStatus.COMPLETED)
+                or snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+                or still_completed
                 or not has_new_state
                 or already_at_same_gate
             ):
@@ -587,17 +603,27 @@ class RunSupervisor:
                 actor="supervisor",
                 payload={"error": str(exc)},
             )
-            self.store.set_run_status(
-                run_id,
-                RunStatus.FAILED,
-                actor="supervisor",
-                stage="graph",
-                detail={"error": str(exc)},
-            )
+            while True:
+                latest = self.store.get_run(run_id)
+                if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                    break
+                try:
+                    self.store.set_run_status(
+                        run_id,
+                        RunStatus.FAILED,
+                        expected_revision=int(latest["state_revision"]),
+                        actor="supervisor",
+                        stage="graph",
+                        detail={"error": str(exc)},
+                    )
+                    break
+                except ConcurrencyConflictError:
+                    continue
+            final = self.store.get_run(run_id)
             self._release_token(run_id, token, clear_pending=True)
             return {
                 "run_id": run_id,
-                "status": RunStatus.FAILED.value,
+                "status": final["status"].value,
                 "error": str(exc),
                 "paused": None,
             }

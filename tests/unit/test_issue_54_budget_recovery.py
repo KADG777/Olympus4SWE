@@ -991,6 +991,74 @@ def test_retry_task_command_meta_cannot_overwrite_core_payload_fields(tmp_path: 
     assert events[-1].payload["sync"] is True
 
 
+@pytest.mark.parametrize("human_status", [RunStatus.PAUSED, RunStatus.CANCELLED])
+def test_advance_guarded_exception_preserves_paused_and_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, human_status: RunStatus
+) -> None:
+    """Async failure in _advance_guarded must never overwrite human PAUSED or CANCELLED."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.READY)
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(),
+    )
+
+    def failing_advance(
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
+    ) -> dict[str, Any]:
+        del raw_input, start_from, auto_approve, recompute_entry
+        store.set_run_status(rid, human_status, actor="zeus", stage="control")
+        raise RuntimeError("upstream error: budget_exhausted on remote tenant")
+
+    monkeypatch.setattr(supervisor, "_advance", failing_advance)
+    try:
+        supervisor.resume_run(run_id, sync=False)
+        res = supervisor.wait(run_id, timeout=5)
+        assert res is not None
+        assert res["status"] == human_status.value
+        assert store.get_run(run_id)["status"] == human_status
+    finally:
+        supervisor.shutdown()
+
+
+def test_completed_run_reopened_by_clarify_routes_to_gate_spec(tmp_path: Path) -> None:
+    """Clarifying a COMPLETED run produces unapproved GoalSpec v2 and must reopen to gate_spec."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.ACCEPTED)
+    store.set_run_status(run_id, RunStatus.COMPLETED, actor="supervisor", stage="graph")
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(),
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    try:
+        cur = store.get_run(run_id)
+        out = app.execute_command(
+            run_id,
+            {
+                "action": "clarify",
+                "answers": {},
+                "expected_state_revision": cur["state_revision"],
+                "auto_advance": True,
+                "sync": True,
+            },
+        )
+        wf = out["command_result"]["workflow"]
+        assert wf["status"] == RunStatus.AWAITING_HUMAN.value
+        assert wf["paused"] is not None
+        assert wf["paused"]["node"] == "gate_spec"
+        assert store.get_run(run_id)["status"] == RunStatus.AWAITING_HUMAN
+    finally:
+        supervisor.shutdown()
+
+
 # --------------------------------------------------------------------------- 5. app.js static
 
 
