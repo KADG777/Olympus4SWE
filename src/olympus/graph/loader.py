@@ -92,7 +92,7 @@ class WorkflowRuntime:
     approver: str = "zeus"
     enable_critique: bool = False
     max_steps: int = 10
-    worker_max_steps: int = 20
+    worker_max_steps: int = 60
     apply_to_workspace: bool = False
     topology: str = "modular_product"
     extra: dict[str, Any] = field(default_factory=dict)

@@ -2331,3 +2331,14 @@ def test_argus_prompt_enforces_hard_write_scope_boundary(tmp_path: Path) -> None
     )
     assert expected_scope_line in user_prompt
 
+
+def test_default_worker_max_steps_supports_multi_file_tasks() -> None:
+    import inspect
+
+    from olympus.graph.loader import WorkflowRuntime
+
+    sig = inspect.signature(OrchestrateStage.run_execution)
+    assert sig.parameters["worker_max_steps"].default == 60
+    assert WorkflowRuntime.worker_max_steps == 60
+
+
