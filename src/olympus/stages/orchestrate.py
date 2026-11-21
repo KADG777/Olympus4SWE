@@ -1314,7 +1314,7 @@ class OrchestrateStage:
         *,
         run_id: str,
         apply_to_workspace: bool = False,
-        worker_max_steps: int = 20,
+        worker_max_steps: int = 60,
         serial_execution: bool = False,
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
