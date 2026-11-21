@@ -9,10 +9,13 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import SimpleQueue
 from threading import Event, Thread
+from threading import enumerate as enumerate_threads
 from typing import Any
 
 import httpx
+import pytest
 
 from olympus.core.contracts import (
     ApprovalDecision,
@@ -30,7 +33,13 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
-from olympus.harness.driver import ActiveTurnHandle
+from olympus.harness.driver import (
+    ActiveTurnHandle,
+    DriverRegistry,
+    ExecutionDriversConfig,
+    TurnOutcome,
+)
+from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -1576,3 +1585,335 @@ def test_cli_run_combines_flags_and_env_for_role_models(tmp_path: Path, monkeypa
         if event.event_type == "run.status_changed" and "execution_drivers" in event.payload
     )
     assert config_event.payload["execution_drivers"]["monitor_model"] == "monitor-flag"
+
+
+def test_watchdog_repeated_native_errors_steer_and_reach_ariadne(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(
+        store, run_id, _single_task_plan(
+            spec=spec, write_scope=["feature.py"], checks=[{
+                "id": "CHK-REV", "kind": "independent_review", "description": "Audit",
+            }],
+        )
+    )
+    monitor_checked, monitor_idle = Event(), Event()
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "watchdog.checked":
+            monitor_checked.set()
+
+    def wait(condition, timeout):
+        if monitor_checked.is_set():
+            monitor_idle.set()
+        condition.wait(timeout)
+
+    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        if "Independent Verifier" in messages[0].content:
+            return LLMResponse(content=json.dumps({
+                "task_id": "T1", "attempt": 1, "passed": True, "summary": "Verified.",
+                "findings": [],
+            }))
+        count = sum(message.role == "tool" for message in messages)
+        if count < 3:
+            return LLMResponse(
+                content="PRIVATE_WORKER_TRANSCRIPT",
+                tool_calls=(
+                    ToolCall(str(count), "read_file", {"path": str(tmp_path / "private.txt")}),
+                ),
+            )
+        if count == 3 and not any("Use the scoped path." in m.content for m in messages):
+            assert monitor_idle.wait(3)
+            return LLMResponse(content="Waiting for the next step.", tool_calls=(
+                ToolCall("write", "glob_files", {"pattern": "*.py"}),
+            ))
+        assert any("Use the scoped path." in m.content for m in messages)
+        return LLMResponse(content="Finished.")
+
+    monitor = MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+        "verdict": "STUCK_LOOP", "summary": "Repeated file errors.",
+        "suggested_steer": "Use the scoped path.",
+    }))])
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=respond),
+        workspace_root=tmp_path,
+        monitor_provider=monitor,
+        watchdog_config=WatchdogConfig(wait=wait),
+        on_driver_event=observe,
+    )
+    assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    assert len(monitor.recorded_requests) == 1
+    (messages, tools), = monitor.recorded_requests
+    assert not tools
+    snapshot = json.loads(messages[-1].content)
+    assert set(snapshot) == {"objective", "write_scope", "milestones", "diff_stat"}
+    assert snapshot["write_scope"] == ["feature.py"]
+    assert "PRIVATE_WORKER_TRANSCRIPT" not in messages[-1].content
+    assert "private.txt" not in messages[-1].content
+    events = store.list_events(run_id)
+    assert any(
+        e.event_type == "agent.steered" and e.payload["source"] == "watchdog" for e in events
+    )
+    progress = app.get_run_payload(run_id)["projection"]["dag"]["nodes"][0]["live_progress"]
+    assert progress["watchdog_verdict"] == "STUCK_LOOP"
+    assert progress["watchdog_summary"] == "Repeated file errors."
+
+
+@pytest.mark.parametrize(("verdicts", "archive_fails"), [
+    (("SCOPE_DRIFT", "STUCK_LOOP"), False),
+    (("BLOCKED_EXTERNAL",), False),
+    (("BLOCKED_EXTERNAL",), True),
+])
+def test_watchdog_pause_preserves_work_and_skips_review(
+    tmp_path: Path, verdicts: tuple[str, ...], archive_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if archive_fails:
+        def fail_archive(*args):
+            raise PermissionError("Cannot write patch")
+
+        monkeypatch.setattr("olympus.stages.orchestrate.archive_sandbox_recovery", fail_archive)
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[_marker_command_check()],
+    ))
+    checked = Event()
+    cancelled = Event()
+    observer_events: list[tuple[str, dict[str, Any]]] = []
+
+    class JsonDriver:
+        name = "test-json"
+        supports_steer = False
+
+        def steer(self, guidance, *, source):
+            pytest.fail("JSON-only driver cannot steer")
+
+        def cancel(self, *, reason):
+            assert reason == "watchdog_paused"
+            cancelled.set()
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            (request.workspace_path / "feature.py").write_bytes(b"\x00unfinished\n")
+            (request.workspace_path / "README.md").write_text("PRIVATE_PATCH_BODY\n")
+            request.trace_path.write_text('{"event":"worker-progress"}\n', encoding="utf-8")
+            for i in range(len(verdicts)):
+                for step in range(3):
+                    on_event("agent.tool_finished", {
+                        "step": step, "tool": "write", "status": "error",
+                        "error_signature": "repeat",
+                    })
+                if i + 1 < len(verdicts):
+                    assert checked.wait(3)
+                    assert not cancelled.is_set()
+            assert cancelled.wait(3)
+            return TurnOutcome(False, "cancelled", "", 1)
+
+    def observe(kind: str, payload: dict[str, Any]) -> None:
+        observer_events.append((kind, payload))
+        if kind == "watchdog.checked":
+            checked.set()
+
+    monitor = MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+        "verdict": verdict, "summary": f"Diagnosis {verdict}.",
+        "suggested_steer": "Try the scoped implementation.",
+    })) for verdict in verdicts])
+    primary = MockLLMProvider()
+    stage = OrchestrateStage(
+        store=store, provider=primary, workspace_root=tmp_path,
+        monitor_provider=monitor, on_driver_event=observe,
+        execution_drivers=ExecutionDriversConfig(worker_driver="test-json"),
+        driver_registry=DriverRegistry({"test-json": JsonDriver()}),
+    )
+    result = stage.run_execution(run_id=run_id)
+    assert result["status"] == RunStatus.PAUSED
+    assert cancelled.is_set()
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+    assert not primary.recorded_requests
+    assert len(monitor.recorded_requests) == len(verdicts)
+    for messages, _ in monitor.recorded_requests:
+        assert "README.md" in json.loads(messages[-1].content)["diff_stat"]
+        assert "PRIVATE_PATCH_BODY" not in messages[-1].content
+    assert [payload["severity"] for kind, payload in observer_events
+            if kind == "watchdog.checked"] == ["warning"] * (len(verdicts) - 1)
+    task = result["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 0
+    assert task.last_error == f"Diagnosis {verdicts[-1]}."
+    attempt = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
+    assert (attempt / "worker.jsonl").is_file()
+    assert json.loads((attempt / "watchdog.json").read_text())["summary"] == task.last_error
+    events = store.list_events(run_id)
+    paused, = [event for event in events if event.event_type == "watchdog.paused"]
+    if archive_fails:
+        assert paused.payload["archive_error"] == "PermissionError"
+        assert task.worktree_path == paused.payload["retained_sandbox"]
+        assert (Path(task.worktree_path) / "feature.py").read_bytes() == b"\x00unfinished\n"
+    else:
+        assert not task.worktree_path
+        patch = attempt / "diff.patch"
+        assert "GIT binary patch" in patch.read_text(encoding="utf-8")
+        subprocess.run(["git", "apply", "--check", str(patch)], cwd=tmp_path, check=True)
+        assert not list((tmp_path / ".olympus" / "sandboxes").iterdir())
+    assert any(e.event_type == "run.paused" for e in events)
+    progress = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
+        "projection"
+    ]["dag"]["nodes"][0]["live_progress"]
+    assert progress["watchdog_verdict"] == verdicts[-1]
+    assert progress["watchdog_summary"] == task.last_error
+
+
+def test_watchdog_recovery_resets_streak_without_resetting_steer_cap(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[{
+            "id": "CHK-REV", "kind": "independent_review", "description": "Audit the change",
+        }],
+    ))
+    verdicts = ["STUCK_LOOP", "HEALTHY", "SCOPE_DRIFT", "HEALTHY", "STUCK_LOOP"]
+    checked = SimpleQueue()
+    steers = []
+
+    class RecoveringDriver:
+        name = "recovering"
+        supports_steer = True
+
+        def steer(self, guidance, *, source):
+            steers.append((guidance, source))
+            return True
+
+        def cancel(self, *, reason):
+            pytest.fail(f"Recovering task unexpectedly cancelled: {reason}")
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            for expected in verdicts:
+                on_event("agent.tool_finished", {
+                    "tool": "read", "step": 1, "status": "error", "error_signature": "retry",
+                })
+                assert checked.get(timeout=3) == expected
+            return TurnOutcome(True, "completed", "", 1)
+
+    stage = OrchestrateStage(
+        store=store, workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=(
+            '{"task_id":"T1","attempt":1,"passed":true,"summary":"Verified."}'
+        ))]),
+        driver_registry=DriverRegistry({"recovering": RecoveringDriver()}),
+        execution_drivers=ExecutionDriversConfig(worker_driver="recovering"),
+        monitor_provider=MockLLMProvider(responses=[LLMResponse(content=json.dumps({
+            "verdict": verdict, "summary": f"Diagnosis {verdict}.",
+            "suggested_steer": "Review the scoped paths.",
+        })) for verdict in verdicts]),
+        watchdog_config=WatchdogConfig(repeat_error_threshold=1),
+        on_driver_event=lambda kind, fields: (
+            checked.put(fields["verdict"]) if kind == "watchdog.checked" else None
+        ),
+    )
+    assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    assert steers == [("Review the scoped paths.", "watchdog")] * 2
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())
+
+
+@pytest.mark.parametrize(("trigger", "provider_reply", "event_type"), [
+    (None, None, None),
+    ("worker_failure", None, None),
+    ("silence", TimeoutError("secret timeout detail"), "watchdog.error"),
+    ("interval", RuntimeError("secret provider detail"), "watchdog.error"),
+    ("silence", '{"verdict":"HEALTHY","summary":"two\\nlines"}', "watchdog.error"),
+    ("interval", '{"verdict":"HEALTHY","summary":"Progress is steady."}', "watchdog.checked"),
+    ("interval_then_silence", '{"verdict":"HEALTHY","summary":"OK"}', "watchdog.checked"),
+])
+def test_watchdog_timers_fail_open_through_stage(
+    tmp_path: Path, trigger: str | None, provider_reply: str | Exception | None,
+    event_type: str | None,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    _approve_plan(store, run_id, _single_task_plan(
+        spec=spec, write_scope=["feature.py"], checks=[{
+            "id": "CHK-REV", "kind": "independent_review", "description": "Audit the change",
+        }],
+    ))
+    observed = Event()
+    observed_triggers: list[str] = []
+    now = 0.0
+    pending = int(event_type is not None)
+    expected_triggers = [trigger] if pending else []
+    if trigger == "interval_then_silence":
+        expected_triggers = ["interval", "silence"]
+        pending = 2
+
+    def wait(condition, timeout):
+        nonlocal now, pending
+        if pending:
+            now += timeout
+            pending -= 1
+        else:
+            condition.wait()
+
+    def observe(kind, fields):
+        if kind == event_type:
+            observed_triggers.append(fields["trigger"])
+            if len(observed_triggers) == len(expected_triggers):
+                observed.set()
+
+    def monitor_response(messages, tools):
+        if isinstance(provider_reply, Exception):
+            raise provider_reply
+        assert provider_reply is not None, "A fast turn must leave L2 idle"
+        return LLMResponse(content=provider_reply)
+
+    class FastDriver:
+        name = "fast"
+        supports_steer = True
+
+        def steer(self, guidance, *, source):
+            pytest.fail("Unexpected steering")
+
+        def cancel(self, *, reason):
+            pytest.fail("Unexpected cancellation")
+
+        def run_turn(self, request, *, on_event, on_handle):
+            on_handle(self)
+            if trigger == "worker_failure":
+                raise ValueError("worker failed")
+            if provider_reply is not None:
+                assert observed.wait(3)
+            return TurnOutcome(True, "completed", "", 1)
+
+    monitor = MockLLMProvider(responder=monitor_response)
+    stage = OrchestrateStage(
+        store=store, workspace_root=tmp_path,
+        provider=MockLLMProvider(responses=[LLMResponse(content=(
+            '{"task_id":"T1","attempt":1,"passed":true,"summary":"Verified."}'
+        ))]),
+        driver_registry=DriverRegistry({"fast": FastDriver()}),
+        execution_drivers=ExecutionDriversConfig(worker_driver="fast", monitor_model="monitor"),
+        model_provider=lambda model: {"monitor": monitor}[model],
+        watchdog_config=WatchdogConfig(
+            silence_seconds=15 if trigger and trigger.startswith("interval") else 10,
+            interval_seconds=20 if trigger == "silence" else 10,
+            clock=lambda: now, wait=wait,
+        ),
+        on_driver_event=observe,
+    )
+    if trigger == "worker_failure":
+        with pytest.raises(ValueError, match="worker failed"):
+            stage.run_execution(run_id=run_id)
+    else:
+        assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
+    watchdog_events = [e for e in store.list_events(run_id) if e.actor == "watchdog"]
+    assert len(monitor.recorded_requests) == len(expected_triggers)
+    assert [event.event_type for event in watchdog_events] == [event_type] * len(expected_triggers)
+    assert [event.payload["trigger"] for event in watchdog_events] == expected_triggers
+    assert all("secret" not in json.dumps(event.payload) for event in watchdog_events)
+    assert not any(t.name == "olympus-watchdog" for t in enumerate_threads())

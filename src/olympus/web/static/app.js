@@ -1402,6 +1402,17 @@
     const progress = task.live_progress;
     if (!progress?.driver_name && !progress?.last_event_at) return "";
     const current = progress.current_tool;
+    const watchdogLabels = {
+      HEALTHY: ["进展正常", "ok"],
+      STUCK_LOOP: ["疑似循环", "warn"],
+      SCOPE_DRIFT: ["偏离范围", "warn"],
+      BLOCKED_EXTERNAL: ["外部阻塞", "bad"],
+    };
+    const verdict = watchdogLabels[progress.watchdog_verdict];
+    const diagnosis = [
+      verdict ? uiBadge(...verdict) : "",
+      progress.watchdog_summary ? `<span>${esc(progress.watchdog_summary)}</span>` : "",
+    ].filter(Boolean).join(" ");
     const rows = [
       progress.driver_name ? uiRow("驱动", esc(progress.driver_name), { mono: true }) : "",
       current ? uiRow("当前工具", esc(`${current.tool} · ${current.target_hint}`), { mono: true }) : "",
@@ -1409,7 +1420,7 @@
         const labels = { ok: "成功", error: "出错", denied: "已拦截" };
         return uiRow(entry.tool, esc(`${labels[entry.status]} · ${entry.duration_ms} ms`), { mono: true });
       }),
-      progress.watchdog_summary ? uiRow("Watchdog", esc(progress.watchdog_summary)) : "",
+      diagnosis ? uiRow("Watchdog", diagnosis) : "",
     ].join("");
     const preview = taskActivityPreview(projection, task);
     return uiCard(task.status === "running" ? "实时执行" : "最近执行",

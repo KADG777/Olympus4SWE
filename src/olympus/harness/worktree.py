@@ -114,6 +114,33 @@ def capture_sandbox_diff(handle: SandboxHandle) -> str:
     return "\n\n".join(parts) if parts else "(no changes)"
 
 
+def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
+    """Record recoverable binary and text changes from a paused attempt."""
+    patch = attempt_dir / "diff.patch"
+    if handle.base_commit is None:
+        patch.write_text("Non-git workspace preserved in sandbox/\n", encoding="utf-8")
+        shutil.move(handle.workspace_path, attempt_dir / "sandbox")
+        return
+
+    ws = handle.workspace_path
+    diff = ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv"]
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=ws, capture_output=True, check=True,
+    ).stdout
+    with patch.open("wb") as output:
+        subprocess.run([*diff, handle.base_commit, "--"], cwd=ws, stdout=output, check=True)
+        for raw_path in untracked.split(b"\0"):
+            if not raw_path:
+                continue
+            result = subprocess.run(
+                [*diff, "--no-index", "--", "/dev/null", os.fsdecode(raw_path)],
+                cwd=ws, stdout=output, check=False,
+            )
+            if result.returncode != 1:
+                result.check_returncode()
+
+
 def _is_ignored_rel(rel: str) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in PurePosixPath(rel).parts)
 

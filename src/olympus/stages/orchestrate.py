@@ -51,8 +51,10 @@ from olympus.harness.driver import (
 )
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
+from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
+    archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
     create_sandbox,
@@ -60,6 +62,7 @@ from olympus.harness.worktree import (
     snapshot_sandbox_state,
 )
 from olympus.providers.base import LLMProvider
+from olympus.providers.factory import build_provider
 from olympus.stages.common import format_workspace_inventory
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
@@ -374,6 +377,8 @@ class OrchestrateStage:
         execution_drivers: ExecutionDriversConfig | None = None,
         driver_registry: DriverRegistry | None = None,
         model_provider: Callable[[str], LLMProvider] | None = None,
+        monitor_provider: LLMProvider | None = None,
+        watchdog_config: WatchdogConfig | None = None,
         on_driver_event: DriverEvent | None = None,
         on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None,
         live_activity: LiveActivity | None = None,
@@ -383,6 +388,8 @@ class OrchestrateStage:
         self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
         self.driver_registry = driver_registry or DriverRegistry()
         self.model_provider = model_provider
+        self.monitor_provider = monitor_provider
+        self.watchdog_config = watchdog_config
         self.on_driver_event = on_driver_event
         self.on_driver_handle = on_driver_handle
         self.live_activity = live_activity
@@ -784,6 +791,7 @@ class OrchestrateStage:
         task: TaskNode,
         driver: AgentDriver,
         request: DriverTurnRequest,
+        watchdog: Watchdog | None,
     ) -> TurnOutcome:
         activity = self.live_activity
 
@@ -807,6 +815,8 @@ class OrchestrateStage:
                         **fields,
                     },
                 )
+                if watchdog is not None:
+                    watchdog.observe(kind, fields)
             if kind == "text_delta" and activity is not None:
                 text = payload.get("text")
                 if isinstance(text, str) and text:
@@ -817,9 +827,20 @@ class OrchestrateStage:
             if self.on_driver_event is not None:
                 self.on_driver_event(kind, payload)
 
+        def start_monitor(handle: ActiveTurnHandle) -> None:
+            assert watchdog is not None
+            watchdog.start(handle)
+            if self.on_driver_handle is not None:
+                self.on_driver_handle(handle)
+
         try:
-            return driver.run_turn(request, on_event=observe, on_handle=self.on_driver_handle)
+            return driver.run_turn(
+                request, on_event=observe,
+                on_handle=start_monitor if watchdog is not None else self.on_driver_handle,
+            )
         finally:
+            if watchdog is not None:
+                watchdog.stop()
             if activity is not None:
                 activity.clear(run_id, task.task_id, task.attempt)
 
@@ -833,6 +854,7 @@ class OrchestrateStage:
         apply_to_workspace: bool,
         worker_max_steps: int,
         worker: tuple[AgentDriver, str | None],
+        monitor_factory: Callable[[], LLMProvider] | None,
         reviewer: tuple[AgentDriver, str | None],
         interrupted: Event,
         design: DesignSpec | None = None,
@@ -848,6 +870,7 @@ class OrchestrateStage:
         )
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
+        retain_sandbox = False
         try:
             worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
@@ -899,7 +922,54 @@ class OrchestrateStage:
                 trace_path=art_dir / "worker.jsonl",
                 model=model,
             )
-            loop_res = self._run_worker_turn(run_id, leased, driver, request)
+            watchdog = None
+            if monitor_factory is not None:
+                def emit_watchdog(kind: str, payload: dict[str, Any]) -> None:
+                    self.store.append_event(
+                        run_id=run_id,
+                        stage="orchestrate",
+                        event_type=kind,
+                        actor="watchdog",
+                        payload={"task_id": leased.task_id, "attempt": leased.attempt, **payload},
+                    )
+                    if self.on_driver_event is not None:
+                        self.on_driver_event(kind, payload)
+
+                watchdog = Watchdog(
+                    config=self.watchdog_config or WatchdogConfig(),
+                    provider_factory=monitor_factory,
+                    sandbox=sandbox,
+                    objective=leased.objective,
+                    write_scope=leased.write_scope,
+                    emit=emit_watchdog,
+                )
+            worker_error = None
+            try:
+                loop_res = self._run_worker_turn(run_id, leased, driver, request, watchdog)
+            except Exception as exc:
+                if watchdog is None or watchdog.pause_diagnosis is None:
+                    raise
+                worker_error = type(exc).__name__
+
+            if watchdog is not None and watchdog.pause_diagnosis is not None:
+                retain_sandbox = True
+                diagnosis = dict(watchdog.pause_diagnosis)
+                if worker_error is not None:
+                    diagnosis["worker_error"] = worker_error
+                try:
+                    (art_dir / "watchdog.json").write_text(
+                        json.dumps(diagnosis, ensure_ascii=False), encoding="utf-8",
+                    )
+                    (art_dir / "worker.jsonl").touch(exist_ok=True)
+                    archive_sandbox_recovery(sandbox, art_dir)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    diagnosis["archive_error"] = type(exc).__name__
+                else:
+                    retain_sandbox = False
+                return RunControl(self.store).pause_for_watchdog(
+                    run_id, task=leased, diagnosis=diagnosis,
+                    retained_sandbox=str(sandbox.workspace_path) if retain_sandbox else None,
+                )
 
             # Transition lease to VERIFYING before running checks/review
             verifying = self.store.update_task_with_lease(
@@ -1124,7 +1194,8 @@ class OrchestrateStage:
             )
             return accepted
         finally:
-            remove_sandbox(sandbox)
+            if not retain_sandbox:
+                remove_sandbox(sandbox)
 
     def _fail_or_requeue(
         self,
@@ -1193,6 +1264,20 @@ class OrchestrateStage:
             event_type="task.budget_paused",
         )
 
+    def _monitor_factory(self) -> Callable[[], LLMProvider] | None:
+        if self.monitor_provider is not None:
+            provider = self.monitor_provider
+            return lambda: provider
+        model = self.execution_drivers.monitor_model
+        if model is None:
+            return None
+        if self.model_provider is not None:
+            factory = self.model_provider
+            return lambda: factory(model)
+        return lambda: build_provider(
+            model=model, project_providers_path=self.workspace_root / ".olympus" / "providers.json"
+        )
+
     def run_execution(
         self,
         *,
@@ -1214,6 +1299,7 @@ class OrchestrateStage:
             self.execution_drivers.reviewer_driver,
             native_factory=lambda model: self._native_driver(run_id, model, review=True),
         )
+        monitor_factory = self._monitor_factory()
         interrupted = Event()
         while True:
             snap = self.store.get_run(run_id)
@@ -1379,6 +1465,7 @@ class OrchestrateStage:
                     apply_to_workspace=apply_to_workspace,
                     worker_max_steps=worker_max_steps,
                     worker=worker,
+                    monitor_factory=monitor_factory,
                     reviewer=reviewer,
                     interrupted=interrupted,
                     design=design,
@@ -1396,6 +1483,7 @@ class OrchestrateStage:
                             apply_to_workspace=apply_to_workspace,
                             worker_max_steps=worker_max_steps,
                             worker=worker,
+                            monitor_factory=monitor_factory,
                             reviewer=reviewer,
                             interrupted=interrupted,
                             design=design,

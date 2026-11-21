@@ -158,6 +158,15 @@ def _emit_work():
             "durationMs": 12,
         }
     )
+    if os.environ.get("FAKE_PI_WATCHDOG_ERRORS") == "1":
+        for step in range(3):
+            _emit({
+                "type": "tool_execution_end",
+                "toolCallId": f"err-{step}",
+                "toolName": "read",
+                "result": {"content": [{"type": "text", "text": "Repeated error"}]},
+                "isError": True,
+            })
     _emit({"type": "turn_end", "message": first, "toolResults": []})
     _emit({"type": "agent_end", "messages": [first], "willRetry": False})
 
@@ -622,8 +631,9 @@ def _review_responder(
     )
 
 
+@pytest.mark.parametrize("watchdog_enabled", [False, True])
 def test_pi_worker_heterogeneous_run_with_argus_review(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watchdog_enabled: bool
 ) -> None:
     _init_repo(tmp_path)
     store, run_id = _confirmed_run(tmp_path)
@@ -653,10 +663,19 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
     monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
     monkeypatch.setenv("FAKE_PI_ENV_FILE", str(env_file))
 
+    monitor = None
+    if watchdog_enabled:
+        monkeypatch.setenv("FAKE_PI_AWAIT_STEER", "1")
+        monkeypatch.setenv("FAKE_PI_WATCHDOG_ERRORS", "1")
+        monitor = MockLLMProvider(responses=[LLMResponse(content=(
+            '{"verdict":"STUCK_LOOP","summary":"Repeated read errors.",'
+            '"suggested_steer":"Continue without the blocked read."}'
+        ))])
     stage = OrchestrateStage(
         store=store,
         provider=MockLLMProvider(responder=_review_responder),
         workspace_root=tmp_path,
+        monitor_provider=monitor,
         execution_drivers=ExecutionDriversConfig(
             worker_driver="pi", reviewer_driver="native"
         ),
@@ -668,6 +687,13 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
     assert task.status == TaskStatus.ACCEPTED
 
     events = store.list_events(run_id)
+    if watchdog_enabled:
+        assert monitor is not None and len(monitor.recorded_requests) == 1
+        assert any(e.event_type == "watchdog.checked" for e in events)
+        assert any(
+            e.event_type == "agent.steered" and e.payload["source"] == "watchdog"
+            for e in events
+        )
     verdicts = [e for e in events if e.event_type == "review.verdict_recorded"]
     assert len(verdicts) == 1 and verdicts[0].payload["passed"] is True
     assert not [e for e in events if e.event_type == "task.diff_gate_rejected"]
