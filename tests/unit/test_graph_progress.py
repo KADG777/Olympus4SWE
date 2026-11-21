@@ -591,6 +591,44 @@ def test_build_workflow_view_keeps_future_nodes_pending_after_failed_frontier() 
         assert view["node_statuses"][downstream] == "pending"
 
 
+def test_build_workflow_view_records_pause_resume_gate_transition() -> None:
+    events = [
+        _event(1, "graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        _event(2, "graph.node_started", {"node": "intake"}),
+        _event(3, "graph.node_finished", {"node": "intake"}),
+        _event(4, "graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        _event(5, "graph.node_started", {"node": "align"}),
+        _event(6, "graph.node_finished", {"node": "align"}),
+        _event(7, "graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        _event(8, "graph.node_started", {"node": "gate_spec"}),
+        _event(9, "graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+        _event(10, "graph.started", {"graph": "full_sdlc_tdd", "start_from": "design"}),
+        _event(11, "graph.node_started", {"node": "design"}),
+        _event(12, "graph.node_finished", {"node": "design"}),
+    ]
+    view = build_workflow_view(
+        "full_sdlc_tdd",
+        events,
+        RunStatus.RUNNING,
+        spec_approved=True,
+    )
+
+    assert view["node_statuses"]["gate_spec"] == "completed"
+    assert view["node_statuses"]["critic"] == "skipped"
+    assert {"source": "gate_spec", "target": "design"} in view["traversed_edges"]
+    assert view["node_statuses"]["validate_design"] == "pending"
+
+
+def test_derive_skipped_ignores_back_edges_in_cyclic_graphs() -> None:
+    from olympus.graph.progress import _derive_skipped
+
+    statuses = {"a": "completed", "b": "paused", "c": "pending"}
+    declared = [("a", "b"), ("b", "c"), ("c", "a")]
+    traversed = [{"source": "a", "target": "b"}]
+
+    assert _derive_skipped(statuses, declared, traversed) == set()
+
+
 # -------------------------------------------------------------- blueprint completion
 
 

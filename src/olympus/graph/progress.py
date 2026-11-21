@@ -181,12 +181,27 @@ def _derive_traversed_edges(
         traversed.append({"source": source, "target": target})
 
     if any(event.event_type == "graph.routed" for event in events):
+        paused_node: str | None = None
         for event in events:
-            if event.event_type != "graph.routed":
-                continue
-            for source in _node_names(event.payload.get("from")):
-                for target in _node_names(event.payload.get("to")):
-                    record(source, target)
+            if event.event_type == "graph.routed":
+                paused_node = None
+                for source in _node_names(event.payload.get("from")):
+                    for target in _node_names(event.payload.get("to")):
+                        record(source, target)
+            elif event.event_type == "graph.paused":
+                node = event.payload.get("node")
+                if isinstance(node, str):
+                    paused_node = node
+            elif event.event_type == "graph.started" and paused_node is not None:
+                start_from = event.payload.get("start_from")
+                if isinstance(start_from, str):
+                    record(paused_node, start_from)
+                    paused_node = None
+            elif event.event_type == "graph.node_started" and paused_node is not None:
+                node = event.payload.get("node")
+                if isinstance(node, str) and node != paused_node:
+                    record(paused_node, node)
+                    paused_node = None
         return traversed
 
     last_finished: str | None = None
@@ -194,7 +209,7 @@ def _derive_traversed_edges(
         node = event.payload.get("node")
         if not isinstance(node, str):
             continue
-        if event.event_type == "graph.node_finished":
+        if event.event_type in ("graph.node_finished", "graph.paused"):
             last_finished = node
         elif event.event_type == "graph.node_started" and last_finished is not None:
             record(last_finished, node)
@@ -202,7 +217,7 @@ def _derive_traversed_edges(
 
 
 def _forward_reachable(start: str, adjacency: Mapping[str, Sequence[str]]) -> set[str]:
-    """Return every node reachable downstream of ``start`` via declared edges."""
+    """Return every node reachable downstream of ``start`` via forward declared edges."""
     reached: set[str] = set()
     stack = [start]
     while stack:
@@ -221,9 +236,15 @@ def _derive_skipped(
 ) -> set[str]:
     """Return never-visited nodes the executed trajectory passed straight over."""
     known = set(statuses)
+    order = {name: idx for idx, name in enumerate(statuses)}
     adjacency: dict[str, list[str]] = {name: [] for name in statuses}
     for source, target in declared:
-        if source in known and target in known and target not in adjacency[source]:
+        if (
+            source in known
+            and target in known
+            and order[target] > order[source]
+            and target not in adjacency[source]
+        ):
             adjacency[source].append(target)
 
     visited = {name for name, status in statuses.items() if status in _VISITED_STATUSES}
