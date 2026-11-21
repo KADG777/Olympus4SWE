@@ -698,7 +698,7 @@ class _PiTurn:
             with self._lock:
                 self._budget_exhausted_reason = "budget_exhausted: Pi exceeded configured budget"
             self.cancel(reason="budget_exhausted")
-        elif step > self._request.max_steps:
+        elif self._request.max_steps is not None and step > self._request.max_steps:
             with self._lock:
                 self._max_steps_exceeded = True
             self.cancel(reason="max_steps_exceeded")
