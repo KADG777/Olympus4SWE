@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from olympus.core.contracts import ApprovalTarget, RunEvent, RunStatus, TaskPlan, TaskStatus
-from olympus.core.control import is_plan_bound_to_upstream
+from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
 from olympus.core.store import RunStore
 
 if TYPE_CHECKING:
@@ -95,8 +95,21 @@ def resolve_resume_node(
         return None
 
     if snap["design"] is not None:
-        if is_artifact_approved(store, run_id, "design", snap):
+        if is_design_bound_to_spec(store, run_id, snap):
             return "plan" if "plan" in names else None
+        spec = snap.get("spec")
+        design = snap["design"]
+        design_stale_for_spec = (
+            spec is not None
+            and is_artifact_approved(store, run_id, "spec", snap)
+            and design.spec_hash is not None
+            and design.spec_hash != spec.content_hash
+        )
+        if design_stale_for_spec:
+            for candidate in ("design", "plan"):
+                if candidate in names:
+                    return candidate
+            return None
         for candidate in ("gate_design", "validate_design", "design"):
             if candidate in names:
                 return candidate

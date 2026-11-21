@@ -129,6 +129,16 @@ def _glob_static_prefix(pattern: str) -> str:
     return prefix[: prefix.rfind("/") + 1]
 
 
+def _glob_literal_prefix(pattern: str) -> str:
+    """Return the literal prefix before the first glob metacharacter."""
+    cut = len(pattern)
+    for char in _GLOB_CHARS:
+        found = pattern.find(char)
+        if found != -1:
+            cut = min(cut, found)
+    return pattern[:cut]
+
+
 def _glob_paths_overlap(a: str, b: str) -> bool:
     """Conservatively decide whether a glob scope can collide with another path."""
     a_glob, b_glob = _has_glob(a), _has_glob(b)
@@ -142,9 +152,17 @@ def _glob_paths_overlap(a: str, b: str) -> bool:
     if fnmatch.fnmatchcase(concrete, pattern):
         return True
     prefix = _glob_static_prefix(pattern)
-    if not prefix:
-        return False
-    return concrete == prefix.rstrip("/") or concrete.startswith(prefix)
+    if prefix:
+        prefix_dir = prefix.rstrip("/")
+        return (
+            concrete == prefix_dir
+            or concrete.startswith(prefix)
+            or prefix.startswith(f"{concrete}/")
+        )
+    lit_prefix = _glob_literal_prefix(pattern)
+    if not lit_prefix:
+        return True
+    return concrete.startswith(lit_prefix) or lit_prefix.startswith(concrete)
 
 
 def paths_overlap(a_raw: str, b_raw: str) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +60,12 @@ class AriadneApp:
                 artifacts_root=self.artifacts_root,
             )
         )
+        self._retry_guard = threading.Lock()
+        self._retry_locks: dict[str, threading.Lock] = {}
+
+    def _retry_lock_for(self, run_id: str) -> threading.Lock:
+        with self._retry_guard:
+            return self._retry_locks.setdefault(run_id, threading.Lock())
 
     def list_runs_payload(self, *, limit: int = 50) -> dict[str, Any]:
         runs = self.store.list_runs(limit=limit)
@@ -118,6 +125,9 @@ class AriadneApp:
         if "target_hash" in body:
             raw_hash = body["target_hash"]
             target_hash = str(raw_hash) if raw_hash is not None else ""
+        auto_advance = bool(body.get("auto_advance", True))
+        sync_flag = bool(body.get("sync", False))
+        dispatch_meta = {"auto_advance": auto_advance, "sync": sync_flag}
 
         if action in ("pause", "resume"):
             cmd_result = self.control.set_paused(
@@ -136,6 +146,7 @@ class AriadneApp:
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
                 operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
             cmd_result = (
                 spec_result
@@ -155,6 +166,7 @@ class AriadneApp:
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
                 operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
             cmd_result = (
                 design_result
@@ -169,6 +181,7 @@ class AriadneApp:
                 expected_revision=expected_rev,
                 expected_target_hash=target_hash,
                 operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
             cmd_result = (
                 plan_result
@@ -184,6 +197,7 @@ class AriadneApp:
                 actor=actor,
                 expected_revision=expected_rev,
                 operation_id=operation_id,
+                command_meta=dispatch_meta,
             )
             cmd_result = (
                 clarify_result
@@ -234,22 +248,26 @@ class AriadneApp:
                 actor=actor,
             )
         elif action == "retry_workflow":
-            retry_result = self.control.prepare_workflow_retry(
-                run_id,
-                expected_revision=expected_rev,
-                actor=actor,
-                operation_id=operation_id,
-            )
-            if retry_result.get("deduplicated"):
-                # A retried HTTP request must never resume the workflow a second time.
-                cmd_result = retry_result
-            else:
-                cmd_result = {
-                    **retry_result,
-                    "workflow": self.supervisor.resume_run(
-                        run_id, sync=bool(body.get("sync", False))
-                    ),
-                }
+            retry_payload: dict[str, Any] = {"action": "retry_workflow", "sync": sync_flag}
+            with self._retry_lock_for(run_id):
+                replay = self.store.lookup_command(
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    action="retry_workflow",
+                    payload=retry_payload,
+                )
+                if replay is not None:
+                    cmd_result = replay
+                else:
+                    self.store.get_run(run_id, expected_revision=expected_rev)
+                    workflow = self.supervisor.resume_run(run_id, sync=sync_flag)
+                    cmd_result = self.control.complete_workflow_retry(
+                        run_id,
+                        operation_id=operation_id,
+                        workflow=workflow,
+                        actor=actor,
+                        sync=sync_flag,
+                    )
         elif action == "promote_to_execute":
             target_workflow = str(body.get("workflow_name") or "full_sdlc_tdd").strip()
             target_def = load_workflow(target_workflow)
@@ -268,7 +286,8 @@ class AriadneApp:
                 operation_id=operation_id,
                 expected_state_revision=expected_rev,
                 max_llm_calls=max_llm_calls,
-                auto_advance=bool(body.get("auto_advance", True)),
+                auto_advance=auto_advance,
+                sync=sync_flag,
                 actor=actor,
             )
         else:
@@ -277,15 +296,13 @@ class AriadneApp:
         if (
             action
             in ("clarify", "approve_spec", "approve_design", "approve_plan", "promote_to_execute")
-            and bool(body.get("auto_advance", True))
+            and auto_advance
             and not cmd_result.get("deduplicated")
             and (action == "promote_to_execute" or self.supervisor.is_supervised(run_id))
         ):
             cmd_result = {
                 **cmd_result,
-                "workflow": self.supervisor.resume_run(
-                    run_id, sync=bool(body.get("sync", False))
-                ),
+                "workflow": self.supervisor.resume_run(run_id, sync=sync_flag),
             }
 
         projection = build_run_projection(

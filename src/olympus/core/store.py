@@ -1060,6 +1060,31 @@ class RunStore:
         finally:
             conn.close()
 
+    def latest_approval_rowid(
+        self,
+        *,
+        run_id: str,
+        target: ApprovalTarget,
+        target_id: str,
+        target_hash: str,
+    ) -> int | None:
+        """Return the latest approved rowid for the exact artifact hash, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT rowid, decision FROM approvals
+                WHERE run_id = ? AND target = ? AND target_id = ? AND target_hash = ?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (run_id, target, target_id, target_hash),
+            ).fetchone()
+            if row is None or row["decision"] not in _APPROVED_DECISIONS:
+                return None
+            return int(row["rowid"])
+        finally:
+            conn.close()
+
     @staticmethod
     def _is_approved(
         conn: sqlite3.Connection, run_id: str, target: ApprovalTarget,
@@ -1156,7 +1181,7 @@ class RunStore:
         run_id: str,
         actor: str,
         action: str,
-        expected_state_revision: int,
+        expected_state_revision: int | None,
         payload: dict[str, Any],
         handler: Callable[[sqlite3.Connection, int], dict[str, Any]],
     ) -> dict[str, Any]:
@@ -1183,7 +1208,7 @@ class RunStore:
 
             row = self._get_run_row(conn, run_id)
             cur_rev = int(row["state_revision"])
-            if cur_rev != expected_state_revision:
+            if expected_state_revision is not None and cur_rev != expected_state_revision:
                 raise ConcurrencyConflictError(
                     f"Command {action} rejected: expected revision "
                     f"{expected_state_revision}, got {cur_rev}"

@@ -1473,4 +1473,4 @@ def build_run_projection(
     }
 
 # Backward-compatible re-export: demo seeding historically lived in this module.
-from olympus.web.demos import seed_demo_runs  # noqa: E402, F401
+from olympus.web.demos import seed_demo_runs  # noqa: E402, F401 - lazy bottom re-export avoids circular import with demos.py

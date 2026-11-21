@@ -38,13 +38,49 @@ _ACTIVE_STATUSES = (
 _DEFAULT_HUMAN_ASSIGNMENT_NOTE = "已改派给人工工程师处理（提交后仍须经独立验收）"
 
 
+def is_design_bound_to_spec(
+    store: RunStore, run_id: str, snap: Mapping[str, Any]
+) -> bool:
+    """Return True when the current DesignSpec is approved and not superseded by GoalSpec."""
+    design: DesignSpec | None = snap.get("design")
+    if design is None:
+        return False
+    design_rowid = store.latest_approval_rowid(
+        run_id=run_id,
+        target=ApprovalTarget.DESIGN_SPEC,
+        target_id=design.design_id,
+        target_hash=design.content_hash,
+    )
+    if design_rowid is None:
+        return False
+    spec: GoalSpec | None = snap.get("spec")
+    if spec is None:
+        return True
+    spec_rowid = store.latest_approval_rowid(
+        run_id=run_id,
+        target=ApprovalTarget.GOAL_SPEC,
+        target_id=spec.spec_id,
+        target_hash=spec.content_hash,
+    )
+    if spec_rowid is None:
+        return True
+    hash_mismatch = design.spec_hash is not None and design.spec_hash != spec.content_hash
+    id_mismatch = design.spec_id is not None and design.spec_id != spec.spec_id
+    if hash_mismatch or id_mismatch:
+        # Stale when GoalSpec was approved after DesignSpec; still valid if the human
+        # explicitly approved DesignSpec after reviewing the current GoalSpec.
+        return design_rowid > spec_rowid
+    return True
+
+
 def is_plan_bound_to_upstream(
     store: RunStore, run_id: str, snap: Mapping[str, Any]
 ) -> bool:
-    """Return True only when the current plan binds to an approved upstream artifact.
+    """Return True only when the current plan binds to an approved, non-stale upstream chain.
 
     A plan whose ``spec_hash`` / ``design_hash`` no longer matches the current
-    (approved) GoalSpec / DesignSpec is stale and must not unlock execution.
+    approved GoalSpec / DesignSpec — or whose DesignSpec references an older
+    GoalSpec than the currently approved one — is stale and must not unlock execution.
     """
     plan: TaskPlan | None = snap.get("plan")
     if plan is None:
@@ -60,15 +96,11 @@ def is_plan_bound_to_upstream(
             target_hash=spec.content_hash,
         )
     )
-    design_approved = bool(
-        design is not None
-        and store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=design.design_id,
-            target_hash=design.content_hash,
-        )
-    )
+    if spec is not None and spec_approved and plan.spec_hash is not None:
+        if plan.spec_hash != spec.content_hash:
+            return False
+        if plan.spec_id is not None and plan.spec_id != spec.spec_id:
+            return False
 
     spec_bound = False
     if spec is not None and (plan.spec_hash is not None or design is None):
@@ -77,10 +109,11 @@ def is_plan_bound_to_upstream(
             and plan.spec_hash == spec.content_hash
             and (plan.spec_id is None or plan.spec_id == spec.spec_id)
         )
+    design_ok = design is not None and is_design_bound_to_spec(store, run_id, snap)
     design_bound = False
-    if design is not None and (plan.design_hash is not None or design_approved):
+    if design is not None and (plan.design_hash is not None or design_ok):
         design_bound = bool(
-            design_approved
+            design_ok
             and plan.design_hash == design.content_hash
             and (plan.design_id is None or plan.design_id == design.design_id)
         )
@@ -143,18 +176,11 @@ class RunControl:
         expected_revision: int,
         actor: str = "zeus",
         operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Move a failed run back to RUNNING so the supervisor can resume its graph."""
-        payload: dict[str, Any] = {"action": "retry_workflow"}
+        payload: dict[str, Any] = {"action": "retry_workflow", **(command_meta or {})}
         if operation_id is not None:
-            replay = self.store.lookup_command(
-                operation_id=operation_id,
-                run_id=run_id,
-                action="retry_workflow",
-                payload=payload,
-            )
-            if replay is not None:
-                return replay
 
             def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
                 snap = self.store.get_run_in_tx(conn, run_id)
@@ -206,6 +232,55 @@ class RunControl:
             return {"run_id": run_id, "status": RunStatus.RUNNING.value, "state_revision": new_rev}
         return {"run_id": run_id, "status": status.value, "state_revision": snap["state_revision"]}
 
+    def complete_workflow_retry(
+        self,
+        run_id: str,
+        *,
+        operation_id: str,
+        workflow: dict[str, Any],
+        actor: str = "zeus",
+        sync: bool = False,
+    ) -> dict[str, Any]:
+        """Record a successfully dispatched workflow retry and clear FAILED status if needed."""
+        payload: dict[str, Any] = {"action": "retry_workflow", "sync": sync}
+
+        def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            status: RunStatus = snap["status"]
+            new_rev = cur_rev
+            if status == RunStatus.FAILED:
+                new_rev = self.store.update_status_in_tx(
+                    conn,
+                    run_id=run_id,
+                    cur_rev=cur_rev,
+                    status=RunStatus.RUNNING,
+                    stage="graph",
+                    event_type="run.status_changed",
+                    actor=actor,
+                    payload={
+                        "from": status.value,
+                        "to": RunStatus.RUNNING.value,
+                        "action": "retry_workflow",
+                    },
+                )
+                status = RunStatus.RUNNING
+            return {
+                "run_id": run_id,
+                "status": status.value,
+                "state_revision": new_rev,
+                "workflow": workflow,
+            }
+
+        return self.store.apply_idempotent_command(
+            operation_id=operation_id,
+            run_id=run_id,
+            actor=actor,
+            action="retry_workflow",
+            expected_state_revision=None,
+            payload=payload,
+            handler=handler,
+        )
+
     # ---------------------------------------------------------------- spec gates
 
     @overload
@@ -219,6 +294,7 @@ class RunControl:
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> GoalSpec: ...
 
     @overload
@@ -232,6 +308,7 @@ class RunControl:
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: str,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def clarify_spec(
@@ -244,66 +321,58 @@ class RunControl:
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> GoalSpec | dict[str, Any]:
         """Apply human answers/resolutions, producing a new spec version (new hash).
 
-        Passing ``operation_id`` records the command result and makes HTTP retries
-        idempotent; without it the legacy ``GoalSpec`` return is preserved.
+        Passing ``operation_id`` records the command result inside one transaction so
+        concurrent or retried HTTP requests replay cleanly without revision races.
         """
-        payload = {
-            "answers": dict(answers),
-            "resolutions": dict(resolutions or {}),
-            "extra_out_of_scope": list(extra_out_of_scope or []),
-        }
-        if operation_id is not None:
-            replay = self.store.lookup_command(
-                operation_id=operation_id,
-                run_id=run_id,
-                action="clarify",
-                payload=payload,
-            )
-            if replay is not None:
-                return replay
-
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        cas_revision = (
-            expected_revision if expected_revision is not None else int(snap["state_revision"])
-        )
-        spec: GoalSpec | None = snap["spec"]
-        if spec is None:
-            raise ValueError(f"Run {run_id} has no GoalSpec to clarify")
-
-        updated_ambiguities = [
-            amb.model_copy(update={"answer": answers[amb.id]}) if amb.id in answers else amb
-            for amb in spec.open_ambiguities
-        ]
         res_map = resolutions or {}
-        updated_notes = [
-            note.model_copy(update={"resolved": True, "resolution_note": res_map[note.id]})
-            if note.id in res_map
-            else note
-            for note in spec.minority_notes
-        ]
-        merged_oos = list(dict.fromkeys([*spec.out_of_scope, *(extra_out_of_scope or [])]))
-        next_spec = spec.model_copy(
-            update={
-                "version": spec.version + 1,
-                "open_ambiguities": updated_ambiguities,
-                "minority_notes": updated_notes,
-                "out_of_scope": merged_oos,
-                "status": SpecStatus.AWAITING_HUMAN,
-            }
-        )
-        clarified_event = (
-            "align",
-            "spec.clarified",
-            {
-                "version": next_spec.version,
-                "spec_hash": next_spec.content_hash,
-                "remaining_blockers": next_spec.unresolved_blockers(),
-            },
-        )
+
+        def _build_next(
+            snap: Mapping[str, Any],
+        ) -> tuple[GoalSpec, tuple[str, str, dict[str, Any]]]:
+            spec: GoalSpec | None = snap["spec"]
+            if spec is None:
+                raise ValueError(f"Run {run_id} has no GoalSpec to clarify")
+            updated_ambiguities = [
+                amb.model_copy(update={"answer": answers[amb.id]}) if amb.id in answers else amb
+                for amb in spec.open_ambiguities
+            ]
+            updated_notes = [
+                note.model_copy(update={"resolved": True, "resolution_note": res_map[note.id]})
+                if note.id in res_map
+                else note
+                for note in spec.minority_notes
+            ]
+            merged_oos = list(dict.fromkeys([*spec.out_of_scope, *(extra_out_of_scope or [])]))
+            next_spec = spec.model_copy(
+                update={
+                    "version": spec.version + 1,
+                    "open_ambiguities": updated_ambiguities,
+                    "minority_notes": updated_notes,
+                    "out_of_scope": merged_oos,
+                    "status": SpecStatus.AWAITING_HUMAN,
+                }
+            )
+            clarified_event = (
+                "align",
+                "spec.clarified",
+                {
+                    "version": next_spec.version,
+                    "spec_hash": next_spec.content_hash,
+                    "remaining_blockers": next_spec.unresolved_blockers(),
+                },
+            )
+            return next_spec, clarified_event
+
         if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            cas_revision = (
+                expected_revision if expected_revision is not None else int(snap["state_revision"])
+            )
+            next_spec, clarified_event = _build_next(snap)
             self.store.save_spec(
                 run_id,
                 next_spec,
@@ -313,7 +382,16 @@ class RunControl:
             )
             return next_spec
 
+        payload: dict[str, Any] = {
+            "answers": dict(answers),
+            "resolutions": dict(res_map),
+            "extra_out_of_scope": list(extra_out_of_scope or []),
+            **(command_meta or {}),
+        }
+
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            next_spec, clarified_event = _build_next(snap)
             self.store.save_spec_in_tx(
                 conn,
                 run_id=run_id,
@@ -335,7 +413,7 @@ class RunControl:
             run_id=run_id,
             actor=actor,
             action="clarify",
-            expected_state_revision=cas_revision,
+            expected_state_revision=expected_revision,
             payload=payload,
             handler=handler,
         )
@@ -352,6 +430,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> GoalSpec: ...
 
     @overload
@@ -366,6 +445,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def confirm_spec(
@@ -379,56 +459,44 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> GoalSpec | dict[str, Any]:
         """Freeze and approve the current GoalSpec once blocking ambiguities are resolved."""
-        payload = {
-            "accept_risk": accept_risk,
-            "reason": reason,
-            "commit_sha": commit_sha,
-            "expected_target_hash": expected_target_hash,
-        }
-        if operation_id is not None:
-            replay = self.store.lookup_command(
-                operation_id=operation_id,
+
+        def _prepare(snap: Mapping[str, Any]) -> tuple[GoalSpec, ApprovalRecord]:
+            spec: GoalSpec | None = snap["spec"]
+            if expected_target_hash is not None and (
+                spec is None or spec.content_hash != expected_target_hash
+            ):
+                raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
+            if spec is None:
+                raise ValueError(f"Run {run_id} has no GoalSpec to confirm")
+            blockers = spec.unresolved_blockers()
+            if blockers and not accept_risk:
+                raise ValueError(
+                    f"Cannot confirm spec with unresolved blockers: {', '.join(blockers)}. "
+                    "Resolve them via clarify or explicitly pass accept_risk=True with a reason."
+                )
+            decision = ApprovalDecision.ACCEPT_RISK if accept_risk else ApprovalDecision.APPROVED
+            confirmed = spec.model_copy(update={"status": SpecStatus.CONFIRMED})
+            record = ApprovalRecord(
                 run_id=run_id,
-                action="approve_spec",
-                payload=payload,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=confirmed.spec_id,
+                target_hash=confirmed.content_hash,
+                commit_sha=commit_sha,
+                approver=approver,
+                decision=decision,
+                reason=reason,
             )
-            if replay is not None:
-                return replay
+            return confirmed, record
 
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        cas_revision = (
-            expected_revision if expected_revision is not None else int(snap["state_revision"])
-        )
-        spec: GoalSpec | None = snap["spec"]
-        if expected_target_hash is not None and (
-            spec is None or spec.content_hash != expected_target_hash
-        ):
-            raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
-        if spec is None:
-            raise ValueError(f"Run {run_id} has no GoalSpec to confirm")
-
-        blockers = spec.unresolved_blockers()
-        if blockers and not accept_risk:
-            raise ValueError(
-                f"Cannot confirm spec with unresolved blockers: {', '.join(blockers)}. "
-                "Resolve them via clarify or explicitly pass accept_risk=True with a reason."
-            )
-
-        decision = ApprovalDecision.ACCEPT_RISK if accept_risk else ApprovalDecision.APPROVED
-        confirmed = spec.model_copy(update={"status": SpecStatus.CONFIRMED})
-        record = ApprovalRecord(
-            run_id=run_id,
-            target=ApprovalTarget.GOAL_SPEC,
-            target_id=confirmed.spec_id,
-            target_hash=confirmed.content_hash,
-            commit_sha=commit_sha,
-            approver=approver,
-            decision=decision,
-            reason=reason,
-        )
         if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            cas_revision = (
+                expected_revision if expected_revision is not None else int(snap["state_revision"])
+            )
+            confirmed, record = _prepare(snap)
             self.store.save_spec(
                 run_id,
                 confirmed,
@@ -438,7 +506,17 @@ class RunControl:
             )
             return confirmed
 
+        payload: dict[str, Any] = {
+            "accept_risk": accept_risk,
+            "reason": reason,
+            "commit_sha": commit_sha,
+            "expected_target_hash": expected_target_hash,
+            **(command_meta or {}),
+        }
+
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            confirmed, record = _prepare(snap)
             self.store.save_spec_in_tx(
                 conn,
                 run_id=run_id,
@@ -460,7 +538,7 @@ class RunControl:
             run_id=run_id,
             actor=approver,
             action="approve_spec",
-            expected_state_revision=cas_revision,
+            expected_state_revision=expected_revision,
             payload=payload,
             handler=handler,
         )
@@ -475,6 +553,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> ApprovalRecord: ...
 
     @overload
@@ -487,6 +566,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def approve_design(
@@ -498,42 +578,36 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> ApprovalRecord | dict[str, Any]:
         """Freeze the current DesignSpec and record a hash-bound approval atomically."""
-        payload = {"reason": reason, "expected_target_hash": expected_target_hash}
-        if operation_id is not None:
-            replay = self.store.lookup_command(
-                operation_id=operation_id,
+
+        def _prepare(snap: Mapping[str, Any]) -> tuple[DesignSpec, ApprovalRecord]:
+            design: DesignSpec | None = snap["design"]
+            if expected_target_hash is not None and (
+                design is None or design.content_hash != expected_target_hash
+            ):
+                raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
+            if design is None:
+                raise ValueError(f"Run {run_id} has no DesignSpec to approve.")
+            confirmed = design.model_copy(update={"status": SpecStatus.CONFIRMED})
+            record = ApprovalRecord(
                 run_id=run_id,
-                action="approve_design",
-                payload=payload,
+                target=ApprovalTarget.DESIGN_SPEC,
+                target_id=confirmed.design_id,
+                target_hash=confirmed.content_hash,
+                approver=approver,
+                decision=ApprovalDecision.APPROVED,
+                reason=reason,
             )
-            if replay is not None:
-                return replay
+            return confirmed, record
 
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        cas_revision = (
-            expected_revision if expected_revision is not None else int(snap["state_revision"])
-        )
-        design: DesignSpec | None = snap["design"]
-        if expected_target_hash is not None and (
-            design is None or design.content_hash != expected_target_hash
-        ):
-            raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
-        if design is None:
-            raise ValueError(f"Run {run_id} has no DesignSpec to approve.")
-
-        confirmed = design.model_copy(update={"status": SpecStatus.CONFIRMED})
-        record = ApprovalRecord(
-            run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=confirmed.design_id,
-            target_hash=confirmed.content_hash,
-            approver=approver,
-            decision=ApprovalDecision.APPROVED,
-            reason=reason,
-        )
         if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            cas_revision = (
+                expected_revision if expected_revision is not None else int(snap["state_revision"])
+            )
+            confirmed, record = _prepare(snap)
             self.store.save_design(
                 run_id,
                 confirmed,
@@ -543,7 +617,15 @@ class RunControl:
             )
             return record
 
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "expected_target_hash": expected_target_hash,
+            **(command_meta or {}),
+        }
+
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            confirmed, record = _prepare(snap)
             self.store.save_design_in_tx(
                 conn,
                 run_id=run_id,
@@ -559,7 +641,7 @@ class RunControl:
             run_id=run_id,
             actor=approver,
             action="approve_design",
-            expected_state_revision=cas_revision,
+            expected_state_revision=expected_revision,
             payload=payload,
             handler=handler,
         )
@@ -574,6 +656,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> ApprovalRecord: ...
 
     @overload
@@ -586,6 +669,7 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def approve_plan(
@@ -597,57 +681,58 @@ class RunControl:
         expected_revision: int | None = None,
         expected_target_hash: str | None = None,
         operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> ApprovalRecord | dict[str, Any]:
         """Record human approval bound to the current TaskPlan content_hash."""
-        payload = {"reason": reason, "expected_target_hash": expected_target_hash}
-        if operation_id is not None:
-            replay = self.store.lookup_command(
-                operation_id=operation_id,
-                run_id=run_id,
-                action="approve_plan",
-                payload=payload,
-            )
-            if replay is not None:
-                return replay
 
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        cas_revision = (
-            expected_revision if expected_revision is not None else int(snap["state_revision"])
-        )
-        plan: TaskPlan | None = snap["plan"]
-        if expected_target_hash is not None and (
-            plan is None or plan.content_hash != expected_target_hash
-        ):
-            raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
-        if plan is None:
-            raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
-        spec: GoalSpec | None = snap["spec"]
-        design: DesignSpec | None = snap["design"]
-
-        if not is_plan_bound_to_upstream(self.store, run_id, snap):
-            if spec is None and design is None:
+        def _prepare(snap: Mapping[str, Any]) -> ApprovalRecord:
+            plan: TaskPlan | None = snap["plan"]
+            if expected_target_hash is not None and (
+                plan is None or plan.content_hash != expected_target_hash
+            ):
+                raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
+            if plan is None:
+                raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
+            spec: GoalSpec | None = snap["spec"]
+            design: DesignSpec | None = snap["design"]
+            if not is_plan_bound_to_upstream(self.store, run_id, snap):
+                if spec is None and design is None:
+                    raise ValueError(
+                        f"Run {run_id} has no GoalSpec or DesignSpec; complete Stage 1 first."
+                    )
                 raise ValueError(
-                    f"Run {run_id} has no GoalSpec or DesignSpec; complete Stage 1 first."
+                    "TaskPlan does not match any approved upstream artifact "
+                    f"(spec_hash={plan.spec_hash}, design_hash={plan.design_hash}); "
+                    "regenerate the plan first."
                 )
-            raise ValueError(
-                "TaskPlan does not match any approved upstream artifact "
-                f"(spec_hash={plan.spec_hash}, design_hash={plan.design_hash}); "
-                "regenerate the plan first."
+            return ApprovalRecord(
+                run_id=run_id,
+                target=ApprovalTarget.TASK_PLAN,
+                target_id=plan.plan_id,
+                target_hash=plan.content_hash,
+                approver=approver,
+                decision=ApprovalDecision.APPROVED,
+                reason=reason,
             )
-        record = ApprovalRecord(
-            run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
-            approver=approver,
-            decision=ApprovalDecision.APPROVED,
-            reason=reason,
-        )
+
         if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            cas_revision = (
+                expected_revision if expected_revision is not None else int(snap["state_revision"])
+            )
+            record = _prepare(snap)
             self.store.record_approval(record, expected_revision=cas_revision)
             return record
 
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "expected_target_hash": expected_target_hash,
+            **(command_meta or {}),
+        }
+
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            record = _prepare(snap)
             self.store.record_approval_in_tx(conn, record, cur_rev=cur_rev)
             return record.model_dump(mode="json")
 
@@ -656,7 +741,7 @@ class RunControl:
             run_id=run_id,
             actor=approver,
             action="approve_plan",
-            expected_state_revision=cas_revision,
+            expected_state_revision=expected_revision,
             payload=payload,
             handler=handler,
         )
@@ -834,14 +919,19 @@ class RunControl:
         expected_state_revision: int,
         max_llm_calls: int | None = None,
         auto_advance: bool = True,
+        sync: bool = False,
         actor: str = "zeus",
     ) -> dict[str, Any]:
         """Promote an approved blueprint run into its execution workflow with budget uplift."""
-        payload: dict[str, Any] = {
-            "workflow_name": target_workflow,
-            "max_llm_calls": max_llm_calls,
-            "auto_advance": auto_advance,
-        }
+        # Keep default payload byte-compatible with legacy records (`{"workflow_name": ...}`)
+        # while still detecting conflicting non-default options on operation_id replay.
+        payload: dict[str, Any] = {"workflow_name": target_workflow}
+        if max_llm_calls is not None:
+            payload["max_llm_calls"] = max_llm_calls
+        if not auto_advance:
+            payload["auto_advance"] = False
+        if sync:
+            payload["sync"] = True
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             # Every guard reads the transaction snapshot so a replayed operation_id
@@ -923,4 +1013,4 @@ class RunControl:
         )
 
 
-__all__ = ["RunControl", "is_plan_bound_to_upstream"]
+__all__ = ["RunControl", "is_design_bound_to_spec", "is_plan_bound_to_upstream"]

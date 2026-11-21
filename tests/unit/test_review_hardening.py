@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -211,7 +212,7 @@ def test_clarify_rolls_back_spec_when_audit_event_fails(
     store, control, run_id, spec, _ = _seeded(tmp_path)
     original_insert = RunStore._insert_event
 
-    def failing_insert(self, conn, **kwargs):  # type: ignore[no-untyped-def]
+    def failing_insert(self: RunStore, conn: Any, **kwargs: Any) -> Any:
         if kwargs.get("event_type") == "spec.clarified":
             raise RuntimeError("disk full")
         return original_insert(self, conn, **kwargs)
@@ -237,7 +238,8 @@ def test_idempotent_command_rejects_operation_id_identity_changes(tmp_path: Path
     run_a = store.create_run(title="A")
     run_b = store.create_run(title="B")
 
-    def handler(conn, cur_rev):  # type: ignore[no-untyped-def]
+    def handler(conn: Any, cur_rev: int) -> dict[str, Any]:
+        del conn, cur_rev
         return {"ok": True}
 
     first = store.apply_idempotent_command(
@@ -552,11 +554,13 @@ def test_projection_reexports_seed_demo_runs_and_seeds_past_100_runs(tmp_path: P
     assert projection_module.seed_demo_runs is seed_demo_runs
 
     store = RunStore(tmp_path / "demos.db")
+    seeded = seed_demo_runs(store, tmp_path)
+    assert seeded == [DELIVERY_DEMO_ID, "run-campus-waitlist"]
+
+    # Push both demos past the newest 100 runs so limit=100 queries would miss them.
     for index in range(105):
         store.create_run(title=f"Filler {index}", run_id=f"filler-{index:03d}")
 
-    seeded = seed_demo_runs(store, tmp_path)
-    assert seeded == [DELIVERY_DEMO_ID, "run-campus-waitlist"]
     assert seed_demo_runs(store, tmp_path) == []
 
 
@@ -689,3 +693,227 @@ def test_http_retries_do_not_resume_or_clarify_twice(
     clarify_app.execute_command(clarify_run, clarify_body)
     assert clarify_resumes == [clarify_run]
     assert clarify_store.get_run(clarify_run)["spec"].version == 2
+
+    # Changing auto_advance or sync under the same operation_id must conflict.
+    with pytest.raises(ConcurrencyConflictError):
+        clarify_app.execute_command(
+            clarify_run,
+            {**clarify_body, "auto_advance": False},
+        )
+    with pytest.raises(ConcurrencyConflictError):
+        clarify_app.execute_command(
+            clarify_run,
+            {**clarify_body, "sync": True},
+        )
+
+
+def test_concurrent_same_operation_id_replays_cleanly_inside_transaction(
+    tmp_path: Path,
+) -> None:
+    store, control, run_id, _, _ = _seeded(tmp_path)
+    rev = store.get_run(run_id)["state_revision"]
+
+    first = control.clarify_spec(
+        run_id,
+        answers={},
+        expected_revision=rev,
+        operation_id="op-concurrent-clarify",
+    )
+    assert first["deduplicated"] is False
+    # Second request carrying the stale pre-commit revision replays cleanly inside BEGIN IMMEDIATE.
+    second = control.clarify_spec(
+        run_id,
+        answers={},
+        expected_revision=rev,
+        operation_id="op-concurrent-clarify",
+    )
+    assert second["deduplicated"] is True
+    assert second["version"] == first["version"]
+
+
+def test_promote_to_execute_replays_legacy_payload_format(tmp_path: Path) -> None:
+    store, control, run_id, spec, _ = _seeded(tmp_path)
+    control.confirm_spec(run_id)
+    plan = _plan(spec)
+    store.save_plan(run_id, plan, actor="orchestrate")
+    control.approve_plan(run_id)
+    rev = store.get_run(run_id)["state_revision"]
+
+    # Simulate a legacy commands row storing only {"workflow_name": "full_sdlc_tdd"}.
+    with store._tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO commands (
+                operation_id, run_id, actor, action, payload_json, result_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "op-legacy-promote",
+                run_id,
+                "zeus",
+                "promote_to_execute",
+                json.dumps({"workflow_name": "full_sdlc_tdd"}, sort_keys=True),
+                json.dumps({"run_id": run_id, "workflow": "full_sdlc_tdd", "status": "running"}),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    replayed = control.promote_to_execute(
+        run_id,
+        target_workflow="full_sdlc_tdd",
+        current_stop_after="plan",
+        operation_id="op-legacy-promote",
+        expected_state_revision=rev,
+    )
+    assert replayed["deduplicated"] is True
+    assert replayed["workflow"] == "full_sdlc_tdd"
+
+    with pytest.raises(ConcurrencyConflictError):
+        control.promote_to_execute(
+            run_id,
+            target_workflow="full_sdlc_tdd",
+            current_stop_after="plan",
+            operation_id="op-legacy-promote",
+            expected_state_revision=rev,
+            auto_advance=False,
+        )
+
+
+def test_retry_workflow_dispatch_failure_allows_retry_with_same_operation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "retry-fail.db")
+    run_id = store.create_run(title="Retry failure", workflow_name="product_blueprint")
+    store.set_run_status(run_id, RunStatus.FAILED, actor="supervisor", stage="graph")
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+
+    attempts = 0
+
+    def flaky_resume(rid: str, *, sync: bool = False) -> dict[str, Any]:
+        nonlocal attempts
+        del sync
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("scheduler temporarily unavailable")
+        return {"run_id": rid, "status": "queued"}
+
+    monkeypatch.setattr(app.supervisor, "resume_run", flaky_resume)
+    rev = store.get_run(run_id)["state_revision"]
+    body = {
+        "action": "retry_workflow",
+        "operation_id": "op-retry-flaky",
+        "expected_state_revision": rev,
+    }
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        app.execute_command(run_id, body)
+    assert store.get_run(run_id)["status"] == RunStatus.FAILED
+
+    recovered = app.execute_command(run_id, body)
+    assert attempts == 2
+    assert recovered["command_result"]["deduplicated"] is False
+    assert recovered["command_result"]["workflow"]["status"] == "queued"
+
+    replayed = app.execute_command(run_id, body)
+    assert attempts == 2
+    assert replayed["command_result"]["deduplicated"] is True
+
+
+def test_workspace_policy_preserves_trailing_space_in_scope_pattern(tmp_path: Path) -> None:
+    policy = WorkspacePolicy(
+        workspace_root=tmp_path,
+        allowed_write_scope=["docs/guide.md "],
+    )
+    ok_exact, _ = policy.authorize_tool(
+        "write_file", {"path": str(tmp_path / "docs/guide.md ")}
+    )
+    ok_trimmed, _ = policy.authorize_tool(
+        "write_file", {"path": str(tmp_path / "docs/guide.md")}
+    )
+    assert ok_exact is True
+    assert ok_trimmed is False
+
+
+def test_dag_paths_overlap_catches_glob_and_directory_collisions() -> None:
+    assert paths_overlap("docs/", "docs/api/*.md") is True
+    assert paths_overlap("docs/api/*.md", "docs/") is True
+    assert paths_overlap("docs/", "*.md") is True
+    assert paths_overlap("*.md", "docs/") is True
+    assert paths_overlap("src/api/", "tests/*.py") is False
+
+
+def test_plan_bound_to_stale_design_after_goal_spec_v2_is_rejected(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "stale-design-plan.db")
+    control = RunControl(store)
+    run_id = store.create_run(title="Stale design chain", workflow_name="product_blueprint")
+    spec_v1 = _spec()
+    store.save_spec(run_id, spec_v1, actor="align")
+    control.confirm_spec(run_id)
+
+    design_v1 = DesignSpec(
+        spec_id=spec_v1.spec_id,
+        spec_hash=spec_v1.content_hash,
+        architecture_summary="v1 architecture",
+        modules=[
+            DesignModule(
+                id="M1",
+                name="core",
+                responsibility="Core logic",
+                target_paths=["src/app.py"],
+                requirement_refs=["R1"],
+            )
+        ],
+    )
+    store.save_design(run_id, design_v1, actor="design")
+    control.approve_design(run_id)
+
+    plan_v1 = TaskPlan(
+        spec_id=None,
+        spec_hash=None,
+        design_id=design_v1.design_id,
+        design_hash=design_v1.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1",
+                title="Implement M1",
+                objective="Implement M1",
+                requirement_refs=["R1"],
+                write_scope=["src/app.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="c1",
+                        kind=CheckKind.COMMAND,
+                        description="Run check",
+                        command="true",
+                    )
+                ],
+            )
+        ],
+    )
+    store.save_plan(run_id, plan_v1, actor="orchestrate")
+    control.approve_plan(run_id)
+
+    # Clarify and approve GoalSpec v2; design_v1 still points to spec_v1.
+    control.clarify_spec(run_id, answers={}, extra_out_of_scope=["no v1 leftovers"])
+    control.confirm_spec(run_id)
+
+    snap = store.get_run(run_id)
+    assert is_plan_bound_to_upstream(store, run_id, snap) is False
+    with pytest.raises(ValueError, match="does not match"):
+        control.approve_plan(run_id)
+    with pytest.raises(ValueError, match="stale"):
+        control.promote_to_execute(
+            run_id,
+            target_workflow="full_sdlc_tdd",
+            current_stop_after="plan",
+            operation_id="op-stale-design-promote",
+            expected_state_revision=snap["state_revision"],
+        )
+
+    full_def = load_workflow("full_sdlc_tdd")
+    assert resolve_resume_node(full_def, snap, store=store) == "design"
+
+    stage = OrchestrateStage(
+        store=store, provider=MockLLMProvider(), workspace_root=tmp_path
+    )
+    with pytest.raises(ValueError, match="stale"):
+        stage.run_execution(run_id=run_id)

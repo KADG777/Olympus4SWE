@@ -138,7 +138,9 @@ class WorkspacePolicy:
             ) from exc
 
     def _scope_pattern(self, raw: str) -> str | None:
-        pattern = self._strip_dot_prefix(raw.strip().replace("\\", "/"))
+        if not raw or not raw.strip():
+            return None
+        pattern = self._strip_dot_prefix(raw.replace("\\", "/"))
         if not pattern:
             return None
         if pattern.startswith("/"):
@@ -157,6 +159,16 @@ class WorkspacePolicy:
         pattern = self._scope_pattern(raw_pattern)
         if pattern is None:
             return False
+        if rel != rel.strip() or pattern != pattern.strip():
+            norm_rel = self._strip_dot_prefix(rel).lstrip("/")
+            norm_pat = pattern.rstrip("/")
+            if any(char in pattern for char in _GLOB_CHARS):
+                return fnmatch.fnmatch(norm_rel, pattern)
+            return (
+                norm_rel == norm_pat
+                or norm_rel.startswith(f"{norm_pat}/")
+                or norm_pat.startswith(f"{norm_rel}/")
+            )
         try:
             return paths_overlap(rel, pattern)
         except ValueError:
