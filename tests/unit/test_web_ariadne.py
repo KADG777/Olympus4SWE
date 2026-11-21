@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -756,6 +757,21 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert app_res.status_code == 200
             assert "javascript" in app_res.headers["content-type"]
             assert "watchSlots();" in app_res.text
+
+            # 1c. The pre-built Graph Island loads offline from the same static root.
+            assert 'href="/static/graph/ariadne-graph.css"' in html_res.text
+            graph_at = html_res.text.find('src="/static/graph/ariadne-graph.js"')
+            assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
+            assert 'id="dag-graph"' in html_res.text
+            assert 'id="dag-svg"' not in html_res.text
+            graph_js = client.get("/static/graph/ariadne-graph.js")
+            assert graph_js.status_code == 200
+            assert "javascript" in graph_js.headers["content-type"]
+            assert "window.AriadneGraph" in graph_js.text or "AriadneGraph=" in graph_js.text
+            graph_css = client.get("/static/graph/ariadne-graph.css")
+            assert graph_css.status_code == 200
+            assert graph_css.headers["content-type"].startswith("text/css")
+            assert ".ag-task-card" in graph_css.text
 
             assert client.get("/static/missing.css").status_code == 404
             assert client.get("/static/..%2fserver.py").status_code == 404
@@ -1678,3 +1694,34 @@ def test_run_snapshot_exposes_recorded_output_versions_with_task_graph(tmp_path:
         (1, original.content_hash, False),
     ]
     assert versions[0]["summary"] == "任务计划 v2 已就绪，包含 1 个任务"
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_WEB_GRAPH = _REPO_ROOT / "web-graph"
+_GRAPH_BUNDLE = _REPO_ROOT / "src" / "olympus" / "web" / "static" / "graph"
+
+
+def _web_graph_source_stamp() -> str:
+    """Mirror of web-graph/vite.config.ts `sourceStamp()`: sha256 over sorted `rel\\0bytes\\0`."""
+    files = [_WEB_GRAPH / name for name in (
+        "package.json", "pnpm-lock.yaml", "tsconfig.json", "vite.config.ts",
+    )]
+    files += [path for path in (_WEB_GRAPH / "src").rglob("*") if path.is_file()]
+    digest = hashlib.sha256()
+    for rel, path in sorted((path.relative_to(_WEB_GRAPH).as_posix(), path) for path in files):
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def test_committed_graph_bundle_matches_web_graph_sources() -> None:
+    """The offline bundle must be rebuilt (`pnpm --dir web-graph build`) after source edits."""
+    banner = f"/*! ariadne-graph | source-sha256:{_web_graph_source_stamp()} */"
+    for name in ("ariadne-graph.js", "ariadne-graph.css"):
+        first_line = (_GRAPH_BUNDLE / name).read_text(encoding="utf-8").splitlines()[0]
+        assert first_line == banner, f"{name} is stale; run `pnpm --dir web-graph build`"
+    bundle = (_GRAPH_BUNDLE / "ariadne-graph.js").read_text(encoding="utf-8")
+    assert "mountDag" in bundle and "mountWorkflow" in bundle
+    assert not (_GRAPH_BUNDLE / "ariadne-graph.js.map").exists()

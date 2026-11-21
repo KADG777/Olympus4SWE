@@ -497,7 +497,7 @@ def test_progress_motion_and_reading_position(workbench, browser, motion):
     expect = playwright.expect
     expect(page.locator("#run-current-stage")).to_contain_text("有任务受阻")
     page.get_by_text("产物历史", exact=True).click()
-    target = page.locator("#dag-svg [data-task-id='T01']")
+    target = page.locator("#dag-graph [data-task-id='T01']")
     target.evaluate("""node => {
       const stage = document.querySelector("#stage");
       stage.scrollTop += document.querySelector("#topology-title").getBoundingClientRect().top
@@ -600,3 +600,324 @@ def test_eventsource_error_reopens_from_snapshot(workbench, browser):
     expect(page.locator("#run-connection")).to_be_hidden()
     assert len(requests) == 2 and requests[1].endswith(f"after_seq={latest}")
     page.close()
+
+
+# ---------------------------------------------------------------------------
+# Task Dependency Graph island (React Flow + ELK) — real-browser geometry seams
+# ---------------------------------------------------------------------------
+
+SKIP_DEPS = {
+    "A": [], "B": [],
+    "C": ["A"], "D": ["B"],
+    "E": ["C", "A"], "F": ["D"],
+    "G": ["E", "B", "D"], "H": ["F"],
+}
+SKIP_WAVES = {"A": 0, "B": 0, "C": 1, "D": 1, "E": 2, "F": 2, "G": 3, "H": 3}
+
+GRAPH_GEOMETRY = """(host) => {
+  const screen = (m, p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f];
+  const cards = Array.from(host.querySelectorAll('[data-task-id]')).map((card) => {
+    const r = card.getBoundingClientRect();
+    return {id: card.dataset.taskId, x: r.left, y: r.top, w: r.width, h: r.height};
+  });
+  const edges = Array.from(host.querySelectorAll('.ag-edge')).map((g) => {
+    const path = g.querySelector('path');
+    const m = path.getScreenCTM();
+    const total = path.getTotalLength();
+    const points = [];
+    for (let s = 0; s <= total; s += 2) points.push(screen(m, path.getPointAtLength(s)));
+    const ref = (path.getAttribute('marker-end') || '').match(/#([^)'"]+)/);
+    const marker = ref && document.getElementById(ref[1]);
+    const style = getComputedStyle(path);
+    return {
+      source: g.dataset.edgeSource, target: g.dataset.edgeTarget, tone: g.dataset.tone,
+      points, end: screen(m, path.getPointAtLength(total)),
+      stroke: style.stroke, dash: style.strokeDasharray,
+      markerUnits: marker && marker.getAttribute('markerUnits'),
+      markerFill: marker && getComputedStyle(marker.querySelector('path')).fill,
+    };
+  });
+  const waves = Array.from(host.querySelectorAll('[data-wave]')).map((w) => {
+    const r = w.getBoundingClientRect();
+    return {layer: Number(w.dataset.wave), text: w.textContent, x: r.left, bottom: r.bottom};
+  });
+  const viewport = host.querySelector('.react-flow__viewport');
+  return {
+    cards, edges, waves,
+    transform: viewport ? getComputedStyle(viewport).transform : null,
+    hostWidth: host.getBoundingClientRect().width,
+  };
+}"""
+
+TOKEN_COLOUR = """(name) => {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  document.body.append(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  return value;
+}"""
+
+
+def _token(page, name):
+    return page.evaluate(TOKEN_COLOUR, name)
+
+
+def _wait_for_layout(page, mode="elk"):
+    island = page.locator(f"#dag-graph .ag-island[data-layout='{mode}']")
+    playwright.expect(island).to_be_visible()
+    page.wait_for_function(
+        "() => document.querySelectorAll('#dag-graph .ag-edge path').length > 0"
+    )
+    return page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
+
+
+def _inside(point, card, inset=1.0):
+    x, y = point
+    return (card["x"] + inset < x < card["x"] + card["w"] - inset
+            and card["y"] + inset < y < card["y"] + card["h"] - inset)
+
+
+@pytest.fixture
+def skip_dag(workbench):
+    store, _, url = workbench
+    run_id = store.create_run(title="跨层依赖 DAG")
+    spec = GoalSpec(goal="跨层依赖", requirements=[RequirementItem(
+        id="R1", description="多层跳跃依赖", acceptance_criteria=["路径不穿过卡片"],
+    )])
+    store.save_spec(run_id, spec)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.GOAL_SPEC, target_id=spec.spec_id,
+        target_hash=spec.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    review = AcceptanceCheck(id="review", kind=CheckKind.INDEPENDENT_REVIEW, description="复核")
+    plan = TaskPlan(spec_id=spec.spec_id, spec_hash=spec.content_hash, tasks=[
+        TaskNode(task_id=task_id, title=f"任务 {task_id}", objective="跨层", depends_on=deps,
+                 write_scope=[f"{task_id.lower()}.py"], acceptance_checks=[review])
+        for task_id, deps in SKIP_DEPS.items()
+    ])
+    store.save_plan(run_id, plan)
+    store.record_approval(ApprovalRecord(
+        run_id=run_id, target=ApprovalTarget.TASK_PLAN, target_id=plan.plan_id,
+        target_hash=plan.content_hash, approver="human", decision=ApprovalDecision.APPROVED,
+    ))
+    return store, run_id, url
+
+
+def test_task_dag_island_keeps_fixed_scale_and_routes_around_cards(skip_dag, browser):
+    _, run_id, url = skip_dag
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    geo = _wait_for_layout(page)
+    cards = {card["id"]: card for card in geo["cards"]}
+    assert set(cards) == set(SKIP_DEPS)
+
+    # Fixed 1:1 physical card size, never stretched to the (much wider) frame.
+    assert geo["transform"] in ("none", "matrix(1, 0, 0, 1, 0, 0)") or geo["transform"].startswith(
+        "matrix(1, 0, 0, 1,"
+    ), geo["transform"]
+    for card in cards.values():
+        assert abs(card["w"] - 184) <= 0.5 and abs(card["h"] - 76) <= 0.5, card
+    assert geo["hostWidth"] > 4 * 184 + 3 * 96
+
+    # Wave columns: one shared x per wave, ordered left to right, under a matching header.
+    wave_x = {}
+    for task_id, wave in SKIP_WAVES.items():
+        wave_x.setdefault(wave, cards[task_id]["x"])
+        assert abs(cards[task_id]["x"] - wave_x[wave]) <= 0.5, (task_id, wave)
+    assert [wave_x[w] for w in sorted(wave_x)] == sorted(wave_x.values())
+    headers = {header["layer"]: header for header in geo["waves"]}
+    assert sorted(headers) == [0, 1, 2, 3]
+    for wave, header in headers.items():
+        assert header["text"] == f"Wave {wave}"
+        assert abs(header["x"] - wave_x[wave]) <= 1
+        assert header["bottom"] <= min(cards[t]["y"] for t, w in SKIP_WAVES.items() if w == wave)
+
+    # Every dependency renders; no edge passes through a non-endpoint card.
+    edges = {(edge["source"], edge["target"]): edge for edge in geo["edges"]}
+    assert set(edges) == {(dep, task) for task, deps in SKIP_DEPS.items() for dep in deps}
+    for (source, target), edge in edges.items():
+        for card_id, card in cards.items():
+            if card_id in (source, target):
+                continue
+            hits = [p for p in edge["points"] if _inside(p, card)]
+            assert not hits, f"{source}->{target} crosses {card_id} at {hits[:3]}"
+
+    # Multi-parent G: incoming heads land on G's west side at separated y coordinates.
+    incoming = [edges[(dep, "G")]["end"] for dep in SKIP_DEPS["G"]]
+    for x, _ in incoming:
+        assert abs(x - cards["G"]["x"]) <= 2
+    ys = sorted(y for _, y in incoming)
+    assert all(b - a >= 6 for a, b in zip(ys, ys[1:], strict=False)), ys
+
+    # Fixed-size heads whose fill matches each edge's stroke tone.
+    ink, rule = _token(page, "--text-ink"), _token(page, "--rule-hard")
+    for edge in edges.values():
+        assert edge["markerUnits"] == "userSpaceOnUse"
+        assert edge["markerFill"] == edge["stroke"]
+        assert edge["stroke"] == (ink if edge["tone"] == "critical" else rule)
+    assert edges[("E", "G")]["tone"] == "critical"
+    assert edges[("B", "G")]["tone"] == "default"
+    page.close()
+
+
+def test_task_dag_island_separates_selection_from_critical_path(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"{url}/?run={run_id}")
+    expect = playwright.expect
+    geo = _wait_for_layout(page)
+    edges = {(edge["source"], edge["target"]): edge for edge in geo["edges"]}
+
+    ink, bad, live, accent = (
+        _token(page, name) for name in ("--text-ink", "--bad", "--live", "--accent")
+    )
+    assert accent != ink
+    assert edges[("T01", "T03")]["tone"] == "critical"
+    assert edges[("T01", "T03")]["stroke"] == ink
+    blocked = edges[("T03-R1", "T06")]
+    assert blocked["tone"] == "blocked" and blocked["stroke"] == bad
+    assert blocked["dash"] not in ("none", "") and blocked["markerFill"] == bad
+    running = edges[("T03", "T05")]
+    assert running["tone"] == "running" and running["stroke"] == live
+
+    def ring(task_id):
+        return expect(page.locator(f"#dag-graph [data-task-id='{task_id}']"))
+
+    blocked_card = page.locator("#dag-graph [data-task-id='T03-R1']")
+    expect(blocked_card).to_have_attribute("aria-selected", "true")
+    expect(blocked_card).to_have_attribute("data-status", "blocked")
+    expect(blocked_card).to_have_attribute("role", "button")
+    expect(blocked_card).to_have_attribute("tabindex", "0")
+    ring("T03-R1").to_have_css("outline-color", accent)
+    ring("T03-R1").to_have_css("outline-style", "solid")
+    ring("T03-R1").to_have_css("outline-width", "2px")
+    ring("T01").not_to_have_css("outline-color", accent)
+
+    card = page.locator("#dag-graph [data-task-id='T05']")
+    card.focus()
+    page.keyboard.press("Enter")
+    expect(card).to_have_attribute("aria-selected", "true")
+    expect(blocked_card).to_have_attribute("aria-selected", "false")
+    expect(page.locator("body")).to_have_attribute("data-dock", "open")
+    expect(page.locator("#dock-title")).to_contain_text("T05")
+    expect(card).to_be_focused()
+
+    first = page.locator("#dag-graph [data-task-id='T01']")
+    first.focus()
+    page.keyboard.press(" ")
+    expect(first).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#dock-title")).to_contain_text("T01")
+    page.locator("#dag-graph [data-task-id='T02']").click()
+    expect(page.locator("#dock-title")).to_contain_text("T02")
+    ring("T02").to_have_css("outline-color", accent)
+    ring("T03").not_to_have_css("outline-color", accent)
+
+    # Dark theme: cards and edges re-read tokens in place, without remounting.
+    light_surface = first.evaluate("node => getComputedStyle(node).backgroundColor")
+    page.locator("#theme-toggle").click()
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    assert _token(page, "--ok-soft") != light_surface
+    expect(first).to_have_css("background-color", _token(page, "--ok-soft"))
+    dark = page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
+    dark_edges = {(edge["source"], edge["target"]): edge for edge in dark["edges"]}
+    assert dark_edges[("T01", "T03")]["stroke"] == _token(page, "--text-ink") != ink
+    ring("T02").to_have_css("outline-color", _token(page, "--accent"))
+    assert len(dark["cards"]) == len(geo["cards"])
+    assert first.evaluate("node => node.isConnected")
+    assert not errors, errors
+    page.close()
+
+
+def test_task_dag_island_preserves_viewport_on_live_updates(workbench, browser):
+    store, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    host = page.locator("#dag-graph")
+    viewport = host.locator(".react-flow__viewport")
+    before = viewport.evaluate("node => getComputedStyle(node).transform")
+    host.scroll_into_view_if_needed()
+    box = host.bounding_box()
+    page.mouse.move(box["x"] + 12, box["y"] + box["height"] - 12)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 72, box["y"] + box["height"] - 32, steps=6)
+    page.mouse.up()
+    panned = viewport.evaluate("node => getComputedStyle(node).transform")
+    assert panned != before
+    card = host.locator("[data-task-id='T05']").element_handle()
+
+    plan = store.get_run(run_id)["plan"]
+    store.save_plan(run_id, plan.model_copy(update={"version": 2}))
+    playwright.expect(page.locator("#run-output-summary")).to_contain_text("任务计划 v2")
+    assert viewport.evaluate("node => getComputedStyle(node).transform") == panned
+    assert card.evaluate("node => node.isConnected")
+    page.close()
+
+
+def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    expect = playwright.expect
+
+    page.evaluate("""() => {
+      const make = (id) => {
+        const host = document.createElement('div');
+        host.id = id;
+        host.style.width = '900px';
+        document.querySelector('#view-topology').prepend(host);
+        return host;
+      };
+      const view = (id, layer) => ({
+        id, layer, status: 'waiting', tone: 'muted', meta: 'engineer · implement',
+        statusText: '◷ 等待', ariaLabel: `任务 ${id} ◷ 等待`,
+      });
+      window.emptyHandle = window.AriadneGraph.mountDag(make('graph-empty'), {
+        runId: 'empty', nodes: [], edges: [], emptyMessage: '当前运行尚未生成任务 DAG',
+      });
+      window.cycleHandle = window.AriadneGraph.mountDag(make('graph-cycle'), {
+        runId: 'cycle',
+        nodes: [view('X', 0), view('Y', 1), view('Z', 2)],
+        edges: [
+          {source: 'X', target: 'Y'}, {source: 'Y', target: 'Z'}, {source: 'Z', target: 'X'},
+          {source: 'Z', target: 'ghost'},
+        ],
+      });
+    }""")
+    empty = page.locator("#graph-empty")
+    expect(empty.get_by_text("当前运行尚未生成任务 DAG", exact=True)).to_be_visible()
+    expect(empty.locator("[data-task-id]")).to_have_count(0)
+
+    cycle = page.locator("#graph-cycle")
+    expect(cycle.locator(".ag-island[data-layout='fallback']")).to_be_visible()
+    expect(cycle.locator("[data-task-id]")).to_have_count(3)
+    expect(cycle.locator(".ag-edge path")).to_have_count(3)
+    for task_id in ("X", "Y", "Z"):
+        box = cycle.locator(f"[data-task-id='{task_id}']").bounding_box()
+        assert abs(box["width"] - 184) <= 0.5 and abs(box["height"] - 76) <= 0.5
+
+    page.evaluate("""() => window.cycleHandle.update({
+      runId: 'cycle', selectedId: 'Y',
+      nodes: ['X', 'Y', 'Z'].map((id, layer) => ({
+        id, layer, status: 'running', tone: 'live', meta: 'engineer · implement',
+        statusText: '▶ 运行中', ariaLabel: `任务 ${id} ▶ 运行中`,
+      })),
+      edges: [{source: 'X', target: 'Y'}, {source: 'Y', target: 'Z'}, {source: 'Z', target: 'X'}],
+    })""")
+    expect(cycle.locator("[data-task-id='Y']")).to_have_attribute("aria-selected", "true")
+    expect(cycle.locator("[data-task-id='Y']")).to_have_attribute("data-status", "running")
+    page.evaluate("() => { window.cycleHandle.destroy(); window.emptyHandle.destroy(); }")
+    expect(cycle.locator(".ag-island")).to_have_count(0)
+    page.close()
+
+    broken = browser.new_page()
+    broken.route("**/static/graph/ariadne-graph.js", lambda route: route.abort())
+    broken.goto(f"{url}/?run={run_id}")
+    expect(broken.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+    expect(broken.locator("#workflow-svg [data-workflow-node]").first).to_be_visible()
+    expect(broken.locator("#run-current-stage")).to_contain_text("有任务受阻")
+    broken.close()
