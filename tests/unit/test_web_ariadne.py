@@ -38,7 +38,8 @@ from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph.loader import build_graph, load_workflow
 from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
-from olympus.web.projection import build_run_projection, seed_demo_runs
+from olympus.web.demos import seed_demo_runs
+from olympus.web.projection import build_run_projection
 from olympus.web.server import AriadneApp, create_http_server
 from olympus.web.supervisor import RunSupervisor
 

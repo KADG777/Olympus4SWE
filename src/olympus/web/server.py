@@ -16,8 +16,8 @@ from olympus.core.contracts import new_id
 from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
-from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
-from olympus.web.projection import build_run_projection, read_recorded_attempt, seed_demo_runs
+from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
+from olympus.web.projection import build_run_projection, read_recorded_attempt
 from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"

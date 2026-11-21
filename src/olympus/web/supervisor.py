@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from olympus.core.contracts import ApprovalTarget, DesignSpec, GoalSpec, RunStatus, TaskPlan
+from olympus.core.contracts import RunStatus
 from olympus.core.store import RunStore
 from olympus.graph import (
     GraphPaused,
@@ -20,6 +20,7 @@ from olympus.graph import (
     run_graph,
 )
 from olympus.graph.loader import WorkflowRuntime
+from olympus.graph.progress import resolve_resume_node
 from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
@@ -449,59 +450,13 @@ class RunSupervisor:
             sync=sync,
         )
 
-    def _is_approved(self, run_id: str, target: ApprovalTarget, target_id: str, hash_: str) -> bool:
-        return self.store.is_approved(
-            run_id=run_id,
-            target=target,
-            target_id=target_id,
-            target_hash=hash_,
-        )
-
     def resume_node(
         self,
         definition: WorkflowDefinition,
         snap: dict[str, Any],
     ) -> str | None:
         """Pick the graph entry point implied by the run's confirmed artifacts."""
-        names = {node.name for node in definition.nodes}
-        run_id = str(snap["run_id"])
-        spec: GoalSpec | None = snap["spec"]
-        design: DesignSpec | None = snap["design"]
-        plan: TaskPlan | None = snap["plan"]
-
-        if plan is not None and self._is_approved(
-            run_id, ApprovalTarget.TASK_PLAN, plan.plan_id, plan.content_hash
-        ):
-            if definition.stop_after == "execute" and "execute" in names:
-                return "execute"
-            # Re-enter the terminal gate so the graph records its final routed/END events.
-            if "gate_plan" in names:
-                return "gate_plan"
-            return None
-
-        if design is not None:
-            if self._is_approved(
-                run_id, ApprovalTarget.DESIGN_SPEC, design.design_id, design.content_hash
-            ):
-                return "plan" if "plan" in names else None
-            for candidate in ("gate_design", "validate_design", "design"):
-                if candidate in names:
-                    return candidate
-            return None
-
-        if spec is not None:
-            if self._is_approved(
-                run_id, ApprovalTarget.GOAL_SPEC, spec.spec_id, spec.content_hash
-            ):
-                for candidate in ("design", "plan"):
-                    if candidate in names:
-                        return candidate
-                return None
-            if "gate_spec" in names:
-                return "gate_spec"
-            return "align" if "align" in names else None
-
-        return "intake" if "intake" in names else ("align" if "align" in names else None)
+        return resolve_resume_node(definition, snap, store=self.store)
 
     def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
         for ev in reversed(self.store.list_events(run_id, after_seq=0)):
