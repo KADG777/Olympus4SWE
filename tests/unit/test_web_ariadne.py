@@ -975,6 +975,136 @@ def test_projection_workflow_traceability_and_triage(tmp_path: Path) -> None:
     assert design["interfaces"][0]["consumer_module_ids"] == ["MOD-API"]
 
 
+def test_projection_derives_workflow_trajectory_and_skipped_nodes(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="轨迹投影测试", workflow_name="full_sdlc_tdd")
+    for event_type, payload in (
+        ("graph.started", {"graph": "full_sdlc_tdd", "start_from": None}),
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.routed", {"from": ["intake"], "to": ["align"], "wave": 1}),
+        ("graph.node_started", {"node": "align"}),
+        ("graph.node_finished", {"node": "align"}),
+        ("graph.routed", {"from": ["align"], "to": ["gate_spec"], "wave": 2}),
+        ("graph.node_started", {"node": "gate_spec"}),
+        ("graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    proj = build_run_projection(store, tmp_path, run_id)
+    workflow = proj["workflow"]
+    assert {"source": "align", "target": "gate_spec"} in workflow["traversed_edges"]
+    assert {"source": "intake", "target": "align"} in workflow["traversed_edges"]
+    assert workflow["node_statuses"]["critic"] == "skipped"
+    assert next(n for n in workflow["nodes"] if n["name"] == "critic")["status"] == "skipped"
+    assert workflow["node_statuses"]["gate_spec"] == "paused"
+    for downstream in (
+        "design",
+        "validate_design",
+        "gate_design",
+        "plan",
+        "validate_plan",
+        "gate_plan",
+        "execute",
+    ):
+        assert workflow["node_statuses"][downstream] == "pending"
+
+    # Once the run executes to completion the bypassed node stays skipped.
+    for event_type, payload in (
+        ("graph.node_finished", {"node": "gate_spec"}),
+        ("graph.node_started", {"node": "design"}),
+        ("graph.node_finished", {"node": "design"}),
+        ("graph.routed", {"from": ["design"], "to": ["execute"], "wave": 3}),
+        ("graph.node_started", {"node": "execute"}),
+        ("graph.node_finished", {"node": "execute"}),
+        ("graph.finished", {"graph": "full_sdlc_tdd", "steps": 3}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.COMPLETED, actor="supervisor", stage="graph")
+
+    finished = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert finished["node_statuses"]["critic"] == "skipped"
+    assert finished["node_statuses"]["execute"] == "completed"
+
+
+def test_projection_skips_alignment_chain_on_design_ready_triage(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="分流投影测试", workflow_name="full_sdlc_tdd")
+    for event_type, payload in (
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.routed", {"from": ["intake"], "to": ["validate_design"], "wave": 1}),
+        ("graph.node_started", {"node": "validate_design"}),
+        ("graph.node_finished", {"node": "validate_design"}),
+        ("graph.routed", {"from": ["validate_design"], "to": ["gate_design"], "wave": 2}),
+        ("graph.node_started", {"node": "gate_design"}),
+        ("graph.paused", {"node": "gate_design", "reason": "human_gate"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    workflow = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert {"source": "intake", "target": "validate_design"} in workflow["traversed_edges"]
+    for bypassed in ("align", "critic", "gate_spec", "design"):
+        assert workflow["node_statuses"][bypassed] == "skipped"
+    assert workflow["node_statuses"]["gate_design"] == "paused"
+    for unreached in ("plan", "validate_plan", "gate_plan", "execute"):
+        assert workflow["node_statuses"][unreached] == "pending"
+
+
+def test_projection_derives_legacy_trajectory_without_routed_events(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="遗留运行", workflow_name="repo_fast_patch")
+    for event_type, payload in (
+        ("graph.node_started", {"node": "intake"}),
+        ("graph.node_finished", {"node": "intake"}),
+        ("graph.node_started", {"node": "align"}),
+        ("graph.node_finished", {"node": "align"}),
+        ("graph.node_started", {"node": "gate_spec"}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="supervisor", stage="graph")
+
+    workflow = build_run_projection(store, tmp_path, run_id)["workflow"]
+    assert workflow["traversed_edges"] == [
+        {"source": "intake", "target": "align"},
+        {"source": "align", "target": "gate_spec"},
+    ]
+    assert "skipped" not in workflow["node_statuses"].values()
+    assert workflow["node_statuses"]["plan"] == "pending"
+
+    # Seeded demo runs predate graph.* events entirely: derivation stays empty, never raises.
+    for seeded_id in seed_demo_runs(store, tmp_path):
+        seeded = build_run_projection(store, tmp_path, seeded_id)["workflow"]
+        assert seeded["traversed_edges"] == []
+        assert "skipped" not in seeded["node_statuses"].values()
+
+
 def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
     db_path = tmp_path / ".olympus" / "olympus.db"
     store = RunStore(db_path)
