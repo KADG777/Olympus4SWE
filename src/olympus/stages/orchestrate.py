@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from olympus.core.contracts import (
     AcceptanceCheck,
-    ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
     CheckKind,
@@ -28,6 +27,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import (
     PlanValidationError,
     compute_dispatchable_tasks,
@@ -539,58 +539,16 @@ class OrchestrateStage:
         approver: str = "zeus",
         reason: str = "",
         expected_revision: int | None = None,
+        expected_target_hash: str | None = None,
     ) -> ApprovalRecord:
         """Record human approval bound to the current TaskPlan content_hash."""
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        plan: TaskPlan | None = snap["plan"]
-        if plan is None:
-            raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
-        spec: GoalSpec | None = snap["spec"]
-        design: DesignSpec | None = snap["design"]
-
-        spec_bound = bool(
-            spec
-            and plan.spec_hash
-            and plan.spec_hash == spec.content_hash
-            and self.store.is_approved(
-                run_id=run_id,
-                target=ApprovalTarget.GOAL_SPEC,
-                target_id=spec.spec_id,
-                target_hash=spec.content_hash,
-            )
-        )
-        design_bound = bool(
-            design
-            and plan.design_hash
-            and plan.design_hash == design.content_hash
-            and self.store.is_approved(
-                run_id=run_id,
-                target=ApprovalTarget.DESIGN_SPEC,
-                target_id=design.design_id,
-                target_hash=design.content_hash,
-            )
-        )
-        if not (spec_bound or design_bound):
-            if spec is None and design is None:
-                raise ValueError(
-                    f"Run {run_id} has no GoalSpec or DesignSpec; complete Stage 1 first."
-                )
-            raise ValueError(
-                "TaskPlan does not match any approved upstream artifact "
-                f"(spec_hash={plan.spec_hash}, design_hash={plan.design_hash}); "
-                "regenerate the plan first."
-            )
-        record = ApprovalRecord(
+        return RunControl(self.store).approve_plan(
             run_id=run_id,
-            target=ApprovalTarget.TASK_PLAN,
-            target_id=plan.plan_id,
-            target_hash=plan.content_hash,
             approver=approver,
-            decision=ApprovalDecision.APPROVED,
             reason=reason,
+            expected_revision=expected_revision,
+            expected_target_hash=expected_target_hash,
         )
-        self.store.record_approval(record, expected_revision=expected_revision)
-        return record
 
     def _run_command_checks(
         self,
@@ -1131,58 +1089,6 @@ class OrchestrateStage:
                     for fut in futures:
                         fut.result()
 
-    def _apply_task_command(
-        self,
-        *,
-        operation_id: str,
-        run_id: str,
-        task_id: str,
-        expected_state_revision: int,
-        action: str,
-        event_type: str,
-        actor: str,
-        payload: dict[str, Any],
-        task_mutator: Callable[[TaskNode], TaskNode],
-        result_status: str,
-    ) -> dict[str, Any]:
-        """Shared idempotent task-mutation command helper."""
-
-        def handler(conn: Any, cur_rev: int) -> dict[str, Any]:
-            def mutate_plan(plan: TaskPlan) -> TaskPlan:
-                updated_tasks: list[TaskNode] = []
-                found = False
-                for t in plan.tasks:
-                    if t.task_id == task_id:
-                        found = True
-                        updated_tasks.append(task_mutator(t))
-                    else:
-                        updated_tasks.append(t)
-                if not found:
-                    raise ValueError(f"Task {task_id} not found")
-                return plan.model_copy(update={"tasks": updated_tasks})
-
-            new_rev = self.store.update_plan_in_tx(
-                conn,
-                run_id=run_id,
-                cur_rev=cur_rev,
-                mutator=mutate_plan,
-                stage="control",
-                event_type=event_type,
-                actor=actor,
-                payload=payload,
-            )
-            return {"task_id": task_id, "status": result_status, "state_revision": new_rev}
-
-        return self.store.apply_idempotent_command(
-            operation_id=operation_id,
-            run_id=run_id,
-            actor=actor,
-            action=action,
-            expected_state_revision=expected_state_revision,
-            payload=payload,
-            handler=handler,
-        )
-
     def retry_blocked_task(
         self,
         *,
@@ -1194,30 +1100,13 @@ class OrchestrateStage:
         actor: str = "zeus",
     ) -> dict[str, Any]:
         """Idempotently reset a BLOCKED/FAILED task back to READY for another cycle."""
-
-        def mutate_retry(t: TaskNode) -> TaskNode:
-            if t.status not in (TaskStatus.BLOCKED, TaskStatus.FAILED):
-                raise ValueError(
-                    f"Task {task_id} status is {t.status.value}, not blocked/failed"
-                )
-            new_err = (
-                f"{t.last_error or ''}\n[Human hint]: {hint}".strip() if hint else t.last_error
-            )
-            return t.model_copy(
-                update={"status": TaskStatus.READY, "review_cycle": 0, "last_error": new_err}
-            )
-
-        return self._apply_task_command(
+        return RunControl(self.store).retry_task(
+            run_id,
+            task_id,
             operation_id=operation_id,
-            run_id=run_id,
-            task_id=task_id,
             expected_state_revision=expected_state_revision,
-            action="retry_task",
-            event_type="task.retried_by_human",
+            hint=hint,
             actor=actor,
-            payload={"task_id": task_id, "hint": hint},
-            task_mutator=mutate_retry,
-            result_status="ready",
         )
 
     def accept_task_risk(
@@ -1231,21 +1120,11 @@ class OrchestrateStage:
         actor: str = "zeus",
     ) -> dict[str, Any]:
         """Explicitly mark a blocked task accepted-with-risk (never marked verified)."""
-        clean_reason = reason.strip()
-        if not clean_reason:
-            raise ValueError("accept_task_risk requires a non-empty reason")
-
-        return self._apply_task_command(
+        return RunControl(self.store).accept_task_risk(
+            run_id,
+            task_id,
             operation_id=operation_id,
-            run_id=run_id,
-            task_id=task_id,
             expected_state_revision=expected_state_revision,
-            action="accept_risk",
-            event_type="task.accepted_with_risk",
+            reason=reason,
             actor=actor,
-            payload={"task_id": task_id, "reason": clean_reason},
-            task_mutator=lambda t: t.model_copy(
-                update={"status": TaskStatus.ACCEPTED, "accepted_risk_reason": clean_reason}
-            ),
-            result_status="accepted_with_risk",
         )

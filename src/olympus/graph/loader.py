@@ -19,6 +19,7 @@ from olympus.core.contracts import (
     SpecStatus,
     StrictModel,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import validate_design_spec, validate_plan
 from olympus.core.store import RunStore
 from olympus.graph.engine import END, Graph, GraphPaused, Node
@@ -292,7 +293,7 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
         )
         if not approved and auto:
             blockers = spec.unresolved_blockers()
-            _align_stage(runtime).confirm_spec(
+            RunControl(runtime.store).confirm_spec(
                 run_id=run_id,
                 approver=runtime.approver,
                 accept_risk=bool(blockers),
@@ -318,7 +319,7 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
             target_hash=design.content_hash,
         )
         if not approved and auto:
-            _design_stage(runtime).approve_design(
+            RunControl(runtime.store).approve_design(
                 run_id=run_id,
                 approver=runtime.approver,
                 reason="workflow auto-approve",
@@ -343,7 +344,7 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
             target_hash=plan.content_hash,
         )
         if not approved and auto:
-            _orchestrate_stage(runtime).approve_plan(
+            RunControl(runtime.store).approve_plan(
                 run_id=run_id,
                 approver=runtime.approver,
                 reason="workflow auto-approve",

@@ -287,6 +287,39 @@ class RunStore:
         )
         return new_rev
 
+    def update_status_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        cur_rev: int,
+        status: RunStatus,
+        stage: str,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Set runs.status and append the status event inside an active transaction."""
+        new_rev = cur_rev + 1
+        conn.execute(
+            """
+            UPDATE runs
+            SET status = ?, state_revision = ?, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (status.value, new_rev, utc_now().isoformat(), run_id),
+        )
+        self._insert_event(
+            conn,
+            run_id=run_id,
+            stage=stage,
+            event_type=event_type,
+            actor=actor,
+            payload=payload,
+            state_revision=new_rev,
+        )
+        return new_rev
+
     def update_plan_in_tx(
         self,
         conn: sqlite3.Connection,

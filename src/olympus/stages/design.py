@@ -10,7 +10,6 @@ import yaml
 from pydantic import ValidationError
 
 from olympus.core.contracts import (
-    ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
     DesignSpec,
@@ -21,6 +20,7 @@ from olympus.core.contracts import (
     StrictModel,
     TriageResult,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import validate_design_spec, validate_goal_spec
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
@@ -475,26 +475,16 @@ class DesignStage:
         reason: str = "",
         *,
         expected_revision: int | None = None,
+        expected_target_hash: str | None = None,
     ) -> ApprovalRecord:
         """Freeze the current DesignSpec and record a hash-bound approval."""
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        design: DesignSpec | None = snap["design"]
-        if design is None:
-            raise ValueError(f"Run {run_id} has no DesignSpec to approve.")
-        confirmed = design.model_copy(update={"status": SpecStatus.CONFIRMED})
-        record = ApprovalRecord(
+        return RunControl(self.store).approve_design(
             run_id=run_id,
-            target=ApprovalTarget.DESIGN_SPEC,
-            target_id=confirmed.design_id,
-            target_hash=confirmed.content_hash,
             approver=approver,
-            decision=ApprovalDecision.APPROVED,
             reason=reason,
+            expected_revision=expected_revision,
+            expected_target_hash=expected_target_hash,
         )
-        self.store.save_design(
-            run_id, confirmed, actor=approver, expected_revision=expected_revision, approval=record
-        )
-        return record
 
 
 __all__ = [
