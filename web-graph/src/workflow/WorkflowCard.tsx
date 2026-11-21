@@ -7,11 +7,13 @@ import { WF_NODE_H, WF_NODE_W } from "./layout";
 
 export interface WorkflowCardData extends Record<string, unknown> {
   view: WorkflowNodeView;
+  height: number;
   kind: WorkflowNodeKind;
   selected: boolean;
   lineage?: NodeLineage;
   select: (id: string) => void;
   hover: (id: string | null) => void;
+  focus: (id: string | null) => void;
 }
 
 export type WorkflowCardNode = Node<WorkflowCardData, "workflow">;
@@ -39,7 +41,7 @@ export function workflowTone(status: string): string {
 
 /** Editorial three-row workflow card: title + kind badge | node name | status capsule. */
 function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
-  const { view, kind, selected, lineage, select, hover } = data;
+  const { view, height, kind, selected, lineage, select, hover, focus } = data;
   const badge = KIND_BADGE[kind];
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -47,12 +49,12 @@ function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
     select(view.id);
   };
   const onFocus = (event: FocusEvent<HTMLDivElement>) => {
-    if (event.currentTarget.matches(":focus-visible")) hover(view.id);
+    if (event.currentTarget.matches(":focus-visible")) focus(view.id);
   };
   return (
     <div
       className="ag-card ag-wf-card nopan"
-      style={{ width: WF_NODE_W, height: WF_NODE_H }}
+      style={{ width: WF_NODE_W, height: height || WF_NODE_H }}
       data-workflow-node={view.id}
       data-status={view.status}
       data-tone={workflowTone(view.status)}
@@ -68,7 +70,7 @@ function WorkflowCardComponent({ data }: NodeProps<WorkflowCardNode>) {
       onMouseEnter={() => hover(view.id)}
       onMouseLeave={() => hover(null)}
       onFocus={onFocus}
-      onBlur={() => hover(null)}
+      onBlur={() => focus(null)}
     >
       <Handle className="ag-handle" type="target" position={Position.Left} isConnectable={false} />
       <div className="ag-card-head">

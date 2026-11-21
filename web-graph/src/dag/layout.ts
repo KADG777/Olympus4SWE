@@ -4,6 +4,7 @@ import type { Point } from "../geometry";
 import {
   CARD_H,
   CARD_W,
+  cardHeights,
   columnsOf,
   edgeKey,
   hasCycle,
@@ -31,6 +32,7 @@ export interface DagLayout {
   signature: string;
   mode: LayoutMode;
   positions: Map<string, Point>;
+  heights: Map<string, number>;
   routes: Map<string, Point[]>;
   waves: { layer: number; x: number }[];
   width: number;
@@ -137,7 +139,8 @@ export async function elkLayout(
   signature: string,
 ): Promise<DagLayout> {
   const column = columnsOf(nodes);
-  const rows = new Map<number, number>();
+  const heights = cardHeights(nodes, edges);
+  const cursorY = new Map<number, number>();
   const ports = new Map<string, ElkPort[]>(nodes.map((node) => [node.id, []]));
   edges.forEach((edge) => {
     ports.get(edge.source)?.push({
@@ -152,18 +155,19 @@ export async function elkLayout(
     layoutOptions: ROOT_OPTIONS,
     children: nodes.map((node) => {
       const col = column.get(node.layer) ?? 0;
-      const row = rows.get(col) || 0;
-      rows.set(col, row + 1);
+      const y = cursorY.get(col) || 0;
+      const height = heights.get(node.id) ?? NODE_H;
+      cursorY.set(col, y + height + ROW_GAP);
       return {
         id: node.id,
         width: NODE_W,
-        height: NODE_H,
+        height,
         x: col * (NODE_W + LAYER_GAP),
-        y: row * (NODE_H + ROW_GAP),
+        y,
         ports: ports.get(node.id),
         layoutOptions: {
           "elk.portConstraints": "FIXED_SIDE",
-          "elk.spacing.portPort": "14",
+          "elk.spacing.portPort": "10",
         },
       };
     }),
@@ -171,7 +175,7 @@ export async function elkLayout(
       (edge): ElkExtendedEdge => ({ id: edge.id, sources: [`${edge.id}#out`], targets: [`${edge.id}#in`] }),
     ),
   };
-  const geometry = await runElk(graph, nodes.length, edges.length, WAVE_BAND);
+  const geometry = await runElk(graph, nodes.length, edges.length, WAVE_BAND, heights);
   const layout: DagLayout = {
     signature,
     mode: "elk",

@@ -4,6 +4,7 @@ import type { Point } from "../geometry";
 import {
   CARD_H,
   CARD_W,
+  cardHeights,
   edgeKey,
   layeredGeometry,
   runElk,
@@ -27,6 +28,7 @@ export interface WorkflowLayout {
   signature: string;
   mode: LayoutMode;
   positions: Map<string, Point>;
+  heights: Map<string, number>;
   routes: Map<string, Point[]>;
   width: number;
   height: number;
@@ -136,13 +138,15 @@ export async function elkWorkflowLayout(
   signature: string,
 ): Promise<WorkflowLayout> {
   const layers = workflowLayers(nodes, edges);
-  const rows = new Map<number, number>();
+  const heights = cardHeights(nodes, edges);
+  const cursorY = new Map<number, number>();
   const hint = new Map(
     nodes.map((node) => {
       const layer = layers.get(node.id) ?? 0;
-      const row = rows.get(layer) || 0;
-      rows.set(layer, row + 1);
-      return [node.id, { x: layer * (WF_NODE_W + LAYER_GAP), y: row * (WF_NODE_H + ROW_GAP) }];
+      const y = cursorY.get(layer) || 0;
+      const height = heights.get(node.id) ?? WF_NODE_H;
+      cursorY.set(layer, y + height + ROW_GAP);
+      return [node.id, { x: layer * (WF_NODE_W + LAYER_GAP), y, height }];
     }),
   );
   // Feed ELK edges in declaration order (source, then target) so crossing minimisation keeps
@@ -166,16 +170,15 @@ export async function elkWorkflowLayout(
     children: nodes.map((node) => ({
       id: node.id,
       width: WF_NODE_W,
-      height: WF_NODE_H,
-      ...hint.get(node.id),
+      ...(hint.get(node.id) || { x: 0, y: 0, height: WF_NODE_H }),
       ports: ports.get(node.id),
-      layoutOptions: { "elk.portConstraints": "FIXED_SIDE", "elk.spacing.portPort": "14" },
+      layoutOptions: { "elk.portConstraints": "FIXED_SIDE", "elk.spacing.portPort": "10" },
     })),
     edges: sorted.map(
       (edge): ElkExtendedEdge => ({ id: edge.id, sources: [`${edge.id}#out`], targets: [`${edge.id}#in`] }),
     ),
   };
-  const geometry = await runElk(graph, nodes.length, edges.length, 0);
+  const geometry = await runElk(graph, nodes.length, edges.length, 0, heights);
   return { signature, mode: "elk", ...geometry };
 }
 

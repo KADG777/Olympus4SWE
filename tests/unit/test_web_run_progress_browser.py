@@ -1373,11 +1373,21 @@ def test_graph_islands_hover_lineage_highlighting(skip_dag, browser):
     for src, dst in (("A", "E"), ("B", "D"), ("D", "F"), ("F", "H"), ("B", "G")):
         expect(edge(src, dst)).to_have_attribute("data-lineage", "dim")
 
-    # Moving pointer off the card clears lineage dimming while keeping selection.
+    # Moving pointer off the card clears hover dimming while keeping selection.
     page.mouse.move(10, 10)
     for tid in ("A", "B", "C", "D", "E", "F", "G", "H"):
         expect(card(tid)).not_to_have_attribute("data-lineage", "dim")
     expect(card("B")).to_have_attribute("aria-selected", "true")
+
+    # Keyboard :focus-visible lineage survives a pointer enter+leave pass.
+    page.keyboard.press("Tab")
+    card("C").focus()
+    assert card("C").evaluate('node => node.matches(":focus-visible")')
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    card("C").hover()
+    page.mouse.move(10, 10)
+    expect(card("C")).to_have_attribute("data-lineage", "focus")
+    assert card("C").evaluate("node => node === document.activeElement")
 
     # Workflow hover: hovering critic highlights intake/align -> critic -> gate_spec..
     # and dims the bypass edge align -> gate_spec.
@@ -1464,4 +1474,91 @@ def test_task_dag_live_sse_status_update_preserves_zoom_and_pan_and_resets_on_ru
     page.locator(f"#thread-list [data-run-id='{second_id}']").click()
     expect(dag.locator("[data-task-id='SOLO-1']")).to_be_visible()
     assert abs(dag.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
+    page.close()
+
+
+def test_task_dag_handles_arrow_ids_and_high_fanin_port_spacing(workbench, browser):
+    store, _, url = workbench
+    run_id = store.create_run(title="箭头字符与高扇入回归")
+    goal = GoalSpec(
+        goal="回归验证",
+        requirements=[
+            RequirementItem(id="R1", description="保留全部边", acceptance_criteria=["不丢边"])
+        ],
+    )
+    store.save_spec(run_id, goal)
+    inputs = {"A": [], "A→B": [], "B→C": ["A"], "C": ["A→B"]}
+    review = AcceptanceCheck(id="review", kind=CheckKind.INDEPENDENT_REVIEW, description="ok")
+    plan = TaskPlan(
+        spec_id=goal.spec_id,
+        spec_hash=goal.content_hash,
+        tasks=[
+            TaskNode(
+                task_id=task_id,
+                title=task_id,
+                objective="test",
+                depends_on=deps,
+                write_scope=[f"task{index}.py"],
+                acceptance_checks=[review],
+            )
+            for index, (task_id, deps) in enumerate(inputs.items())
+        ],
+    )
+    store.save_plan(run_id, plan)
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+            approver="human",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_layout(page)
+    rendered = page.locator("#dag-graph .ag-edge[data-edge-source]").evaluate_all(
+        "els => els.map(el => [el.dataset.edgeSource, el.dataset.edgeTarget])"
+    )
+    assert sorted(rendered) == [["A", "B→C"], ["A→B", "C"]]
+
+    # High fan-in (12 edges into T): card expands cleanly so fixed 7.2px arrowheads never overlap.
+    page.evaluate(
+        """() => {
+          const host = document.createElement('div');
+          host.id = 'fanin-check';
+          host.style.width = '1100px';
+          document.querySelector('#view-topology').prepend(host);
+          const nodes = [...Array(12)].map((_, i) => ({
+            id: 'S' + i, layer: 0, status: 'accepted', tone: 'ok',
+            meta: 'engineer', statusText: '✓ 已验收', ariaLabel: 'S' + i,
+          })).concat({
+            id: 'T', layer: 1, status: 'waiting', tone: 'muted',
+            meta: 'engineer', statusText: '◷ 等待', ariaLabel: 'T',
+          });
+          const edges = nodes.slice(0, -1).map(n => ({ source: n.id, target: 'T' }));
+          window.faninHandle = window.AriadneGraph.mountDag(host, { runId: 'fanin', nodes, edges });
+        }"""
+    )
+    page.locator("#fanin-check [data-layout='elk']").wait_for()
+    fanin = page.evaluate(
+        """() => {
+          const card = document.querySelector('#fanin-check [data-task-id="T"]');
+          const wrap = card.closest('.react-flow__node');
+          const matrix = new DOMMatrix(getComputedStyle(wrap).transform);
+          const ys = [...document.querySelectorAll(
+            '#fanin-check .ag-edge[data-edge-target="T"] path.ag-edge-path'
+          )].map(p => p.getPointAtLength(p.getTotalLength()).y - matrix.f).sort((a, b) => a - b);
+          const marker = document.querySelector('#fanin-check marker[data-tone="default"]');
+          const arrowH = marker.querySelector('path').getBBox().height
+            * Number(marker.getAttribute('markerHeight')) / marker.viewBox.baseVal.height;
+          const minGap = Math.min(...ys.slice(1).map((y, i) => y - ys[i]));
+          return { count: ys.length, minGap, arrowH };
+        }"""
+    )
+    assert fanin["count"] == 12
+    assert fanin["minGap"] >= fanin["arrowH"], fanin
+    page.evaluate("() => window.faninHandle.destroy()")
     page.close()

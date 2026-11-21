@@ -7,29 +7,31 @@ import { NODE_H, NODE_W } from "./layout";
 
 export interface TaskCardData extends Record<string, unknown> {
   view: DagNodeView;
+  height: number;
   selected: boolean;
   lineage?: NodeLineage;
   select: (id: string) => void;
   hover: (id: string | null) => void;
+  focus: (id: string | null) => void;
 }
 
 export type TaskCardNode = Node<TaskCardData, "task">;
 
 /** Editorial three-row task card: id + pill | role · kind | status capsule. */
 function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
-  const { view, selected, lineage, select, hover } = data;
+  const { view, height, selected, lineage, select, hover, focus } = data;
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     select(view.id);
   };
   const onFocus = (event: FocusEvent<HTMLDivElement>) => {
-    if (event.currentTarget.matches(":focus-visible")) hover(view.id);
+    if (event.currentTarget.matches(":focus-visible")) focus(view.id);
   };
   return (
     <div
       className="ag-card ag-task-card nopan"
-      style={{ width: NODE_W, height: NODE_H }}
+      style={{ width: NODE_W, height: height || NODE_H }}
       data-task-id={view.id}
       data-status={view.status}
       data-tone={view.tone}
@@ -46,7 +48,7 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
       onMouseEnter={() => hover(view.id)}
       onMouseLeave={() => hover(null)}
       onFocus={onFocus}
-      onBlur={() => hover(null)}
+      onBlur={() => focus(null)}
     >
       <Handle className="ag-handle" type="target" position={Position.Left} isConnectable={false} />
       <div className="ag-card-head">

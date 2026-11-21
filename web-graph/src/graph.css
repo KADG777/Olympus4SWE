@@ -390,7 +390,7 @@
   block-size: 24px;
   padding-inline: var(--space-1);
   border: 1px solid transparent;
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: var(--radius);
   background: transparent;
   color: var(--text-secondary);
   font-family: var(--face-mono);

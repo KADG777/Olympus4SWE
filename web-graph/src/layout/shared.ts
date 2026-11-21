@@ -9,6 +9,8 @@ import type { Point } from "../geometry";
  */
 export const CARD_W = 184;
 export const CARD_H = 76;
+/** Minimum vertical port step (px) so fixed 7.2px arrowheads never overlap on high fan-in cards. */
+const PORT_STEP = 12;
 
 export type LayoutMode = "elk" | "fallback";
 
@@ -23,9 +25,10 @@ export interface LayerNodeRef {
   layer: number;
 }
 
-/** Card positions and edge polylines in graph coordinates, plus the laid-out extent. */
+/** Card positions, per-node heights, and edge polylines in graph coordinates. */
 export interface Geometry {
   positions: Map<string, Point>;
+  heights: Map<string, number>;
   routes: Map<string, Point[]>;
   width: number;
   height: number;
@@ -38,7 +41,26 @@ export interface LayerBox {
   top: number;
 }
 
-export const edgeKey = (source: string, target: string): string => `${source}\u2192${target}`;
+export const edgeKey = (source: string, target: string): string => JSON.stringify([source, target]);
+
+/** Compute card heights: standard 76px for normal fan-in/out, taller only when side ports exceed capacity. */
+export function cardHeights(
+  nodes: readonly { id: string }[],
+  edges: readonly LayoutEdgeRef[],
+): Map<string, number> {
+  const incoming = new Map<string, number>();
+  const outgoing = new Map<string, number>();
+  edges.forEach((edge) => {
+    outgoing.set(edge.source, (outgoing.get(edge.source) || 0) + 1);
+    incoming.set(edge.target, (incoming.get(edge.target) || 0) + 1);
+  });
+  return new Map(
+    nodes.map((node) => {
+      const maxSide = Math.max(incoming.get(node.id) || 0, outgoing.get(node.id) || 0);
+      return [node.id, Math.max(CARD_H, (maxSide + 1) * PORT_STEP)];
+    }),
+  );
+}
 
 /** Kahn's algorithm: true when the edges contain a directed cycle. */
 export function hasCycle(nodes: { id: string }[], edges: LayoutEdgeRef[]): boolean {
@@ -82,18 +104,20 @@ export function layeredGeometry(
   box: LayerBox,
 ): Geometry {
   const column = columnsOf(nodes);
-  const rows = new Map<number, number>();
+  const heights = cardHeights(nodes, edges);
+  const cursorY = new Map<number, number>();
   const positions = new Map<string, Point>();
   const colOf = new Map<string, number>();
   nodes.forEach((node) => {
     const col = column.get(node.layer) ?? 0;
-    const row = rows.get(col) || 0;
-    rows.set(col, row + 1);
+    const y = cursorY.get(col) ?? box.top;
+    const h = heights.get(node.id) ?? CARD_H;
+    cursorY.set(col, y + h + box.rowGap);
     colOf.set(node.id, col);
-    positions.set(node.id, { x: col * (CARD_W + box.layerGap), y: box.top + row * (CARD_H + box.rowGap) });
+    positions.set(node.id, { x: col * (CARD_W + box.layerGap), y });
   });
-  const portY = (ids: string[], id: string, top: number): number =>
-    top + (CARD_H * (ids.indexOf(id) + 1)) / (ids.length + 1);
+  const portY = (ids: string[], id: string, top: number, h: number): number =>
+    top + (h * (ids.indexOf(id) + 1)) / (ids.length + 1);
   const byY = (key: "source" | "target") => (a: LayoutEdgeRef, b: LayoutEdgeRef) =>
     (positions.get(a[key]) as Point).y - (positions.get(b[key]) as Point).y || (a.id < b.id ? -1 : 1);
   const incoming = new Map<string, string[]>();
@@ -102,14 +126,16 @@ export function layeredGeometry(
     incoming.set(node.id, edges.filter((e) => e.target === node.id).sort(byY("source")).map((e) => e.id));
     outgoing.set(node.id, edges.filter((e) => e.source === node.id).sort(byY("target")).map((e) => e.id));
   });
-  let bottom = Math.max(...Array.from(positions.values(), (pos) => pos.y + CARD_H));
+  let bottom = Math.max(
+    ...nodes.map((node) => ((positions.get(node.id) as Point).y + (heights.get(node.id) ?? CARD_H))),
+  );
   const routes = new Map<string, Point[]>();
   let rail = 0;
   edges.forEach((edge, index) => {
     const s = positions.get(edge.source) as Point;
     const t = positions.get(edge.target) as Point;
-    const sy = portY(outgoing.get(edge.source) || [], edge.id, s.y);
-    const ty = portY(incoming.get(edge.target) || [], edge.id, t.y);
+    const sy = portY(outgoing.get(edge.source) || [], edge.id, s.y, heights.get(edge.source) ?? CARD_H);
+    const ty = portY(incoming.get(edge.target) || [], edge.id, t.y, heights.get(edge.target) ?? CARD_H);
     const start = { x: s.x + CARD_W, y: sy };
     const end = { x: t.x, y: ty };
     if ((colOf.get(edge.target) ?? 0) - (colOf.get(edge.source) ?? 0) === 1) {
@@ -132,7 +158,7 @@ export function layeredGeometry(
   });
   if (rail) bottom += RAIL_GAP + rail * RAIL_STEP + 8;
   const width = Math.max(...Array.from(positions.values(), (pos) => pos.x + CARD_W));
-  return { positions, routes, width, height: bottom };
+  return { positions, heights, routes, width, height: bottom };
 }
 
 let engine: InstanceType<typeof ELK> | null = null;
@@ -146,6 +172,7 @@ export async function runElk(
   nodeCount: number,
   edgeCount: number,
   top: number,
+  heights: Map<string, number>,
 ): Promise<Geometry> {
   engine = engine || new ELK();
   const result = await engine.layout(graph);
@@ -167,7 +194,10 @@ export async function runElk(
     throw new Error("ELK returned an incomplete layout");
   }
   const all = [
-    ...Array.from(positions.values()).flatMap((p) => [p, { x: p.x + CARD_W, y: p.y + CARD_H }]),
+    ...Array.from(positions.entries()).flatMap(([id, p]) => [
+      p,
+      { x: p.x + CARD_W, y: p.y + (heights.get(id) ?? CARD_H) },
+    ]),
     ...Array.from(routes.values()).flat(),
   ];
   const minX = Math.min(...all.map((p) => p.x));
@@ -177,6 +207,7 @@ export async function runElk(
   routes.forEach((points, id) => routes.set(id, points.map(shift)));
   return {
     positions,
+    heights,
     routes,
     width: Math.max(...all.map((p) => p.x)) - minX,
     height: Math.max(...all.map((p) => p.y)) - minY + top,

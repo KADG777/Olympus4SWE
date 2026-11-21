@@ -87,8 +87,24 @@ def test_graph_island_reads_tokens_only() -> None:
         found = COLOUR.findall(path.read_text(encoding="utf-8"))
         assert not found, f"{path.name} holds raw colours — use var(--token): {found[:8]}"
     css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
-    sizes = [v for _s, body in _blocks(css) for p, v in _decls(body) if p == "font-size"]
+    decls = [(selector, prop, val) for selector, body in _blocks(css) for prop, val in _decls(body)]
+    sizes = [v for _s, p, v in decls if p == "font-size"]
     assert sizes and set(sizes) <= SIZES, f"graph font-size must be a --text-* token: {sizes}"
+    faces = [
+        (s, v)
+        for s, p, v in decls
+        if p == "font-family" and v != "inherit" and not v.startswith("var(--face-")
+    ]
+    assert not faces, f"graph font-family must be a --face-* token: {faces}"
+    corners = [(s, v) for s, p, v in decls if p == "border-radius" and not set(v.split()) <= SHAPES]
+    assert not corners, f"graph border-radius must use SHAPES tokens: {corners}"
+    bad_motion = [
+        (s, v)
+        for s, p, v in decls
+        if p in ("transition", "transition-duration")
+        and re.search(r"(?<![\w-])\d*\.?\d+m?s\b", v)
+    ]
+    assert not bad_motion, f"graph transitions must use var(--motion-fast): {bad_motion}"
 
 
 def test_no_shadows_except_floating() -> None:

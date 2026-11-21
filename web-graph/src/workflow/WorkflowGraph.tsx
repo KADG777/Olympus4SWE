@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { Position, type EdgeTypes, type NodeHandle, type NodeTypes } from "@xyflow/react";
 
 import { GraphCanvas, frameHeight, useMarkerPrefix } from "../canvas/GraphCanvas";
+import { useGraphIsland } from "../canvas/useGraphIsland";
 import { OrthogonalEdge, type OrthogonalEdgeType } from "../edges/OrthogonalEdge";
 import type { Point } from "../geometry";
-import { dispatchToHost, type IslandController } from "../island";
-import { computeLineage, edgeLineage, nodeLineage } from "../lineage";
+import type { IslandController } from "../island";
+import { edgeLineage, nodeLineage } from "../lineage";
 import type { EdgeTone, WorkflowGraphProps } from "../types";
 import {
   WF_NODE_H,
@@ -27,9 +28,9 @@ const EDGE_TYPES: EdgeTypes = { orthogonal: OrthogonalEdge };
 const MIN_HEIGHT = 220;
 const MAX_HEIGHT = 360;
 
-const NODE_HANDLES: NodeHandle[] = [
-  { type: "target", position: Position.Left, x: 0, y: WF_NODE_H / 2, width: 1, height: 1 },
-  { type: "source", position: Position.Right, x: WF_NODE_W - 1, y: WF_NODE_H / 2, width: 1, height: 1 },
+const handlesFor = (height: number): NodeHandle[] => [
+  { type: "target", position: Position.Left, x: 0, y: height / 2, width: 1, height: 1 },
+  { type: "source", position: Position.Right, x: WF_NODE_W - 1, y: height / 2, width: 1, height: 1 },
 ];
 
 /** Taken path in full contrast; untaken router fan-out and repair loops recede. */
@@ -48,65 +49,46 @@ export function WorkflowGraph(props: WorkflowGraphProps & { controller: IslandCo
     () => workflowSignature(runId, graph.nodes, graph.edges),
     [runId, graph],
   );
-
-  const latestGraph = useRef(graph);
-  latestGraph.current = graph;
-  const onSelectRef = useRef(onSelect);
-  onSelectRef.current = onSelect;
-
-  const [layout, setLayout] = useState<WorkflowLayout | null>(null);
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const version = useRef(0);
-
-  useEffect(() => {
-    setHoveredId(null);
-    const ticket = ++version.current;
-    const { nodes, edges } = latestGraph.current;
-    if (!nodes.length) return undefined;
-    let cancelled = false;
-    void computeWorkflowLayout(nodes, edges, signature).then((result) => {
-      if (!cancelled && ticket === version.current) setLayout(result);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [signature]);
-
-  const select = useCallback((id: string) => {
-    const handler = onSelectRef.current;
-    if (handler) dispatchToHost(() => handler(id));
-  }, []);
-
-  const hover = useCallback((id: string | null) => {
-    setHoveredId(id);
-  }, []);
-
-  const current = layout && layout.signature === signature ? layout : null;
-  const lineage = useMemo(() => computeLineage(graph.edges, hoveredId), [graph.edges, hoveredId]);
+  const runLayout = useCallback(
+    (snapshot: typeof graph, sig: string): Promise<WorkflowLayout> =>
+      computeWorkflowLayout(snapshot.nodes, snapshot.edges, sig),
+    [],
+  );
+  const { current, lineage, select, hover, focus: focusNode } = useGraphIsland(
+    graph,
+    signature,
+    runLayout,
+    onSelect,
+  );
 
   const nodes = useMemo<WorkflowCardNode[]>(() => {
     if (!current) return [];
-    return graph.nodes.map((view) => ({
-      id: view.id,
-      type: "workflow" as const,
-      position: current.positions.get(view.id) || { x: 0, y: 0 },
-      width: WF_NODE_W,
-      height: WF_NODE_H,
-      handles: NODE_HANDLES,
-      draggable: false,
-      connectable: false,
-      selectable: false,
-      focusable: false,
-      data: {
-        view,
-        kind: classifyNode(view.id, view.kind),
-        selected: view.id === selectedId,
-        lineage: nodeLineage(lineage, view.id),
-        select,
-        hover,
-      },
-    }));
-  }, [current, graph, lineage, selectedId, select, hover]);
+    return graph.nodes.map((view) => {
+      const height = current.heights.get(view.id) ?? WF_NODE_H;
+      return {
+        id: view.id,
+        type: "workflow" as const,
+        position: current.positions.get(view.id) || { x: 0, y: 0 },
+        width: WF_NODE_W,
+        height,
+        handles: handlesFor(height),
+        draggable: false,
+        connectable: false,
+        selectable: false,
+        focusable: false,
+        data: {
+          view,
+          height,
+          kind: classifyNode(view.id, view.kind),
+          selected: view.id === selectedId,
+          lineage: nodeLineage(lineage, view.id),
+          select,
+          hover,
+          focus: focusNode,
+        },
+      };
+    });
+  }, [current, graph, lineage, selectedId, select, hover, focusNode]);
 
   const edges = useMemo<OrthogonalEdgeType[]>(() => {
     if (!current) return [];
@@ -136,14 +118,15 @@ export function WorkflowGraph(props: WorkflowGraphProps & { controller: IslandCo
     });
   }, [current, graph, lineage, markerPrefix]);
 
-  const estimate = useMemo(
-    () => (graph.nodes.length ? workflowFallback(graph.nodes, graph.edges, signature).height : 0),
-    [graph, signature],
-  );
+  const contentHeight = useMemo(() => {
+    if (current) return current.height;
+    return graph.nodes.length ? workflowFallback(graph.nodes, graph.edges, signature).height : 0;
+  }, [current, graph, signature]);
 
   const focus = useMemo<Point | null>(() => {
     const pos = current && focusId ? current.positions.get(focusId) : undefined;
-    return pos ? { x: pos.x + WF_NODE_W / 2, y: pos.y + WF_NODE_H / 2 } : null;
+    const height = current && focusId ? current.heights.get(focusId) ?? WF_NODE_H : WF_NODE_H;
+    return pos ? { x: pos.x + WF_NODE_W / 2, y: pos.y + height / 2 } : null;
   }, [current, focusId]);
 
   if (!graph.nodes.length) {
@@ -160,7 +143,7 @@ export function WorkflowGraph(props: WorkflowGraphProps & { controller: IslandCo
     <GraphCanvas
       graph="workflow"
       layout={current}
-      height={frameHeight(current ? current.height : estimate, MIN_HEIGHT, MAX_HEIGHT)}
+      height={frameHeight(contentHeight, MIN_HEIGHT, MAX_HEIGHT)}
       ariaLabel={props.ariaLabel || "工作流拓扑有向图"}
       nodes={nodes}
       edges={edges}

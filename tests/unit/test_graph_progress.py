@@ -626,7 +626,39 @@ def test_derive_skipped_ignores_back_edges_in_cyclic_graphs() -> None:
     declared = [("a", "b"), ("b", "c"), ("c", "a")]
     traversed = [{"source": "a", "target": "b"}]
 
-    assert _derive_skipped(statuses, declared, traversed) == set()
+    assert _derive_skipped(statuses, declared, traversed, starts=["a"]) == set()
+
+
+def test_derive_skipped_is_independent_of_node_declaration_order() -> None:
+    from olympus.graph.progress import _derive_skipped
+
+    declared = [("gate_spec", "optional"), ("optional", "terminal"), ("gate_spec", "terminal")]
+    traversed = [{"source": "gate_spec", "target": "terminal"}]
+    for order in (
+        ("gate_spec", "optional", "terminal"),
+        ("gate_spec", "terminal", "optional"),
+    ):
+        statuses = {
+            name: ("pending" if name == "optional" else "completed")
+            for name in order
+        }
+        assert _derive_skipped(statuses, declared, traversed, starts=["gate_spec"]) == {"optional"}
+
+
+def test_derive_traversed_edges_preserves_declared_self_loop() -> None:
+    from olympus.graph.progress import _declared_edges, _derive_traversed_edges
+
+    description = {
+        "edges": [{"source": "gate_spec", "target": "gate_spec", "conditional": False}],
+    }
+    declared = _declared_edges(description)
+    events = [
+        _event(1, "graph.routed", {"from": ["gate_spec"], "to": ["gate_spec"], "wave": 1}),
+        _event(2, "graph.routed", {"from": ["gate_spec"], "to": ["gate_spec"], "wave": 2}),
+    ]
+    assert _derive_traversed_edges(events, declared) == [
+        {"source": "gate_spec", "target": "gate_spec"},
+    ]
 
 
 # -------------------------------------------------------------- blueprint completion

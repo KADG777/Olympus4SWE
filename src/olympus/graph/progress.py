@@ -141,7 +141,7 @@ def _declared_edges(description: Mapping[str, Any] | None) -> list[tuple[str, st
         if not isinstance(edge, Mapping):
             continue
         source, target = edge.get("source"), edge.get("target")
-        if not isinstance(source, str) or not isinstance(target, str) or source == target:
+        if not isinstance(source, str) or not isinstance(target, str):
             continue
         if (source, target) in seen:
             continue
@@ -229,23 +229,65 @@ def _forward_reachable(start: str, adjacency: Mapping[str, Sequence[str]]) -> se
     return reached
 
 
+def _acyclic_forward_adjacency(
+    nodes: Sequence[str],
+    declared: Sequence[tuple[str, str]],
+    starts: Sequence[str],
+) -> dict[str, list[str]]:
+    """Build forward adjacency stripping only DFS back-edges from workflow entry roots.
+
+    On acyclic graphs every declared edge survives regardless of YAML node declaration order;
+    on cyclic graphs retry back-edges are removed so unreached downstream nodes cannot loop
+    back to visited ancestors.
+    """
+    known = set(nodes)
+    raw: dict[str, list[str]] = {name: [] for name in nodes}
+    indegree: dict[str, int] = {name: 0 for name in nodes}
+    for source, target in declared:
+        if source in known and target in known and source != target and target not in raw[source]:
+            raw[source].append(target)
+            indegree[target] += 1
+
+    roots = [name for name in starts if name in known]
+    if not roots:
+        roots = [name for name in nodes if indegree[name] == 0]
+    order_seeds = list(dict.fromkeys([*roots, *nodes]))
+
+    adjacency: dict[str, list[str]] = {name: [] for name in nodes}
+    state: dict[str, int] = {}  # 1 = on DFS stack, 2 = finished
+    for seed in order_seeds:
+        if state.get(seed):
+            continue
+        stack: list[tuple[str, int]] = [(seed, 0)]
+        state[seed] = 1
+        while stack:
+            current, idx = stack[-1]
+            neighbors = raw[current]
+            if idx >= len(neighbors):
+                state[current] = 2
+                stack.pop()
+                continue
+            stack[-1] = (current, idx + 1)
+            nxt = neighbors[idx]
+            nxt_state = state.get(nxt, 0)
+            if nxt_state == 1:
+                continue
+            adjacency[current].append(nxt)
+            if nxt_state == 0:
+                state[nxt] = 1
+                stack.append((nxt, 0))
+    return adjacency
+
+
 def _derive_skipped(
     statuses: Mapping[str, str],
     declared: Sequence[tuple[str, str]],
     traversed: Sequence[Mapping[str, str]],
+    starts: Sequence[str] = (),
 ) -> set[str]:
     """Return never-visited nodes the executed trajectory passed straight over."""
     known = set(statuses)
-    order = {name: idx for idx, name in enumerate(statuses)}
-    adjacency: dict[str, list[str]] = {name: [] for name in statuses}
-    for source, target in declared:
-        if (
-            source in known
-            and target in known
-            and order[target] > order[source]
-            and target not in adjacency[source]
-        ):
-            adjacency[source].append(target)
+    adjacency = _acyclic_forward_adjacency(list(statuses), declared, starts)
 
     visited = {name for name, status in statuses.items() if status in _VISITED_STATUSES}
     if not visited:
@@ -370,8 +412,11 @@ def build_workflow_view(
             last_error = "工作流执行异常中断"
 
     declared_edges = _declared_edges(description)
+    start_nodes = [
+        name for name in ((description or {}).get("start") or ()) if isinstance(name, str)
+    ]
     traversed_edges = _derive_traversed_edges(events, declared_edges)
-    for name in _derive_skipped(statuses, declared_edges, traversed_edges):
+    for name in _derive_skipped(statuses, declared_edges, traversed_edges, start_nodes):
         statuses[name] = "skipped"
 
     return {
