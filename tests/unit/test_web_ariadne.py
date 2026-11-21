@@ -764,6 +764,8 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
             assert 'id="dag-graph"' in html_res.text
             assert 'id="dag-svg"' not in html_res.text
+            assert 'id="workflow-graph"' in html_res.text
+            assert 'id="workflow-svg"' not in html_res.text
             graph_js = client.get("/static/graph/ariadne-graph.js")
             assert graph_js.status_code == 200
             assert "javascript" in graph_js.headers["content-type"]
@@ -772,6 +774,7 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             assert graph_css.status_code == 200
             assert graph_css.headers["content-type"].startswith("text/css")
             assert ".ag-task-card" in graph_css.text
+            assert ".ag-wf-card" in graph_css.text
 
             assert client.get("/static/missing.css").status_code == 404
             assert client.get("/static/..%2fserver.py").status_code == 404
@@ -1148,7 +1151,7 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
                 'id="new-run-file"',
                 'id="triage-banner"',
                 'id="clarify-panel"',
-                'id="workflow-svg"',
+                'id="workflow-graph"',
                 'id="view-design"',
                 'id="btn-approve-spec"',
                 'id="btn-approve-design"',

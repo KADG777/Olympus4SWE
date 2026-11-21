@@ -47,11 +47,6 @@ def _declarations() -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def _is_svg_text(selector: str) -> bool:
-    """SVG label sizes live in the viewBox's own units; the type scale is CSS-only."""
-    return all(part.strip().startswith(".dag-svg") for part in selector.split(","))
-
-
 def test_design_files_load_in_order() -> None:
     html = _text("index.html")
     tokens_at = html.find('href="/static/tokens.css"')
@@ -144,7 +139,7 @@ def test_font_sizes_use_tokens() -> None:
     found = [
         (name, selector, value)
         for name, selector, prop, value in _declarations()
-        if prop == "font-size" and value not in SIZES | {"inherit"} and not _is_svg_text(selector)
+        if prop == "font-size" and value not in SIZES | {"inherit"}
     ]
     assert not found, f"font-size must be a --text-* token: {found[:10]}"
     shorthand = [
@@ -183,9 +178,13 @@ def test_soft_rounded_tokens() -> None:
     assert "--radius: 8px;" in tokens
     assert "--radius-lg: 12px;" in tokens
     assert "--shape-chip: 999px;" in tokens
-    app = _text("app.js")
-    assert 'rx="8"' in app
-    assert 'rx="2"' not in app
+    assert 'rx="2"' not in _text("app.js")
+    graph_css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
+    card_corners = [
+        value for selector, body in _blocks(graph_css) if selector == ".ag-card"
+        for prop, value in _decls(body) if prop == "border-radius"
+    ]
+    assert card_corners == ["var(--radius)"], "graph cards share the soft --radius corner"
 
 
 def test_faces_and_corners_come_from_tokens() -> None:

@@ -22,7 +22,7 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
   };
   return (
     <div
-      className="ag-task-card nopan"
+      className="ag-card ag-task-card nopan"
       style={{ width: NODE_W, height: NODE_H }}
       data-task-id={view.id}
       data-status={view.status}

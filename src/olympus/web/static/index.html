@@ -160,12 +160,12 @@
               <span class="legend-item">▶ 运行中</span>
               <span class="legend-item">✕ 中断/阻塞</span>
               <span class="legend-item">◷ 待确认</span>
-              <span class="legend-item"><span class="legend-dash" aria-hidden="true"></span> 条件路由 / 修复回边</span>
+              <span class="legend-item">— 已跳过</span>
+              <span class="legend-item"><span class="legend-swatch" data-tone="traversed" aria-hidden="true"></span> 已执行路径</span>
+              <span class="legend-item"><span class="legend-dash" aria-hidden="true"></span> 未走条件路由 / 修复回边</span>
             </div>
           </header>
-          <div class="dag-frame scroller">
-            <svg class="dag-svg workflow-svg" id="workflow-svg" role="img" aria-label="工作流拓扑有向图" width="760" height="148" viewBox="0 0 760 148"></svg>
-          </div>
+          <div class="graph-host" id="workflow-graph" data-graph-host="workflow"></div>
         </section>
 
         <section class="task-dag-section" id="task-dag-section" aria-labelledby="topology-title" hidden>

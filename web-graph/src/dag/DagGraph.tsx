@@ -1,17 +1,10 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import {
-  Position,
-  ReactFlow,
-  ViewportPortal,
-  useReactFlow,
-  type EdgeTypes,
-  type NodeHandle,
-  type NodeTypes,
-} from "@xyflow/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Position, ViewportPortal, type EdgeTypes, type NodeHandle, type NodeTypes } from "@xyflow/react";
 
+import { GraphCanvas, frameHeight, useMarkerPrefix } from "../canvas/GraphCanvas";
+import { OrthogonalEdge, edgeTone, type OrthogonalEdgeType } from "../edges/OrthogonalEdge";
 import { dispatchToHost, type IslandController } from "../island";
 import type { DagGraphProps } from "../types";
-import { ArrowMarkers, OrthogonalEdge, edgeTone, type OrthogonalEdgeType } from "../edges/OrthogonalEdge";
 import {
   NODE_H,
   NODE_W,
@@ -26,84 +19,18 @@ import { TaskCard, type TaskCardNode } from "./TaskCard";
 const NODE_TYPES: NodeTypes = { task: TaskCard };
 const EDGE_TYPES: EdgeTypes = { orthogonal: OrthogonalEdge };
 
-/** Viewport padding and adaptive frame bounds (px). */
-const PAD = 24;
+/** Adaptive frame bounds (px). */
 const MIN_HEIGHT = 300;
 const MAX_HEIGHT = 540;
-/** Initial auto-fit never magnifies (<= 1) and never crushes below this. */
-const MIN_FIT_ZOOM = 0.8;
-
-const frameHeight = (graphHeight: number): number =>
-  Math.round(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, graphHeight + PAD * 2)));
 
 const NODE_HANDLES: NodeHandle[] = [
   { type: "target", position: Position.Left, x: 0, y: NODE_H / 2, width: 1, height: 1 },
   { type: "source", position: Position.Right, x: NODE_W - 1, y: NODE_H / 2, width: 1, height: 1 },
 ];
 
-/**
- * Centers the laid-out graph at 1:1 when it fits, scales down (>= MIN_FIT_ZOOM) when it does not,
- * and re-fits only on topology change or container resize before the user has moved the viewport.
- */
-function AutoFit({
-  layout,
-  rootRef,
-  controller,
-  userMoved,
-}: {
-  layout: DagLayout | null;
-  rootRef: React.RefObject<HTMLDivElement | null>;
-  controller: IslandController;
-  userMoved: React.RefObject<boolean>;
-}) {
-  const flow = useReactFlow();
-  const fitted = useRef<string | null>(null);
-
-  const fit = useCallback((): boolean => {
-    const root = rootRef.current;
-    if (!layout || !root || !flow.viewportInitialized) return false;
-    const width = root.clientWidth;
-    const height = root.clientHeight;
-    if (!width || !height) return false;
-    const zoom = Math.max(
-      MIN_FIT_ZOOM,
-      Math.min(1, (width - PAD * 2) / layout.width, (height - PAD * 2) / layout.height),
-    );
-    const x = layout.width * zoom + PAD * 2 <= width ? (width - layout.width * zoom) / 2 : PAD;
-    const y = layout.height * zoom + PAD * 2 <= height ? (height - layout.height * zoom) / 2 : PAD;
-    void flow.setViewport({ x: Math.round(x), y: Math.round(y), zoom });
-    fitted.current = layout.signature;
-    userMoved.current = false;
-    return true;
-  }, [flow, layout, rootRef, userMoved]);
-
-  controller.fit = () => {
-    fit();
-  };
-
-  useLayoutEffect(() => {
-    if (layout && fitted.current !== layout.signature) fit();
-  });
-
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!root || typeof ResizeObserver === "undefined") return undefined;
-    const observer = new ResizeObserver(() => {
-      if (!layout) return;
-      if (fitted.current !== layout.signature || !userMoved.current) fit();
-    });
-    observer.observe(root);
-    return () => observer.disconnect();
-  }, [fit, layout, rootRef, userMoved]);
-
-  return null;
-}
-
 export function DagGraph(props: DagGraphProps & { controller: IslandController }) {
   const { runId, selectedId, onSelect, controller } = props;
-  const markerPrefix = `ag-arrow-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const userMoved = useRef(false);
+  const markerPrefix = useMarkerPrefix();
 
   const graph = useMemo(() => normalizeGraph(props.nodes, props.edges), [props.nodes, props.edges]);
   const signature = useMemo(
@@ -189,61 +116,34 @@ export function DagGraph(props: DagGraphProps & { controller: IslandController }
   }
 
   return (
-    <div
-      ref={rootRef}
-      className="ag-island"
-      data-graph="dag"
-      data-layout={current ? current.mode : "pending"}
-      role="group"
-      aria-label={props.ariaLabel || "任务依赖有向无环图"}
-      style={{ height: frameHeight(current ? current.height : estimate) }}
+    <GraphCanvas
+      graph="dag"
+      layout={current}
+      height={frameHeight(current ? current.height : estimate, MIN_HEIGHT, MAX_HEIGHT)}
+      ariaLabel={props.ariaLabel || "任务依赖有向无环图"}
+      nodes={nodes}
+      edges={edges}
+      nodeTypes={NODE_TYPES}
+      edgeTypes={EDGE_TYPES}
+      markerPrefix={markerPrefix}
+      controller={controller}
     >
-      <ArrowMarkers prefix={markerPrefix} />
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={NODE_TYPES}
-        edgeTypes={EDGE_TYPES}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        nodesFocusable={false}
-        edgesFocusable={false}
-        elementsSelectable={false}
-        disableKeyboardA11y
-        deleteKeyCode={null}
-        selectionKeyCode={null}
-        multiSelectionKeyCode={null}
-        zoomOnScroll={false}
-        panOnScroll={false}
-        zoomOnPinch
-        zoomOnDoubleClick={false}
-        panOnDrag
-        preventScrolling={false}
-        minZoom={0.4}
-        maxZoom={2}
-        proOptions={{ hideAttribution: true }}
-        onMoveStart={(event) => {
-          if (event) userMoved.current = true;
-        }}
-      >
-        <AutoFit layout={current} rootRef={rootRef} controller={controller} userMoved={userMoved} />
-        {current ? (
-          <ViewportPortal>
-            <div className="ag-waves" aria-hidden="true">
-              {current.waves.map((wave) => (
-                <div
-                  key={wave.layer}
-                  className="ag-wave"
-                  data-wave={wave.layer}
-                  style={{ width: NODE_W, transform: `translate(${wave.x}px, 0px)` }}
-                >
-                  Wave {wave.layer}
-                </div>
-              ))}
-            </div>
-          </ViewportPortal>
-        ) : null}
-      </ReactFlow>
-    </div>
+      {current ? (
+        <ViewportPortal>
+          <div className="ag-waves" aria-hidden="true">
+            {current.waves.map((wave) => (
+              <div
+                key={wave.layer}
+                className="ag-wave"
+                data-wave={wave.layer}
+                style={{ width: NODE_W, transform: `translate(${wave.x}px, 0px)` }}
+              >
+                Wave {wave.layer}
+              </div>
+            ))}
+          </div>
+        </ViewportPortal>
+      ) : null}
+    </GraphCanvas>
   );
 }

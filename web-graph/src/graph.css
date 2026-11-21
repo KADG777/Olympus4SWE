@@ -87,9 +87,10 @@
   white-space: nowrap;
 }
 
-/* ---- Task card ---- */
+/* ---- Cards: one physical frame shared by task and workflow nodes ---- */
 
-.ag-task-card {
+.ag-card {
+  position: relative;
   box-sizing: border-box;
   display: grid;
   grid-template-rows: auto auto auto;
@@ -111,25 +112,25 @@
     transform var(--motion-fast);
 }
 
-.ag-task-card:active {
+.ag-card:active {
   transform: scale(0.98);
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .ag-task-card:hover {
+  .ag-card:hover {
     outline-color: var(--rule-hard);
   }
 }
 
-.ag-task-card:focus-visible {
+.ag-card:focus-visible {
   outline-color: var(--accent);
   outline-style: dashed;
 }
 
-/* Selection is a warm amber outer ring, never ink: ink belongs to the critical path. */
-.ag-task-card[aria-selected="true"],
-.ag-task-card[aria-selected="true"]:hover,
-.ag-task-card[aria-selected="true"]:focus-visible {
+/* Selection is a warm amber outer ring, never ink: ink belongs to the critical / taken path. */
+.ag-card[aria-selected="true"],
+.ag-card[aria-selected="true"]:hover,
+.ag-card[aria-selected="true"]:focus-visible {
   outline-color: var(--accent);
   outline-style: solid;
 }
@@ -143,14 +144,20 @@
 }
 
 .ag-card-id,
-.ag-card-meta {
+.ag-card-meta,
+.ag-card-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ag-card-id,
+.ag-card-meta {
   font-family: var(--face-mono);
 }
 
-.ag-card-id {
+.ag-card-id,
+.ag-card-title {
   font-size: var(--text-sm);
   font-weight: var(--font-weight-medium);
 }
@@ -160,7 +167,8 @@
   font-size: var(--text-xs);
 }
 
-.ag-card-pill {
+.ag-card-pill,
+.ag-card-kind {
   flex: none;
   padding-inline: 6px;
   border: 1px solid var(--rule-hard);
@@ -196,42 +204,42 @@
   white-space: nowrap;
 }
 
-.ag-task-card[data-tone="ok"] {
+.ag-card[data-tone="ok"] {
   border-color: var(--ok);
   background: var(--ok-soft);
 }
 
-.ag-task-card[data-tone="ok"] .ag-card-status {
+.ag-card[data-tone="ok"] .ag-card-status {
   background: var(--surface-raised);
   color: var(--ok);
 }
 
-.ag-task-card[data-tone="live"] {
+.ag-card[data-tone="live"] {
   border-color: var(--live);
   background: var(--live-soft);
 }
 
-.ag-task-card[data-tone="live"] .ag-card-status {
+.ag-card[data-tone="live"] .ag-card-status {
   background: var(--surface-raised);
   color: var(--live);
 }
 
-.ag-task-card[data-tone="bad"] {
+.ag-card[data-tone="bad"] {
   border-color: var(--bad);
   background: var(--bad-soft);
 }
 
-.ag-task-card[data-tone="bad"] .ag-card-status {
+.ag-card[data-tone="bad"] .ag-card-status {
   background: var(--surface-raised);
   color: var(--bad);
 }
 
-.ag-task-card[data-tone="warn"] {
+.ag-card[data-tone="warn"] {
   border-color: var(--warn);
   background: var(--warn-soft);
 }
 
-.ag-task-card[data-tone="warn"] .ag-card-status {
+.ag-card[data-tone="warn"] .ag-card-status {
   background: var(--surface-raised);
   color: var(--warn);
 }
@@ -244,6 +252,64 @@
 
 .ag-task-card[data-tone="planned"] .ag-card-status {
   color: var(--ok);
+}
+
+/* ---- Workflow node kinds: gate (warm accent bar + 关口), validator (double hairline + 校验) ---- */
+
+.ag-wf-card[data-node-kind="gate"]::before {
+  content: "";
+  position: absolute;
+  inset-block: 10px;
+  inset-inline-start: -1px;
+  inline-size: 3px;
+  border-radius: 0 var(--shape-pill) var(--shape-pill) 0;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.ag-card-kind[data-kind="gate"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+
+.ag-wf-card[data-node-kind="validator"] {
+  border-block-start-style: double;
+  border-block-start-width: 3px;
+}
+
+.ag-card-kind[data-kind="validator"] {
+  background: transparent;
+  font-family: var(--face-mono);
+  letter-spacing: 0.04em;
+}
+
+/* Skipped: recessed into the page, dashed and muted, clearly not "still waiting". */
+.ag-wf-card[data-tone="skipped"] {
+  border-style: dashed;
+  border-color: var(--rule-hard);
+  background: var(--surface-sunk);
+  color: var(--text-muted);
+}
+
+.ag-wf-card[data-tone="skipped"] .ag-card-title,
+.ag-wf-card[data-tone="skipped"] .ag-card-meta,
+.ag-wf-card[data-tone="skipped"] .ag-card-kind {
+  color: var(--text-muted);
+}
+
+.ag-wf-card[data-tone="skipped"] .ag-card-kind {
+  border-color: var(--rule-hard);
+  background: transparent;
+}
+
+.ag-wf-card[data-tone="skipped"] .ag-card-status {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.ag-wf-card[data-tone="skipped"]::before {
+  opacity: 0.45;
 }
 
 /* ---- Edges + fixed-size, tone-matched arrowheads ---- */
@@ -276,6 +342,22 @@
   animation: ag-edge-flow 900ms linear infinite;
 }
 
+/* Workflow trajectory: the taken path in full contrast; untaken routes and loops recede. */
+.ag-edge[data-tone="traversed"] .ag-edge-path {
+  stroke: var(--text-ink);
+  stroke-width: 1.8;
+}
+
+.ag-edge[data-tone="conditional"] {
+  opacity: 0.7;
+}
+
+.ag-edge[data-tone="conditional"] .ag-edge-path {
+  stroke-width: 1.2;
+  stroke-dasharray: 5 4;
+  stroke-linecap: butt;
+}
+
 @keyframes ag-edge-flow {
   to {
     stroke-dashoffset: -11;
@@ -287,8 +369,8 @@
     animation: none;
   }
 
-  .ag-task-card,
-  .ag-task-card:active {
+  .ag-card,
+  .ag-card:active {
     transform: none;
     transition:
       outline-color var(--motion-fast),
@@ -312,4 +394,8 @@
 
 .ag-arrow[data-tone="running"] path {
   fill: var(--live);
+}
+
+.ag-arrow[data-tone="traversed"] path {
+  fill: var(--text-ink);
 }

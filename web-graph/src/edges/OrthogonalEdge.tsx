@@ -8,15 +8,26 @@ export interface OrthogonalEdgeData extends Record<string, unknown> {
   points: Point[];
   tone: EdgeTone;
   markerId: string;
+  /** Extra stable hooks rendered as `data-<key>` on the edge group (e.g. `traversed`). */
+  attrs?: Record<string, string>;
 }
 
 export type OrthogonalEdgeType = Edge<OrthogonalEdgeData, "orthogonal">;
+
+const dataAttrs = (attrs: Record<string, string> | undefined): Record<string, string> =>
+  Object.fromEntries(Object.entries(attrs || {}).map(([key, value]) => [`data-${key}`, value]));
 
 /** Renders the exact layout polyline (ELK `sections`) with rounded corners and a tone-matched head. */
 function OrthogonalEdgeComponent({ source, target, data }: EdgeProps<OrthogonalEdgeType>) {
   if (!data || data.points.length < 2) return null;
   return (
-    <g className="ag-edge" data-tone={data.tone} data-edge-source={source} data-edge-target={target}>
+    <g
+      className="ag-edge"
+      data-tone={data.tone}
+      data-edge-source={source}
+      data-edge-target={target}
+      {...dataAttrs(data.attrs)}
+    >
       <path
         className="ag-edge-path"
         d={roundedPolylinePath(data.points, 6)}
@@ -28,7 +39,14 @@ function OrthogonalEdgeComponent({ source, target, data }: EdgeProps<OrthogonalE
 
 export const OrthogonalEdge = memo(OrthogonalEdgeComponent);
 
-export const EDGE_TONES: EdgeTone[] = ["default", "critical", "blocked", "running"];
+export const EDGE_TONES: EdgeTone[] = [
+  "default",
+  "critical",
+  "blocked",
+  "running",
+  "traversed",
+  "conditional",
+];
 
 /** Fixed-size (userSpaceOnUse) arrowheads, one per tone, so heads never scale with stroke width. */
 export function ArrowMarkers({ prefix }: { prefix: string }) {

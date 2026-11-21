@@ -27,5 +27,10 @@ handle.fitView();
 handle.destroy();
 ```
 
-`mountWorkflow` is a reserved slot for the Orchestration Workflow cut-over (#57).
+`mountWorkflow` renders the Orchestration Workflow: gate / validator / stage cards, the
+`skipped` status and the traversed trajectory (solid) versus untaken routes and loops (dashed).
+
+Both graphs share one canvas (`src/canvas/GraphCanvas.tsx`: scroll-safe React Flow, fixed-size
+markers, 1:1 auto-fit) and one physical card size plus ELK / fallback helpers
+(`src/layout/shared.ts`); `src/dag/` and `src/workflow/` only add their own cards and layout options.
 Types live in [`src/types.ts`](src/types.ts). All styling reads `tokens.css` variables.
