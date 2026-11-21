@@ -884,7 +884,7 @@ class RunControl:
         command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Shared idempotent task-mutation command helper."""
-        payload = {**payload, **(command_meta or {})}
+        payload = {**(command_meta or {}), **payload}
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             def mutate_plan(plan: TaskPlan) -> TaskPlan:

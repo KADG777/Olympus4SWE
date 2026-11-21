@@ -24,6 +24,10 @@ from olympus.tools.aci import WorkspaceToolkit
 Observer = Callable[[str, dict[str, Any]], None]
 
 
+class BudgetExhaustedError(RuntimeError):
+    """Raised when an explicit local budget cap prevents reserving another LLM call."""
+
+
 def compose_observers(*observers: Observer | None) -> Observer:
     """Fan out ``(kind, payload)`` to every observer; UI failures never break the loop."""
     active = tuple(observer for observer in observers if observer is not None)
@@ -457,7 +461,11 @@ class AgentLoop:
         )
         for attempt in range(max_parse_retries + 1):
             if not res.completed:
-                if res.stop_reason.startswith(("budget_exhausted", "provider_error")):
+                if res.stop_reason.startswith("budget_exhausted"):
+                    raise BudgetExhaustedError(
+                        f"AgentLoop stopped before producing final output: {res.stop_reason}"
+                    )
+                if res.stop_reason.startswith("provider_error"):
                     raise RuntimeError(
                         f"AgentLoop stopped before producing final output: {res.stop_reason}"
                     )

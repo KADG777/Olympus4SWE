@@ -14,14 +14,17 @@ import pytest
 
 import olympus.web
 from olympus.core.contracts import (
+    AcceptanceCheck,
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
     BudgetLedger,
     BudgetPolicy,
+    CheckKind,
     GoalSpec,
     RunMode,
     RunStatus,
+    TaskNode,
     TaskPlan,
     TaskStatus,
 )
@@ -29,10 +32,12 @@ from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.providers.base import (
     ChatMessage,
+    LLMProvider,
     LLMResponse,
     MockLLMProvider,
     ToolCall,
     ToolSpec,
+    UsageStats,
 )
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection
@@ -121,6 +126,7 @@ def _seed_exec_run(
     task_status: TaskStatus = TaskStatus.READY,
     mode: RunMode = RunMode.SIMULATION,
     supervised: bool = True,
+    extra_tasks: list[TaskNode] | None = None,
 ) -> tuple[RunStore, str, GoalSpec, TaskPlan]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
     run_id = store.create_run(
@@ -134,6 +140,8 @@ def _seed_exec_run(
     store.save_spec(run_id, spec, actor="align")
     _approve(store, run_id, ApprovalTarget.GOAL_SPEC, spec.spec_id, spec.content_hash)
     plan = _plan(spec, task_status=task_status)
+    if extra_tasks:
+        plan = plan.model_copy(update={"tasks": [*plan.tasks, *extra_tasks]})
     store.save_plan(run_id, plan, actor="orchestrate")
     _approve(store, run_id, ApprovalTarget.TASK_PLAN, plan.plan_id, plan.content_hash)
     store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="zeus", stage="control")
@@ -146,6 +154,29 @@ def _seed_exec_run(
             payload={"node": "gate_plan"},
         )
     return store, run_id, spec, plan
+
+
+class _OneCallExhaustProvider(LLMProvider):
+    """Issues a read tool call once to consume a single-call budget."""
+
+    model_name = "exhaust-mock"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        temperature: float = 0.0,
+    ) -> LLMResponse:
+        del messages, tools, temperature
+        self.calls += 1
+        return LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc-1", name="list_directory", arguments={"path": "."})],
+            usage=UsageStats(input_tokens=10, output_tokens=5),
+        )
 
 
 def _budget_responder(*, file_name: str = "feature.py") -> Responder:
@@ -461,9 +492,14 @@ def test_resume_run_coalesces_concurrent_async_advances(
     starts: list[str | None] = []
 
     def fake_advance(
-        rid: str, *, raw_input: str, start_from: str | None, auto_approve: bool
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        del raw_input, auto_approve
+        del raw_input, auto_approve, recompute_entry
         starts.append(start_from)
         snap_at_entry = store.get_run(rid)
         rev = snap_at_entry["state_revision"]
@@ -503,7 +539,7 @@ def test_resume_run_coalesces_concurrent_async_advances(
         assert len(starts) == 2
         assert starts[1] == "execute"
         with supervisor._guard:
-            assert run_id not in supervisor._active_runs
+            assert run_id not in supervisor._active_tokens
             assert run_id not in supervisor._pending_resume
     finally:
         release.set()
@@ -526,9 +562,14 @@ def test_resume_run_coalesced_midflight_mutation_runs_even_when_advance_returns_
     starts: list[str | None] = []
 
     def fake_advance(
-        rid: str, *, raw_input: str, start_from: str | None, auto_approve: bool
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        del raw_input, auto_approve
+        del raw_input, auto_approve, recompute_entry
         starts.append(start_from)
         if len(starts) == 1:
             entered.set()
@@ -578,9 +619,14 @@ def test_resume_run_coalesced_pass_skips_when_no_progress(
     starts: list[str | None] = []
 
     def fake_advance(
-        rid: str, *, raw_input: str, start_from: str | None, auto_approve: bool
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        del raw_input, auto_approve
+        del raw_input, auto_approve, recompute_entry
         starts.append(start_from)
         snap_at_entry = store.get_run(rid)
         rev = snap_at_entry["state_revision"]
@@ -606,7 +652,7 @@ def test_resume_run_coalesced_pass_skips_when_no_progress(
         supervisor.wait(run_id, timeout=5)
         assert len(starts) == 1
         with supervisor._guard:
-            assert run_id not in supervisor._active_runs
+            assert run_id not in supervisor._active_tokens
             assert run_id not in supervisor._pending_resume
     finally:
         release.set()
@@ -626,9 +672,14 @@ def test_sync_resume_not_coalesced(
     starts: list[str | None] = []
 
     def fake_advance(
-        rid: str, *, raw_input: str, start_from: str | None, auto_approve: bool
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        del raw_input, auto_approve
+        del raw_input, auto_approve, recompute_entry
         starts.append(start_from)
         snap = store.get_run(rid)
         return {
@@ -645,9 +696,299 @@ def test_sync_resume_not_coalesced(
         assert "coalesced" not in result
         assert starts == ["execute"]
         with supervisor._guard:
-            assert run_id not in supervisor._active_runs
+            assert run_id not in supervisor._active_tokens
     finally:
         supervisor.shutdown()
+
+
+# --------------------------------------------------------------------------- 6. Codex hardening
+
+
+def test_queued_resume_recomputes_entry_inside_lock_after_clarify(tmp_path: Path) -> None:
+    """Clarify landing after async execute queued must pause at gate_spec, not fail."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.READY)
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(),
+    )
+    lock = supervisor._lock_for(run_id)
+    try:
+        # Hold run lock so the queued async execute thread waits before entering _advance.
+        lock.acquire()
+        queued = supervisor.resume_run(run_id, sync=False)
+        assert queued["status"] == "queued"
+
+        # Clarify produces unapproved GoalSpec v2 before the queued worker acquires the lock.
+        control = RunControl(store)
+        rev = store.get_run(run_id)["state_revision"]
+        control.clarify_spec(run_id, answers={}, actor="zeus", expected_revision=rev)
+        lock.release()
+
+        result = supervisor.wait(run_id, timeout=10)
+        assert result is not None
+        assert result["status"] == RunStatus.AWAITING_HUMAN.value
+        assert result["paused"] is not None
+        assert result["paused"]["node"] == "gate_spec"
+        assert store.get_run(run_id)["status"] == RunStatus.AWAITING_HUMAN
+    finally:
+        if lock.locked():
+            lock.release()
+        supervisor.shutdown()
+
+
+def test_sync_resume_coalesces_with_in_flight_async_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sync=True arriving while async execute is in flight must not launch a second execute."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.READY)
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    starts: list[str | None] = []
+
+    def fake_advance(
+        rid: str,
+        *,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool = False,
+    ) -> dict[str, Any]:
+        del raw_input, auto_approve, recompute_entry
+        starts.append(start_from)
+        entered.set()
+        assert release.wait(timeout=5)
+        snap = store.get_run(rid)
+        return {
+            "run_id": rid,
+            "workflow": snap["workflow_name"],
+            "status": RunStatus.COMPLETED.value,
+            "state_revision": snap["state_revision"],
+            "paused": None,
+        }
+
+    monkeypatch.setattr(supervisor, "_advance", fake_advance)
+    sync_results: list[dict[str, Any]] = []
+    try:
+        supervisor.resume_run(run_id, sync=False)
+        assert entered.wait(timeout=5)
+        t = threading.Thread(
+            target=lambda: sync_results.append(supervisor.resume_run(run_id, sync=True))
+        )
+        t.start()
+        # Wait until the sync thread has coalesced onto the in-flight active token.
+        deadline = threading.Event()
+        for _ in range(200):
+            with supervisor._guard:
+                if run_id in supervisor._pending_resume:
+                    break
+            deadline.wait(0.01)
+        release.set()
+        t.join(timeout=5)
+        supervisor.wait(run_id, timeout=5)
+        assert len(starts) == 1
+        assert sync_results and sync_results[0]["status"] == RunStatus.COMPLETED.value
+    finally:
+        release.set()
+        supervisor.shutdown()
+
+
+def test_stale_token_cannot_release_newer_active_token(tmp_path: Path) -> None:
+    """_release_token must ignore stale tokens owned by an older worker pass."""
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.READY)
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(),
+    )
+    try:
+        with supervisor._guard:
+            supervisor._active_tokens[run_id] = 2
+        supervisor._release_token(run_id, token=1, clear_pending=True)
+        with supervisor._guard:
+            assert supervisor._active_tokens.get(run_id) == 2
+        supervisor._release_token(run_id, token=2)
+        with supervisor._guard:
+            assert run_id not in supervisor._active_tokens
+    finally:
+        supervisor.shutdown()
+
+
+def test_upstream_provider_error_mentioning_budget_exhausted_not_misclassified(
+    tmp_path: Path,
+) -> None:
+    """Upstream provider errors containing 'budget_exhausted' must NOT pause as local budget."""
+    _init_repo(tmp_path)
+    (tmp_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.py"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add feature"], cwd=tmp_path, check=True, capture_output=True
+    )
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.READY)
+
+    class UpstreamErrorProvider(LLMProvider):
+        model_name = "upstream-err"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[ToolSpec] = (),
+            temperature: float = 0.0,
+        ) -> LLMResponse:
+            del messages, tools, temperature
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    content="Done editing.",
+                    tool_calls=[],
+                    usage=UsageStats(input_tokens=10, output_tokens=5),
+                )
+            raise RuntimeError("upstream gateway error: budget_exhausted on remote tenant")
+
+    provider = UpstreamErrorProvider()
+    orch = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=tmp_path,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    with pytest.raises(RuntimeError, match="provider_error"):
+        orch.run_execution(run_id=run_id)
+    assert provider.calls == 2
+
+
+def test_run_execution_does_not_overwrite_concurrent_human_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PAUSED set before entry or during budget check must not be overwritten."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(
+        tmp_path,
+        budget_policy=BudgetPolicy(max_llm_calls=1),
+        task_status=TaskStatus.READY,
+    )
+    store.set_run_status(run_id, RunStatus.PAUSED, actor="zeus", stage="control")
+    provider = _OneCallExhaustProvider()
+    orch = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=tmp_path,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    snap = orch.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.PAUSED
+    assert provider.calls == 0
+
+    # Also test PAUSED landing right before budget_exhausted status write.
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="zeus", stage="control")
+    store.reserve_llm_call(run_id, actor="test", purpose="fill")
+    store.settle_llm_call(run_id, actor="test", input_tokens=1, output_tokens=1)
+    orig_set_status = store.set_run_status
+    injected = False
+
+    def racing_set_status(rid: str, status: RunStatus, **kwargs: Any) -> int:
+        nonlocal injected
+        if status == RunStatus.AWAITING_HUMAN and not injected:
+            injected = True
+            orig_set_status(rid, RunStatus.PAUSED, actor="zeus", stage="control")
+        return orig_set_status(rid, status, **kwargs)
+
+    monkeypatch.setattr(store, "set_run_status", racing_set_status)
+    snap2 = orch.run_execution(run_id=run_id)
+    assert snap2["status"] == RunStatus.PAUSED
+
+
+def test_pause_for_budget_preserves_existing_human_hint(tmp_path: Path) -> None:
+    """Zero-call budget pause must not overwrite an unconsumed [Human hint] on the task."""
+    _init_repo(tmp_path)
+    store, run_id, _, _ = _seed_exec_run(
+        tmp_path,
+        budget_policy=BudgetPolicy(max_llm_calls=1),
+        task_status=TaskStatus.READY,
+        extra_tasks=[
+            TaskNode(
+                task_id="T2",
+                title="Second task with hint",
+                objective="Apply hint",
+                requirement_refs=["R1"],
+                write_scope=["b.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="c2", kind=CheckKind.COMMAND, description="ok", command="true"
+                    )
+                ],
+                status=TaskStatus.READY,
+                last_error="[Human hint]: keep atomic lock order",
+                max_cycles=3,
+            )
+        ],
+    )
+    orch = OrchestrateStage(
+        store=store,
+        provider=_OneCallExhaustProvider(),
+        workspace_root=tmp_path,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    snap = orch.run_execution(run_id=run_id)
+    by_id = {t.task_id: t for t in snap["plan"].tasks}
+    assert by_id["T2"].status == TaskStatus.READY
+    assert by_id["T2"].last_error == "[Human hint]: keep atomic lock order"
+
+
+def test_ready_task_blocked_by_cancelled_dependency_has_no_ready_banner(tmp_path: Path) -> None:
+    """READY task whose depends_on is CANCELLED is not dispatchable => no ready_to_resume."""
+    store, run_id, _, _ = _seed_exec_run(
+        tmp_path,
+        task_status=TaskStatus.CANCELLED,
+        extra_tasks=[
+            TaskNode(
+                task_id="T2",
+                title="Dependent task",
+                objective="Depends on cancelled T1",
+                requirement_refs=["R1"],
+                depends_on=["T1"],
+                write_scope=["b.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="c2", kind=CheckKind.COMMAND, description="ok", command="true"
+                    )
+                ],
+                status=TaskStatus.READY,
+                max_cycles=3,
+            )
+        ],
+    )
+    proj = build_run_projection(store, tmp_path, run_id)
+    assert proj["hitl_banner"] is None
+
+
+def test_retry_task_command_meta_cannot_overwrite_core_payload_fields(tmp_path: Path) -> None:
+    """command_meta must never spoof task_id or hint in idempotency/audit payloads."""
+    store, run_id, _, _ = _seed_exec_run(tmp_path, task_status=TaskStatus.BLOCKED)
+    control = RunControl(store)
+    rev = store.get_run(run_id)["state_revision"]
+    control.retry_task(
+        run_id,
+        "T1",
+        operation_id="op-meta-guard",
+        expected_state_revision=rev,
+        hint="real hint",
+        command_meta={"task_id": "T2", "hint": "spoofed", "sync": True},
+    )
+    events = [e for e in store.list_events(run_id) if e.event_type == "task.retried_by_human"]
+    assert events[-1].payload["task_id"] == "T1"
+    assert events[-1].payload["hint"] == "real hint"
+    assert events[-1].payload["sync"] is True
 
 
 # --------------------------------------------------------------------------- 5. app.js static

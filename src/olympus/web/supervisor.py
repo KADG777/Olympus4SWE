@@ -5,11 +5,12 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from olympus.core.contracts import RunStatus
-from olympus.core.store import RunStore
+from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph import (
     GraphPaused,
     WorkflowDefinition,
@@ -67,7 +68,8 @@ class RunSupervisor:
         self._run_locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
         self._managed_runs: set[str] = set()
-        self._active_runs: set[str] = set()
+        self._active_tokens: dict[str, int] = {}
+        self._next_token: int = 0
         self._pending_resume: dict[str, int] = {}
         self._providers: dict[str, LLMProvider] = {}
         self.dotenv_loaded = self._load_dotenv()
@@ -254,11 +256,55 @@ class RunSupervisor:
         raw_input: str,
         start_from: str | None,
         auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
         with self._lock_for(run_id):
             snap = self.store.get_run(run_id)
             ws = self.resolve_workspace(run_id)
             definition = load_workflow(snap["workflow_name"])
+            effective_start = start_from
+            if recompute_entry:
+                if snap["status"] in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                    RunStatus.COMPLETED,
+                ):
+                    return {
+                        "run_id": run_id,
+                        "workflow": definition.name,
+                        "topology": definition.topology,
+                        "stop_after": definition.stop_after,
+                        "status": snap["status"].value,
+                        "state_revision": snap["state_revision"],
+                        "paused": None,
+                    }
+                resolved = self.resume_node(definition, snap)
+                if resolved is None:
+                    with suppress(ConcurrencyConflictError):
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.COMPLETED,
+                            expected_revision=int(snap["state_revision"]),
+                            actor="supervisor",
+                            stage="graph",
+                            detail={
+                                "workflow": definition.name,
+                                "stop_after": definition.stop_after,
+                            },
+                        )
+                    final = self.store.get_run(run_id)
+                    return {
+                        "run_id": run_id,
+                        "workflow": definition.name,
+                        "topology": definition.topology,
+                        "stop_after": definition.stop_after,
+                        "status": final["status"].value,
+                        "state_revision": final["state_revision"],
+                        "paused": None,
+                        "complete": final["status"] == RunStatus.COMPLETED,
+                    }
+                effective_start = resolved
+
             graph = build_graph(definition)
             runtime = WorkflowRuntime(
                 store=self.store,
@@ -288,41 +334,57 @@ class RunSupervisor:
                 state,
                 observer=self._observer(run_id),
                 max_steps=runtime.max_steps * 2,
-                start_from=start_from,
+                start_from=effective_start,
             )
             paused_node = result.get("_paused_node")
-            latest = self.store.get_run(run_id)
-            if paused_node:
-                if latest["status"] not in (RunStatus.PAUSED, RunStatus.CANCELLED):
-                    self.store.set_run_status(
-                        run_id,
-                        RunStatus.AWAITING_HUMAN,
-                        actor="supervisor",
-                        stage="graph",
-                        detail={
-                            "paused_node": paused_node,
-                            "pause_reason": result.get("_pause_reason"),
-                        },
+            while True:
+                latest = self.store.get_run(run_id)
+                if paused_node:
+                    if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                        break
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.AWAITING_HUMAN,
+                            expected_revision=int(latest["state_revision"]),
+                            actor="supervisor",
+                            stage="graph",
+                            detail={
+                                "paused_node": paused_node,
+                                "pause_reason": result.get("_pause_reason"),
+                            },
+                        )
+                        break
+                    except ConcurrencyConflictError:
+                        continue
+                if (
+                    not (
+                        latest["status"] == RunStatus.AWAITING_HUMAN
+                        and isinstance(result.get("execution"), dict)
                     )
-            elif (
-                not (
-                    latest["status"] == RunStatus.AWAITING_HUMAN
-                    and isinstance(result.get("execution"), dict)
-                )
-                and latest["status"]
-                not in (
-                    RunStatus.PAUSED,
-                    RunStatus.CANCELLED,
-                    RunStatus.COMPLETED,
-                )
-            ):
-                self.store.set_run_status(
-                    run_id,
-                    RunStatus.COMPLETED,
-                    actor="supervisor",
-                    stage="graph",
-                    detail={"workflow": definition.name, "stop_after": definition.stop_after},
-                )
+                    and latest["status"]
+                    not in (
+                        RunStatus.PAUSED,
+                        RunStatus.CANCELLED,
+                        RunStatus.COMPLETED,
+                    )
+                ):
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.COMPLETED,
+                            expected_revision=int(latest["state_revision"]),
+                            actor="supervisor",
+                            stage="graph",
+                            detail={
+                                "workflow": definition.name,
+                                "stop_after": definition.stop_after,
+                            },
+                        )
+                        break
+                    except ConcurrencyConflictError:
+                        continue
+                break
             final = self.store.get_run(run_id)
             return {
                 "run_id": run_id,
@@ -338,6 +400,74 @@ class RunSupervisor:
                 ),
             }
 
+    def _release_token(self, run_id: str, token: int, *, clear_pending: bool = False) -> None:
+        """Release active ownership only if ``token`` still owns ``run_id``."""
+        with self._guard:
+            if self._active_tokens.get(run_id) == token:
+                self._active_tokens.pop(run_id, None)
+                if clear_pending:
+                    self._pending_resume.pop(run_id, None)
+
+    def _drain_advance_loop(
+        self,
+        run_id: str,
+        *,
+        token: int,
+        raw_input: str,
+        start_from: str | None,
+        auto_approve: bool,
+        recompute_entry: bool,
+    ) -> dict[str, Any]:
+        """Run ``_advance`` and drain any coalesced mid-flight resumes for ``token``."""
+        current_start = start_from
+        current_recompute = recompute_entry
+        while True:
+            start_rev = int(self.store.get_run(run_id)["state_revision"])
+            result = self._advance(
+                run_id,
+                raw_input=raw_input,
+                start_from=current_start,
+                auto_approve=auto_approve,
+                recompute_entry=current_recompute,
+            )
+            with self._guard:
+                if self._active_tokens.get(run_id) != token:
+                    return result
+                if run_id not in self._pending_resume:
+                    self._active_tokens.pop(run_id, None)
+                    return result
+                pending_rev = self._pending_resume.pop(run_id)
+            snap = self.store.get_run(run_id)
+            definition = load_workflow(snap["workflow_name"])
+            entry = self.resume_node(definition, snap)
+            entry_node = definition.node(entry) if entry is not None else None
+            paused_node = (result.get("paused") or {}).get("node")
+            has_new_state = (
+                pending_rev > start_rev
+                or int(snap["state_revision"]) > int(result["state_revision"])
+            )
+            already_at_same_gate = (
+                entry_node is not None
+                and entry_node.type == "human_gate"
+                and paused_node == entry
+                and int(snap["state_revision"]) <= int(result["state_revision"])
+            )
+            if (
+                entry is None
+                or snap["status"]
+                in (RunStatus.PAUSED, RunStatus.CANCELLED, RunStatus.COMPLETED)
+                or not has_new_state
+                or already_at_same_gate
+            ):
+                with self._guard:
+                    if self._active_tokens.get(run_id) == token and run_id in self._pending_resume:
+                        continue
+                    if self._active_tokens.get(run_id) == token:
+                        self._active_tokens.pop(run_id, None)
+                return result
+            current_start = entry
+            current_recompute = True
+
     def _launch(
         self,
         run_id: str,
@@ -346,25 +476,73 @@ class RunSupervisor:
         start_from: str | None,
         auto_approve: bool,
         sync: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        if sync:
-            return self._advance(
-                run_id,
-                raw_input=raw_input,
-                start_from=start_from,
-                auto_approve=auto_approve,
-            )
-        # Mark active before submitting so rapid resume_run calls immediately coalesce
-        # instead of queueing a duplicate thread with a stale start_from.
         snap = self.store.get_run(run_id)
+        if sync:
+            active_future: Future[dict[str, Any]] | None = None
+            sync_future: Future[dict[str, Any]] | None = None
+            token = 0
+            with self._guard:
+                if run_id in self._active_tokens:
+                    prev_rev = self._pending_resume.get(run_id, -1)
+                    self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
+                    active_future = self._future_by_run.get(run_id)
+                else:
+                    self._next_token += 1
+                    token = self._next_token
+                    self._active_tokens[run_id] = token
+                    sync_future = Future()
+                    self._future_by_run[run_id] = sync_future
+            if active_future is not None:
+                return active_future.result()
+            assert sync_future is not None
+            try:
+                result = self._drain_advance_loop(
+                    run_id,
+                    token=token,
+                    raw_input=raw_input,
+                    start_from=start_from,
+                    auto_approve=auto_approve,
+                    recompute_entry=recompute_entry,
+                )
+                sync_future.set_result(result)
+                return result
+            except BaseException as exc:
+                self._release_token(run_id, token, clear_pending=True)
+                if not sync_future.done():
+                    sync_future.set_exception(exc)
+                raise
+            finally:
+                self._release_token(run_id, token)
+
+        # Async: check ownership, mint token, submit future, and publish _future_by_run
+        # atomically under _guard so neither active tokens nor futures can race or invert.
         coalesced = False
         with self._guard:
-            if run_id in self._active_runs:
+            if run_id in self._active_tokens:
                 prev_rev = self._pending_resume.get(run_id, -1)
                 self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
                 coalesced = True
             else:
-                self._active_runs.add(run_id)
+                self._next_token += 1
+                token = self._next_token
+                self._active_tokens[run_id] = token
+                try:
+                    future = self._executor.submit(
+                        self._advance_guarded,
+                        run_id,
+                        token=token,
+                        raw_input=raw_input,
+                        start_from=start_from,
+                        auto_approve=auto_approve,
+                        recompute_entry=recompute_entry,
+                    )
+                except Exception:
+                    if self._active_tokens.get(run_id) == token:
+                        self._active_tokens.pop(run_id, None)
+                    raise
+                self._future_by_run[run_id] = future
         if coalesced:
             return {
                 "run_id": run_id,
@@ -374,20 +552,6 @@ class RunSupervisor:
                 "state_revision": snap["state_revision"],
                 "paused": None,
             }
-        try:
-            future = self._executor.submit(
-                self._advance_guarded,
-                run_id,
-                raw_input=raw_input,
-                start_from=start_from,
-                auto_approve=auto_approve,
-            )
-        except Exception:
-            with self._guard:
-                self._active_runs.discard(run_id)
-            raise
-        with self._guard:
-            self._future_by_run[run_id] = future
         return {
             "run_id": run_id,
             "workflow": snap["workflow_name"],
@@ -400,58 +564,21 @@ class RunSupervisor:
         self,
         run_id: str,
         *,
+        token: int,
         raw_input: str,
         start_from: str | None,
         auto_approve: bool,
+        recompute_entry: bool = False,
     ) -> dict[str, Any]:
-        current_start = start_from
         try:
-            while True:
-                start_rev = int(self.store.get_run(run_id)["state_revision"])
-                result = self._advance(
-                    run_id,
-                    raw_input=raw_input,
-                    start_from=current_start,
-                    auto_approve=auto_approve,
-                )
-                with self._guard:
-                    if run_id not in self._pending_resume:
-                        self._active_runs.discard(run_id)
-                        return result
-                    pending_rev = self._pending_resume.pop(run_id)
-                # A resume coalesced while we were advancing: re-read fresh state and
-                # recompute the entry node so a stale start_from never re-runs a
-                # superseded stage. Re-run only when state changed since this pass
-                # began (or after it finished) and we are not already parked at the
-                # same unapproved human gate.
-                snap = self.store.get_run(run_id)
-                definition = load_workflow(snap["workflow_name"])
-                entry = self.resume_node(definition, snap)
-                entry_node = definition.node(entry) if entry is not None else None
-                paused_node = (result.get("paused") or {}).get("node")
-                has_new_state = (
-                    pending_rev > start_rev
-                    or int(snap["state_revision"]) > int(result["state_revision"])
-                )
-                already_at_same_gate = (
-                    entry_node is not None
-                    and entry_node.type == "human_gate"
-                    and paused_node == entry
-                    and int(snap["state_revision"]) <= int(result["state_revision"])
-                )
-                if (
-                    entry is None
-                    or snap["status"]
-                    in (RunStatus.PAUSED, RunStatus.CANCELLED, RunStatus.COMPLETED)
-                    or not has_new_state
-                    or already_at_same_gate
-                ):
-                    with self._guard:
-                        if run_id in self._pending_resume:
-                            continue
-                        self._active_runs.discard(run_id)
-                    return result
-                current_start = entry
+            return self._drain_advance_loop(
+                run_id,
+                token=token,
+                raw_input=raw_input,
+                start_from=start_from,
+                auto_approve=auto_approve,
+                recompute_entry=recompute_entry,
+            )
         except Exception as exc:  # noqa: BLE001 - background failures must be auditable
             self.store.append_event(
                 run_id=run_id,
@@ -467,9 +594,7 @@ class RunSupervisor:
                 stage="graph",
                 detail={"error": str(exc)},
             )
-            with self._guard:
-                self._active_runs.discard(run_id)
-                self._pending_resume.pop(run_id, None)
+            self._release_token(run_id, token, clear_pending=True)
             return {
                 "run_id": run_id,
                 "status": RunStatus.FAILED.value,
@@ -477,8 +602,7 @@ class RunSupervisor:
                 "paused": None,
             }
         finally:
-            with self._guard:
-                self._active_runs.discard(run_id)
+            self._release_token(run_id, token)
 
     def start_run(
         self,
@@ -552,7 +676,7 @@ class RunSupervisor:
         snap = self.store.get_run(run_id)
         if not sync:
             with self._guard:
-                if run_id in self._active_runs:
+                if run_id in self._active_tokens:
                     # An advance is already in flight; coalesce instead of submitting a
                     # duplicate thread with a stale start_from. The running pass will
                     # recompute a fresh entry node after it finishes.
@@ -575,13 +699,18 @@ class RunSupervisor:
                 RunStatus.CANCELLED,
                 RunStatus.COMPLETED,
             ):
-                self.store.set_run_status(
-                    run_id,
-                    RunStatus.COMPLETED,
-                    actor="supervisor",
-                    stage="graph",
-                    detail={"workflow": definition.name, "stop_after": definition.stop_after},
-                )
+                with suppress(ConcurrencyConflictError):
+                    self.store.set_run_status(
+                        run_id,
+                        RunStatus.COMPLETED,
+                        expected_revision=int(snap["state_revision"]),
+                        actor="supervisor",
+                        stage="graph",
+                        detail={
+                            "workflow": definition.name,
+                            "stop_after": definition.stop_after,
+                        },
+                    )
                 latest = self.store.get_run(run_id)
             return {
                 "run_id": run_id,
@@ -589,7 +718,7 @@ class RunSupervisor:
                 "status": latest["status"].value,
                 "state_revision": latest["state_revision"],
                 "paused": None,
-                "complete": True,
+                "complete": latest["status"] == RunStatus.COMPLETED,
             }
         entry_node = definition.node(entry)
         effective_sync = sync or (entry_node is not None and entry_node.type == "human_gate")
@@ -599,6 +728,7 @@ class RunSupervisor:
             start_from=entry,
             auto_approve=False,
             sync=effective_sync,
+            recompute_entry=True,
         )
 
     def wait(self, run_id: str, *, timeout: float | None = None) -> dict[str, Any] | None:

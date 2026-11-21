@@ -1375,9 +1375,7 @@ def build_run_projection(
                 "detail": "当前运行已耗尽显式配置的调用或 Token 上限，未继续消耗任务重试次数。",
                 "actions": [],
             }
-        elif compute_dispatchable_tasks(plan, max_concurrent=1) or any(
-            t.status == TaskStatus.READY for t in plan.tasks
-        ):
+        elif compute_dispatchable_tasks(plan, max_concurrent=1):
             hitl_banner = {
                 "kind": "ready_to_resume",
                 "tone": "info",
