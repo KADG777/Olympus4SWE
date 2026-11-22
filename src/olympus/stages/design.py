@@ -71,36 +71,46 @@ Rules:
    module slicing (error envelope format, ID scheme, UTC ISO-8601 time encoding, config,
    validation). Categories: `error_envelope`, `id_format`, `time_encoding`, `concurrency`,
    `naming_convention`, `config`, `validation`, `security`.
-2. Shared contract paths (`shared_contract_paths`): declare repo-relative paths/dirs
-   for Wave 0 contract code/schemas (owned exclusively by `kind='contract'` tasks in Wave 0,
-   strictly read-only for Wave 1+ workers). `shared_contract_paths` MUST NOT overlap any
-   module's `target_paths`.
-3. Module boundaries: each module owns an exclusive `target_paths` list (repo-relative
+2. Deep cohesive modules: default to 1-3 modules that hide substantial behavior behind a
+   narrow interface. Keep a single-module design when the product is small and cohesive;
+   never split into speculative horizontal layers (routes/schemas/services/wrappers).
+3. The Deletion Test: do not emit single-caller pass-through wrappers (`ports`, `adapters`,
+   `dto`, `facade`) or any layer whose deletion would merely inline one call site. A
+   wrapper earns its existence only with >= 2 real callers/adapters or a genuine external
+   boundary; otherwise inline it into its caller.
+4. Real vs. hypothetical seams: emit `shared_contract_paths` and set
+   `execution_strategy='contract_first_parallel'` ONLY when multiple independent modules
+   genuinely build in parallel against frozen Wave 0 contracts. For a single deep module
+   or a tightly coupled vertical core, choose `serial_handoff` and leave
+   `shared_contract_paths` empty; never pay for a speculative Wave 0 contract layer.
+   `shared_contract_paths` MUST NOT overlap any module's `target_paths`.
+5. Module boundaries: each module owns an exclusive `target_paths` list (repo-relative
    files or directory prefixes). Paths of any two modules MUST NOT overlap.
-4. Full coverage: every GoalSpec requirement id appears in at least one module's
+6. Full coverage: every GoalSpec requirement id appears in at least one module's
    `requirement_refs`; never invent requirement ids.
-5. Typed acyclic interface seams: whenever two or more modules exist, declare at least
+7. Typed acyclic interface seams: whenever two or more modules exist, declare at least
    one InterfaceContract with provider, consumers, signature, non-empty `input_schema`
    (`SchemaField` list), non-empty `output_schema`, `data_entity_refs`, and non-empty
-   `error_cases`. Module dependencies (`consumer -> provider`) MUST be acyclic (no cycles).
-6. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
-7. Explicit execution strategy: set `execution_strategy` to `'contract_first_parallel'`
-   (when modules can implement orthogonally after Wave 0 contracts) or `'serial_handoff'`
-   (when tightly coupled / single write-lock / sequential refactor is safer), plus a
-   concrete `strategy_rationale` (>= 10 chars).
-8. Stay white-box & cohesive: name real files/directories, keep module count 2-6
-   orthogonal modules, and set `spec_id` and `spec_hash` to the frozen prompt values.
-9. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
-   human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
-   `strategy_rationale`, `risks_and_tradeoffs`); for greenfield products unrelated to the
-   host workspace, choose clean standalone repo-relative `target_paths`.
-10. Human design review: write `architecture_summary` in one or two sentences. In
+   `error_cases`. Align each interface directly with the GoalSpec `test_seams` (falling
+   back to `observable_surfaces` when none are declared): expose the observable seam the
+   product is verified through instead of internal plumbing. Module dependencies
+   (`consumer -> provider`) MUST be acyclic (no cycles).
+8. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
+9. Explicit execution strategy: set `execution_strategy` to `'contract_first_parallel'`
+   or `'serial_handoff'` per rule 4, plus a concrete `strategy_rationale` (>= 10 chars).
+10. Stay white-box & cohesive: name real files/directories, make each module deep rather
+    than wide, and set `spec_id` and `spec_hash` to the frozen prompt values.
+11. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
+    human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
+    `strategy_rationale`, `risks_and_tradeoffs`); for greenfield products unrelated to the
+    host workspace, choose clean standalone repo-relative `target_paths`.
+12. Human design review: write `architecture_summary` in one or two sentences. In
     `design_tradeoffs`, record each consequential decision affecting the existing system,
     deployment or rollback. Use impact `existing_system`, `deployment` or `rollback`, and
     state both the selected `choice` and its concrete `cost` (what gets harder or more
     expensive, or which capability is reduced). Match the GoalSpec language. Base entries on
     the proposed design and known constraints. Use [] if no such decision applies.
-11. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+13. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:
