@@ -2157,6 +2157,14 @@
             "$ref": "#/components/schemas/SpecStatus",
             "default": "draft"
           },
+          "test_seams": {
+            "description": "Fewest, highest-level public seams (HTTP routes, CLI commands, public APIs) where behavior is verified.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Test Seams",
+            "type": "array"
+          },
           "version": {
             "default": 1,
             "minimum": 1.0,
