@@ -279,13 +279,30 @@ def validate_goal_spec(
     return violations
 
 
+def _module_owns_observable_surface(
+    normalized_paths: list[str],
+    observable_surfaces: set[str],
+) -> bool:
+    for path in normalized_paths:
+        bare = path.rstrip("/").lower()
+        for surface in observable_surfaces:
+            if (
+                bare == surface
+                or surface.startswith(f"{bare}/")
+                or bare.startswith(f"{surface}/")
+            ):
+                return True
+    return False
+
+
 def validate_design_spec(
     design: DesignSpec,
     spec: GoalSpec | None = None,
     *,
     strict_v2: bool = False,
 ) -> list[str]:
-    """Zero-token gate for invariants, shared contract seams, module cycles, and coverage."""
+    """Zero-token gate for invariants, shared contract seams, module cycles, coverage, and
+    shallow-duplicate modules."""
     violations: list[str] = []
 
     module_ids: set[str] = set()
@@ -448,6 +465,39 @@ def validate_design_spec(
                     "execution_strategy='contract_first_parallel' with multiple modules "
                     "requires non-empty shared_contract_paths for Wave 0 contract lock"
                 )
+
+        data_owner_ids = {entity.owner_module_id for entity in design.data_models}
+        interface_providers = {
+            iface.provider_module_id for iface in design.interfaces if iface.consumer_module_ids
+        }
+        observable_surfaces = {
+            surface.strip().rstrip("/").lower()
+            for surface in (spec.observable_surfaces if spec is not None else [])
+            if surface.strip()
+        }
+        for index, left_module in enumerate(design.modules):
+            for right_module in design.modules[index + 1 :]:
+                shared_refs = set(left_module.requirement_refs)
+                if not shared_refs or shared_refs != set(right_module.requirement_refs):
+                    continue
+                shallow = [
+                    module.id
+                    for module in (left_module, right_module)
+                    if module.id not in data_owner_ids
+                    and module.id not in interface_providers
+                    and not _module_owns_observable_surface(
+                        normalized.get(module.id, []), observable_surfaces
+                    )
+                ]
+                if shallow:
+                    violations.append(
+                        f"Design modules {left_module.id} and {right_module.id} declare "
+                        f"identical requirement_refs ({', '.join(sorted(shared_refs))}) while "
+                        f"{', '.join(shallow)} owns no data_models, provides no "
+                        "interface to a distinct consumer, and owns no observable "
+                        "surface; apply the Deletion Test and consolidate the shallow "
+                        "duplicate, or give it a distinct entity or interface"
+                    )
 
     if spec is not None:
         if design.spec_id is None:
