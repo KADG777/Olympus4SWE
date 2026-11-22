@@ -171,14 +171,11 @@ class AlignStage:
                 return []
             return validate_goal_spec(candidate)
 
+        exhausted_violations: list[str] = []
+
         def record_validation_failure(candidate: GoalSpec, violations: list[str]) -> GoalSpec:
-            self.store.append_event(
-                run_id=run_id,
-                stage="align",
-                event_type="spec.validation_failed",
-                actor="align",
-                payload={"violations": violations},
-            )
+            exhausted_violations.clear()
+            exhausted_violations.extend(violations)
             return candidate
 
         draft = loop.run_structured(
@@ -205,6 +202,17 @@ class AlignStage:
             }
         )
         self.store.save_spec(run_id, spec, actor="align")
+        if exhausted_violations:
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="spec.validation_failed",
+                actor="align",
+                payload={
+                    "violations": list(exhausted_violations),
+                    "spec_hash": spec.content_hash,
+                },
+            )
         self.store.set_run_status(
             run_id,
             RunStatus.AWAITING_HUMAN,

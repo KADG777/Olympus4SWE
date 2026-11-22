@@ -675,7 +675,7 @@ def test_propose_plan_injects_vertical_tracer_bullet_guidance(
     assert "Vertical tracer-bullet decomposition" in prompts[0]
     assert "tracer bullet" in prompts[0].lower()
     assert "depends_on" in prompts[0]
-    assert "CheckKind.COMMAND" in prompts[0]
+    assert "kind='command'" in prompts[0]
     assert plan.tasks[0].kind == TaskKind.IMPLEMENT
 
 
@@ -714,7 +714,6 @@ def test_propose_plan_vertical_topologies_reject_slices_without_command(
     with pytest.raises(PlanValidationError, match="command"):
         orch.propose_plan(run_id=run_id, topology=topology)
 
-    # The same code-only plan stays legal for the legacy minimal_patch topology.
     legacy = orch.propose_plan(run_id=run_id)
     assert legacy.tasks[0].acceptance_checks[0].kind == CheckKind.INDEPENDENT_REVIEW
 
@@ -798,7 +797,6 @@ def test_propose_plan_legacy_topologies_keep_their_guidance(tmp_path: Path) -> N
     assert len(modular_prompts) == 1
     assert "Modular product decomposition" in modular_prompts[0]
     assert "Vertical tracer-bullet decomposition" not in modular_prompts[0]
-
 
 
 def test_timeout_retry_is_visible_while_an_independent_task_completes(tmp_path: Path) -> None:
@@ -3617,7 +3615,7 @@ def test_worker_system_prompt_is_harness_agnostic_seam_first_and_anti_bloat() ->
     lowered = prompt.lower()
     assert "run_bash" not in prompt
     assert "failing seam test" in lowered
-    assert "minimal" in lowered and "next criterion" in lowered
+    assert "minimal clean" in lowered and "next criterion" in lowered
     assert "speculative" in lowered and "tautological" in lowered
     assert "batch" in lowered and "native" in lowered
     assert "shell execution" in lowered

@@ -272,7 +272,7 @@ def _node_pm_decompose(state: dict[str, Any], params: Mapping[str, Any]) -> dict
 def _node_validate_plan(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
     runtime = _runtime(state)
     run_id = _run_id(state)
-    topology = str(state.get("topology") or params.get("topology") or runtime.topology)
+    topology = state.get("topology") or params.get("topology") or runtime.topology
     snap = runtime.store.get_run(run_id)
     plan = snap["plan"]
     if plan is None:

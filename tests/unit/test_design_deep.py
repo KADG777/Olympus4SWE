@@ -255,16 +255,64 @@ def test_validate_design_spec_rejects_shallow_duplicate_modules() -> None:
     )
     assert validate_design_spec(distinct_owner, spec, strict_v2=True) == []
 
-    observable_spec = _goal_spec().model_copy(
-        update={"observable_surfaces": ["HTTP API", "src/facade/"]}
+    for surface in ("HTTP /api/notes", "CLI blacknote"):
+        boundary_spec = _goal_spec().model_copy(update={"observable_surfaces": [surface]})
+        boundary = DesignSpec.model_validate(
+            _payload(
+                boundary_spec,
+                architecture_summary="Domain core paired with a dedicated public boundary",
+                modules=[
+                    {
+                        "id": "M1",
+                        "name": "Notes core",
+                        "responsibility": "Persist notes and enforce domain invariants",
+                        "requirement_refs": ["R1", "R2"],
+                        "target_paths": ["src/core/"],
+                    },
+                    {
+                        "id": "M2",
+                        "name": "Public boundary",
+                        "responsibility": (
+                            f"Own {surface}, authenticate requests, decode input, "
+                            "and map domain errors to public responses"
+                        ),
+                        "requirement_refs": ["R1", "R2"],
+                        "target_paths": ["src/edge/"],
+                    },
+                ],
+                data_models=[{"name": "Note", "fields": ["id", "name"], "owner_module_id": "M1"}],
+                interfaces=[_interface(provider_module_id="M1", consumer_module_ids=["M2"])],
+            )
+        )
+        assert validate_design_spec(boundary, boundary_spec, strict_v2=True) == []
+
+    case_spec = _goal_spec().model_copy(update={"observable_surfaces": ["bin/BlackNote"]})
+    case_wrapper = DesignSpec.model_validate(
+        _payload(
+            case_spec,
+            architecture_summary="Case-mismatched thin wrapper around binary entrypoint",
+            modules=[
+                {
+                    "id": "M1",
+                    "name": "Notes core",
+                    "responsibility": "Persist notes and ship the binary entrypoint",
+                    "requirement_refs": ["R1", "R2"],
+                    "target_paths": ["src/core/", "bin/BlackNote"],
+                },
+                {
+                    "id": "M2",
+                    "name": "Forwarding shim",
+                    "responsibility": "Single-caller forwarding wrapper delegating straight to M1",
+                    "requirement_refs": ["R1", "R2"],
+                    "target_paths": ["bin/blacknote"],
+                },
+            ],
+            data_models=[{"name": "Note", "fields": ["id", "name"], "owner_module_id": "M1"}],
+            interfaces=[_interface(provider_module_id="M1", consumer_module_ids=["M2"])],
+        )
     )
-    observable = DesignSpec.model_validate(
-        {
-            **duplicate_payload,
-            "spec_hash": observable_spec.content_hash,
-        }
-    )
-    assert validate_design_spec(observable, observable_spec, strict_v2=True) == []
+    case_violations = validate_design_spec(case_wrapper, case_spec, strict_v2=True)
+    assert any("M2" in violation and "Deletion Test" in violation for violation in case_violations)
 
 
 def test_validate_design_spec_keeps_contract_first_parallel_multimodule_designs_valid() -> None:

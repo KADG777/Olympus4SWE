@@ -33,6 +33,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import RunControl, is_plan_bound_to_upstream
 from olympus.core.dag import (
+    VERTICAL_SLICE_TOPOLOGIES,
     PlanValidationError,
     compute_dispatchable_tasks,
     scopes_overlap,
@@ -79,7 +80,8 @@ if TYPE_CHECKING:
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
 Rules:
-1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable.
+1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable
+   (unless vertical tracer-bullet slicing applies).
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
 4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
@@ -179,7 +181,7 @@ def _copy_matching_scope(
 
 
 def _format_spec_context(spec: GoalSpec) -> str:
-    """Format constraints, assumptions, and resolved Stage 1 clarifications for Stage 2 roles."""
+    """Format constraints, assumptions, test seams, and clarifications for Stage 2 roles."""
     clarifications = [
         {"id": amb.id, "question": amb.question, "answer": amb.answer}
         for amb in spec.open_ambiguities
@@ -448,17 +450,19 @@ Modular product decomposition (topology={topology}):
 
 _VERTICAL_PLANNER_GUIDANCE = """
 Vertical tracer-bullet decomposition (topology={topology}):
+- If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
+  `kind='contract'` task owning those paths before Slice 1.
 - Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
   the smallest vertical path that wires core storage/logic to one observable user-facing seam
   named by GoalSpec.test_seams or observable_surfaces, with at least one executable
-  kind='command' seam check (CheckKind.COMMAND) proving the path runs.
+  kind='command' seam check proving the path runs.
 - Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
   each delivers exactly one observable capability end to end (its storage/logic plus seam
   wiring) and carries its own executable kind='command' seam test.
 - NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
   routes/templates/static wave, and no bulk test-only wave after unverified code waves.
-- NEVER emit a catch-all mega-ticket that owns every design module or four or more write
-  scopes; split that work into vertical slices.
+- NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,
+  4+ top-level scopes, or 4+ requirements across 4+ write scopes; split into vertical slices.
 - Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
   have strictly disjoint write_scope.
 """
@@ -591,11 +595,14 @@ class OrchestrateStage:
         else:
             spec = self._require_confirmed_spec(run_id)
 
-        vertical = topology in ("tdd_first", "vertical_slices")
+        vertical = topology in VERTICAL_SLICE_TOPOLOGIES
         modular = design is not None and (topology == "modular_product" or vertical)
-        guidance_block = (
-            _VERTICAL_PLANNER_GUIDANCE.format(topology=topology) if vertical else ""
-        )
+        if vertical:
+            guidance_block = _VERTICAL_PLANNER_GUIDANCE.format(topology=topology)
+        elif modular:
+            guidance_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+        else:
+            guidance_block = ""
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -625,8 +632,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
-            if not vertical:
-                guidance_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
             design_paths = [
                 p for mod in design.modules for p in mod.target_paths
             ] + list(design.shared_contract_paths)

@@ -180,7 +180,7 @@ class GoalSpec(FingerprintedModel):
     )
 
     def _hash_payload(self) -> dict[str, Any]:
-        """Keep existing approvals valid when provenance is absent."""
+        """Drop empty optional fields so legacy approvals keep identical hashes."""
         payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
         if not self.agent_high_impact_assumptions:
             del payload["agent_high_impact_assumptions"]

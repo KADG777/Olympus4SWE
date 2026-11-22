@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from olympus.core.contracts import (
     CheckKind,
+    DesignModule,
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
@@ -298,19 +299,78 @@ def validate_goal_spec(
     return violations
 
 
+_SHALLOW_WRAPPER_RE = re.compile(
+    r"\b(?:pass[- ]?through|forwarding\s+wrapper|thin\s+wrapper|single[- ]caller)\b",
+    re.IGNORECASE,
+)
+_GENERIC_SURFACE_WORDS = frozenset(
+    {
+        "api",
+        "app",
+        "application",
+        "command",
+        "endpoint",
+        "interface",
+        "layer",
+        "service",
+        "surface",
+    }
+)
+
+
+def _is_path_surface(surface: str) -> bool:
+    stripped = surface.strip()
+    return (
+        bool(stripped)
+        and "/" in stripped
+        and not stripped.startswith("/")
+        and not any(ch.isspace() for ch in stripped)
+    )
+
+
+def _module_matches_named_surface(module_text: str, surface: str) -> bool:
+    lowered = surface.strip().lower()
+    if not lowered:
+        return False
+    if lowered in module_text:
+        return True
+    tokens = [
+        tok
+        for tok in re.findall(r"[a-z0-9_./:-]+", lowered)
+        if len(tok) >= 2 and tok not in _GENERIC_SURFACE_WORDS
+    ]
+    return bool(tokens) and all(tok in module_text for tok in tokens)
+
+
 def _module_owns_observable_surface(
+    module: DesignModule,
+    peer: DesignModule,
     normalized_paths: list[str],
-    observable_surfaces: set[str],
+    spec: GoalSpec | None,
 ) -> bool:
+    if spec is None:
+        return False
+    module_text = f"{module.name} {module.responsibility}".lower()
+    if _SHALLOW_WRAPPER_RE.search(module_text):
+        return False
+
+    surfaces = [s.strip() for s in spec.observable_surfaces if s.strip()]
+    path_surfaces = [s for s in surfaces if _is_path_surface(s)]
     for path in normalized_paths:
-        bare = path.rstrip("/").lower()
-        for surface in observable_surfaces:
-            if (
-                bare == surface
-                or surface.startswith(f"{bare}/")
-                or bare.startswith(f"{surface}/")
-            ):
-                return True
+        for surface in path_surfaces:
+            with contextlib.suppress(ValueError):
+                if paths_overlap(path, surface):
+                    return True
+
+    peer_text = f"{peer.name} {peer.responsibility}".lower()
+    named_surfaces = [s for s in surfaces if not _is_path_surface(s)] + [
+        s.strip() for s in spec.test_seams if s.strip()
+    ]
+    for surface in named_surfaces:
+        if _module_matches_named_surface(
+            module_text, surface
+        ) and not _module_matches_named_surface(peer_text, surface):
+            return True
     return False
 
 
@@ -489,11 +549,6 @@ def validate_design_spec(
         interface_providers = {
             iface.provider_module_id for iface in design.interfaces if iface.consumer_module_ids
         }
-        observable_surfaces = {
-            surface.strip().rstrip("/").lower()
-            for surface in (spec.observable_surfaces if spec is not None else [])
-            if surface.strip()
-        }
         for index, left_module in enumerate(design.modules):
             for right_module in design.modules[index + 1 :]:
                 shared_refs = set(left_module.requirement_refs)
@@ -501,11 +556,14 @@ def validate_design_spec(
                     continue
                 shallow = [
                     module.id
-                    for module in (left_module, right_module)
+                    for module, peer in (
+                        (left_module, right_module),
+                        (right_module, left_module),
+                    )
                     if module.id not in data_owner_ids
                     and module.id not in interface_providers
                     and not _module_owns_observable_surface(
-                        normalized.get(module.id, []), observable_surfaces
+                        module, peer, normalized.get(module.id, []), spec
                     )
                 ]
                 if shallow:
@@ -835,43 +893,91 @@ def _validate_command_syntax_and_deps(
     return violations
 
 
-_VERTICAL_SLICE_TOPOLOGIES = frozenset({"tdd_first", "vertical_slices"})
+VERTICAL_SLICE_TOPOLOGIES = frozenset({"tdd_first", "vertical_slices"})
 
-# A monolithic sink must be broad on every axis at once: path scope plus either requirement
-# spread or whole-design module ownership. One wide axis alone is a legitimate vertical slice.
 _MONOLITH_MIN_SCOPES = 4
 _MONOLITH_MIN_REQUIREMENTS = 4
 _MONOLITH_MIN_MODULES = 3
+_SHELL_PUNCTUATION_TOKENS = frozenset({";", "&&", "||", "|", "&", "(", ")"})
+
+
+def _command_has_executable_statement(command: str | None) -> bool:
+    if not command or not command.strip():
+        return False
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        non_comment = [
+            line.strip()
+            for line in command.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        return bool(non_comment)
+    return any(token not in _SHELL_PUNCTUATION_TOKENS for token in tokens)
 
 
 def _has_executable_command(task: TaskNode) -> bool:
     return any(
-        check.kind == CheckKind.COMMAND and (check.command or "").strip()
+        check.kind == CheckKind.COMMAND and _command_has_executable_statement(check.command)
         for check in task.acceptance_checks
     )
 
 
 def _is_human_gate_task(task: TaskNode) -> bool:
-    return all(check.kind == CheckKind.HUMAN for check in task.acceptance_checks)
+    return (
+        task.role.strip().lower() == "human"
+        and bool(task.acceptance_checks)
+        and all(check.kind == CheckKind.HUMAN for check in task.acceptance_checks)
+    )
 
 
 def _monolithic_sink_reason(
     task: TaskNode,
     *,
-    module_ids: set[str],
-    requirement_ids: set[str],
+    module_paths: dict[str, list[str]],
+    requirement_ids: set[str] | None,
 ) -> str | None:
-    owned_modules = set(task.design_refs) & module_ids
-    owned_requirements = set(task.requirement_refs) & requirement_ids
-    scopes = {scope.strip().rstrip("/") for scope in task.write_scope}
-    wide_scope = len(scopes) >= _MONOLITH_MIN_SCOPES
-    wide_requirements = len(owned_requirements) >= _MONOLITH_MIN_REQUIREMENTS
-    wide_modules = len(owned_modules) >= _MONOLITH_MIN_MODULES
-    if not (wide_scope and (wide_requirements or wide_modules)):
+    norm_scopes: list[str] = []
+    for scope in task.write_scope:
+        with contextlib.suppress(ValueError):
+            norm_scopes.append(normalize_scope_path(scope))
+    unique_scopes = set(norm_scopes)
+    effective_modules = set(task.design_refs) & set(module_paths)
+    if norm_scopes:
+        for mod_id, paths in module_paths.items():
+            if mod_id not in effective_modules and scopes_overlap(norm_scopes, paths):
+                effective_modules.add(mod_id)
+
+    if len(effective_modules) < _MONOLITH_MIN_MODULES:
         return None
+
+    owned_requirements = (
+        set(task.requirement_refs) & requirement_ids
+        if requirement_ids is not None
+        else set(task.requirement_refs)
+    )
+    covers_repo_root = "." in unique_scopes
+    top_level_scopes = {
+        PurePosixPath(scope).parts[0]
+        for scope in unique_scopes
+        if scope != "." and PurePosixPath(scope).parts
+    }
+    wide_top_level = len(top_level_scopes) >= _MONOLITH_MIN_SCOPES
+    wide_multi_req = (
+        len(unique_scopes) >= _MONOLITH_MIN_SCOPES
+        and len(owned_requirements) >= _MONOLITH_MIN_REQUIREMENTS
+    )
+    if not (covers_repo_root or wide_top_level or wide_multi_req):
+        return None
+
+    scope_desc = (
+        "the repository root ('.')"
+        if covers_repo_root
+        else f"{len(unique_scopes)} write scopes ({len(top_level_scopes)} top-level)"
+    )
     return (
-        f"owns {len(owned_modules)} design module(s), {len(owned_requirements)} requirement(s) "
-        f"across {len(scopes)} write scopes"
+        f"covers {len(effective_modules)} design module(s) and {len(owned_requirements)} "
+        f"requirement(s) across {scope_desc}"
     )
 
 
@@ -881,7 +987,6 @@ def _validate_vertical_slices(
     design: DesignSpec | None,
     ancestors: dict[str, set[str]],
 ) -> list[str]:
-    """0-token gate: every vertical slice ships its own executable seam verification."""
     violations: list[str] = []
     by_id = {task.task_id: task for task in plan.tasks}
 
@@ -893,7 +998,7 @@ def _validate_vertical_slices(
         violations.append(
             f"Vertical slice {task.task_id} ({task.kind.value}) has no executable kind='command' "
             "acceptance check; every implementation slice must verify its user-facing seam "
-            "end to end (CheckKind.COMMAND)."
+            "end to end."
         )
 
     for task in plan.tasks:
@@ -904,7 +1009,7 @@ def _validate_vertical_slices(
             upstream = by_id.get(ancestor_id)
             if (
                 upstream is not None
-                and upstream.kind == TaskKind.IMPLEMENT
+                and upstream.kind in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE)
                 and not _is_human_gate_task(upstream)
                 and not _has_executable_command(upstream)
             ):
@@ -912,25 +1017,30 @@ def _validate_vertical_slices(
         if deferred:
             violations.append(
                 f"Task {task.task_id} (test) horizontally defers verification: upstream "
-                f"implement task(s) {', '.join(deferred)} carry no executable kind='command' "
+                f"slice(s) {', '.join(deferred)} carry no executable kind='command' "
                 "check; move the seam test into each vertical slice."
             )
 
     if (
-        spec is not None
-        and design is not None
-        and len(spec.requirements) >= _MONOLITH_MIN_REQUIREMENTS
+        design is not None
         and len(design.modules) >= _MONOLITH_MIN_MODULES
+        and (spec is None or len(spec.requirements) >= _MONOLITH_MIN_REQUIREMENTS)
     ):
-        module_ids = {module.id for module in design.modules}
-        requirement_ids = {requirement.id for requirement in spec.requirements}
+        module_paths: dict[str, list[str]] = {}
+        for module in design.modules:
+            paths: list[str] = []
+            for raw in module.target_paths:
+                with contextlib.suppress(ValueError):
+                    paths.append(normalize_scope_path(raw))
+            module_paths[module.id] = paths
+        requirement_ids = {requirement.id for requirement in spec.requirements} if spec else None
         for task in plan.tasks:
             if task.kind not in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE):
                 continue
             if _is_human_gate_task(task):
                 continue
             reason = _monolithic_sink_reason(
-                task, module_ids=module_ids, requirement_ids=requirement_ids
+                task, module_paths=module_paths, requirement_ids=requirement_ids
             )
             if reason is not None:
                 violations.append(
@@ -940,6 +1050,19 @@ def _validate_vertical_slices(
                 )
 
     return violations
+
+
+def validate_plan_topology(
+    plan: TaskPlan,
+    spec: GoalSpec | None = None,
+    *,
+    design: DesignSpec | None = None,
+    topology: str | None = None,
+) -> list[str]:
+    """Run only the topology-specific structural gate for ``plan``."""
+    if topology not in VERTICAL_SLICE_TOPOLOGIES:
+        return []
+    return _validate_vertical_slices(plan, spec, design, _build_ancestors(plan.tasks))
 
 
 def validate_plan(
@@ -1110,7 +1233,7 @@ def validate_plan(
 
     violations.extend(_validate_command_syntax_and_deps(plan.tasks, ancestors))
 
-    if topology in _VERTICAL_SLICE_TOPOLOGIES:
+    if topology in VERTICAL_SLICE_TOPOLOGIES:
         vertical_ancestors = ancestors if ancestors is not None else _build_ancestors(plan.tasks)
         violations.extend(_validate_vertical_slices(plan, spec, design, vertical_ancestors))
 

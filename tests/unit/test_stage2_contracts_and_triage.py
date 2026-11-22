@@ -334,7 +334,43 @@ def test_align_stage_persists_and_renders_test_seams_under_strict_canonical(
     assert saved.test_seams == spec.test_seams
     assert saved.content_hash == spec.content_hash
     strict_user_prompt = provider.recorded_requests[0][0][1].content
-    assert "test_seams" in strict_user_prompt
+    assert "highest-level public seams" in strict_user_prompt
+
+
+def test_strict_align_missing_test_seams_blocks_normal_confirm_spec(tmp_path: Path) -> None:
+    from olympus.core.control import RunControl
+
+    store = RunStore(tmp_path / "strict-align-block.db")
+    run_id = store.create_run(title="Strict align missing seams")
+    missing_seams_draft = _canonical_spec().model_dump(exclude={"content_hash", "status"})
+    missing_seams_draft["test_seams"] = []
+    provider = MockLLMProvider(
+        responses=[
+            LLMResponse(content=json.dumps(missing_seams_draft)),
+            LLMResponse(content=json.dumps(missing_seams_draft)),
+        ]
+    )
+    align = AlignStage(store=store, provider=provider, workspace_root=tmp_path)
+    align.propose_spec(
+        run_id=run_id,
+        raw_goal="Operators manage inventory through a REST API",
+        strict_canonical=True,
+        max_steps=1,
+    )
+
+    control = RunControl(store)
+    with pytest.raises(ValueError, match="test_seams"):
+        control.confirm_spec(run_id)
+
+    repaired = store.get_run(run_id)["spec"]
+    assert repaired is not None
+    store.save_spec(
+        run_id,
+        repaired.model_copy(update={"test_seams": ["POST /items"]}),
+        actor="zeus",
+    )
+    confirmed = control.confirm_spec(run_id)
+    assert confirmed.test_seams == ["POST /items"]
 
 
 def test_spec_context_freezes_test_seams_for_downstream_roles() -> None:

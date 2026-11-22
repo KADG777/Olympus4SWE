@@ -449,7 +449,13 @@ def test_validate_plan_vertical_gate_requires_executable_command_per_slice(
     blank_command = AcceptanceCheck(
         id="C1", kind=CheckKind.COMMAND, description="Blank command", command="   "
     )
-    for checks in ([review_only], [blank_command]):
+    comment_only = AcceptanceCheck(
+        id="C1", kind=CheckKind.COMMAND, description="TODO placeholder", command="# seam test TODO"
+    )
+    human_on_engineer = AcceptanceCheck(
+        id="C1", kind=CheckKind.HUMAN, description="Manual signoff on coding slice"
+    )
+    for checks in ([review_only], [blank_command], [comment_only], [human_on_engineer]):
         plan = TaskPlan(
             spec_id=spec.spec_id,
             spec_hash=spec.content_hash,
@@ -467,6 +473,24 @@ def test_validate_plan_vertical_gate_requires_executable_command_per_slice(
         )
         violations = validate_plan(plan, spec=spec, topology=topology)
         assert any("T1-slice" in violation and "command" in violation for violation in violations)
+
+    human_gate = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1-human",
+                title="Human approval gate",
+                objective="Review release notes",
+                requirement_refs=["R1", "R2"],
+                role="human",
+                kind=kind,
+                write_scope=["docs/release.md"],
+                acceptance_checks=[human_on_engineer],
+            )
+        ],
+    )
+    assert validate_plan(human_gate, spec=spec, topology=topology) == []
 
 
 def test_validate_plan_vertical_gate_rejects_horizontal_test_only_deferral() -> None:
@@ -572,3 +596,106 @@ def test_validate_plan_vertical_gate_is_noop_for_legacy_topologies(
     assert validate_plan(monolithic, spec=spec, design=design, topology=topology) == []
     with pytest.raises(PlanValidationError):
         assert_valid_plan(monolithic, spec=spec, design=design, topology="tdd_first")
+
+
+def test_validate_plan_monolithic_sink_catches_bypasses_and_allows_thin_tracer() -> None:
+    spec = _vertical_spec()
+    design = _vertical_design(spec)
+
+    root_monolith = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        design_id=design.design_id,
+        design_hash=design.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T-root",
+                title="Repo-root monolith",
+                objective="Implement everything under repo root",
+                requirement_refs=["R1", "R2", "R3", "R4"],
+                design_refs=["M1", "M2", "M3"],
+                write_scope=["."],
+                acceptance_checks=[_check()],
+            )
+        ],
+    )
+    assert any(
+        "T-root" in v and "monolithic" in v
+        for v in validate_plan(root_monolith, spec=spec, design=design, topology="tdd_first")
+    )
+
+    dir_scopes = ["storage/", "logic/", "ui/", "tests/"]
+    multi_dir_design = design.model_copy(
+        update={
+            "modules": [
+                mod.model_copy(update={"target_paths": [scope]})
+                for mod, scope in zip(design.modules, dir_scopes[:3], strict=True)
+            ]
+        }
+    )
+    omitted_refs_plan = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        design_id=multi_dir_design.design_id,
+        design_hash=multi_dir_design.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T-boot",
+                title="Bootstrap",
+                objective="Seed bootstrap",
+                requirement_refs=["R1", "R2", "R3"],
+                design_refs=["M1", "M2", "M3"],
+                write_scope=["bootstrap/"],
+                acceptance_checks=[_check("C1")],
+            ),
+            TaskNode(
+                task_id="T-sink",
+                title="Catch-all without design_refs",
+                objective="Write every module scope at once",
+                requirement_refs=["R4"],
+                design_refs=[],
+                depends_on=["T-boot"],
+                write_scope=dir_scopes,
+                acceptance_checks=[_check("C2")],
+            ),
+        ],
+    )
+    assert any(
+        "T-sink" in v and "monolithic" in v
+        for v in validate_plan(
+            omitted_refs_plan, spec=spec, design=multi_dir_design, topology="tdd_first"
+        )
+    )
+
+    design_only_sink = TaskPlan(
+        design_id=multi_dir_design.design_id,
+        design_hash=multi_dir_design.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T-design-only",
+                title="Design-only catch-all",
+                objective="Implement all modules in one task",
+                requirement_refs=["R1", "R2", "R3", "R4"],
+                design_refs=["M1", "M2", "M3"],
+                write_scope=dir_scopes,
+                acceptance_checks=[_check()],
+            )
+        ],
+    )
+    assert any(
+        "T-design-only" in v and "monolithic" in v
+        for v in validate_plan(design_only_sink, design=multi_dir_design, topology="tdd_first")
+    )
+
+    clean_plan = _vertical_slices_plan(spec, design)
+    thin_tracer = clean_plan.tasks[0].model_copy(
+        update={
+            "requirement_refs": ["R1"],
+            "design_refs": ["M1", "M2", "M3"],
+            "write_scope": ["src/core.py", "src/items.py", "src/count.py", "src/app.py"],
+        }
+    )
+    tracer_plan = clean_plan.model_copy(
+        update={"tasks": [thin_tracer, clean_plan.tasks[1], clean_plan.tasks[2]]}
+    )
+    assert validate_plan(tracer_plan, spec=spec, design=design, topology="tdd_first") == []

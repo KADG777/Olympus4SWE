@@ -296,3 +296,105 @@ def test_validate_plan_node_enforces_topology_from_workflow_state(tmp_path) -> N
         )
         == {"route": "ok"}
     )
+
+
+def test_cli_plan_and_resume_node_enforce_workflow_topology(tmp_path, monkeypatch) -> None:
+    import importlib
+    import json
+
+    from typer.testing import CliRunner
+
+    from olympus.core.contracts import (
+        ApprovalDecision,
+        ApprovalRecord,
+        ApprovalTarget,
+        GoalSpec,
+        RequirementItem,
+        TaskPlan,
+    )
+    from olympus.core.dag import PlanValidationError
+    from olympus.core.store import RunStore
+    from olympus.graph.progress import resolve_resume_node
+    from olympus.providers.base import LLMResponse, MockLLMProvider
+
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(title="CLI topology enforcement", workflow_name="full_sdlc_tdd")
+    spec = GoalSpec(
+        spec_id="spec-cli-topo",
+        goal="Ship one vertical slice",
+        requirements=[
+            RequirementItem(
+                id="R1", description="Deliver the capability", acceptance_criteria=["Works"]
+            )
+        ],
+    )
+    store.save_spec(run_id, spec)
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.GOAL_SPEC,
+            target_id=spec.spec_id,
+            target_hash=spec.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    bad_plan_payload = {
+        "plan_id": "plan-cli-bad",
+        "spec_id": spec.spec_id,
+        "spec_hash": spec.content_hash,
+        "tasks": [
+            {
+                "task_id": "T1",
+                "title": "Unverified coding slice",
+                "objective": "Ship code with review check only",
+                "requirement_refs": ["R1"],
+                "write_scope": ["src/app.py"],
+                "acceptance_checks": [
+                    {
+                        "id": "C1",
+                        "kind": "independent_review",
+                        "description": "Cold review only",
+                    }
+                ],
+            }
+        ],
+    }
+    cli_mod = importlib.import_module("olympus.cli.app")
+    mock = MockLLMProvider(
+        responses=[LLMResponse(content=json.dumps(bad_plan_payload)) for _ in range(3)]
+    )
+    monkeypatch.setattr(cli_mod, "build_provider", lambda **kwargs: mock)
+
+    result = CliRunner().invoke(
+        cli_mod.app,
+        [
+            "plan",
+            run_id,
+            "--workspace",
+            str(tmp_path),
+            "--db",
+            str(db_path),
+            "--provider",
+            "mock",
+            "--auto-approve",
+        ],
+    )
+    assert result.exit_code != 0
+    assert isinstance(result.exception, PlanValidationError)
+
+    bad_plan = TaskPlan.model_validate(bad_plan_payload)
+    store.save_plan(run_id, bad_plan)
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=bad_plan.plan_id,
+            target_hash=bad_plan.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    definition = load_workflow("full_sdlc_tdd")
+    assert resolve_resume_node(definition, store.get_run(run_id), store=store) == "validate_plan"
