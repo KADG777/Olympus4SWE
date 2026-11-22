@@ -34,6 +34,7 @@ import shlex
 import tarfile
 import time
 import tomllib
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -77,6 +78,23 @@ OLYMPUS_AGENT_IMPORT_PATH = (
     "tests.evals.benchmarks.harbor_together:UserEnabledOlympusAgent"
 )
 _REDACTED = "***REDACTED***"
+_USER_API_KEY_REFS: dict[str, str] = {}
+
+
+def _register_user_api_key(value: str) -> str:
+    ref = f"ref:{uuid.uuid4().hex}"
+    _USER_API_KEY_REFS[ref] = value
+    return ref
+
+
+def _resolve_user_api_key(
+    *, user_api_key: str | None, user_api_key_ref: str | None
+) -> str | None:
+    if user_api_key:
+        return user_api_key
+    if user_api_key_ref:
+        return _USER_API_KEY_REFS.get(user_api_key_ref)
+    return None
 
 _SESSION_STATUSES = frozenset({"needs_input", "completed", "failed"})
 _STOP_WORDS = frozenset({"stop", "done", "finish", "finished", "terminate", "exit"})
@@ -667,6 +685,16 @@ def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
     return redacted
 
 
+def _redact_json_value(value: Any, secrets: Iterable[str]) -> Any:
+    if isinstance(value, str):
+        return redact_text(value, secrets)
+    if isinstance(value, dict):
+        return {k: _redact_json_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_json_value(item, secrets) for item in value]
+    return value
+
+
 class UserEnabledOlympusAgent(BaseAgent):
     """Harbor agent wrapping ``olympus session start/reply`` with a user simulator."""
 
@@ -721,6 +749,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         user_model_name: str = "anthropic/claude-opus-4-6",
         user_api_base: str | None = None,
         user_api_key: str | None = None,
+        user_api_key_ref: str | None = None,
         user_temperature: float = 0.5,
         user_context_chars: int = 3000,
         original_user_messages: list[str] | None = None,
@@ -766,13 +795,17 @@ class UserEnabledOlympusAgent(BaseAgent):
         driver_name = (self._worker_driver or "").split("@", 1)[0].strip().lower()
         self._needs_pi = bool(install_pi) if install_pi is not None else driver_name == "pi"
         self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
-        self._redaction_secrets = collect_redaction_secrets(self._extra_env)
-
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
         self._user_model_name = user_model_name
         self._user_api_base = user_api_base
-        self._user_api_key = user_api_key
+        self._user_api_key = _resolve_user_api_key(
+            user_api_key=user_api_key, user_api_key_ref=user_api_key_ref
+        )
+        redaction_env = dict(self._extra_env)
+        if self._user_api_key:
+            redaction_env["USER_SIM_API_KEY"] = self._user_api_key
+        self._redaction_secrets = collect_redaction_secrets(redaction_env)
         self._user_temperature = user_temperature
         self._user_context_chars = max(500, int(user_context_chars))
         self._original_user_messages = list(original_user_messages or [])
@@ -1030,7 +1063,12 @@ class UserEnabledOlympusAgent(BaseAgent):
             pause_kind=envelope.pause_kind,
         )
         (self.logs_dir / f"envelope-{turn}.json").write_text(
-            json.dumps(dict(envelope.raw), indent=2, ensure_ascii=False) + "\n",
+            json.dumps(
+                _redact_json_value(dict(envelope.raw), self._redaction_secrets),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
             encoding="utf-8",
         )
         return envelope
@@ -1123,8 +1161,13 @@ class UserEnabledOlympusAgent(BaseAgent):
             "is_completion_attempt": completing,
             "action": str(getattr(decision, "action", "") or ""),
             "has_message": bool(getattr(decision, "has_message", False)),
-            "content": str(getattr(decision, "content", "") or ""),
-            "raw_response": str(getattr(decision, "raw_response", "") or "")[:500],
+            "content": redact_text(
+                str(getattr(decision, "content", "") or ""), self._redaction_secrets
+            ),
+            "raw_response": redact_text(
+                str(getattr(decision, "raw_response", "") or "")[:500],
+                self._redaction_secrets,
+            ),
         }
         stats_getter = getattr(self._sim_user, "get_stats", None)
         if callable(stats_getter):
@@ -1214,7 +1257,7 @@ class UserEnabledOlympusAgent(BaseAgent):
             "timestamp": _utc_now(),
             "turn": turn,
             "role": role,
-            "content": content,
+            "content": redact_text(content, self._redaction_secrets),
         }
         if kind:
             record["kind"] = kind
@@ -1479,7 +1522,6 @@ def build_olympus_trial_config(
     original_messages = _load_task_user_messages(task)
     sim_kwargs: dict[str, Any] = {
         "user_model_name": user_model or model,
-        "user_api_key": user_api_key,
         "user_api_base": user_api_base,
         "original_user_messages": original_messages,
         "session_analysis": _load_task_session_analysis(task, len(original_messages)),
@@ -1487,6 +1529,8 @@ def build_olympus_trial_config(
         "user_context_chars": user_context_chars,
         "call_user_on_completion": call_user_on_completion,
     }
+    if user_api_key:
+        sim_kwargs["user_api_key_ref"] = _register_user_api_key(user_api_key)
     if user_temperature != 0.5:
         sim_kwargs["user_temperature"] = user_temperature
     if base_url is not None:

@@ -94,6 +94,11 @@ _REVISION_MARKERS = (
     "不对",
     "改一下",
 )
+_NEGATED_SHIP_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|doesn'?t|didn'?t|not|never|cannot|can'?t|won'?t|will\s+not|"
+    r"wouldn'?t|shouldn'?t|should\s+not|hold\s+off)\b",
+    re.IGNORECASE,
+)
 _NEGATED_SHIP_MARKERS = (
     "can't approve",
     "cannot approve",
@@ -354,6 +359,8 @@ class InteractBridge:
         if not lowered.strip():
             return False
         if any(marker in lowered for marker in _NEGATED_SHIP_MARKERS):
+            return False
+        if _NEGATED_SHIP_RE.search(lowered) is not None:
             return False
         if any(marker in lowered for marker in _REVISION_MARKERS):
             return False

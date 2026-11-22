@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
@@ -310,6 +311,11 @@ def load_upstream_judge_module(swe_together_root: Path | str) -> Any | None:
         ) from exc
 
 
+_UPSTREAM_JUDGE_ENV_LOCK = threading.Lock()
+_UPSTREAM_BACKEND_STACK: dict[int, list[DockerJudgeBackend]] = {}
+_UPSTREAM_BACKEND_ORIGINAL: dict[int, Any] = {}
+
+
 class DockerJudgeBackend:
     """Patch upstream ``open_judge_sandbox`` to hand out ``DockerJudgeSandbox``."""
 
@@ -322,11 +328,17 @@ class DockerJudgeBackend:
         extra_envs: Mapping[str, str] | None = None,
     ) -> None:
         self.module = module
-        self._original = module.open_judge_sandbox
         self._image_resolver = image_resolver
         self._cli = cli
         self._extra_envs = dict(extra_envs or {"IS_SANDBOX": "1"})
-        module.open_judge_sandbox = self.open_sandbox
+        self._restored = False
+        mod_id = id(module)
+        with _UPSTREAM_JUDGE_ENV_LOCK:
+            stack = _UPSTREAM_BACKEND_STACK.setdefault(mod_id, [])
+            if not stack:
+                _UPSTREAM_BACKEND_ORIGINAL[mod_id] = module.open_judge_sandbox
+            stack.append(self)
+            module.open_judge_sandbox = self.open_sandbox
 
     async def open_sandbox(
         self,
@@ -348,7 +360,21 @@ class DockerJudgeBackend:
         )
 
     def restore(self) -> None:
-        self.module.open_judge_sandbox = self._original
+        mod_id = id(self.module)
+        with _UPSTREAM_JUDGE_ENV_LOCK:
+            if self._restored:
+                return
+            self._restored = True
+            stack = _UPSTREAM_BACKEND_STACK.get(mod_id, [])
+            if self in stack:
+                stack.remove(self)
+            if stack:
+                self.module.open_judge_sandbox = stack[-1].open_sandbox
+            else:
+                original = _UPSTREAM_BACKEND_ORIGINAL.pop(mod_id, None)
+                _UPSTREAM_BACKEND_STACK.pop(mod_id, None)
+                if original is not None:
+                    self.module.open_judge_sandbox = original
 
     def __enter__(self) -> DockerJudgeBackend:
         return self
@@ -879,6 +905,10 @@ async def run_judge_task(
     )
 
 
+_UPSTREAM_MODEL_STACK: list[str | None] = []
+_UPSTREAM_MODEL_ORIGINAL: list[str | None] = []
+
+
 async def _run_upstream_judge(
     backend: DockerJudgeBackend,
     *,
@@ -889,9 +919,15 @@ async def _run_upstream_judge(
     max_turns: int,
     model: str | None,
 ) -> JudgeRunResult:
-    previous_model = os.environ.get("SWT_JUDGE_MODEL")
+    pushed_model = False
     if model:
-        os.environ["SWT_JUDGE_MODEL"] = model
+        with _UPSTREAM_JUDGE_ENV_LOCK:
+            if not _UPSTREAM_MODEL_STACK:
+                _UPSTREAM_MODEL_ORIGINAL.clear()
+                _UPSTREAM_MODEL_ORIGINAL.append(os.environ.get("SWT_JUDGE_MODEL"))
+            _UPSTREAM_MODEL_STACK.append(model)
+            os.environ["SWT_JUDGE_MODEL"] = model
+            pushed_model = True
     try:
         result = await backend.module.run_judge(
             task_name,
@@ -904,11 +940,22 @@ async def _run_upstream_judge(
         )
     finally:
         backend.restore()
-        if model:
-            if previous_model is None:
-                os.environ.pop("SWT_JUDGE_MODEL", None)
-            else:
-                os.environ["SWT_JUDGE_MODEL"] = previous_model
+        if pushed_model:
+            with _UPSTREAM_JUDGE_ENV_LOCK:
+                if model in _UPSTREAM_MODEL_STACK:
+                    _UPSTREAM_MODEL_STACK.remove(model)
+                if _UPSTREAM_MODEL_STACK:
+                    top = _UPSTREAM_MODEL_STACK[-1]
+                    if top is not None:
+                        os.environ["SWT_JUDGE_MODEL"] = top
+                else:
+                    baseline = (
+                        _UPSTREAM_MODEL_ORIGINAL.pop() if _UPSTREAM_MODEL_ORIGINAL else None
+                    )
+                    if baseline is None:
+                        os.environ.pop("SWT_JUDGE_MODEL", None)
+                    else:
+                        os.environ["SWT_JUDGE_MODEL"] = baseline
     verdict = result.verdict
     if not isinstance(verdict, dict):
         verdict = {"error": "non_dict_verdict", "value": verdict}
@@ -1031,10 +1078,12 @@ def metrics_from_rows(
     return _local_metrics_from_rows(rows)
 
 
-def _stage_trial_links(trial_dirs: Sequence[Path], parent: Path) -> Path:
+def _stage_trial_links(
+    trial_entries: Sequence[tuple[Path, str]], parent: Path
+) -> Path:
     staged = Path(tempfile.mkdtemp(prefix="olympus-user-tagging-", dir=parent))
     used: set[str] = set()
-    for index, trial in enumerate(trial_dirs):
+    for index, (trial, out_name) in enumerate(trial_entries):
         name = trial.name or f"trial-{index}"
         candidate = name
         suffix = 1
@@ -1042,7 +1091,18 @@ def _stage_trial_links(trial_dirs: Sequence[Path], parent: Path) -> Path:
             suffix += 1
             candidate = f"{name}-{suffix}"
         used.add(candidate)
-        os.symlink(trial, staged / candidate, target_is_directory=True)
+        if out_name == "intent_coverage_verdict.json":
+            os.symlink(trial, staged / candidate, target_is_directory=True)
+            continue
+        link_dir = staged / candidate
+        link_dir.mkdir(parents=True, exist_ok=True)
+        for child in trial.iterdir():
+            if child.name == "intent_coverage_verdict.json":
+                continue
+            os.symlink(child, link_dir / child.name, target_is_directory=child.is_dir())
+        verdict_target = trial / out_name
+        if verdict_target.exists():
+            os.symlink(verdict_target, link_dir / "intent_coverage_verdict.json")
     return staged
 
 
@@ -1091,7 +1151,7 @@ def _run_tagging_batch(
     *,
     root: Path,
     workspace: Path,
-    trial_dirs: Sequence[Path],
+    trial_entries: Sequence[tuple[Path, str]],
     workers: int,
     model: str | None,
     force: bool,
@@ -1102,7 +1162,7 @@ def _run_tagging_batch(
     module = root / "eval" / "user_behavior" / "tag_messages.py"
     if not module.exists():
         raise FileNotFoundError(f"SWE-Together message tagger not found: {module}")
-    staged = _stage_trial_links(trial_dirs, workspace)
+    staged = _stage_trial_links(trial_entries, workspace)
     argv = [
         python or sys.executable,
         "-m",
@@ -1173,15 +1233,19 @@ def run_user_behavior(
         timeout=timeout,
         runner=runner,
     )
-    trial_dirs = list(
+    trial_entries = list(
         dict.fromkeys(
-            Path(job["trial_dir"]).expanduser().resolve() for job in jobs
+            (
+                Path(job["trial_dir"]).expanduser().resolve(),
+                str(job.get("out_name", "intent_coverage_verdict.json")),
+            )
+            for job in jobs
         )
     )
     tagging = _run_tagging_batch(
         root=root,
         workspace=workspace,
-        trial_dirs=trial_dirs,
+        trial_entries=trial_entries,
         workers=workers,
         model=tag_model if tag_model is not None else model,
         force=force,

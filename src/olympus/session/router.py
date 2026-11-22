@@ -150,18 +150,24 @@ def _reply_context(
 _NEGATED_APPROVAL_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
-        r"\bdo\s+not\s+(?:proceed|approve|go\s+ahead|continue|ship|merge)\b",
-        r"\bdon'?t\s+(?:proceed|approve|go\s+ahead|continue|ship|merge)\b",
+        r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never)\b[^.!?\n]{0,40}\b(?:proceed|approve|approved|go\s+ahead|continue|ship|merge)\b",
+        r"\bnot\s+(?:ready|approv(?:e|ed|al)|good\s+to\s+go|ok(?:ay)?|yet)\b",
         r"\b(?:not|never)\s+approv(?:e|ed|al)\b",
+        r"\bhold\s+off\b",
         r"\bno\s*[,;:]",
         r"^\s*no\b",
         r"\breject(?:s|ed|ing)?\b",
         r"\bcancel(?:s|led|ing)?\b",
     )
 )
-_NEGATED_APPROVAL_CJK = ("不要", "不批准", "不同意", "拒绝", "取消")
+_NEGATED_APPROVAL_CJK = ("不要", "不批准", "不同意", "拒绝", "取消", "暂不", "先不")
 # ``别`` negates an instruction, but is also a morpheme in 特别/分别/区别/个别 ….
 _NEGATED_APPROVAL_CJK_BIE = re.compile(r"(?<![特分区个性差级告])别")
+_ACTIONABLE_CHARS = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
+
+
+def _has_actionable_text(text: str) -> bool:
+    return len(_ACTIONABLE_CHARS.findall(text)) >= 3
 
 
 def _negated_approval(text: str) -> bool:
@@ -226,6 +232,13 @@ def _sanitize(
         action = "clarify"
     elif action == "clarify":
         action = "unknown"
+    if action == "approve" and _negated_approval(message.casefold()):
+        revise = any(token in message.casefold() for token in _REVISE_TOKENS)
+        action = "revise" if revise else "unknown"
+        feedback = message.strip() if revise else ""
+    if action in ("reopen", "revise") and not _has_actionable_text(message):
+        action = "unknown"
+        feedback = ""
     if action == "revise" and not feedback:
         feedback = message.strip()
         if not feedback:
@@ -256,20 +269,20 @@ def parse_reply(
         gate=gate,
         completed=completed,
     )
+    response = provider.complete(
+        messages=[
+            ChatMessage(role="system", content=_ROUTER_SYSTEM_PROMPT),
+            ChatMessage(role="user", content=user_prompt),
+        ]
+    )
     try:
-        response = provider.complete(
-            messages=[
-                ChatMessage(role="system", content=_ROUTER_SYSTEM_PROMPT),
-                ChatMessage(role="user", content=user_prompt),
-            ]
-        )
         parsed = _RawIntent.model_validate_json(_extract_json(response.content))
-        intent = _sanitize(parsed, snapshot=snapshot, message=message)
-        if intent.action == "unknown":
-            return _keyword_fallback(message)
-        return intent
-    except Exception:  # noqa: BLE001 - a malformed reply must never corrupt state
+    except Exception:  # noqa: BLE001 -- malformed router JSON falls back to keyword guard
         return _keyword_fallback(message)
+    intent = _sanitize(parsed, snapshot=snapshot, message=message)
+    if intent.action == "unknown":
+        return _keyword_fallback(message)
+    return intent
 
 
 def _extract_json(content: str) -> str:

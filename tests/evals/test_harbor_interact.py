@@ -1660,3 +1660,12 @@ def test_core_package_stays_free_of_harbor_and_fastmcp_imports() -> None:
         if pattern.search(text):
             offenders.append(str(path.relative_to(PROJECT_SRC)))
     assert offenders == []
+
+
+
+def test_is_ship_reply_rejects_negated_ship_phrases() -> None:
+    from tests.evals.benchmarks.interact_bridge import InteractBridge
+
+    assert not InteractBridge._is_ship_reply("I don't think you should ship it.")
+    assert not InteractBridge._is_ship_reply("We are not ready to ship this yet.")
+    assert InteractBridge._is_ship_reply("Looks good, ship it!")

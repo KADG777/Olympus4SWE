@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.control import RunControl
+from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
 from olympus.graph.loader import (
@@ -80,14 +82,11 @@ class SessionConfig:
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
-def resolve_state_dir(workspace: Path | str, state_dir: Path | str | None) -> Path:
-    """Return an external state directory, never nested inside the target repo."""
-    root = Path(workspace).resolve()
-    if state_dir is None:
-        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
-        candidate = Path(tempfile.gettempdir()) / "olympus-session" / digest
-    else:
-        candidate = Path(state_dir).expanduser().resolve()
+def _assert_state_outside_workspace(
+    workspace: Path | str, state_dir: Path | str
+) -> Path:
+    root = Path(workspace).expanduser().resolve()
+    candidate = Path(state_dir).expanduser().resolve()
     toplevel = _git_toplevel(root)
     for boundary in (root, toplevel):
         if boundary is None:
@@ -102,6 +101,18 @@ def resolve_state_dir(workspace: Path | str, state_dir: Path | str | None) -> Pa
                 f"--state-dir {candidate} is inside {scope}; "
                 "headless session state must live outside the repository"
             )
+    return candidate
+
+
+def resolve_state_dir(workspace: Path | str, state_dir: Path | str | None) -> Path:
+    """Return an external state directory, never nested inside the target repo."""
+    root = Path(workspace).resolve()
+    if state_dir is None:
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        candidate = Path(tempfile.gettempdir()) / "olympus-session" / digest
+    else:
+        candidate = Path(state_dir).expanduser().resolve()
+    candidate = _assert_state_outside_workspace(root, candidate)
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
 
@@ -158,11 +169,15 @@ def resolve_workspace_binding(
     requested_path = (
         Path(requested).expanduser().resolve() if requested is not None else None
     )
+    if requested_path is not None and state_dir is not None:
+        _assert_state_outside_workspace(requested_path, state_dir)
     if run_id is None:
         return requested_path
     recorded = _recorded_workspace(state_dir, run_id)
     if recorded is None:
         return requested_path
+    if state_dir is not None:
+        _assert_state_outside_workspace(recorded, state_dir)
     if requested_path is None:
         return recorded
     if requested_path != recorded:
@@ -177,16 +192,22 @@ def _recorded_workspace(state_dir: Path | str | None, run_id: str) -> Path | Non
     if state_dir is None:
         return None
     db_path = Path(state_dir).expanduser().resolve() / "olympus.db"
-    if not db_path.is_file():
+    if not db_path.is_file() or db_path.stat().st_size == 0:
         return None
+    conn: sqlite3.Connection | None = None
     try:
-        snap = RunStore(db_path).get_run(run_id)
-    except NotFoundError:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT workspace_root FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    except sqlite3.Error:
         return None
-    raw = snap.get("workspace_root")
-    if not raw:
+    finally:
+        if conn is not None:
+            conn.close()
+    if row is None or not row[0]:
         return None
-    return Path(str(raw)).resolve()
+    return Path(str(row[0])).resolve()
 
 
 def plan_only_definition(definition: WorkflowDefinition) -> WorkflowDefinition:
@@ -272,6 +293,7 @@ class SessionRunner:
                 "constraints": clean_constraints,
                 "workflow": definition.name,
                 "workflow_path": str(workflow_path) if workflow_path is not None else None,
+                "workflow_hash": content_hash(definition.model_dump(mode="json")),
                 "workspace_root": str(self.workspace_root),
                 "git_toplevel": str(toplevel) if toplevel is not None else None,
                 "step_mode": self.config.step_mode.value,
@@ -717,6 +739,14 @@ class SessionRunner:
                 f"Workflow '{definition.name}' does not match the run's workflow "
                 f"'{recorded_name}'"
             )
+        recorded_hash = self._recorded_workflow_hash(run_id)
+        if recorded_hash is not None:
+            actual_hash = content_hash(definition.model_dump(mode="json"))
+            if actual_hash != recorded_hash:
+                raise ValueError(
+                    f"Workflow definition for '{definition.name}' does not match the "
+                    "workflow that started this run"
+                )
         return definition
 
     def _recorded_workflow_path(self, run_id: str) -> Path | None:
@@ -732,6 +762,18 @@ class SessionRunner:
                 return None
             path = Path(str(raw))
             return path if path.is_file() else None
+        return None
+
+    def _recorded_workflow_hash(self, run_id: str) -> str | None:
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return None
+        for event in events:
+            if event.event_type != "session.started":
+                continue
+            raw = event.payload.get("workflow_hash")
+            return str(raw) if raw else None
         return None
 
     def _incremental_reopen(

@@ -1220,3 +1220,123 @@ def test_reply_rejects_a_workflow_that_does_not_match_the_run(
     assert code == 1, json.dumps(mismatch, indent=2)
     assert mismatch["status"] == "failed"
     assert "does not match the run's workflow" in str(mismatch["error"])
+
+
+
+def test_reply_rejects_empty_db_inside_repo_without_writing_bytes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    nested = repo / "nested"
+    nested.mkdir()
+    state = repo / "session-state"
+    state.mkdir()
+    db = state / "olympus.db"
+    db.write_bytes(b"")
+
+    code, env = _invoke(["reply", "run-missing", "Approve.", *_base(nested, state)])
+    assert code == 1
+    assert env["status"] == "failed"
+    assert db.stat().st_size == 0
+
+
+def test_router_guards_valid_json_negations_gibberish_and_provider_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.types import LLMResponse, MockLLMProvider, ProviderError
+    from olympus.session.contracts import PauseKind
+    from olympus.session.router import parse_reply
+
+    snap = {"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None}
+    approve_llm = MockLLMProvider(
+        responder=lambda _m, _t: LLMResponse(content='{"action": "approve"}')
+    )
+    bad_json_llm = MockLLMProvider(responder=lambda _m, _t: LLMResponse(content="not json"))
+    reopen_llm = MockLLMProvider(
+        responder=lambda _m, _t: LLMResponse(
+            content='{"action": "reopen", "feedback": "invented task"}'
+        )
+    )
+
+    assert (
+        parse_reply(
+            provider=bad_json_llm,
+            message="I am not ready to proceed.",
+            snapshot=snap,
+            pause_kind=PauseKind.APPROVAL,
+        ).action
+        != "approve"
+    )
+    assert (
+        parse_reply(
+            provider=approve_llm,
+            message="Please do not proceed.",
+            snapshot=snap,
+            pause_kind=PauseKind.APPROVAL,
+        ).action
+        != "approve"
+    )
+    assert (
+        parse_reply(
+            provider=reopen_llm,
+            message="???",
+            snapshot=snap,
+            pause_kind=None,
+            completed=True,
+        ).action
+        == "unknown"
+    )
+
+    def _fail(_m: object, _t: object) -> LLMResponse:
+        raise ProviderError("boom")
+
+    with pytest.raises(ProviderError, match="boom"):
+        parse_reply(
+            provider=MockLLMProvider(responder=_fail),
+            message="yes",
+            snapshot=snap,
+            pause_kind=PauseKind.APPROVAL,
+        )
+
+
+def test_reply_rejects_same_name_tampered_yaml_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    first = _custom_workflow(tmp_path)
+    tampered = tmp_path / "wf_b.yaml"
+    tampered.write_text(
+        first.read_text(encoding="utf-8").replace(
+            "approve_design: true", "approve_design: false"
+        )
+    )
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Add add(a, b)",
+            "--workflow",
+            str(first),
+            "--gate-policy",
+            "default",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0
+    code, rejected = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "Approve the spec.",
+            "--workflow",
+            str(tampered),
+            *_base(repo, state),
+        ]
+    )
+    assert code == 1
+    assert rejected["status"] == "failed"
+    assert "does not match the workflow that started this run" in str(rejected["error"])

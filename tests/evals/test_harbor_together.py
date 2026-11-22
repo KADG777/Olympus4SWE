@@ -1384,3 +1384,80 @@ def test_session_envelope_view_failure_defaults() -> None:
     assert failed.status == "failed"
     assert failed.error == "boom"
     assert failed.run_id == ""
+
+
+
+def test_together_redacts_secrets_in_conversation_envelope_and_trial_config(
+    tmp_path: Path,
+) -> None:
+    secret = "synthetic-review-key-only"
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix bug")
+    log_dir = tmp_path / "logs"
+    agent = UserEnabledOlympusAgent(
+        logs_dir=log_dir,
+        model_name="openai/gpt-4o",
+        extra_env={"OPENAI_API_KEY": secret},
+    )
+    raw = {"status": "needs_input", "run_id": "probe", "message": f"Echoed {secret}"}
+    result = SimpleNamespace(stdout=json.dumps(raw), stderr="", return_code=0, exit_code=0)
+
+    class _FakeEnv:
+        async def exec(self, **kwargs: Any) -> Any:
+            if "session start" in kwargs["command"]:
+                return result
+            return SimpleNamespace(stdout="", stderr="", return_code=0, exit_code=0)
+
+    agent._repo = "/workspace"
+    asyncio.run(agent._execute_turn(_FakeEnv(), action="start", message="probe", turn=0))
+    leaked = [
+        str(path.relative_to(log_dir))
+        for path in log_dir.rglob("*")
+        if path.is_file() and secret in path.read_text(encoding="utf-8")
+    ]
+    assert not leaked, leaked
+
+    cfg = build_olympus_trial_config(
+        task, model="openai/gpt-4o", user_api_key=secret, swe_together_root=root
+    )
+    assert secret not in json.dumps(cfg.agent.kwargs)
+    rebuilt = UserEnabledOlympusAgent(logs_dir=tmp_path / "rebuilt", **cfg.agent.kwargs)
+    assert rebuilt._user_api_key == secret
+
+
+def test_run_user_behavior_stages_custom_out_name_for_tag_messages(tmp_path: Path) -> None:
+    root, task, trial = _make_task_and_trial(tmp_path)
+    behavior_dir = root / "eval" / "user_behavior"
+    behavior_dir.mkdir(parents=True, exist_ok=True)
+    (behavior_dir / "run_batch.py").write_text("# stub\n", encoding="utf-8")
+    (behavior_dir / "tag_messages.py").write_text("# stub\n", encoding="utf-8")
+    episode = trial / "agent" / "episode-1"
+    episode.mkdir(parents=True, exist_ok=True)
+    (episode / "user_decision.json").write_text(
+        json.dumps({"turn": 1, "has_message": True, "action": "redirect", "content": "Fix it."})
+    )
+    custom = "intent_coverage_verdict_custom.json"
+
+    def _runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[2].endswith("run_batch"):
+            (trial / custom).write_text(json.dumps({"trial_dir": str(trial)}))
+        else:
+            staged_root = Path(argv[argv.index("--trials-root") + 1])
+            verdicts = list(staged_root.glob("*/intent_coverage_verdict.json"))
+            assert len(verdicts) == 1
+            payload = json.loads(verdicts[0].read_text(encoding="utf-8"))
+            payload["trial_msg_tags"] = [
+                {"trial_idx": 1, "tags": ["correction"], "frustration": 0}
+            ]
+            payload["user_correction"] = 1.0
+            verdicts[0].write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    res = run_user_behavior(
+        swe_together_root=root,
+        jobs=[{"trial_dir": trial, "task_dir": task, "out_name": custom}],
+        runner=_runner,
+        tag_model="openai/mock",
+    )
+    assert res["status"] == "ok"
+    assert res["trials"][0]["user_correction"] == 1.0
