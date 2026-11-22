@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -435,24 +435,27 @@ def _completion_response() -> httpx.Response:
     )
 
 
-def test_pooled_provider_sticky_failover_across_endpoints(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _request_body(request: httpx.Request) -> dict[str, Any]:
+    body: dict[str, Any] = json.loads(request.content)
+    return body
+
+
+def test_pooled_provider_sticky_failover_across_endpoints() -> None:
     calls: list[tuple[str, str]] = []
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del json, timeout
-        authorization = headers.get("Authorization", "")
-        calls.append((url, authorization))
+    def handler(request: httpx.Request) -> httpx.Response:
+        authorization = request.headers.get("Authorization", "")
+        calls.append((str(request.url), authorization))
         if authorization == "Bearer sk-primary":
             return httpx.Response(429, json={"error": {"message": "Quota exceeded"}})
-        if url.startswith("https://second.example.com/"):
+        if str(request.url).startswith("https://second.example.com/"):
             return httpx.Response(403, json={"error": {"message": "access denied"}})
         return _completion_response()
 
-    monkeypatch.setattr(httpx, "post", fake_post)
     pool = CredentialPool(
         [
             EndpointTarget(api_key="sk-primary", base_url="https://first.example.com/v1"),
@@ -460,7 +463,11 @@ def test_pooled_provider_sticky_failover_across_endpoints(
             EndpointTarget(api_key="sk-final", base_url="https://third.example.com/v1"),
         ]
     )
-    provider = PooledProvider(model_name="wire-model", dialect=OpenAIChatDialect(), pool=pool)
+    provider = PooledProvider(
+        model_name="wire-model",
+        dialect=OpenAIChatDialect(http_client=_mock_client(handler)),
+        pool=pool,
+    )
 
     first = provider.complete(messages=[ChatMessage(role="user", content="hi")])
     assert first.content == "OK"
@@ -469,34 +476,72 @@ def test_pooled_provider_sticky_failover_across_endpoints(
     assert pool.active_index == 2
     assert len(calls) == 3
 
-    # Sticky: the next call starts at the working endpoint, not the exhausted ones.
     second = provider.complete(messages=[ChatMessage(role="user", content="again")])
     assert second.content == "OK"
     assert len(calls) == 4
     assert calls[-1] == ("https://third.example.com/v1/chat/completions", "Bearer sk-final")
 
 
-@pytest.mark.parametrize("status", [400, 404])
-def test_pooled_provider_does_not_failover_on_client_errors(
-    monkeypatch: pytest.MonkeyPatch, status: int
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (401, {"error": {"message": "invalid api key"}}),
+        (402, {"error": {"message": "payment required"}}),
+        (403, {"error": {"message": "forbidden"}}),
+        (400, {"error": {"message": "Insufficient quota for this key"}}),
+    ],
+)
+def test_pooled_provider_failover_on_credential_and_quota_failures(
+    status: int, body: dict[str, Any]
 ) -> None:
     attempts: list[str] = []
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del headers, json, timeout
-        attempts.append(url)
-        return httpx.Response(status, json={"error": {"message": "invalid parameter"}})
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        if str(request.url).startswith("https://first.example.com/"):
+            return httpx.Response(status, json=body)
+        return _completion_response()
 
-    monkeypatch.setattr(httpx, "post", fake_post)
     pool = CredentialPool(
         [
             EndpointTarget(api_key="sk-primary", base_url="https://first.example.com/v1"),
             EndpointTarget(api_key="sk-backup", base_url="https://second.example.com/v1"),
         ]
     )
-    provider = PooledProvider(model_name="wire-model", dialect=OpenAIChatDialect(), pool=pool)
+    provider = PooledProvider(
+        model_name="wire-model",
+        dialect=OpenAIChatDialect(http_client=_mock_client(handler)),
+        pool=pool,
+    )
+
+    response = provider.complete(messages=[ChatMessage(role="user", content="hi")])
+    assert response.content == "OK"
+    assert pool.active_index == 1
+    assert attempts == [
+        "https://first.example.com/v1/chat/completions",
+        "https://second.example.com/v1/chat/completions",
+    ]
+
+
+@pytest.mark.parametrize("status", [400, 404, 500])
+def test_pooled_provider_does_not_failover_on_client_errors(status: int) -> None:
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        return httpx.Response(status, json={"error": {"message": "invalid parameter"}})
+
+    pool = CredentialPool(
+        [
+            EndpointTarget(api_key="sk-primary", base_url="https://first.example.com/v1"),
+            EndpointTarget(api_key="sk-backup", base_url="https://second.example.com/v1"),
+        ]
+    )
+    provider = PooledProvider(
+        model_name="wire-model",
+        dialect=OpenAIChatDialect(http_client=_mock_client(handler)),
+        pool=pool,
+    )
     with pytest.raises(HttpStatusError) as excinfo:
         provider.complete(messages=[ChatMessage(role="user", content="hi")])
     assert excinfo.value.status_code == status
@@ -504,23 +549,53 @@ def test_pooled_provider_does_not_failover_on_client_errors(
     assert pool.active_index == 0
 
 
-def test_openai_dialect_default_compat_omits_optional_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_pooled_provider_fails_over_anthropic_dialect() -> None:
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        if len(attempts) == 1:
+            return httpx.Response(401, json={"error": {"message": "invalid x-api-key"}})
+        return httpx.Response(
+            200,
+            json={"model": "claude-test", "content": [{"type": "text", "text": "OK"}]},
+        )
+
+    pool = CredentialPool(
+        [
+            EndpointTarget(api_key="sk-primary", base_url="https://first.example.com"),
+            EndpointTarget(api_key="sk-backup", base_url="https://second.example.com"),
+        ]
+    )
+    provider = PooledProvider(
+        model_name="claude-test",
+        dialect=AnthropicMessagesDialect(http_client=_mock_client(handler)),
+        pool=pool,
+    )
+    response = provider.complete(messages=[ChatMessage(role="user", content="hi")])
+    assert response.content == "OK"
+    assert pool.active_index == 1
+    assert attempts == [
+        "https://first.example.com/v1/messages",
+        "https://second.example.com/v1/messages",
+    ]
+
+
+def test_openai_dialect_default_compat_omits_optional_fields() -> None:
     captured: dict[str, Any] = {}
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del url, timeout
-        captured["headers"] = headers
-        captured["body"] = json
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        captured["body"] = _request_body(request)
         return _completion_response()
 
-    monkeypatch.setattr(httpx, "post", fake_post)
-    dialect = OpenAIChatDialect()
+    dialect = OpenAIChatDialect(http_client=_mock_client(handler))
     dialect.send(
-        EndpointTarget(api_key="sk-key", base_url="https://host.example.com/v1", headers={}),
+        EndpointTarget(
+            api_key="sk-key",
+            base_url="https://host.example.com/v1",
+            headers={"X-Trace": "trace-1"},
+        ),
         model="wire-model",
         messages=[
             ChatMessage(
@@ -531,23 +606,60 @@ def test_openai_dialect_default_compat_omits_optional_fields(
         ],
     )
     body = captured["body"]
-    assert captured["headers"]["Authorization"] == "Bearer sk-key"
+    headers = captured["headers"]
+    assert headers["Authorization"] == "Bearer sk-key"
+    assert headers["X-Trace"] == "trace-1"
     assert body["messages"][0]["content"] is None
+    assert body["messages"][0]["tool_calls"][0]["function"]["arguments"] == '{"path": "a"}'
     assert "max_tokens" not in body
     assert "max_completion_tokens" not in body
 
 
-def test_openai_dialect_compat_flags_shape_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_dialect_keyless_endpoint_omits_authorization_header() -> None:
     captured: dict[str, Any] = {}
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del url, headers, timeout
-        captured["body"] = json
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
         return _completion_response()
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    dialect = OpenAIChatDialect(http_client=_mock_client(handler))
+    response = dialect.send(
+        EndpointTarget(api_key="", base_url="http://127.0.0.1:11434/v1"),
+        model="local-model",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert response.content == "OK"
+    assert "authorization" not in captured["headers"]
+    assert "Bearer" not in str(captured["headers"])
+
+
+def test_openai_dialect_keyless_endpoint_preserves_explicit_authorization_header() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return _completion_response()
+
+    dialect = OpenAIChatDialect(http_client=_mock_client(handler))
+    dialect.send(
+        EndpointTarget(
+            api_key="",
+            base_url="http://127.0.0.1:11434/v1",
+            headers={"Authorization": "Bearer custom-token"},
+        ),
+        model="local-model",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert captured["headers"]["Authorization"] == "Bearer custom-token"
+
+
+def test_openai_dialect_compat_flags_shape_payload() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _request_body(request)
+        return _completion_response()
+
     dialect = OpenAIChatDialect(
         compat=OpenAIChatCompat(
             max_tokens_field="max_completion_tokens",
@@ -555,6 +667,7 @@ def test_openai_dialect_compat_flags_shape_payload(monkeypatch: pytest.MonkeyPat
             non_null_assistant_content=True,
         ),
         max_tokens=256,
+        http_client=_mock_client(handler),
     )
     tools = (ToolSpec(name="read_file", description="Read", parameters={"type": "object"}),)
     dialect.send(
@@ -577,24 +690,41 @@ def test_openai_dialect_compat_flags_shape_payload(monkeypatch: pytest.MonkeyPat
     assert body["tools"][0]["function"]["name"] == "read_file"
 
 
-def test_openai_chat_compat_extra_body_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_dialect_max_tokens_field_switch() -> None:
     captured: dict[str, Any] = {}
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del url, headers, timeout
-        captured["body"] = json
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _request_body(request)
         return _completion_response()
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    dialect = OpenAIChatDialect(
+        compat=OpenAIChatCompat(max_tokens_field="max_tokens"),
+        max_tokens=128,
+        http_client=_mock_client(handler),
+    )
+    dialect.send(
+        EndpointTarget(api_key="sk-key", base_url="https://host.example.com/v1"),
+        model="wire-model",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert captured["body"]["max_tokens"] == 128
+    assert "max_completion_tokens" not in captured["body"]
+
+
+def test_openai_chat_compat_extra_body_passthrough() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _request_body(request)
+        return _completion_response()
+
     compat = OpenAIChatCompat.from_mapping(
         {
             "non_null_assistant_content": True,
             "extra_body": {"enable_thinking": False, "model": "should-not-override"},
         }
     )
-    dialect = OpenAIChatDialect(compat=compat)
+    dialect = OpenAIChatDialect(compat=compat, http_client=_mock_client(handler))
     dialect.send(
         EndpointTarget(api_key="sk-key", base_url="https://host.example.com/v1"),
         model="wire-model",
@@ -606,18 +736,36 @@ def test_openai_chat_compat_extra_body_passthrough(monkeypatch: pytest.MonkeyPat
     assert body["messages"] == [{"role": "user", "content": "hello"}]
 
 
-def test_anthropic_dialect_serializes_messages_and_tools(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_openai_dialect_serializes_tools_canonically() -> None:
     captured: dict[str, Any] = {}
 
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del timeout
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["body"] = json
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _request_body(request)
+        return _completion_response()
+
+    dialect = OpenAIChatDialect(http_client=_mock_client(handler))
+    tools = (
+        ToolSpec(name="write_file", description="Write", parameters={"type": "object", "b": 1}),
+        ToolSpec(name="read_file", description="Read", parameters={"type": "object", "a": 1}),
+    )
+    dialect.send(
+        EndpointTarget(api_key="sk-key", base_url="https://host.example.com/v1"),
+        model="wire-model",
+        messages=[ChatMessage(role="user", content="hi")],
+        tools=tools,
+    )
+    serialized = captured["body"]["tools"]
+    assert [t["function"]["name"] for t in serialized] == ["read_file", "write_file"]
+    assert serialized[0]["function"]["parameters"] == {"a": 1, "type": "object"}
+
+
+def test_anthropic_dialect_serializes_messages_and_tools() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        captured["body"] = _request_body(request)
         return httpx.Response(
             200,
             json={
@@ -635,8 +783,7 @@ def test_anthropic_dialect_serializes_messages_and_tools(
             },
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
-    dialect = AnthropicMessagesDialect(max_tokens=512)
+    dialect = AnthropicMessagesDialect(max_tokens=512, http_client=_mock_client(handler))
     endpoint = EndpointTarget(
         api_key="sk-anthropic",
         base_url="https://anthropic.example.com/",
@@ -667,6 +814,7 @@ def test_anthropic_dialect_serializes_messages_and_tools(
     body = captured["body"]
     assert body["max_tokens"] == 512
     assert body["system"] == "be brief"
+    assert body["temperature"] == 0.2
     assert body["messages"][0] == {"role": "user", "content": "hi"}
     assert body["messages"][1]["content"][0]["type"] == "tool_use"
     assert body["messages"][2]["content"][0] == {
@@ -683,15 +831,80 @@ def test_anthropic_dialect_serializes_messages_and_tools(
     assert response.raw_model == "claude-test"
 
 
-def test_anthropic_dialect_raises_http_status_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del headers, json, timeout
+def test_anthropic_dialect_keyless_endpoint_omits_api_key_header() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(
+            200,
+            json={"model": "claude-test", "content": [{"type": "text", "text": "ok"}]},
+        )
+
+    dialect = AnthropicMessagesDialect(http_client=_mock_client(handler))
+    response = dialect.send(
+        EndpointTarget(api_key="", base_url="http://127.0.0.1:8080"),
+        model="local-claude",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert response.content == "ok"
+    assert "x-api-key" not in captured["headers"]
+
+
+def test_anthropic_dialect_keyless_endpoint_preserves_explicit_api_key_header() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(
+            200,
+            json={"model": "claude-test", "content": [{"type": "text", "text": "ok"}]},
+        )
+
+    dialect = AnthropicMessagesDialect(http_client=_mock_client(handler))
+    dialect.send(
+        EndpointTarget(
+            api_key="",
+            base_url="http://127.0.0.1:8080",
+            headers={"X-Api-Key": "gateway-token"},
+        ),
+        model="local-claude",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert captured["headers"]["x-api-key"] == "gateway-token"
+
+
+def test_anthropic_dialect_serializes_tools_canonically() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _request_body(request)
+        return httpx.Response(
+            200,
+            json={"model": "claude-test", "content": [{"type": "text", "text": "ok"}]},
+        )
+
+    dialect = AnthropicMessagesDialect(http_client=_mock_client(handler))
+    tools = (
+        ToolSpec(name="write_file", description="Write", parameters={"type": "object", "b": 1}),
+        ToolSpec(name="read_file", description="Read", parameters={"type": "object", "a": 1}),
+    )
+    dialect.send(
+        EndpointTarget(api_key="sk-anthropic", base_url="https://anthropic.example.com"),
+        model="claude-test",
+        messages=[ChatMessage(role="user", content="hi")],
+        tools=tools,
+    )
+    serialized = captured["body"]["tools"]
+    assert [t["name"] for t in serialized] == ["read_file", "write_file"]
+    assert serialized[0]["input_schema"] == {"a": 1, "type": "object"}
+
+
+def test_anthropic_dialect_raises_http_status_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "invalid credential"}})
 
-    monkeypatch.setattr(httpx, "post", fake_post)
-    dialect = AnthropicMessagesDialect()
+    dialect = AnthropicMessagesDialect(http_client=_mock_client(handler))
     with pytest.raises(HttpStatusError) as excinfo:
         dialect.send(
             EndpointTarget(api_key="sk-secret-value", base_url="https://anthropic.example.com"),
@@ -746,21 +959,7 @@ def test_no_vendor_specific_references_in_source_or_tests() -> None:
     assert offenders == []
 
 
-def test_convenience_providers_delegate_to_dialects(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str | None, str | None]] = []
-
-    def fake_post(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
-    ) -> Any:
-        del json, timeout
-        calls.append((url, headers.get("Authorization"), headers.get("x-api-key")))
-        if url.endswith("/v1/messages"):
-            return httpx.Response(
-                200, json={"content": [{"type": "text", "text": "anthropic-ok"}]}
-            )
-        return _completion_response()
-
-    monkeypatch.setattr(httpx, "post", fake_post)
+def test_convenience_providers_build_expected_dialects() -> None:
     openai_provider = OpenAICompatibleProvider(
         model="wire-model",
         endpoints=[EndpointTarget(api_key="sk-openai", base_url="https://openai.example.com/v1")],
@@ -770,13 +969,158 @@ def test_convenience_providers_delegate_to_dialects(monkeypatch: pytest.MonkeyPa
         endpoints=[EndpointTarget(api_key="sk-anthropic", base_url="https://anthropic.example.com")],
     )
 
-    assert (
-        openai_provider.complete(messages=[ChatMessage(role="user", content="hi")]).content == "OK"
+    assert openai_provider.model_name == "wire-model"
+    assert isinstance(openai_provider.dialect, OpenAIChatDialect)
+    assert openai_provider.pool.endpoints == (
+        EndpointTarget(api_key="sk-openai", base_url="https://openai.example.com/v1"),
     )
-    assert anthropic_provider.complete(
-        messages=[ChatMessage(role="user", content="hi")]
-    ).content == "anthropic-ok"
-    assert calls == [
-        ("https://openai.example.com/v1/chat/completions", "Bearer sk-openai", None),
-        ("https://anthropic.example.com/v1/messages", None, "sk-anthropic"),
+
+    assert anthropic_provider.model_name == "claude-test"
+    assert isinstance(anthropic_provider.dialect, AnthropicMessagesDialect)
+    assert anthropic_provider.dialect.max_tokens == 4096
+    assert anthropic_provider.pool.endpoints == (
+        EndpointTarget(api_key="sk-anthropic", base_url="https://anthropic.example.com"),
+    )
+
+
+def test_dialects_preserve_credential_precedence_and_suppress_env_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_ORG_ID", "env-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "env-project")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
+
+    seen: list[tuple[list[str], list[str], str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.headers.get_list("authorization"),
+                request.headers.get_list("x-api-key"),
+                request.headers.get("openai-organization"),
+                request.headers.get("openai-project"),
+            )
+        )
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = _mock_client(handler)
+    OpenAIChatDialect(http_client=client).send(
+        EndpointTarget("", "https://gateway.invalid", {"authorization": "Bearer explicit"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    OpenAIChatDialect(http_client=client).send(
+        EndpointTarget("sk-endpoint", "https://gateway.invalid", {"Authorization": "Bearer other"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    AnthropicMessagesDialect(http_client=client).send(
+        EndpointTarget("sk-endpoint", "https://gateway.invalid", {"x-api-key": "explicit"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert seen == [
+        (["Bearer explicit"], [], None, None),
+        (["Bearer sk-endpoint"], [], None, None),
+        ([], ["explicit"], None, None),
     ]
+
+
+def test_dialects_handle_gateway_quirks_and_unwrap_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def openai_quirks(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "t1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": {"x": 1}},
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": "3"},
+            },
+        )
+
+    openai_resp = OpenAIChatDialect(http_client=_mock_client(openai_quirks)).send(
+        EndpointTarget("sk-test", "https://gateway.invalid"),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert openai_resp.tool_calls[0].arguments == {"x": 1}
+    assert openai_resp.usage.input_tokens == 3
+    assert openai_resp.usage.output_tokens == 0
+
+    captured_system: list[Any] = []
+
+    def anthropic_quirks(request: httpx.Request) -> httpx.Response:
+        captured_system.append(json.loads(request.content).get("system"))
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "other"},
+                    {"type": "text", "text": "ok"},
+                    {"type": "tool_use", "id": "t2", "name": "g"},
+                ],
+                "usage": {"input_tokens": "4"},
+            },
+        )
+
+    anthropic_resp = AnthropicMessagesDialect(http_client=_mock_client(anthropic_quirks)).send(
+        EndpointTarget("sk-test", "https://gateway.invalid"),
+        model="m",
+        messages=[ChatMessage(role="system", content=""), ChatMessage(role="user", content="hi")],
+    )
+    assert captured_system == [""]
+    assert anthropic_resp.content == "ok"
+    assert anthropic_resp.tool_calls[0].arguments == {}
+    assert anthropic_resp.usage.input_tokens == 4
+    assert anthropic_resp.usage.output_tokens == 0
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(httpx.ReadTimeout):
+        OpenAIChatDialect(http_client=_mock_client(timeout_handler)).send(
+            EndpointTarget("sk-test", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+    with pytest.raises(httpx.ReadTimeout):
+        AnthropicMessagesDialect(http_client=_mock_client(timeout_handler)).send(
+            EndpointTarget("sk-test", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+
+    hosts: list[str] = []
+
+    def redirect_handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(307, headers={"Location": "https://other.invalid/v1/messages"})
+
+    monkeypatch.setattr(
+        httpx.Client,
+        "_transport_for_url",
+        lambda self, url: httpx.MockTransport(redirect_handler),
+    )
+    with pytest.raises(HttpStatusError) as excinfo:
+        AnthropicMessagesDialect().send(
+            EndpointTarget("sk-secret", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+    assert excinfo.value.status_code == 307
+    assert hosts == ["gateway.invalid"]
