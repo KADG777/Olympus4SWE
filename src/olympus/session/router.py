@@ -10,6 +10,7 @@ The router is deliberately two-layered:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import ConfigDict
@@ -146,23 +147,56 @@ def _reply_context(
     return "\n".join(parts)
 
 
+_NEGATED_APPROVAL_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bdo\s+not\s+(?:proceed|approve|go\s+ahead|continue|ship|merge)\b",
+        r"\bdon'?t\s+(?:proceed|approve|go\s+ahead|continue|ship|merge)\b",
+        r"\b(?:not|never)\s+approv(?:e|ed|al)\b",
+        r"\bno\s*[,;:]",
+        r"^\s*no\b",
+        r"\breject(?:s|ed|ing)?\b",
+        r"\bcancel(?:s|led|ing)?\b",
+    )
+)
+_NEGATED_APPROVAL_CJK = ("不要", "不批准", "不同意", "拒绝", "取消")
+# ``别`` negates an instruction, but is also a morpheme in 特别/分别/区别/个别 ….
+_NEGATED_APPROVAL_CJK_BIE = re.compile(r"(?<![特分区个性差级告])别")
+
+
+def _negated_approval(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _NEGATED_APPROVAL_PATTERNS):
+        return True
+    if any(token in text for token in _NEGATED_APPROVAL_CJK):
+        return True
+    return _NEGATED_APPROVAL_CJK_BIE.search(text) is not None
+
+
 def _keyword_fallback(message: str) -> ReplyIntent:
     """Conservative fallback used only when the structured parse fails."""
     text = message.casefold().strip()
     if not text:
         return ReplyIntent(action="unknown", message="Empty reply")
-    negative = any(
-        token in text
-        for token in ("not approved", "don't approve", "do not approve", "拒绝")
-    )
-    revise = any(token in text for token in _REVISE_TOKENS) or negative
-    approve = any(token in text for token in _APPROVE_TOKENS) and not revise
-    if approve:
-        return ReplyIntent(action="approve", message="Keyword fallback: approval")
+    revise = any(token in text for token in _REVISE_TOKENS)
+    if _negated_approval(text):
+        # A negated approval is never an approval: treat an explicit revision ask
+        # as a revision and everything else as ambiguous, so no gate is confirmed.
+        if revise:
+            return ReplyIntent(
+                action="revise",
+                feedback=message.strip(),
+                message="Keyword fallback: negated approval, treated as revision",
+            )
+        return ReplyIntent(
+            action="unknown",
+            message="Keyword fallback: negated approval needs an explicit revision request",
+        )
     if revise:
         return ReplyIntent(
             action="revise", feedback=message.strip(), message="Keyword fallback: revision"
         )
+    if any(token in text for token in _APPROVE_TOKENS):
+        return ReplyIntent(action="approve", message="Keyword fallback: approval")
     return ReplyIntent(action="unknown", message="Could not parse the reply safely")
 
 

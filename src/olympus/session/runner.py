@@ -8,6 +8,7 @@ as the Web supervisor does, but exposes one blocking call per CLI invocation.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -66,6 +67,7 @@ class SessionConfig:
     workspace_root: Path
     state_dir: Path | None = None
     workflow: str = "full_sdlc_tdd"
+    workflow_explicit: bool = True
     gate_policy: GatePolicyName | None = None
     step_mode: StepMode = StepMode.EXECUTE
     provider: str = "auto"
@@ -86,13 +88,105 @@ def resolve_state_dir(workspace: Path | str, state_dir: Path | str | None) -> Pa
         candidate = Path(tempfile.gettempdir()) / "olympus-session" / digest
     else:
         candidate = Path(state_dir).expanduser().resolve()
-    if candidate == root or candidate.is_relative_to(root):
-        raise ValueError(
-            f"--state-dir {candidate} is inside the target workspace {root}; "
-            "headless session state must live outside the repository"
-        )
+    toplevel = _git_toplevel(root)
+    for boundary in (root, toplevel):
+        if boundary is None:
+            continue
+        if candidate == boundary or candidate.is_relative_to(boundary):
+            scope = (
+                "the target workspace"
+                if boundary == root
+                else f"the enclosing git repository {boundary} of the target workspace"
+            )
+            raise ValueError(
+                f"--state-dir {candidate} is inside {scope}; "
+                "headless session state must live outside the repository"
+            )
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
+
+
+def _git_toplevel(path: Path | str) -> Path | None:
+    """Return the enclosing git work tree root for ``path``, when there is one."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    return Path(raw).resolve()
+
+
+def _yaml_workflow_path(value: str | Path) -> Path | None:
+    """Return the absolute path of a custom ``.yaml``/``.yml`` workflow argument."""
+    candidate = Path(value).expanduser()
+    if candidate.suffix.lower() in (".yaml", ".yml"):
+        return candidate.resolve()
+    return None
+
+
+_ACTIONABLE_CHARS = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
+
+
+def _looks_actionable(text: str) -> bool:
+    """True when a completed-run reply carries a concrete follow-up request."""
+    return len(_ACTIONABLE_CHARS.findall(text)) >= 3
+
+
+def resolve_workspace_binding(
+    *,
+    requested: Path | str | None,
+    state_dir: Path | str | None,
+    run_id: str | None,
+) -> Path | None:
+    """Bind one CLI invocation to the repository that owns the run.
+
+    ``start`` has no recorded run yet and just resolves ``--workspace``. A ``reply``
+    must never resume inside a different repository: when ``--workspace`` is omitted
+    the recorded root wins, and an explicit mismatch raises ``ValueError`` before any
+    runner, database, or trace file is created.
+    """
+    requested_path = (
+        Path(requested).expanduser().resolve() if requested is not None else None
+    )
+    if run_id is None:
+        return requested_path
+    recorded = _recorded_workspace(state_dir, run_id)
+    if recorded is None:
+        return requested_path
+    if requested_path is None:
+        return recorded
+    if requested_path != recorded:
+        raise ValueError(
+            f"--workspace {requested_path} does not match the run's recorded workspace "
+            f"{recorded}; a reply must resume in the repository that started the run"
+        )
+    return recorded
+
+
+def _recorded_workspace(state_dir: Path | str | None, run_id: str) -> Path | None:
+    if state_dir is None:
+        return None
+    db_path = Path(state_dir).expanduser().resolve() / "olympus.db"
+    if not db_path.is_file():
+        return None
+    try:
+        snap = RunStore(db_path).get_run(run_id)
+    except NotFoundError:
+        return None
+    raw = snap.get("workspace_root")
+    if not raw:
+        return None
+    return Path(str(raw)).resolve()
 
 
 def plan_only_definition(definition: WorkflowDefinition) -> WorkflowDefinition:
@@ -154,6 +248,7 @@ class SessionRunner:
             return SessionEnvelope.failure(
                 error=str(exc), step_mode=self.config.step_mode, workflow=self.config.workflow
             )
+        workflow_path = _yaml_workflow_path(self.config.workflow)
         clean_constraints = [str(item).strip() for item in (constraints or []) if str(item).strip()]
         drivers = self._drivers_config()
         provider_config = self._provider_config()
@@ -166,6 +261,7 @@ class SessionRunner:
             workspace_root=self.workspace_root,
             actor="session",
         )
+        toplevel = _git_toplevel(self.workspace_root)
         self.store.append_event(
             run_id=run_id,
             stage="session",
@@ -175,6 +271,9 @@ class SessionRunner:
                 "raw_input": clean_goal,
                 "constraints": clean_constraints,
                 "workflow": definition.name,
+                "workflow_path": str(workflow_path) if workflow_path is not None else None,
+                "workspace_root": str(self.workspace_root),
+                "git_toplevel": str(toplevel) if toplevel is not None else None,
                 "step_mode": self.config.step_mode.value,
                 "gate_policy": self._resolved_gate_policy(run_id).value,
             },
@@ -195,8 +294,22 @@ class SessionRunner:
             return SessionEnvelope.failure(
                 error=str(exc), run_id=run_id, step_mode=self.config.step_mode
             )
+        recorded = snap.get("workspace_root")
+        if recorded:
+            recorded_root = Path(str(recorded)).resolve()
+            if recorded_root != self.workspace_root:
+                return SessionEnvelope.failure(
+                    error=(
+                        f"--workspace {self.workspace_root} does not match the run's recorded "
+                        f"workspace {recorded_root}; refusing to continue in a different "
+                        "repository"
+                    ),
+                    run_id=run_id,
+                    step_mode=self.config.step_mode,
+                    workflow=snap["workflow_name"],
+                )
         try:
-            definition = load_workflow(snap["workflow_name"])
+            definition = self._workflow_for_run(run_id, snap)
         except Exception as exc:  # noqa: BLE001 -- surface workflow load failure as SessionEnvelope
             return SessionEnvelope.failure(
                 error=str(exc),
@@ -578,6 +691,49 @@ class SessionRunner:
             definition=definition,
         )
 
+    def _workflow_for_run(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> WorkflowDefinition:
+        """Reload the workflow the run was started with, custom YAML included.
+
+        ``reply`` accepts an explicit ``--workflow`` path; it must name the same
+        workflow the run recorded. When the flag is omitted, the path persisted by
+        ``start`` wins so custom YAML workflows survive the pause/resume boundary.
+        """
+        recorded_name = str(snap["workflow_name"])
+        requested_path = _yaml_workflow_path(self.config.workflow)
+        if requested_path is not None:
+            candidate: str | Path = requested_path
+        else:
+            recorded_path = self._recorded_workflow_path(run_id)
+            candidate = (
+                recorded_path
+                if recorded_path is not None and not self.config.workflow_explicit
+                else self.config.workflow
+            )
+        definition = load_workflow(candidate)
+        if definition.name != recorded_name:
+            raise ValueError(
+                f"Workflow '{definition.name}' does not match the run's workflow "
+                f"'{recorded_name}'"
+            )
+        return definition
+
+    def _recorded_workflow_path(self, run_id: str) -> Path | None:
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return None
+        for event in events:
+            if event.event_type != "session.started":
+                continue
+            raw = event.payload.get("workflow_path")
+            if not raw:
+                return None
+            path = Path(str(raw))
+            return path if path.is_file() else None
+        return None
+
     def _incremental_reopen(
         self,
         run_id: str,
@@ -596,6 +752,24 @@ class SessionRunner:
             completed=True,
         )
         feedback = intent.feedback.strip() or message
+        if intent.action not in ("reopen", "revise") or not _looks_actionable(feedback):
+            # Empty, punctuation-only, or unparseable replies must never reopen a
+            # finished run: keep the completed status and ask for a concrete request.
+            return SessionEnvelope(
+                run_id=run_id,
+                status=SessionStatus.NEEDS_INPUT,
+                pause_kind=None,
+                step_mode=self.config.step_mode,
+                workflow=snap["workflow_name"],
+                message=(
+                    "This run is already completed, and the reply did not describe a "
+                    "concrete follow-up change. Send a specific correction (for example "
+                    "'revise: <change>') to reopen it."
+                ),
+                unresolved_blockers=[],
+                changed_files=self._changed_files(),
+                error=None,
+            )
         try:
             self.control.reopen_run(run_id=run_id, feedback=feedback, actor="human")
         except (ValueError, ConcurrencyConflictError) as exc:
@@ -948,4 +1122,5 @@ __all__ = [
     "SessionRunner",
     "plan_only_definition",
     "resolve_state_dir",
+    "resolve_workspace_binding",
 ]

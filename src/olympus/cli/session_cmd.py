@@ -7,10 +7,14 @@ from typing import Annotated
 
 import typer
 
-from olympus.providers.base import LLMProvider, MockLLMProvider
+from olympus.providers.base import LLMProvider, MockLLMProvider, ProviderError
 from olympus.providers.factory import build_provider
 from olympus.session.contracts import GatePolicyName, SessionEnvelope, SessionStatus, StepMode
-from olympus.session.runner import SessionConfig, SessionRunner
+from olympus.session.runner import (
+    SessionConfig,
+    SessionRunner,
+    resolve_workspace_binding,
+)
 
 session_app = typer.Typer(
     name="session",
@@ -32,6 +36,13 @@ StateDirOpt = Annotated[
 WorkflowOpt = Annotated[
     str,
     typer.Option("--workflow", help="Builtin workflow name or YAML path."),
+]
+ReplyWorkflowOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--workflow",
+        help="Builtin workflow name or YAML path (defaults to the run's recorded workflow).",
+    ),
 ]
 GatePolicyOpt = Annotated[
     GatePolicyName | None,
@@ -100,7 +111,7 @@ def _build_runner(
     *,
     workspace: Path | None,
     state_dir: Path | None,
-    workflow: str,
+    workflow: str | None,
     gate_policy: GatePolicyName | None,
     step_mode: StepMode,
     provider: str | None,
@@ -109,12 +120,18 @@ def _build_runner(
     worker_driver: str | None,
     reviewer_driver: str | None,
     monitor_model: str | None,
+    run_id: str | None = None,
 ) -> SessionRunner:
-    root = (workspace if workspace is not None else Path.cwd()).resolve()
+    root = resolve_workspace_binding(
+        requested=workspace, state_dir=state_dir, run_id=run_id
+    )
+    if root is None:
+        root = Path.cwd().resolve()
     config = SessionConfig(
         workspace_root=root,
         state_dir=state_dir,
-        workflow=workflow,
+        workflow=workflow or "full_sdlc_tdd",
+        workflow_explicit=workflow is not None,
         gate_policy=gate_policy,
         step_mode=step_mode,
         provider=provider or "auto",
@@ -166,14 +183,19 @@ def cmd_start(
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
         )
-    except (ValueError, OSError) as exc:
+    except (ProviderError, ValueError, OSError) as exc:
         _emit(
             SessionEnvelope.failure(
                 error=str(exc), step_mode=step_mode, workflow=workflow
             )
         )
         return
-    envelope = runner.start(goal=raw_goal, title=title, constraints=list(constraint or []))
+    try:
+        envelope = runner.start(goal=raw_goal, title=title, constraints=list(constraint or []))
+    except (ProviderError, ValueError, OSError) as exc:
+        envelope = SessionEnvelope.failure(
+            error=str(exc), step_mode=step_mode, workflow=workflow
+        )
     _emit(envelope)
 
 
@@ -186,7 +208,7 @@ def cmd_reply(
     message: MessageOpt = None,
     workspace: WorkspaceOpt = None,
     state_dir: StateDirOpt = None,
-    workflow: WorkflowOpt = "full_sdlc_tdd",
+    workflow: ReplyWorkflowOpt = None,
     gate_policy: GatePolicyOpt = None,
     step_mode: StepModeOpt = StepMode.EXECUTE,
     provider: ProviderOpt = "auto",
@@ -211,18 +233,27 @@ def cmd_reply(
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
+            run_id=run_id,
         )
-    except (ValueError, OSError) as exc:
+    except (ProviderError, ValueError, OSError) as exc:
         _emit(
             SessionEnvelope.failure(
                 error=str(exc),
                 run_id=run_id,
                 step_mode=step_mode,
-                workflow=workflow,
+                workflow=workflow or "",
             )
         )
         return
-    envelope = runner.reply(run_id=run_id, message=text)
+    try:
+        envelope = runner.reply(run_id=run_id, message=text)
+    except (ProviderError, ValueError, OSError) as exc:
+        envelope = SessionEnvelope.failure(
+            error=str(exc),
+            run_id=run_id,
+            step_mode=step_mode,
+            workflow=workflow or "",
+        )
     _emit(envelope)
 
 

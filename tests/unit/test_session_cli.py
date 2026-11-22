@@ -17,9 +17,12 @@ import pytest
 from typer.testing import CliRunner
 
 from olympus.cli.app import app
-from olympus.core.contracts import ApprovalTarget
+from olympus.core.contracts import ApprovalTarget, RunStatus
 from olympus.core.store import RunStore
+from olympus.graph.loader import WORKFLOW_DIR
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolCall, ToolSpec
+from olympus.session.contracts import PauseKind
+from olympus.session.router import parse_reply
 from olympus.session.runner import resolve_state_dir
 
 RUNNER = CliRunner()
@@ -780,3 +783,440 @@ def test_resolve_state_dir_defaults_outside_repository(tmp_path: Path) -> None:
     resolved = resolve_state_dir(repo, None)
     assert not resolved.is_relative_to(repo)
     assert resolved.is_dir()
+
+
+# --------------------------------------------------------------------------- review A1-A5
+
+
+def test_reply_rejects_a_different_workspace_without_writing_anywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    _init_git_repo(other)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append(json.dumps({"action": "approve"}))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "interactive_minimal",
+            "--step-mode",
+            "plan_only",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0
+    assert started["pause_kind"] == "plan_handoff"
+    run_id = str(started["run_id"])
+
+    code, rebound = _invoke(
+        [
+            "reply",
+            run_id,
+            "approve",
+            "--step-mode",
+            "execute",
+            "--workspace",
+            str(other),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code == 1, json.dumps(rebound, indent=2)
+    assert rebound["status"] == "failed"
+    assert "does not match the run's recorded workspace" in str(rebound["error"])
+    assert _git_status(repo) == ""
+    assert _git_status(other) == ""
+    assert not (repo / "calculator.py").exists()
+    assert not (other / "calculator.py").exists()
+
+    store = RunStore(state / "olympus.db")
+    assert Path(str(store.get_run(run_id)["workspace_root"])) == repo
+    assert store.get_run(run_id)["status"].value == "awaiting_human"
+
+
+def test_reply_without_workspace_resumes_the_recorded_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append(json.dumps({"action": "approve"}))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--step-mode",
+            "plan_only",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0
+    assert started["pause_kind"] == "plan_handoff"
+
+    # No --workspace: the recorded workspace must win over the invocation cwd.
+    code, executed = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "Plan looks good, implement it.",
+            "--step-mode",
+            "execute",
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code == 0, json.dumps(executed, indent=2)
+    assert executed["status"] == "completed"
+    assert (repo / "calculator.py").read_text(encoding="utf-8") == _CALC_CODE
+    store = RunStore(state / "olympus.db")
+    assert Path(str(store.get_run(str(started["run_id"]))["workspace_root"])) == repo
+
+
+def test_state_dir_inside_enclosing_git_repository_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    nested = repo / "nested"
+    nested.mkdir()
+    script = SessionScript()
+    _patch_provider(monkeypatch, script)
+
+    code, envelope = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workspace",
+            str(nested),
+            "--state-dir",
+            str(repo / "session-state"),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code == 1
+    assert envelope["status"] == "failed"
+    assert "inside" in str(envelope["error"])
+    assert "git repository" in str(envelope["error"])
+    assert not (repo / "session-state").exists()
+    assert _git_status(repo) == ""
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "do not proceed",
+        "Please don't proceed.",
+        "I do not approve this",
+        "no, not this version",
+        "reject",
+        "cancel",
+        "不要继续",
+        "别继续了",
+        "拒绝这个方案",
+        "取消",
+    ],
+)
+def test_negated_approval_never_routes_to_approve(message: str) -> None:
+    provider = MockLLMProvider(responses=[LLMResponse(content="invalid JSON")])
+    intent = parse_reply(
+        provider=provider,
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN},
+        pause_kind=PauseKind.APPROVAL,
+        gate="spec",
+    )
+    assert intent.action != "approve"
+    assert intent.answers == {}
+    assert intent.resolutions == {}
+
+
+@pytest.mark.parametrize("message", ["looks good, proceed", "特别好的方案，批准"])
+def test_unambiguous_approval_fallback_still_approves(message: str) -> None:
+    provider = MockLLMProvider(responses=[LLMResponse(content="invalid JSON")])
+    intent = parse_reply(
+        provider=provider,
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN},
+        pause_kind=PauseKind.APPROVAL,
+        gate="spec",
+    )
+    assert intent.action == "approve"
+
+
+def test_negated_reply_never_approves_the_pending_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.router.append("invalid JSON")
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        ["start", "Build a calculator library", "--gate-policy", "default", *_base(repo, state)]
+    )
+    assert code == 0
+    assert started["pause_kind"] == "approval"
+    run_id = str(started["run_id"])
+    store = RunStore(state / "olympus.db")
+    before = store.get_run(run_id)
+    assert not store.is_approved(
+        run_id=run_id,
+        target=ApprovalTarget.GOAL_SPEC,
+        target_id=before["spec"].spec_id,
+        target_hash=before["spec"].content_hash,
+    )
+
+    code, refused = _invoke(["reply", run_id, "Please do not proceed.", *_base(repo, state)])
+    assert code == 0, json.dumps(refused, indent=2)
+    assert refused["status"] == "needs_input"
+    assert refused["pause_kind"] == "approval"
+    after = store.get_run(run_id)
+    assert after["spec"].version == before["spec"].version
+    assert after["spec"].content_hash == before["spec"].content_hash
+    assert after["status"].value == "awaiting_human"
+    assert not store.is_approved(
+        run_id=run_id,
+        target=ApprovalTarget.GOAL_SPEC,
+        target_id=after["spec"].spec_id,
+        target_hash=after["spec"].content_hash,
+    )
+
+    script.router.append(json.dumps({"action": "approve"}))
+    _invoke(["reply", run_id, "Approve the spec.", *_base(repo, state)])
+    assert store.is_approved(
+        run_id=run_id,
+        target=ApprovalTarget.GOAL_SPEC,
+        target_id=after["spec"].spec_id,
+        target_hash=after["spec"].content_hash,
+    )
+
+
+def test_completed_run_ignores_unparseable_follow_up_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "interactive_minimal",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0
+    assert started["status"] == "completed"
+    run_id = str(started["run_id"])
+    store = RunStore(state / "olympus.db")
+    before_events = [event.event_type for event in store.list_events(run_id)]
+
+    script.router.append("invalid JSON")
+    code, reply = _invoke(["reply", run_id, "???", *_base(repo, state)])
+    assert code == 0, json.dumps(reply, indent=2)
+    assert reply["status"] == "needs_input"
+    assert "already completed" in str(reply["message"])
+
+    after_events = [event.event_type for event in store.list_events(run_id)]
+    assert "run.reopened" not in after_events
+    assert "session.continued" not in after_events[len(before_events) :]
+    assert store.get_run(run_id)["status"].value == "completed"
+    assert script.align == []
+
+
+def test_unavailable_provider_on_reply_emits_a_failure_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    with pytest.MonkeyPatch.context() as scoped:
+        script = SessionScript()
+        script.align.append(json.dumps(_goal_spec()))
+        _patch_provider(scoped, script)
+        code, started = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0
+
+    code, reply = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "approve",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "definitely-unsupported",
+        ]
+    )
+    assert code == 1
+    assert reply["status"] == "failed"
+    assert "Unknown provider" in str(reply["error"])
+
+
+def test_unavailable_provider_on_start_emits_a_failure_envelope(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+
+    code, envelope = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "definitely-unsupported",
+        ]
+    )
+    assert code == 1
+    assert envelope["status"] == "failed"
+    assert "Unknown provider" in str(envelope["error"])
+
+
+def _custom_workflow(tmp_path: Path) -> Path:
+    custom = tmp_path / "review_workflow.yaml"
+    custom.write_text(
+        (WORKFLOW_DIR / "full_sdlc_tdd.yaml")
+        .read_text(encoding="utf-8")
+        .replace("name: full_sdlc_tdd", "name: review_workflow"),
+        encoding="utf-8",
+    )
+    return custom
+
+
+def test_custom_yaml_workflow_resumes_on_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    custom = _custom_workflow(tmp_path)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.extend(json.dumps({"action": "approve"}) for _ in range(3))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    common = [
+        "--workspace",
+        str(repo),
+        "--state-dir",
+        str(state),
+        "--provider",
+        "mock",
+        "--gate-policy",
+        "default",
+    ]
+    code, started = _invoke(
+        ["start", "Build a calculator library", "--workflow", str(custom), *common]
+    )
+    assert code == 0, json.dumps(started, indent=2)
+    assert started["pause_kind"] == "approval"
+    assert started["workflow"] == "review_workflow"
+    run_id = str(started["run_id"])
+
+    payloads = [
+        event.payload
+        for event in RunStore(state / "olympus.db").list_events(run_id)
+        if event.event_type == "session.started"
+    ]
+    assert Path(str(payloads[0]["workflow_path"])) == custom.resolve()
+
+    # Explicit --workflow <path> on reply reloads the same custom YAML.
+    code, second = _invoke(
+        ["reply", run_id, "Approve the spec.", "--workflow", str(custom), *common]
+    )
+    assert code == 0, json.dumps(second, indent=2)
+    assert second["pause_kind"] == "approval"
+    assert second["workflow"] == "review_workflow"
+
+    # Omitted --workflow on reply falls back to the persisted workflow path.
+    code, third = _invoke(["reply", run_id, "Approve the design.", *common])
+    assert code == 0, json.dumps(third, indent=2)
+    assert third["pause_kind"] == "approval"
+    assert third["workflow"] == "review_workflow"
+
+    code, final = _invoke(["reply", run_id, "Approve the plan.", *common])
+    assert code == 0, json.dumps(final, indent=2)
+    assert final["status"] == "completed"
+    assert (repo / "calculator.py").is_file()
+
+
+def test_reply_rejects_a_workflow_that_does_not_match_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    custom = _custom_workflow(tmp_path)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workflow",
+            str(custom),
+            "--gate-policy",
+            "default",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0
+    assert started["workflow"] == "review_workflow"
+
+    code, mismatch = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "Approve the spec.",
+            "--workflow",
+            "full_sdlc_tdd",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 1, json.dumps(mismatch, indent=2)
+    assert mismatch["status"] == "failed"
+    assert "does not match the run's workflow" in str(mismatch["error"])
