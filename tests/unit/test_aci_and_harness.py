@@ -13,7 +13,17 @@ import olympus.tools.aci as aci_module
 from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
-from olympus.harness.worktree import capture_sandbox_diff, create_sandbox, remove_sandbox
+from olympus.harness.worktree import (
+    absorb_verification_artifacts,
+    capture_sandbox_diff,
+    collect_sandbox_changes,
+    create_sandbox,
+    load_sandbox_baseline,
+    remove_sandbox,
+    save_sandbox_baseline,
+    snapshot_sandbox_state,
+    sync_upstream_files,
+)
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -110,6 +120,225 @@ def test_git_worktree_sandbox_isolates_changes_and_captures_diff(tmp_path: Path)
     finally:
         remove_sandbox(handle)
     assert not handle.workspace_path.exists()
+
+
+def test_baseline_scoped_diff_only_emits_paths_mutated_since_baseline(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def f() -> int:\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    handle = create_sandbox(repo, label="task-scope-a1")
+    try:
+        ws = handle.workspace_path
+        # accepted_overlay-style files already exist before the pre-worker baseline
+        (ws / "upstream.py").write_text("UPSTREAM = 1\n", encoding="utf-8")
+        (ws / "stable.py").write_text("STABLE = True\n", encoding="utf-8")
+        (ws / "old_name.py").write_text("RENAMED = True\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+
+        (ws / "app.py").write_text("def f() -> int:\n    return 2\n", encoding="utf-8")
+        (ws / "new_mod.py").write_text("VAL = 9\n", encoding="utf-8")
+        (ws / "old_name.py").rename(ws / "renamed.py")
+        (ws / "upstream.py").unlink()
+
+        scoped = capture_sandbox_diff(handle, baseline)
+        assert "return 2" in scoped
+        assert "new_mod.py" in scoped and "VAL = 9" in scoped
+        assert "rename from old_name.py" in scoped
+        assert "rename to renamed.py" in scoped
+        assert "deleted file mode" in scoped
+        assert "upstream.py" in scoped
+        assert "stable.py" not in scoped
+        assert "STABLE = True" not in scoped
+
+        unscoped = capture_sandbox_diff(handle)
+        assert "stable.py" in unscoped and "STABLE = True" in unscoped
+    finally:
+        remove_sandbox(handle)
+
+
+def _init_git_repo(root: Path) -> Path:
+    repo = (root / "repo").resolve()
+    repo.mkdir()
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+def test_build_sandbox_env_isolates_temp_dirs_outside_the_git_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-tmp")
+    expected = repo / ".olympus" / "sandbox_tmp" / "task-tmp"
+    try:
+        envs = (
+            build_sandbox_env(handle.workspace_path, host_root=repo),
+            build_sandbox_env(handle.workspace_path),
+        )
+        for env in envs:
+            for name in ("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR"):
+                assert env[name] == str(expected)
+            assert expected.is_dir()
+            assert not expected.is_relative_to(handle.workspace_path)
+    finally:
+        remove_sandbox(handle)
+    assert not expected.exists()
+    assert not handle.workspace_path.exists()
+
+
+def test_retained_sandbox_reuses_work_and_original_baseline(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    first = create_sandbox(repo, label="task-retain")
+    assert first.reused is False
+    baseline = snapshot_sandbox_state(first)
+    save_sandbox_baseline(first, baseline)
+    (first.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+    (first.workspace_path / "scratch.db").write_text("stray\n", encoding="utf-8")
+    try:
+        reused = create_sandbox(repo, label="task-retain", reuse=True)
+        assert reused.reused is True
+        assert reused.workspace_path == first.workspace_path
+        assert (reused.workspace_path / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        assert load_sandbox_baseline(reused) == baseline
+        assert collect_sandbox_changes(reused, baseline) == ["feature.py", "scratch.db"]
+        remove_sandbox(reused)
+        assert not first.workspace_path.exists()
+        assert load_sandbox_baseline(first) is None
+
+        fresh = create_sandbox(repo, label="task-retain")
+        try:
+            assert fresh.reused is False
+            assert not (fresh.workspace_path / "feature.py").exists()
+        finally:
+            remove_sandbox(fresh)
+    finally:
+        if first.workspace_path.exists():
+            remove_sandbox(first)
+
+
+def test_sync_upstream_files_updates_only_synced_baseline_entries(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-sync")
+    try:
+        ws = handle.workspace_path
+        (ws / "shared.py").write_text("VALUE = 1\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "shared.py").write_text("VALUE = 2\n", encoding="utf-8")
+        (overlay / "feature.py").write_text("UPSTREAM = True\n", encoding="utf-8")
+        (overlay / "new_upstream.py").write_text("NEW = True\n", encoding="utf-8")
+
+        synced = sync_upstream_files(handle, overlay, baseline, write_scope=["feature.py"])
+
+        assert (ws / "shared.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        assert (ws / "new_upstream.py").read_text(encoding="utf-8") == "NEW = True\n"
+        assert collect_sandbox_changes(handle, synced) == ["feature.py"]
+        assert collect_sandbox_changes(handle, baseline) == [
+            "feature.py",
+            "new_upstream.py",
+            "shared.py",
+        ]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_absorb_verification_artifacts_hides_only_out_of_scope_side_effects(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    (repo / "contract.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "contract.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add contract"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="task-checks")
+    try:
+        ws = handle.workspace_path
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "check-ran.txt").write_text("ran\n", encoding="utf-8")
+        (ws / "contract.txt").write_text("", encoding="utf-8")
+
+        absorbed = absorb_verification_artifacts(handle, baseline, write_scope=["feature.py"])
+
+        assert collect_sandbox_changes(handle, absorbed) == ["contract.txt", "feature.py"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_sync_upstream_files_never_overwrites_worker_deletion_of_tracked_file(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    (repo / "upstream.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "upstream.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add upstream"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="task-del")
+    try:
+        ws = handle.workspace_path
+        baseline = snapshot_sandbox_state(handle)
+        save_sandbox_baseline(handle, baseline)
+        (ws / "upstream.txt").unlink()
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "upstream.txt").write_text("accepted later\n", encoding="utf-8")
+
+        reopened = create_sandbox(repo, label="task-del", reuse=True)
+        loaded = load_sandbox_baseline(reopened)
+        assert loaded is not None
+        synced = sync_upstream_files(reopened, overlay, loaded, write_scope=["feature.py"])
+
+        assert not (ws / "upstream.txt").exists()
+        assert collect_sandbox_changes(reopened, synced) == ["upstream.txt"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_capture_sandbox_diff_handles_nongit_binary_and_reverted_overlay(
+    tmp_path: Path,
+) -> None:
+    nongit_root = tmp_path / "plain"
+    nongit_root.mkdir()
+    nongit_handle = create_sandbox(nongit_root, label="plain-diff")
+    try:
+        nongit_baseline = snapshot_sandbox_state(nongit_handle)
+        (nongit_handle.workspace_path / "feature.txt").write_text("hello\n", encoding="utf-8")
+        nongit_diff = capture_sandbox_diff(nongit_handle, nongit_baseline)
+        assert "feature.txt" in nongit_diff
+        assert "+hello" in nongit_diff
+    finally:
+        remove_sandbox(nongit_handle)
+
+    repo = _init_git_repo(tmp_path)
+    (repo / "tracked.txt").write_text("HEAD\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="git-diff-edge")
+    try:
+        ws = handle.workspace_path
+        (ws / "tracked.txt").write_text("accepted overlay\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "tracked.txt").write_text("HEAD\n", encoding="utf-8")
+        (ws / "binary.dat").write_bytes(b"\x00\xff\x01")
+        (ws / "added.txt").write_text("hello\n", encoding="utf-8")
+
+        diff = capture_sandbox_diff(handle, baseline)
+        assert "tracked.txt" in diff
+        assert "GIT binary patch" in diff
+        assert "@@ -0,0 +1 @@" in diff
+    finally:
+        remove_sandbox(handle)
 
 
 def test_agent_loop_preserves_prefix_and_errors_and_respects_budget(tmp_path: Path) -> None:

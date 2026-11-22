@@ -61,6 +61,10 @@ def test_openapi_projection_and_command_contracts_are_concrete() -> None:
     assert "ProviderConfig" in components
     assert "anyOf" in components["ApprovalReview"]["properties"]["baseline"]
 
+    budget = components["BudgetSummary"]
+    assert {"cache_read_tokens", "cache_write_tokens"} <= set(budget["properties"])
+    assert not ({"cache_read_tokens", "cache_write_tokens"} & set(budget["required"]))
+
     for path_item in schema["paths"].values():
         for operation in path_item.values():
             assert "422" not in operation.get("responses", {})
@@ -98,3 +102,21 @@ def test_openapi_covers_every_ariadne_route() -> None:
         "/api/demos",
         "/api/seed-demo",
     } <= paths
+
+
+def test_budget_summary_accepts_legacy_wire_payload_without_cache_fields() -> None:
+    from olympus.web.schemas import BudgetSummary
+
+    summary = BudgetSummary.model_validate(
+        {
+            "calls_used": 1,
+            "calls_reserved": 0,
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "total_tokens": 5,
+            "unknown_outcome_calls": 0,
+        }
+    )
+    assert summary.cache_read_tokens == 0
+    assert summary.cache_write_tokens == 0
+
