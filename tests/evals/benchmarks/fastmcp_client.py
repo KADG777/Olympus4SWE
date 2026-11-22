@@ -112,8 +112,6 @@ class McpHttpClient:
     protocol_version: str | None = None
     _next_id: int = field(default=0, init=False)
 
-    # ------------------------------------------------------------------ public API
-
     def initialize(self) -> dict[str, Any]:
         """Perform the ``initialize`` handshake once and notify the server."""
         if self.protocol_version is not None:
@@ -181,8 +179,6 @@ class McpHttpClient:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
-
-    # ------------------------------------------------------------------ internals
 
     def _next_request_id(self) -> int:
         self._next_id += 1

@@ -275,8 +275,6 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             **kwargs,
         )
 
-    # ------------------------------------------------------------------ identity
-
     @staticmethod
     def name() -> str:
         return "olympus-interact"
@@ -295,8 +293,6 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
     @property
     def run_id(self) -> str | None:
         return self._run_id
-
-    # ------------------------------------------------------------------ Harbor hooks
 
     @classmethod
     def resolve_model_connection_config(
@@ -395,8 +391,6 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             "run_id": self._run_id,
         }
         context.metadata = metadata
-
-    # ------------------------------------------------------------------ setup helpers
 
     def _pi_install_requested(self) -> bool:
         options = self._interact
@@ -503,8 +497,6 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
     @staticmethod
     def _project_root() -> Path:
         return Path(__file__).resolve().parents[3]
-
-    # ------------------------------------------------------------------ step helpers
 
     async def _run_handoff(self, instruction: str, environment: Any) -> None:
         script = extract_handoff_script(

@@ -6,6 +6,11 @@ run directly on the host during offline tests). It drives the
 task's FastMCP ``ask_user`` tool over streamable HTTP, feeds the maintainer's
 reply back into the session, and appends a redacted JSONL trajectory.
 
+In the execute phase it also honours the upstream maintainer contract: configure
+a local git identity, record the starting commit, commit every coherent pass,
+and ask the maintainer to review the committed state before finishing or
+addressing revision feedback.
+
 Exits codes are part of the adapter contract:
 ``0`` success, ``1`` session failed, ``2`` user-server/MCP failure, ``3`` the
 per-step interaction cap was reached, ``4`` invalid bridge configuration.
@@ -44,6 +49,68 @@ _SECRET_NAME = re.compile(
     r"(API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY)", re.IGNORECASE
 )
 _MAX_LOGGED_CHARS = 20_000
+_DEFAULT_GIT_IDENTITY = (("user.name", "Dev"), ("user.email", "dev@example.com"))
+_TEST_STEP_MARKERS = (
+    "add tests",
+    "write tests",
+    "test changes in a separate commit",
+)
+_SHIP_MARKERS = (
+    "ship it",
+    "ship this",
+    "looks good",
+    "lgtm",
+    "approved",
+    "approve",
+    "go ahead",
+    "proceed",
+    "可以",
+    "同意",
+    "批准",
+    "通过",
+    "没问题",
+    "继续",
+)
+_REVISION_MARKERS = (
+    "change",
+    "revise",
+    "rework",
+    "fix",
+    "update",
+    "instead",
+    "reject",
+    "not right",
+    "wrong",
+    "missing",
+    "redo",
+    "rename",
+    "remove",
+    "move ",
+    "ensure",
+    "make sure",
+    "修改",
+    "调整",
+    "重做",
+    "不对",
+    "改一下",
+)
+_NEGATED_SHIP_MARKERS = (
+    "can't approve",
+    "cannot approve",
+    "can not approve",
+    "won't approve",
+    "don't approve",
+    "do not approve",
+    "not approved",
+    "can't ship",
+    "cannot ship",
+    "don't ship",
+    "do not ship",
+    "not ship",
+    "do not proceed",
+    "don't proceed",
+    "拒绝",
+)
 
 
 def redact_text(text: str, environ: dict[str, str] | None = None) -> str:
@@ -124,6 +191,7 @@ class BridgeConfig:
     plan_out: Path | None
     session_timeout: float
     pi_bin: str | None
+    base_commit_file: Path
 
 
 class InteractBridge:
@@ -142,8 +210,6 @@ class InteractBridge:
         self.dialogue: list[dict[str, str]] = []
         self.run_id = ""
 
-    # ------------------------------------------------------------------ entry point
-
     def run(self) -> None:
         if self.config.phase == "plan":
             self._run_plan()
@@ -153,8 +219,6 @@ class InteractBridge:
             raise BridgeError(
                 f"unsupported phase {self.config.phase!r}", EXIT_CONFIG_ERROR
             )
-
-    # ------------------------------------------------------------------ plan phase
 
     def _run_plan(self) -> None:
         goal = self._initial_goal()
@@ -239,8 +303,6 @@ class InteractBridge:
         path.write_text(content, encoding="utf-8")
         self.log("plan.saved", path=str(path), chars=len(content))
 
-    # ------------------------------------------------------------------ execute phase
-
     def _run_execute(self) -> None:
         run_id = self._load_run_id()
         if not run_id:
@@ -249,17 +311,29 @@ class InteractBridge:
                 EXIT_CONFIG_ERROR,
             )
         self.run_id = run_id
-        reply = self._reply_text()
-        pause_kind = self.last_pause_kind()
-        first_message = "approve" if pause_kind == "plan_handoff" else reply
-        if pause_kind == "plan_handoff":
-            self.log("execute.approve_plan", run_id=run_id)
-        envelope = self.invoke("reply", first_message, step_mode="execute")
+        instruction = self._reply_text()
+        self._prepare_git_workspace()
+        if self.last_pause_kind() == "plan_handoff":
+            self.log("execute.continue_after_plan", run_id=run_id)
+        envelope = self.invoke("reply", instruction, step_mode="execute")
+        test_step = self._is_test_step(instruction)
+        commit_message = "add tests" if test_step else "initial implementation"
         while True:
             status = envelope.get("status")
             self._record_envelope(envelope)
             if status == "completed":
-                return
+                commit = self._commit_pass(commit_message)
+                if test_step:
+                    return
+                feedback = self.ask_user(
+                    "execute_review", {"message": self._review_message(commit)}
+                )
+                if self._is_ship_reply(feedback):
+                    self.log("execute.review_approved", run_id=run_id, turns=self.turns)
+                    return
+                commit_message = "address feedback"
+                envelope = self.invoke("reply", feedback, step_mode="execute")
+                continue
             if status != "needs_input":
                 raise BridgeError(
                     "session failed in execute phase: "
@@ -268,6 +342,118 @@ class InteractBridge:
                 )
             answer = self.ask_user("execute", envelope)
             envelope = self.invoke("reply", answer, step_mode="execute")
+
+    @staticmethod
+    def _is_test_step(instruction: str) -> bool:
+        lowered = instruction.casefold()
+        return any(marker in lowered for marker in _TEST_STEP_MARKERS)
+
+    @staticmethod
+    def _is_ship_reply(reply: str) -> bool:
+        lowered = reply.casefold()
+        if not lowered.strip():
+            return False
+        if any(marker in lowered for marker in _NEGATED_SHIP_MARKERS):
+            return False
+        if any(marker in lowered for marker in _REVISION_MARKERS):
+            return False
+        return any(marker in lowered for marker in _SHIP_MARKERS)
+
+    def _prepare_git_workspace(self) -> None:
+        for key, value in _DEFAULT_GIT_IDENTITY:
+            current = self._git_probe("config", "--get", key, exit_code=EXIT_CONFIG_ERROR)
+            if current.returncode == 0 and current.stdout.strip():
+                continue
+            self._git("config", key, value, exit_code=EXIT_CONFIG_ERROR)
+            self.log("execute.git_identity", key=key, value=value)
+        path = self.config.base_commit_file
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+        if existing:
+            self.log("execute.base_commit", path=str(path), commit=existing, status="kept")
+            return
+        head = self._git("rev-parse", "HEAD", exit_code=EXIT_CONFIG_ERROR).strip()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(head + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise BridgeError(
+                f"could not save base commit to {path}: {exc}", EXIT_SESSION_FAILED
+            ) from exc
+        self.log("execute.base_commit", path=str(path), commit=head, status="created")
+
+    def _commit_pass(self, message: str) -> dict[str, Any] | None:
+        self._git("add", "-A")
+        staged = self._git_probe("diff", "--cached", "--quiet")
+        if staged.returncode == 0:
+            self.log("execute.commit", status="no_changes")
+            return None
+        if staged.returncode != 1:
+            detail = (staged.stderr or staged.stdout or "").strip()
+            raise BridgeError(
+                f"git diff --cached failed ({staged.returncode}): {detail}",
+                EXIT_SESSION_FAILED,
+            )
+        self._git("commit", "-m", message)
+        commit = self._git("rev-parse", "--short", "HEAD").strip()
+        subject = self._git("log", "-1", "--pretty=%s").strip()
+        summary = self._git("show", "--stat", "--oneline", "--no-renames", "HEAD").strip()
+        self.log("execute.commit", status="committed", commit=commit, subject=subject)
+        return {"commit": commit, "subject": subject, "summary": summary}
+
+    def _review_message(self, commit: dict[str, Any] | None) -> str:
+        lines = ["I finished this implementation pass."]
+        if commit is None:
+            lines.append("This pass produced no new working-tree changes.")
+        else:
+            lines.append(f"Latest commit: {commit['commit']} {commit['subject']}")
+        try:
+            base = self.config.base_commit_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            base = ""
+        log = self._git_probe(
+            "log", "--oneline", "--max-count=20", f"{base}..HEAD" if base else "HEAD"
+        )
+        if log.returncode == 0 and log.stdout.strip():
+            lines += ["", "Commits since the base commit:", log.stdout.strip()]
+        if commit is not None and commit["summary"]:
+            lines += ["", "Key changes:", commit["summary"][:4000]]
+        lines += [
+            "",
+            "Please review the committed repository state. If it looks good, say "
+            "'ship it'; otherwise describe the changes you want.",
+        ]
+        return "\n".join(lines)
+
+    def _git_probe(
+        self, *args: str, exit_code: int = EXIT_SESSION_FAILED
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.config.workspace,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=self.environ,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BridgeError(
+                f"could not run git {' '.join(args)}: {exc}", exit_code
+            ) from exc
+
+    def _git(self, *args: str, exit_code: int = EXIT_SESSION_FAILED) -> str:
+        proc = self._git_probe(*args, exit_code=exit_code)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise BridgeError(
+                f"git {' '.join(args)} failed ({proc.returncode}): {detail}",
+                exit_code,
+            )
+        return proc.stdout
 
     def _reply_text(self) -> str:
         text = self.config.reply.strip()
@@ -314,8 +500,6 @@ class InteractBridge:
             elif event_type in ("session.completed", "session.failed"):
                 pause_kind = None
         return pause_kind
-
-    # ------------------------------------------------------------------ session IO
 
     def invoke(self, subcommand: str, message: str, *, step_mode: str) -> dict[str, Any]:
         argv = self.session_argv(subcommand, message, step_mode)
@@ -411,8 +595,6 @@ class InteractBridge:
             )
         return payload
 
-    # ------------------------------------------------------------------ user server
-
     def ask_user(self, phase: str, envelope: dict[str, Any]) -> str:
         self.turns += 1
         if self.turns > self.config.max_turns:
@@ -451,20 +633,20 @@ class InteractBridge:
             return f"{PLAN_REVIEW_PREFIX}\n\n{message}" if message else PLAN_REVIEW_PREFIX
         return message or "The session needs your input to continue."
 
-    # ------------------------------------------------------------------ persistence
-
     def _run_id_path(self) -> Path:
         return self.config.run_id_file
 
     def _save_run_id(self) -> None:
         if not self.run_id:
             return
+        path = self._run_id_path()
         try:
-            path = self._run_id_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(self.run_id + "\n", encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            raise BridgeError(
+                f"could not persist run id to {path}: {exc}", EXIT_SESSION_FAILED
+            ) from exc
 
     def _load_run_id(self) -> str:
         try:
@@ -498,13 +680,8 @@ class InteractBridge:
         raw = payload.get("pause_kind") if isinstance(payload, dict) else None
         return str(raw) if raw else None
 
-    # ------------------------------------------------------------------ logging
-
     def log(self, event: str, **fields: Any) -> None:
         append_jsonl(self.config.trajectory, {"event": event, **fields}, self.environ)
-
-
-# --------------------------------------------------------------------------- CLI
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,6 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reply", default="")
     parser.add_argument("--reply-file", default=None)
     parser.add_argument("--plan-out", default="/tmp/plan.md")
+    parser.add_argument("--base-commit-file", default="/tmp/base_commit.txt")
     parser.add_argument("--session-timeout", type=float, default=3600.0)
     parser.add_argument("--pi-bin", default=None)
     return parser
@@ -573,6 +751,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         plan_out=Path(args.plan_out).expanduser() if args.plan_out else None,
         session_timeout=args.session_timeout,
         pi_bin=args.pi_bin,
+        base_commit_file=Path(args.base_commit_file).expanduser(),
     )
 
 

@@ -41,6 +41,7 @@ from tests.evals.benchmarks.harbor_interact import (
 )
 from tests.evals.benchmarks.interact_bridge import (
     EXIT_CONFIG_ERROR,
+    EXIT_SESSION_FAILED,
     EXIT_SIDECAR_ERROR,
     EXIT_TURN_CAP,
     redact_text,
@@ -83,6 +84,82 @@ mkdir -p /logs/agent
 git status --short > /logs/agent/final-status.txt
 ```
 """
+
+UPSTREAM_IMPLEMENT_INSTRUCTION = "\n".join(
+    [
+        "You're working in the repository at `/app`.",
+        "",
+        "**Read `/tmp/plan.md` first** - it is the plan you agreed with the maintainer "
+        "in the previous step. Carry it out now in `/app`.",
+        "",
+        "- Make the minimal production-code and documentation changes needed to "
+        "implement the agreed behavior.",
+        "- Do not modify test files, test harness files, or anything under `/tests`.",
+        "- Keep existing behavior intact except for the requested change.",
+        "- Before editing, configure a local git identity if this repo does not "
+        "already have one:",
+        "",
+        "```bash",
+        'git config user.name "Dev"',
+        'git config user.email "dev@example.com"',
+        "```",
+        "",
+        "- Save the starting commit before your first implementation commit:",
+        "",
+        "```bash",
+        "git rev-parse HEAD > /tmp/base_commit.txt",
+        "```",
+        "",
+        "- After each coherent implementation pass, commit the current repo changes "
+        "before asking the maintainer for review. A coherent pass is the initial "
+        "implementation, or a later revision made in response to maintainer feedback. "
+        "Use short commit messages like `initial implementation` or "
+        "`address feedback: parser behavior`.",
+        "- The maintainer can inspect the repository state directly after your commit, "
+        "so a concise review request is fine. Still make sure each coherent "
+        "implementation pass is committed before calling `ask_user`.",
+        "- Do not commit `/logs`, temporary investigation files, or unrelated "
+        "generated files.",
+        "- When you believe it is done, run focused validation that is practical in "
+        "this environment, review the latest commit and working tree, then report "
+        "the key changes to the maintainer via `ask_user`. If they ask for changes, "
+        "make another coherent pass and commit it. If they say ship it, then finish.",
+    ]
+)
+
+UPSTREAM_HANDOFF_INSTRUCTION = """You're working in the repository at `/app`.
+
+This is a handoff step. Do not make intentional implementation changes.
+
+Save the local commit history for handoff:
+
+```bash
+set -euo pipefail
+cd /app
+mkdir -p /logs/agent
+base="$(cat /tmp/base_commit.txt)"
+
+{
+  echo "Base commit: $base"
+  echo
+  echo "Commits:"
+  git log --oneline --reverse "$base"..HEAD
+  echo
+  echo "Patches:"
+  git log --patch --reverse --find-renames "$base"..HEAD
+} > /logs/agent/change-log.txt
+
+git status --short > /logs/agent/final-status.txt
+git diff "$base"..HEAD > /logs/agent/final.diff
+```
+"""
+
+UPSTREAM_WRITE_TESTS_INSTRUCTION = (
+    "You're working in the repository at `/app`.\n"
+    "\n"
+    "Now add tests for the implementation changes you made. "
+    "Keep the test changes in a separate commit, then hand off.\n"
+)
 
 
 # --------------------------------------------------------------------------- HTTP fixtures
@@ -278,8 +355,9 @@ def _bridge_common(
     plan_path: Path,
     *,
     max_turns: int = 4,
+    base_commit_file: Path | None = None,
 ) -> list[str]:
-    return [
+    args = [
         "--phase",
         phase,
         "--olympus-bin",
@@ -297,6 +375,39 @@ def _bridge_common(
         "--mcp-url",
         server.url,
     ]
+    if base_commit_file is not None:
+        args += ["--base-commit-file", str(base_commit_file)]
+    return args
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _git_subjects(repo: Path) -> list[str]:
+    return [line for line in _git(repo, "log", "--format=%s", "--reverse").splitlines() if line]
+
+
+def _pinned_git_env() -> dict[str, str]:
+    return {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _upstream_handoff_script(repo: Path, logs: Path, base_file: Path) -> str:
+    instruction = (
+        UPSTREAM_HANDOFF_INSTRUCTION.replace("/app", str(repo))
+        .replace("/logs/agent", str(logs))
+        .replace("/tmp/base_commit.txt", str(base_file))
+    )
+    return extract_handoff_script(instruction, logs_dir=logs, workspace=str(repo))
+
+
+def _run_upstream_handoff(
+    repo: Path, logs: Path, base_file: Path
+) -> subprocess.CompletedProcess[str]:
+    script = _upstream_handoff_script(repo, logs, base_file)
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
 
 def _jsonl_events(path: Path) -> list[dict[str, Any]]:
@@ -346,6 +457,30 @@ step_mode = opt("--step-mode", "execute")
 message = opt("--message", "")
 workflow = opt("--workflow", "full_sdlc_tdd")
 state_path = state_dir / "fake-state.json"
+CALC = (
+    "def divide(a, b):\n"
+    "    if b == 0:\n"
+    "        raise ValueError('zero')\n"
+    "    return a / b\n"
+)
+CALC_REVISED = (
+    "def divide(a, b):\n"
+    "    if b == 0:\n"
+    "        raise ValueError('zero divisor')\n"
+    "    return a / b\n"
+)
+TEST_FILE = (
+    "from calculator import divide\n"
+    "\n"
+    "\n"
+    "def test_divide_by_zero():\n"
+    "    try:\n"
+    "        divide(1, 0)\n"
+    "    except ValueError as exc:\n"
+    "        assert str(exc) == 'zero'\n"
+    "    else:\n"
+    "        raise AssertionError('expected ValueError')\n"
+)
 
 with (state_dir / "fake-invocations.jsonl").open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
@@ -420,15 +555,31 @@ if subcommand == "reply":
             save(state)
         emit("needs_input", pause_kind="plan_handoff", message=PLAN_MESSAGE)
     if step_mode == "execute":
+        instruction = message.casefold()
         if state.get("phase") == "plan_handoff":
-            (workspace / "calculator.py").write_text(
-                "def divide(a, b):\n"
-                "    if b == 0:\n"
-                "        raise ValueError('zero')\n"
-                "    return a / b\n",
-                encoding="utf-8",
-            )
+            (workspace / "calculator.py").write_text(CALC, encoding="utf-8")
             state["phase"] = "completed"
+            save(state)
+            emit(
+                "completed",
+                message="Session completed with 1 changed file(s).",
+                changed_files=["calculator.py"],
+            )
+        if "add tests" in instruction and not state.get("tests_written"):
+            (workspace / "tests").mkdir(exist_ok=True)
+            (workspace / "tests" / "test_calculator.py").write_text(
+                TEST_FILE, encoding="utf-8"
+            )
+            state["tests_written"] = True
+            save(state)
+            emit(
+                "completed",
+                message="Session completed with 1 changed file(s).",
+                changed_files=["tests/test_calculator.py"],
+            )
+        if not state.get("revised") and ("change" in instruction or "fix" in instruction):
+            (workspace / "calculator.py").write_text(CALC_REVISED, encoding="utf-8")
+            state["revised"] = True
             save(state)
             emit(
                 "completed",
@@ -810,7 +961,11 @@ def test_bridge_plan_then_execute_preserves_state_and_scope(tmp_path: Path) -> N
     trajectory = tmp_path / "trajectory.jsonl"
     fake = _write_fake_olympus(tmp_path)
     server = FakeMcpServer(
-        replies=["AMB-1: raise ValueError('zero')", "Looks good, ship it."],
+        replies=[
+            "AMB-1: raise ValueError('zero')",
+            "Looks good, ship it.",
+            "Looks good, ship it.",
+        ],
         mode="sse",
     )
     try:
@@ -842,14 +997,24 @@ def test_bridge_plan_then_execute_preserves_state_and_scope(tmp_path: Path) -> N
 
         reply_file = tmp_path / "execute-instruction.md"
         reply_file.write_text(EXECUTE_INSTRUCTION, encoding="utf-8")
+        base_file = tmp_path / "base_commit.txt"
         execute_args = _bridge_common(
-            "execute", fake, repo, state, server, trajectory, plan_path
+            "execute",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
         ) + ["--reply-file", str(reply_file)]
         process, summary = _run_bridge(execute_args)
         assert process.returncode == 0, process.stdout + process.stderr
         assert summary["status"] == "ok"
         assert (repo / "calculator.py").is_file()
-        assert _git_status(repo).strip() == "?? calculator.py"
+        assert _git_status(repo) == ""
+        assert "calculator.py" in _git(repo, "ls-files").splitlines()
+        assert _git_subjects(repo)[-1] == "initial implementation"
         assert not (repo / ".olympus").exists()
 
         invocations = [
@@ -1012,6 +1177,7 @@ def test_real_session_cli_plan_then_execute(tmp_path: Path) -> None:
         replies=[
             "AMB-1: raise ValueError('zero') and accept int and float inputs.",
             "Looks good, ship it.",
+            "Looks good, ship it.",
         ]
     )
     try:
@@ -1031,7 +1197,14 @@ def test_real_session_cli_plan_then_execute(tmp_path: Path) -> None:
         reply_file = tmp_path / "execute-instruction.md"
         reply_file.write_text(EXECUTE_INSTRUCTION, encoding="utf-8")
         execute_args = _bridge_common(
-            "execute", olympus, repo, state, server, trajectory, plan_path
+            "execute",
+            olympus,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=tmp_path / "base_commit.txt",
         ) + ["--reply-file", str(reply_file), "--provider", "mock"]
         process, summary = _run_bridge(execute_args)
         assert process.returncode == 0, process.stdout + process.stderr
@@ -1039,8 +1212,256 @@ def test_real_session_cli_plan_then_execute(tmp_path: Path) -> None:
         calculator = repo / "calculator.py"
         assert calculator.is_file()
         assert "def divide" in calculator.read_text(encoding="utf-8")
-        assert _git_status(repo).strip() == "?? calculator.py"
+        assert _git_status(repo) == ""
+        assert "calculator.py" in _git(repo, "ls-files").splitlines()
+        assert _git_subjects(repo)[-1] == "initial implementation"
         assert not (repo / ".olympus").exists()
+    finally:
+        server.close()
+
+
+def test_bridge_execute_bootstraps_git_commits_reviews_and_hands_off(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    for key in ("user.name", "user.email"):
+        subprocess.run(["git", "config", "--unset", key], cwd=repo, check=True)
+    state = tmp_path / "state"
+    plan_path = tmp_path / "plan.md"
+    trajectory = tmp_path / "trajectory.jsonl"
+    base_file = tmp_path / "base_commit.txt"
+    logs = tmp_path / "logs"
+    olympus = _write_real_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=[
+            "AMB-1: raise ValueError('zero').",
+            "Looks good, ship it.",
+            "Looks good, ship it.",
+        ]
+    )
+    try:
+        plan_args = _bridge_common(
+            "plan", olympus, repo, state, server, trajectory, plan_path
+        ) + ["--goal", "Build a small calculator library", "--provider", "mock"]
+        process, summary = _run_bridge(plan_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        start_commit = _git(repo, "rev-parse", "HEAD").strip()
+
+        instruction_path = tmp_path / "implement.md"
+        instruction_path.write_text(UPSTREAM_IMPLEMENT_INSTRUCTION, encoding="utf-8")
+        execute_args = _bridge_common(
+            "execute",
+            olympus,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
+        ) + ["--reply-file", str(instruction_path), "--provider", "mock"]
+        process, summary = _run_bridge(execute_args, env=_pinned_git_env())
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert summary["turns"] == 1
+
+        assert base_file.read_text(encoding="utf-8").strip() == start_commit
+        assert _git(repo, "rev-parse", "HEAD").strip() != start_commit
+        assert _git_subjects(repo) == ["init", "initial implementation"]
+        assert _git(repo, "config", "--local", "user.name").strip() == "Dev"
+        assert _git(repo, "config", "--local", "user.email").strip() == "dev@example.com"
+        assert _git_status(repo) == ""
+
+        session_events = [
+            record
+            for record in _jsonl_events(trajectory)
+            if record["event"] == "session.invoke" and record["step_mode"] == "execute"
+        ]
+        assert session_events
+        assert session_events[0]["message"] == UPSTREAM_IMPLEMENT_INSTRUCTION.strip()
+
+        reviews = [
+            record
+            for record in _jsonl_events(trajectory)
+            if record["event"] == "ask_user" and record["phase"] == "execute_review"
+        ]
+        assert len(reviews) == 1
+        assert "review" in reviews[0]["question"].casefold()
+        assert "latest commit" in reviews[0]["question"].casefold()
+
+        result = _run_upstream_handoff(repo, logs, base_file)
+        assert result.returncode == 0, result.stderr
+        change_log = (logs / "change-log.txt").read_text(encoding="utf-8")
+        assert f"Base commit: {start_commit}" in change_log
+        assert "initial implementation" in change_log
+        final_diff = (logs / "final.diff").read_text(encoding="utf-8")
+        assert "calculator.py" in final_diff
+        assert "def divide" in final_diff
+        assert (logs / "final-status.txt").read_text(encoding="utf-8").strip() == ""
+    finally:
+        server.close()
+
+
+def test_bridge_execute_revision_round_commits_and_hands_off(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    plan_path = tmp_path / "plan.md"
+    trajectory = tmp_path / "trajectory.jsonl"
+    base_file = tmp_path / "base_commit.txt"
+    logs = tmp_path / "logs"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=[
+            "AMB-1: raise ValueError('zero').",
+            "Looks good, ship it.",
+            "Please change the zero-division message to 'zero divisor'.",
+            "Looks good, ship it.",
+        ]
+    )
+    try:
+        plan_args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, plan_path
+        ) + ["--goal", "Build a calculator library"]
+        process, summary = _run_bridge(plan_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        start_commit = _git(repo, "rev-parse", "HEAD").strip()
+
+        reply_file = tmp_path / "implement.md"
+        reply_file.write_text(UPSTREAM_IMPLEMENT_INSTRUCTION, encoding="utf-8")
+        execute_args = _bridge_common(
+            "execute",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
+        ) + ["--reply-file", str(reply_file)]
+        process, summary = _run_bridge(execute_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert summary["turns"] == 2
+
+        assert base_file.read_text(encoding="utf-8").strip() == start_commit
+        assert _git_subjects(repo) == [
+            "init",
+            "initial implementation",
+            "address feedback",
+        ]
+        calculator = (repo / "calculator.py").read_text(encoding="utf-8")
+        assert "zero divisor" in calculator
+        assert _git_status(repo) == ""
+
+        result = _run_upstream_handoff(repo, logs, base_file)
+        assert result.returncode == 0, result.stderr
+        change_log = (logs / "change-log.txt").read_text(encoding="utf-8")
+        assert "initial implementation" in change_log
+        assert "address feedback" in change_log
+        final_diff = (logs / "final.diff").read_text(encoding="utf-8")
+        assert "zero divisor" in final_diff
+        assert (logs / "final-status.txt").read_text(encoding="utf-8").strip() == ""
+    finally:
+        server.close()
+
+
+def test_bridge_write_tests_step_commits_separately(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    plan_path = tmp_path / "plan.md"
+    trajectory = tmp_path / "trajectory.jsonl"
+    base_file = tmp_path / "base_commit.txt"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=[
+            "AMB-1: raise ValueError('zero').",
+            "Looks good, ship it.",
+            "Looks good, ship it.",
+        ]
+    )
+    try:
+        plan_args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, plan_path
+        ) + ["--goal", "Build a calculator library"]
+        process, _ = _run_bridge(plan_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+
+        implement_file = tmp_path / "implement.md"
+        implement_file.write_text(UPSTREAM_IMPLEMENT_INSTRUCTION, encoding="utf-8")
+        implement_args = _bridge_common(
+            "execute",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
+        ) + ["--reply-file", str(implement_file)]
+        process, summary = _run_bridge(implement_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert _git_subjects(repo) == ["init", "initial implementation"]
+
+        tests_file = tmp_path / "write-tests.md"
+        tests_file.write_text(UPSTREAM_WRITE_TESTS_INSTRUCTION, encoding="utf-8")
+        review_turns = len(server.questions)
+        tests_args = _bridge_common(
+            "execute",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
+        ) + ["--reply-file", str(tests_file)]
+        process, summary = _run_bridge(tests_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert summary["turns"] == 0
+        assert len(server.questions) == review_turns
+
+        assert _git_subjects(repo) == [
+            "init",
+            "initial implementation",
+            "add tests",
+        ]
+        assert "tests/test_calculator.py" in _git(repo, "ls-files").splitlines()
+        assert _git_status(repo) == ""
+        assert base_file.read_text(encoding="utf-8").strip() == _git(
+            repo, "rev-list", "--max-parents=0", "HEAD"
+        ).strip()
+    finally:
+        server.close()
+
+
+def test_bridge_run_id_write_failure_exits_session_failed(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake = _write_fake_olympus(tmp_path)
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    server = FakeMcpServer()
+    try:
+        args = _bridge_common(
+            "plan",
+            fake,
+            repo,
+            state,
+            server,
+            tmp_path / "trajectory.jsonl",
+            tmp_path / "plan.md",
+        ) + [
+            "--goal",
+            "Build a calculator library",
+            "--run-id-file",
+            str(blocker / "run-id.txt"),
+        ]
+        process, summary = _run_bridge(args)
+        assert process.returncode == EXIT_SESSION_FAILED
+        assert summary["status"] == "error"
+        assert "could not persist run id" in summary["error"]
+        assert "run-id.txt" in summary["error"]
     finally:
         server.close()
 
