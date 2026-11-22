@@ -1,10 +1,12 @@
 """Run with uv run --with playwright pytest tests/unit/test_web_run_progress_browser.py."""
 
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -688,6 +690,40 @@ def _wait_for_layout(page, mode="elk"):
     return page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
 
 
+GRAPH_STYLESHEET = """() => {
+  const links = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+    .filter((node) => node.href.includes('ariadne-graph.css'))
+    .map((node) => {
+      let rules = 0;
+      try {
+        rules = node.sheet ? node.sheet.cssRules.length : 0;
+      } catch {
+        rules = 0;
+      }
+      return {href: node.href, crossOrigin: node.crossOrigin, rules};
+    });
+  const viewport = document.querySelector('#dag-graph .react-flow__viewport');
+  return {
+    links,
+    viewportPosition: viewport ? getComputedStyle(viewport).position : null,
+  };
+}"""
+
+
+def _assert_graph_stylesheet_applied(page, *, allow_retry=False):
+    """Regression #79: ariadne-graph.css must be applied cleanly with a single stylesheet link."""
+    state = page.evaluate(GRAPH_STYLESHEET)
+    assert len(state["links"]) == 1, state
+    stylesheet = state["links"][0]
+    parsed = urlparse(stylesheet["href"])
+    assert parsed.path.endswith("/static/assets/ariadne-graph.css"), stylesheet
+    if not allow_retry:
+        assert not parsed.query, stylesheet
+    assert stylesheet["crossOrigin"] == "anonymous", stylesheet
+    assert stylesheet["rules"] > 0, stylesheet
+    assert state["viewportPosition"] == "absolute", state
+
+
 def _inside(point, card, inset=1.0):
     x, y = point
     return (card["x"] + inset < x < card["x"] + card["w"] - inset
@@ -725,6 +761,7 @@ def test_task_dag_island_keeps_fixed_scale_and_routes_around_cards(skip_dag, bro
     page = browser.new_page(viewport={"width": 1600, "height": 1000})
     page.goto(f"{url}/?run={run_id}")
     geo = _wait_for_layout(page)
+    _assert_graph_stylesheet_applied(page)
     cards = {card["id"]: card for card in geo["cards"]}
     assert set(cards) == set(SKIP_DEPS)
 
@@ -892,6 +929,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     page = browser.new_page(viewport={"width": 1400, "height": 900})
     page.goto(f"{url}/?run={run_id}")
     _wait_for_layout(page)
+    _assert_graph_stylesheet_applied(page)
     expect = playwright.expect
 
     page.evaluate("""() => {
@@ -955,7 +993,81 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     broken.locator("#thread-list .thread-item").nth(1).click()
     expect(broken.locator("#dag-graph .ag-island")).to_be_visible()
     expect(broken.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(broken)
     broken.close()
+
+    for label, handler in (
+        ("http-503", lambda route: route.fulfill(status=503, body="css unavailable")),
+        ("abort", lambda route: route.abort()),
+    ):
+        css_broken = browser.new_page()
+        css_broken.route("**/static/assets/ariadne-graph*.css*", handler)
+        css_broken.goto(f"{url}/?run={run_id}")
+        expect(css_broken.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+        expect(css_broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
+        assert css_broken.locator("#dag-graph .ag-island").count() == 0, label
+        css_broken.unroute("**/static/assets/ariadne-graph*.css*")
+        css_broken.locator("#thread-list .thread-item").nth(1).click()
+        expect(css_broken.locator("#dag-graph .ag-island")).to_be_visible()
+        expect(css_broken.locator("#workflow-graph .ag-island")).to_be_visible()
+        _assert_graph_stylesheet_applied(css_broken, allow_retry=True)
+        css_broken.close()
+
+    stalled_css = browser.new_page()
+    stalled_css.route("**/static/assets/ariadne-graph*.css*", lambda _route: None)
+    stalled_css.goto(f"{url}/?run={run_id}")
+    expect(stalled_css.locator("#dag-graph")).to_contain_text(
+        "任务依赖图组件未能加载", timeout=7000
+    )
+    expect(stalled_css.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
+    assert stalled_css.locator("#dag-graph .ag-island").count() == 0
+    stalled_css.unroute("**/static/assets/ariadne-graph*.css*")
+    stalled_css.locator("#thread-list .thread-item").nth(1).click()
+    expect(stalled_css.locator("#dag-graph .ag-island")).to_be_visible()
+    expect(stalled_css.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(stalled_css, allow_retry=True)
+    stalled_css.close()
+
+    held_js = []
+    held_retry_css = []
+    late_js = browser.new_page()
+    initial_js_re = re.compile(r"/static/assets/ariadne-graph\.js$")
+    initial_css_re = re.compile(r"/static/assets/ariadne-graph\.css$")
+    retry_css_re = re.compile(r"/static/assets/ariadne-graph\.css\?retry=")
+    late_js.route(
+        initial_css_re,
+        lambda route: route.fulfill(status=200, content_type="text/css", body=""),
+    )
+    late_js.route(initial_js_re, lambda route: held_js.append(route))
+    late_js.route(retry_css_re, lambda route: held_retry_css.append(route))
+    late_js.goto(f"{url}/?run={run_id}")
+    expect(late_js.locator("#dag-graph")).to_contain_text(
+        "任务依赖图组件未能加载", timeout=7000
+    )
+    late_js.locator("#thread-list .thread-item").nth(1).click()
+    late_js.wait_for_function(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
+    )
+    late_js.unroute(initial_css_re)
+    with late_js.expect_response(initial_js_re):
+        for route in held_js:
+            route.continue_()
+    late_js.unroute(initial_js_re)
+    late_js.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
+    assert late_js.evaluate(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
+    )
+    for route in held_retry_css:
+        route.continue_()
+    late_js.unroute(retry_css_re)
+    expect(late_js.locator("#dag-graph .ag-island")).to_be_visible()
+    expect(late_js.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(late_js, allow_retry=True)
+    late_js.close()
 
 
 # ---------------------------------------------------------------------------
