@@ -1,0 +1,199 @@
+{
+  "version": "v0.0",
+  "git_tag": "v0.0",
+  "commit_sha": "e87b7e30b5634512fbb3d95877ac82956fb6a8f5",
+  "pr_reference": "#72",
+  "run_id": "run-4ee14e0c68b0",
+  "date": "2026-11-21",
+  "outcome": "partial_stopped_by_user",
+  "outcome_summary": "5/8 tasks accepted (Wave 0 + entire Wave 1); T2-web stopped mid-Attempt 2 at step 273 (69/85 tests passing) after Attempt 1 (650 steps, 607/608 passing) was rejected by Diff Gate for 3 stray file:/.../*.db files.",
+  "wall_clock_minutes": {
+    "total_from_run_created": 604.5,
+    "since_pr72_unlimited_steps": 533.0,
+    "phase_1_to_3_align_design_plan": 5.0
+  },
+  "tasks": [
+    {
+      "task_id": "T0-contracts",
+      "wave": 0,
+      "status": "accepted",
+      "final_attempt": 2,
+      "final_steps": 51,
+      "argus": {
+        "passed": true,
+        "important": 0,
+        "nit": 3
+      }
+    },
+    {
+      "task_id": "T1-account",
+      "wave": 1,
+      "status": "accepted",
+      "final_attempt": 1,
+      "final_steps": 91,
+      "argus": {
+        "passed": true,
+        "important": 0,
+        "nit": 2
+      }
+    },
+    {
+      "task_id": "T1-note",
+      "wave": 1,
+      "status": "accepted",
+      "final_attempt": 1,
+      "final_steps": 111,
+      "argus": {
+        "passed": true,
+        "important": 0,
+        "nit": 0
+      }
+    },
+    {
+      "task_id": "T1-moderation",
+      "wave": 1,
+      "status": "accepted",
+      "final_attempt": 1,
+      "final_steps": 104,
+      "argus": {
+        "passed": true,
+        "important": 0,
+        "nit": 2
+      }
+    },
+    {
+      "task_id": "T1-interaction",
+      "wave": 1,
+      "status": "accepted",
+      "final_attempt": 2,
+      "final_steps": 340,
+      "argus": {
+        "passed": true,
+        "important": 0,
+        "nit": 1
+      }
+    },
+    {
+      "task_id": "T2-web",
+      "wave": 2,
+      "status": "stopped_by_user",
+      "final_attempt": 2,
+      "final_steps": 273,
+      "note": "Attempt 1 reached ~650 steps (607/608 tests green) before Diff Gate rejected 3 stray file:/.../*.db artifacts; Attempt 2 reached 69/85 passing when stopped."
+    },
+    {
+      "task_id": "T2-integration",
+      "wave": 3,
+      "status": "waiting",
+      "final_attempt": 0,
+      "final_steps": 0
+    },
+    {
+      "task_id": "T2-e2e-human",
+      "wave": 4,
+      "status": "waiting",
+      "final_attempt": 0,
+      "final_steps": 0
+    }
+  ],
+  "accepted_overlay": {
+    "file_count": 49,
+    "pytest_passed": 540,
+    "pytest_failed": 0,
+    "pytest_duration_s": 3.33
+  },
+  "argus_verdicts": [
+    {
+      "task_id": "T0-contracts",
+      "attempt": 2,
+      "passed": true,
+      "important_count": 0,
+      "nit_count": 3
+    },
+    {
+      "task_id": "T1-account",
+      "attempt": 1,
+      "passed": true,
+      "important_count": 0,
+      "nit_count": 2
+    },
+    {
+      "task_id": "T1-note",
+      "attempt": 1,
+      "passed": true,
+      "important_count": 0,
+      "nit_count": 0
+    },
+    {
+      "task_id": "T1-moderation",
+      "attempt": 1,
+      "passed": true,
+      "important_count": 0,
+      "nit_count": 2
+    },
+    {
+      "task_id": "T1-interaction",
+      "attempt": 2,
+      "passed": false,
+      "important_count": 1,
+      "nit_count": 2
+    },
+    {
+      "task_id": "T1-interaction",
+      "attempt": 2,
+      "passed": true,
+      "important_count": 0,
+      "nit_count": 1
+    }
+  ],
+  "diff_gate_rejections": [
+    {
+      "task_id": "T1-interaction",
+      "attempt": 1,
+      "violating_paths_sample": [
+        "data/blacknote.db",
+        "data/x_test.db"
+      ],
+      "cause": "SQLite runtime test artifacts created outside write_scope"
+    },
+    {
+      "task_id": "T2-web",
+      "attempt": 1,
+      "violating_paths_sample": [
+        "file:/.../blacknote_moderation_audit.db (3 files)"
+      ],
+      "cause": "SQLite URI opened without uri=True created literal file:/ directory outside write_scope"
+    }
+  ],
+  "watchdog": {
+    "checked": 1244,
+    "healthy": 1244,
+    "false_pauses": 0,
+    "errors": 475,
+    "error_breakdown": {
+      "JSONDecodeError": 413,
+      "ValidationError": 9,
+      "ValueError": 1,
+      "ReadTimeout": 1,
+      "HttpStatusError": 51
+    }
+  },
+  "budget_ledger": {
+    "llm_calls_used": 2349,
+    "llm_calls_reserved": 0,
+    "input_tokens": 11572542,
+    "output_tokens": 2366876,
+    "unknown_outcome_calls": 0
+  },
+  "estimated_cost_rmb": {
+    "booked_ledger_exact": 15.65,
+    "estimated_total_incl_unbooked_cache_and_watchdog_range": [
+      24.0,
+      32.0
+    ],
+    "accounting_gaps": [
+      "PiDriver only settled usage.input and omitted usage.cacheRead.",
+      "Watchdog LLM calls (1,719 total) were not settled into BudgetLedger."
+    ]
+  }
+}

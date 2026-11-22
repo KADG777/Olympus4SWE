@@ -1,0 +1,30 @@
+{
+  "benchmark_id": "blacknote-dev",
+  "title": "BlackNote Dev",
+  "workflow": "full_sdlc_tdd",
+  "raw_input": "我想开发一个类似小红书的平台, 不过目标用户是AI工程师, 我希望大家能一起在这个平台讨论AI新闻/工具/产品等等",
+  "reference_clarification_assumptions": [
+    "交付形态为可通过浏览器访问的 Web 应用（类小红书的图文信息流体验），而非仅 REST API 或 CLI",
+    "笔记主体为图文（图片+文字+话题标签），话题固定包含 AI 新闻 / AI 工具 / AI 产品 三类并支持自定义标签",
+    "MVP 阶段使用内置邮箱+密码账号体系，管理员角色通过预置账号存在",
+    "数据存储采用服务端持久化数据库，用户内容与互动数据在服务重启后不丢失"
+  ],
+  "baseline_execution_config": {
+    "worker_driver": "pi@bailian/qwen3.8-flash",
+    "reviewer_driver": "native",
+    "monitor_model": "qwen3.8-flash",
+    "worker_max_steps": null,
+    "max_concurrent_tasks": 3,
+    "watchdog": {
+      "interval_seconds": 25,
+      "silence_seconds": 90,
+      "repeat_error_threshold": 3
+    }
+  },
+  "pricing_reference_rmb_per_1m_tokens": {
+    "input_uncached": 0.8,
+    "input_cache_hit": 0.1,
+    "output": 2.7
+  },
+  "notes": "Keep raw_input and baseline model fixed across Olympus4SWE major versions so harness gains are directly comparable. When upgrading the model, record both vX.Y@qwen3.8-flash and vX.Y@<new-model>."
+}

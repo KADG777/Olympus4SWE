@@ -1,0 +1,699 @@
+{
+  "content_hash": "sha256:d780a1aac9a8d63defda539b4b43680d94d6294658e4700ee2aa7d38b8adb61a",
+  "design_id": "blacknote-design-v2",
+  "version": 2,
+  "spec_id": "blacknote-goal-spec-v1",
+  "spec_hash": "sha256:5890b579369df437c141ade9375e079606b99f404057af3411b5155d72d2e1e9",
+  "architecture_summary": "BlackNote 采用分层单向依赖架构：账号层提供认证与用户资料，笔记层依赖账号层负责图文笔记 CRUD，互动层依赖账号+笔记层负责点赞/收藏/评论并维护计数，治理层依赖下层通过共享契约的可见性谓词执行下架/屏蔽，Web 层作为唯一顶层消费者组装路由与页面。所有跨层规则（错误信封、ID、UTC 时间、可见性判定）冻结在只读的 Wave 0 共享契约中，从根本上杜绝模块间循环依赖。",
+  "shared_invariants": [
+    {
+      "id": "INV-error-envelope",
+      "category": "error_envelope",
+      "rule": "所有服务接口与 HTTP 响应在出错时统一返回 JSON 信封 {\"error\": {\"code\": str, \"message\": str, \"details\": object|null}}；成功响应不得混入该字段。业务错误码使用大写下划线常量（如 EMAIL_TAKEN, NOTE_NOT_FOUND, PERMISSION_DENIED）。",
+      "enforcement_hint": "Wave 0 在 contracts/errors.py 定义 ErrorEnvelope 与错误码枚举，各层仅 raise 契约异常或返回该结构，禁止自定义错误格式。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-id-format",
+      "category": "id_format",
+      "rule": "所有实体主键采用 UUIDv4 字符串（36 位小写带连字符），字段名统一为 id；对外引用使用 <entity>_id 命名（如 note_id, user_id, parent_comment_id）。禁止自增整型对外暴露。",
+      "enforcement_hint": "contracts/ids.py 提供 new_id() 生成器与 validate_id()；建表默认值调用 new_id()。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-time-encoding",
+      "category": "time_encoding",
+      "rule": "所有时间戳以 UTC 存储并以 ISO-8601 字符串（YYYY-MM-DDTHH:MM:SS.ffffffZ）序列化输出；信息流排序、分页游标与'下次加载即见新内容'语义均基于 created_at/updated_at 的 UTC 单调比较。禁止本地时区裸时间入库。",
+      "enforcement_hint": "contracts/timeutil.py 提供 utcnow_iso() 与 parse_iso()；序列化层强制 Z 结尾。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-concurrency-counters",
+      "category": "concurrency",
+      "rule": "点赞/收藏/评论计数必须与其实体关系表在同一事务内派生或原子更新，保证任意两视图计数误差为 0；重复点赞/收藏通过 (user_id, note_id) 唯一约束实现幂等，取消操作删除该行并计数减一，二者不得产生负数或超计。",
+      "enforcement_hint": "互动层以事务包裹关系写入与计数变更；计数读取走同一 DB 快照。",
+      "applies_to": [
+        "mod-interaction",
+        "mod-note",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-visibility-predicate",
+      "category": "validation",
+      "rule": "任何公开列表/详情/搜索读取路径必须先经共享契约的 is_visible_to(entity, viewer) 谓词过滤：已删除笔记、被管理员下架笔记、非作者的草稿状态笔记、被屏蔽评论及其子回复一律不可见（详情返回 NOTE_NOT_FOUND 等价 404）。可见性判定逻辑唯一定义于契约层，各模块只读调用不得各自实现。",
+      "enforcement_hint": "contracts/visibility.py 定义唯一谓词函数与各状态枚举；moderation 只写状态标志，读取方只调谓词，避免反向依赖。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-auth-session",
+      "category": "security",
+      "rule": "所有写操作（发布/编辑/删除笔记、点赞/收藏/评论、管理动作）仅限已登录用户；未登录访客触发写操作返回 AUTH_REQUIRED 且不写入任何数据；需登录页面在未会话时重定向至登录页。密码以加盐哈希存储，会话凭据不落明文。",
+      "enforcement_hint": "contracts/auth_guard.py 定义 require_auth 装饰器/中间件与 AUTH_REQUIRED 错误码，由 account 层实现、其余层调用。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-role-check",
+      "category": "security",
+      "rule": "管理操作入口在进入处理逻辑前强制校验角色为 admin，非管理员越权返回 PERMISSION_DENIED 并记录一次越权尝试日志；越权成功率必须为 0%。角色枚举固定为 {user, admin}。",
+      "enforcement_hint": "contracts/roles.py 定义 Role 枚举与 require_admin 守卫；moderation 层复用而非自建。",
+      "applies_to": [
+        "mod-account",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-field-validation",
+      "category": "validation",
+      "rule": "输入长度上限集中定义于契约层并在服务端强制：邮箱合法格式且唯一、密码≥8位、笔记标题≤100字、正文≤10000字、图片≤9张(单图≤5MB)、至少1个话题标签、评论≤2000字且非空。违反返回 VALIDATION_ERROR 并在 details 列出具体缺失/超限字段。",
+      "enforcement_hint": "contracts/validation.py 定义 LIMITS 常量与 check_fields()；各层调用同一校验器。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    },
+    {
+      "id": "INV-config-db",
+      "category": "config",
+      "rule": "数据库连接串、图片存储根目录、会话密钥、分页默认大小(每页≥10)等运行参数统一从 config 层读取环境变量并提供安全默认值；持久化数据存储在服务端数据库，进程重启后内容与互动数据不丢失。禁止硬编码连接信息。",
+      "enforcement_hint": "contracts/config.py 用 dataclass 加载 Settings，全模块共享单例。",
+      "applies_to": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ]
+    }
+  ],
+  "shared_contract_paths": [
+    "src/blacknote/contracts/"
+  ],
+  "modules": [
+    {
+      "id": "mod-account",
+      "name": "账号与身份层",
+      "responsibility": "最底层无内部依赖的身份提供者：注册（邮箱唯一+密码≥8位）、登录、登出、会话守护、个人资料（方向/公司学校/擅长领域/简介）维护，以及个人主页所需的作者身份与用户查询能力。实现 INV-auth-session 与 INV-role-check 的守卫。",
+      "requirement_refs": [
+        "R1-account"
+      ],
+      "target_paths": [
+        "src/blacknote/account/",
+        "tests/test_account.py"
+      ]
+    },
+    {
+      "id": "mod-note",
+      "name": "笔记内容层",
+      "responsibility": "依赖账号层的图文笔记 CRUD：创建/编辑/删除笔记（标题/Markdown正文/图片/话题标签/分类），草稿与公开状态管理，作者归属与所有权校验，向信息流提供按发布时间倒序的公开笔记数据源。读取路径调用共享可见性谓词过滤下架/删除/他人草稿。",
+      "requirement_refs": [
+        "R2-note-crud",
+        "R3-feed-discovery"
+      ],
+      "target_paths": [
+        "src/blacknote/note/",
+        "tests/test_note.py"
+      ]
+    },
+    {
+      "id": "mod-interaction",
+      "name": "互动讨论层",
+      "responsibility": "依赖账号层与笔记层的点赞、收藏、多层评论回复：幂等点赞/收藏、评论线程关联父评论、与关系表同事务维护计数一致性。仅向下调用 note 的存在性/可见性查询接口，不被 note 同步回调，从而保持单向依赖。",
+      "requirement_refs": [
+        "R4-interactions"
+      ],
+      "target_paths": [
+        "src/blacknote/interaction/",
+        "tests/test_interaction.py"
+      ]
+    },
+    {
+      "id": "mod-moderation",
+      "name": "内容治理层",
+      "responsibility": "依赖下层的治理动作执行者：管理员下架违规笔记、屏蔽违规评论及其子回复，写入状态标志（moderated/blocked）供共享可见性谓词读取，并对越权访问记录审计日志。不实现读取过滤本身，只改变状态，避免与读取层形成环。",
+      "requirement_refs": [
+        "R5-moderation"
+      ],
+      "target_paths": [
+        "src/blacknote/moderation/",
+        "tests/test_moderation.py"
+      ]
+    },
+    {
+      "id": "mod-web",
+      "name": "Web 应用与路由层",
+      "responsibility": "唯一顶层消费者：组装可浏览器访问的 Web 界面与 HTTP 路由（注册/登录页、信息流首页与滚动分页、话题分类与标签检索、关键词搜索、笔记详情、发布编辑器、个人主页、收藏夹、管理后台入口），落地重定向与错误信封渲染，接入静态图片资源服务。",
+      "requirement_refs": [
+        "R1-account",
+        "R2-note-crud",
+        "R3-feed-discovery",
+        "R4-interactions",
+        "R5-moderation"
+      ],
+      "target_paths": [
+        "src/blacknote/web/",
+        "src/blacknote/static/",
+        "templates/",
+        "tests/test_web_routes.py"
+      ]
+    }
+  ],
+  "data_models": [
+    {
+      "name": "User",
+      "fields": [
+        "id: str(uuid4)",
+        "email: str(unique,lowercased)",
+        "password_hash: str",
+        "username: str",
+        "bio: str|null",
+        "specialty: str|null (方向)",
+        "affiliation: str|null (公司/学校)",
+        "expertise_tags: list[str] (擅长领域)",
+        "role: enum(user,admin)",
+        "created_at: str(iso8601-utc)",
+        "updated_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-account",
+      "notes": "管理员通过预置账号 seed，role=admin。"
+    },
+    {
+      "name": "Session",
+      "fields": [
+        "token: str(opaque)",
+        "user_id: str(fk User.id)",
+        "created_at: str(iso8601-utc)",
+        "expires_at: str(iso8601-utc)|null"
+      ],
+      "owner_module_id": "mod-account",
+      "notes": "登出即失效；受保护路由据此重定向。"
+    },
+    {
+      "name": "Note",
+      "fields": [
+        "id: str(uuid4)",
+        "author_id: str(fk User.id)",
+        "title: str(<=100)",
+        "body_markdown: str(<=10000)",
+        "topic: enum(ai_news,ai_tools,ai_products)",
+        "tags: list[str](>=1)",
+        "image_paths: list[str](<=9)",
+        "status: enum(draft,published,deleted)",
+        "moderated: bool (由 moderation 写入, 读取经可见性谓词)",
+        "like_count: int",
+        "favorite_count: int",
+        "comment_count: int",
+        "created_at: str(iso8601-utc)",
+        "updated_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-note",
+      "notes": "计数为缓存列，权威来源为 interaction 关系表，同事务更新以保证一致。"
+    },
+    {
+      "name": "Like",
+      "fields": [
+        "id: str(uuid4)",
+        "user_id: str(fk User.id)",
+        "note_id: str(fk Note.id)",
+        "created_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-interaction",
+      "notes": "unique(user_id,note_id) 实现幂等点赞。"
+    },
+    {
+      "name": "Favorite",
+      "fields": [
+        "id: str(uuid4)",
+        "user_id: str(fk User.id)",
+        "note_id: str(fk Note.id)",
+        "created_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-interaction",
+      "notes": "unique(user_id,note_id)；收藏夹列表由此派生。"
+    },
+    {
+      "name": "Comment",
+      "fields": [
+        "id: str(uuid4)",
+        "note_id: str(fk Note.id)",
+        "author_id: str(fk User.id)",
+        "parent_comment_id: str(fk Comment.id)|null",
+        "body: str(1..2000)",
+        "blocked: bool (由 moderation 写入)",
+        "created_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-interaction",
+      "notes": "parent_comment_id 支持多层回复线程；blocked 及祖先链决定可见性。"
+    },
+    {
+      "name": "ModerationAuditLog",
+      "fields": [
+        "id: str(uuid4)",
+        "actor_id: str(fk User.id)",
+        "action: enum(unlist_note,block_comment,privilege_denied)",
+        "target_type: enum(note,comment,null)",
+        "target_id: str|null",
+        "created_at: str(iso8601-utc)"
+      ],
+      "owner_module_id": "mod-moderation",
+      "notes": "记录管理操作与越权尝试(AC R5-AC2)。"
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "IF-account-auth",
+      "provider_module_id": "mod-account",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "register(email:str,password:str)->SessionToken|Error; login(email:str,password:str)->SessionToken|Error; logout(token:str)->None; current_user(token:str)->UserSummary|Error",
+      "input_schema": [
+        {
+          "name": "email",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "合法邮箱格式，唯一"
+        },
+        {
+          "name": "password",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "长度>=8"
+        },
+        {
+          "name": "token",
+          "type_expr": "str",
+          "required": false,
+          "constraints": "会话令牌"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "session_token",
+          "type_expr": "str",
+          "required": false,
+          "constraints": "注册/登录成功返回"
+        },
+        {
+          "name": "user",
+          "type_expr": "UserSummary",
+          "required": false,
+          "constraints": "current_user 返回"
+        },
+        {
+          "name": "error",
+          "type_expr": "ErrorEnvelope",
+          "required": false,
+          "constraints": "EMAIL_TAKEN/INVALID_CREDENTIALS/AUTH_REQUIRED"
+        }
+      ],
+      "data_entity_refs": [
+        "User",
+        "Session"
+      ],
+      "error_cases": [
+        "EMAIL_TAKEN",
+        "VALIDATION_ERROR",
+        "INVALID_CREDENTIALS",
+        "AUTH_REQUIRED"
+      ]
+    },
+    {
+      "id": "IF-account-profile",
+      "provider_module_id": "mod-account",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "get_profile(user_id:str)->ProfileView; update_profile(token:str,patch:ProfilePatch)->ProfileView",
+      "input_schema": [
+        {
+          "name": "user_id",
+          "type_expr": "str(uuid4)",
+          "required": true,
+          "constraints": "目标用户"
+        },
+        {
+          "name": "token",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "须为本人会话"
+        },
+        {
+          "name": "patch",
+          "type_expr": "ProfilePatch",
+          "required": true,
+          "constraints": "username/bio/specialty/affiliation/expertise_tags"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "profile",
+          "type_expr": "ProfileView",
+          "required": true,
+          "constraints": "含用户名/简介/专业背景/已发布笔记列表(经可见性过滤)"
+        }
+      ],
+      "data_entity_refs": [
+        "User"
+      ],
+      "error_cases": [
+        "AUTH_REQUIRED",
+        "PERMISSION_DENIED",
+        "USER_NOT_FOUND",
+        "VALIDATION_ERROR"
+      ]
+    },
+    {
+      "id": "IF-note-crud",
+      "provider_module_id": "mod-note",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "create_note(token:str,input:NoteInput)->NoteView; update_note(token:str,note_id:str,input:NoteInput)->NoteView; delete_note(token:str,note_id:str)->None; get_note(token_or_null,note_id:str)->NoteView",
+      "input_schema": [
+        {
+          "name": "token",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "作者会话"
+        },
+        {
+          "name": "note_id",
+          "type_expr": "str(uuid4)",
+          "required": false,
+          "constraints": "编辑/删除/详情目标"
+        },
+        {
+          "name": "input",
+          "type_expr": "NoteInput",
+          "required": true,
+          "constraints": "title<=100,body<=10000,images<=9,tags>=1,topic∈枚举,status∈{draft,published}"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "note",
+          "type_expr": "NoteView",
+          "required": false,
+          "constraints": "含作者摘要与计数占位"
+        },
+        {
+          "name": "error",
+          "type_expr": "ErrorEnvelope",
+          "required": false,
+          "constraints": "NOTE_NOT_FOUND/PERMISSION_DENIED/VALIDATION_ERROR"
+        }
+      ],
+      "data_entity_refs": [
+        "Note"
+      ],
+      "error_cases": [
+        "AUTH_REQUIRED",
+        "PERMISSION_DENIED",
+        "NOTE_NOT_FOUND",
+        "VALIDATION_ERROR"
+      ]
+    },
+    {
+      "id": "IF-note-feed",
+      "provider_module_id": "mod-note",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "list_feed(query:FeedQuery)->Page[NoteSummary]; search_notes(keyword:str,query:PageQuery)->Page[NoteSummary]",
+      "input_schema": [
+        {
+          "name": "query",
+          "type_expr": "FeedQuery",
+          "required": true,
+          "constraints": "topic?/tag?/author_id?/following_only?/cursor?/page_size>=10"
+        },
+        {
+          "name": "keyword",
+          "type_expr": "str",
+          "required": false,
+          "constraints": "命中 title 或 body"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "items",
+          "type_expr": "list[NoteSummary]",
+          "required": true,
+          "constraints": "published 且经可见性谓词过滤，按 created_at desc"
+        },
+        {
+          "name": "next_cursor",
+          "type_expr": "str|null",
+          "required": false,
+          "constraints": "分页游标"
+        },
+        {
+          "name": "total",
+          "type_expr": "int",
+          "required": false,
+          "constraints": "命中总数，可为0表示空结果态"
+        }
+      ],
+      "data_entity_refs": [
+        "Note"
+      ],
+      "error_cases": [
+        "VALIDATION_ERROR"
+      ]
+    },
+    {
+      "id": "IF-note-exists-for-interaction",
+      "provider_module_id": "mod-note",
+      "consumer_module_ids": [
+        "mod-interaction"
+      ],
+      "protocol": "fn",
+      "signature": "is_publicly_interactable(note_id:str)->bool; get_note_author_id(note_id:str)->str|None",
+      "input_schema": [
+        {
+          "name": "note_id",
+          "type_expr": "str(uuid4)",
+          "required": true,
+          "constraints": "待校验笔记"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "interactable",
+          "type_expr": "bool",
+          "required": true,
+          "constraints": "published 且未被下架/删除时为 True"
+        },
+        {
+          "name": "author_id",
+          "type_expr": "str|null",
+          "required": false,
+          "constraints": "笔记作者，不存在返回 None"
+        }
+      ],
+      "data_entity_refs": [
+        "Note"
+      ],
+      "error_cases": [
+        "NOTE_NOT_FOUND"
+      ]
+    },
+    {
+      "id": "IF-interaction-actions",
+      "provider_module_id": "mod-interaction",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "like(token:str,note_id:str)->Counters; unlike(token:str,note_id:str)->Counters; favorite(token:str,note_id:str)->Counters; unfavorite(token:str,note_id:str)->Counters; comment(token:str,note_id:str,parent_comment_id:str|null,body:str)->CommentView; list_comments(note_id:str)->list[CommentThread]; list_favorites(token:str,query:PageQuery)->Page[NoteSummary]",
+      "input_schema": [
+        {
+          "name": "token",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "已登录会话"
+        },
+        {
+          "name": "note_id",
+          "type_expr": "str(uuid4)",
+          "required": true,
+          "constraints": "须 publicly interactable"
+        },
+        {
+          "name": "parent_comment_id",
+          "type_expr": "str|null",
+          "required": false,
+          "constraints": "回复线程父节点"
+        },
+        {
+          "name": "body",
+          "type_expr": "str",
+          "required": false,
+          "constraints": "1..2000 非空"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "counters",
+          "type_expr": "Counters",
+          "required": false,
+          "constraints": "like/favorite/comment 计数，事务后一致"
+        },
+        {
+          "name": "comment",
+          "type_expr": "CommentView",
+          "required": false,
+          "constraints": "新建评论，立即返回"
+        },
+        {
+          "name": "comments",
+          "type_expr": "list[CommentThread]",
+          "required": false,
+          "constraints": "按时间正序，过滤 blocked 及子树"
+        }
+      ],
+      "data_entity_refs": [
+        "Like",
+        "Favorite",
+        "Comment",
+        "Note"
+      ],
+      "error_cases": [
+        "AUTH_REQUIRED",
+        "NOTE_NOT_FOUND",
+        "COMMENT_NOT_FOUND",
+        "VALIDATION_ERROR"
+      ]
+    },
+    {
+      "id": "IF-moderation-actions",
+      "provider_module_id": "mod-moderation",
+      "consumer_module_ids": [
+        "mod-web"
+      ],
+      "protocol": "http_or_fn",
+      "signature": "unlist_note(admin_token:str,note_id:str)->None; block_comment(admin_token:str,comment_id:str)->None",
+      "input_schema": [
+        {
+          "name": "admin_token",
+          "type_expr": "str",
+          "required": true,
+          "constraints": "须 role=admin"
+        },
+        {
+          "name": "note_id",
+          "type_expr": "str(uuid4)",
+          "required": false,
+          "constraints": "下架目标"
+        },
+        {
+          "name": "comment_id",
+          "type_expr": "str(uuid4)",
+          "required": false,
+          "constraints": "屏蔽目标"
+        }
+      ],
+      "output_schema": [
+        {
+          "name": "ok",
+          "type_expr": "bool",
+          "required": true,
+          "constraints": "状态标志写入成功"
+        },
+        {
+          "name": "error",
+          "type_expr": "ErrorEnvelope",
+          "required": false,
+          "constraints": "PERMISSION_DENIED/NOT_FOUND"
+        }
+      ],
+      "data_entity_refs": [
+        "Note",
+        "Comment",
+        "ModerationAuditLog"
+      ],
+      "error_cases": [
+        "AUTH_REQUIRED",
+        "PERMISSION_DENIED",
+        "NOTE_NOT_FOUND",
+        "COMMENT_NOT_FOUND"
+      ]
+    }
+  ],
+  "execution_strategy": "contract_first_parallel",
+  "strategy_rationale": "Wave 0 先冻结 src/blacknote/contracts/（错误信封、ID、时间、可见性谓词、鉴权/角色守卫、校验常量、配置），此后 account/note/interaction/moderation 四层依赖方向严格单向且接口签名已在契约中锁定，可并行实现各自的 service/repository；web 层最后依接口组装。契约只读隔离避免了实现期边界冲突与循环依赖复发。",
+  "risks_and_tradeoffs": [
+    "Note 表同时持有 like/favorite/comment 计数缓存列，权威数据在 interaction 关系表；若并发写事务边界处理不当可能短暂不一致，已通过 INV-concurrency-counters 要求同事务更新缓解。",
+    "可见性谓词集中于 contracts/visibility.py，moderation 只写状态标志而不参与读取过滤，牺牲了治理层对展示的直接控制以换取无环依赖。",
+    "图片采用本地磁盘存储（回应 C2），引入静态资源服务与备份运维成本，且无法水平扩展到对象存储；单图≤5MB 上限需在 web 上传层强制执行。",
+    "搜索采用标题/正文 LIKE 或轻量全文索引（≤1万条满足 P95≤2s），数据量增长后需迁移到专用检索引擎。",
+    "Markdown 渲染（A2）在前端/模板层实现，存在 XSS 风险，需白名单净化。"
+  ],
+  "design_tradeoffs": [
+    {
+      "impact": "existing_system",
+      "choice": "将可见性判定与鉴权/角色守卫下沉到只读 Wave 0 契约层，moderation 仅写状态标志、读取方仅调谓词。",
+      "cost": "治理层无法直接控制内容如何展示，新增可见性规则时必须修改共享契约并触发全模块回归，契约成为潜在改动瓶颈。"
+    },
+    {
+      "impact": "deployment",
+      "choice": "图片存储采用服务端本地磁盘 + 静态资源路由，而非外部对象存储。",
+      "cost": "部署需预留并挂载持久卷、配置备份，多实例水平扩展时磁盘不共享会导致图片不可达，后续迁移对象存储需重写存储适配层。"
+    },
+    {
+      "impact": "existing_system",
+      "choice": "Note 行内冗余计数缓存列以支撑信息流首屏 P95≤2s。",
+      "cost": "引入缓存与关系表双写，破坏单一数据源，任何绕过事务的计数修改都会造成偏差，回滚或数据修复需重建计数。"
+    },
+    {
+      "impact": "rollback",
+      "choice": "笔记删除与管理员下架采用软状态(status=deleted / moderated=true)而非物理删除。",
+      "cost": "数据库保留历史数据占用增长，回滚误删容易但彻底清除合规数据需额外硬删流程，且所有读取路径都必须正确过滤软删状态否则泄露。"
+    },
+    {
+      "impact": "deployment",
+      "choice": "管理员通过预置 seed 账号存在，而非运行时角色授予界面。",
+      "cost": "生产环境需安全的 seed/引导流程与初始密码轮换，缺少自助提升管理员的能力，运维新增管理员需接触数据库或部署脚本。"
+    }
+  ],
+  "status": "confirmed"
+}
