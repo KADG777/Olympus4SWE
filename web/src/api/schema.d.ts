@@ -1008,6 +1008,11 @@ export interface components {
             /** @default draft */
             status: components["schemas"]["SpecStatus"];
             /**
+             * Test Seams
+             * @description Fewest, highest-level public seams (HTTP routes, CLI commands, public APIs) where behavior is verified.
+             */
+            test_seams?: string[];
+            /**
              * Version
              * @default 1
              */

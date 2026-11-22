@@ -185,6 +185,8 @@ def _format_spec_context(spec: GoalSpec) -> str:
     lines = [
         f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
         f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+        "Test seams (verify behavior at these public boundaries): "
+        f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
         f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
     ]
     if unresolved:

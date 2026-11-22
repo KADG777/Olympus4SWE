@@ -220,9 +220,9 @@ def validate_goal_spec(
 ) -> list[str]:
     """Zero-token gate for the 5-element + EARS GoalSpec contract.
 
-    Covers deliverable kind, observable surfaces, actors, per-requirement EARS criteria,
-    anti-vague lexical hygiene, premature implementation leaks, out-of-scope boundaries,
-    and unresolved blocking ambiguities.
+    Covers deliverable kind, observable surfaces, actors, public test seams,
+    per-requirement EARS criteria, anti-vague lexical hygiene, premature
+    implementation leaks, out-of-scope boundaries, and unresolved blocking ambiguities.
     """
     violations: list[str] = []
     actor_pool = {actor.strip().lower() for actor in spec.actors if actor.strip()}
@@ -234,6 +234,25 @@ def validate_goal_spec(
             violations.append("GoalSpec is missing observable_surfaces")
         if not actor_pool:
             violations.append("GoalSpec is missing actors")
+        public_seams = [seam for seam in spec.test_seams if seam.strip()]
+        if not public_seams:
+            violations.append(
+                "GoalSpec is missing test_seams (declare 1-2 public boundary seams: "
+                "HTTP routes, CLI commands, or public module APIs)"
+            )
+        for idx, seam in enumerate(public_seams, start=1):
+            label = f"test seam {idx}"
+            vague = _vague_terms(seam)
+            if vague:
+                violations.append(
+                    f"Vague unquantified wording in {label}: "
+                    f"{', '.join(vague)} (name an exercisable public boundary)"
+                )
+            leaks = _implementation_leaks(seam, spec.constraints)
+            if leaks:
+                violations.append(
+                    f"Premature internal implementation leak in {label}: {', '.join(leaks)}"
+                )
 
     for req in spec.requirements:
         if strict_ears:
