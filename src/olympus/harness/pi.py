@@ -33,6 +33,7 @@ _INSTALL_HINT = (
     "or point OLYMPUS_PI_BIN at the pi executable."
 )
 _READ_ONLY_TOOLS = "read,grep,find,ls"
+_WRITABLE_TOOLS = "read,bash,edit,write,grep,find,ls"
 _FORBIDDEN_WRITE_TOOLS = "bash,write,edit,powershell"
 _HELP_PROBE_TIMEOUT_SECONDS = 10.0
 _SCOPE_GUARD_PATH = Path(__file__).with_name("pi_scope_guard.ts")
@@ -401,17 +402,19 @@ class _PiTurn:
             "--no-skills",
         ]
         if request.system_prompt.strip():
-            command += ["--system-prompt", request.system_prompt]
+            command += ["--append-system-prompt", request.system_prompt]
         if request.model:
             command += ["--model", request.model]
         if request.read_only:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
-        elif self._scope_guard_path.is_file():
-            command += ["--extension", str(self._scope_guard_path)]
         else:
-            self._trace.append(
-                {"event": "pi.scope_guard_missing", "path": str(self._scope_guard_path)}
-            )
+            command += ["--tools", _WRITABLE_TOOLS]
+            if self._scope_guard_path.is_file():
+                command += ["--extension", str(self._scope_guard_path)]
+            else:
+                self._trace.append(
+                    {"event": "pi.scope_guard_missing", "path": str(self._scope_guard_path)}
+                )
         if not self._supports_rpc:
             command += ["--", request.user_prompt]
         return command

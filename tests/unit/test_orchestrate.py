@@ -50,7 +50,7 @@ from olympus.providers.base import (
     ToolSpec,
 )
 from olympus.stages.align import AlignStage
-from olympus.stages.orchestrate import OrchestrateStage
+from olympus.stages.orchestrate import _WORKER_SYSTEM_PROMPT, OrchestrateStage
 from olympus.tools.aci import build_sandbox_env
 from olympus.web.projection import build_run_projection
 from olympus.web.server import AriadneApp, create_fastapi_app
@@ -3442,6 +3442,19 @@ def test_nongit_watchdog_pause_preserves_retained_sandbox_for_retry(tmp_path: Pa
     finished = stage.run_execution(run_id=run_id)
     assert finished["status"] == RunStatus.COMPLETED
     assert seen_prior == [False, True]
+
+
+def test_worker_system_prompt_is_harness_agnostic_seam_first_and_anti_bloat() -> None:
+    prompt = _WORKER_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    assert "run_bash" not in prompt
+    assert "failing seam test" in lowered
+    assert "minimal" in lowered and "next criterion" in lowered
+    assert "speculative" in lowered and "tautological" in lowered
+    assert "batch" in lowered and "native" in lowered
+    assert "shell execution" in lowered
+    for probe in ("`cat`", "`sed`", "`grep`", "`find`"):
+        assert probe in prompt
 
 
 

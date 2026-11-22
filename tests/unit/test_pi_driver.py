@@ -38,7 +38,7 @@ from olympus.harness.driver import (
     ExecutionDriversConfig,
     TurnOutcome,
 )
-from olympus.harness.pi import PiDriver, PiNotAvailableError
+from olympus.harness.pi import PiDriver, PiNotAvailableError, _safe_argv
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
@@ -628,6 +628,55 @@ def test_pi_driver_missing_binary_fails_fast(tmp_path: Path) -> None:
         driver.run_turn(_request(tmp_path))
 
 
+def test_pi_driver_writable_turn_appends_prompt_and_enables_native_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
+
+    outcome = PiDriver(binary=str(fake)).run_turn(_request(tmp_path))
+
+    assert outcome.completed
+    argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert "--append-system-prompt" in argv
+    assert "--system-prompt" not in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == "You are the fake worker."
+    assert argv[argv.index("--tools") + 1] == "read,bash,edit,write,grep,find,ls"
+    assert "--exclude-tools" not in argv
+    assert argv[argv.index("--extension") + 1].endswith("pi_scope_guard.ts")
+
+    spawn = next(
+        entry
+        for entry in _read_jsonl(tmp_path / "worker.jsonl")
+        if entry.get("event") == "pi.spawn"
+    )
+    assert f"<{len('You are the fake worker.')} chars>" in spawn["argv"]
+    assert "You are the fake worker." not in json.dumps(spawn)
+
+
+def test_safe_argv_redacts_prompt_flags_and_trailing_prompt() -> None:
+    argv = _safe_argv(
+        [
+            "pi",
+            "--append-system-prompt",
+            "system rules",
+            "--model",
+            "fake-model",
+            "--",
+            "user prompt",
+        ]
+    )
+    assert argv == [
+        "--append-system-prompt",
+        f"<{len('system rules')} chars>",
+        "--model",
+        "fake-model",
+        "--",
+        f"<prompt: {len('user prompt')} chars>",
+    ]
+
+
 def test_pi_driver_read_only_turn_restricts_pi_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -638,8 +687,10 @@ def test_pi_driver_read_only_turn_restricts_pi_tools(
 
     assert outcome.completed
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert "--append-system-prompt" in argv and "--system-prompt" not in argv
     assert argv[argv.index("--tools") + 1] == "read,grep,find,ls"
     assert argv[argv.index("--exclude-tools") + 1] == "bash,write,edit,powershell"
+    assert "read,bash,edit,write,grep,find,ls" not in argv
     assert "--no-extensions" in argv
     assert "--extension" not in argv
 
