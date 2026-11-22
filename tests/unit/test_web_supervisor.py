@@ -35,6 +35,7 @@ GOAL_SPEC: dict[str, object] = {
     "deliverable_kind": "rest_api",
     "observable_surfaces": ["HTTP API"],
     "actors": ["operator"],
+    "test_seams": ["POST /items", "GET /items/{item_id}"],
     "requirements": [
         {
             "id": "R1",

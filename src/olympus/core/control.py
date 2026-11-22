@@ -8,6 +8,7 @@ provider or importing higher layers.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from typing import Any, overload
@@ -26,6 +27,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.dag import validate_goal_spec
 from olympus.core.store import ConcurrencyConflictError, RunStore
 
 _TARGET_HASH_MISMATCH = "Approval target hash no longer matches"
@@ -526,7 +528,34 @@ class RunControl:
     ) -> GoalSpec | dict[str, Any]:
         """Freeze and approve the current GoalSpec once blocking ambiguities are resolved."""
 
-        def _prepare(snap: Mapping[str, Any]) -> tuple[GoalSpec, ApprovalRecord]:
+        def _strict_validation_failed(
+            spec: GoalSpec, conn: sqlite3.Connection | None
+        ) -> bool:
+            if conn is not None:
+                rows = conn.execute(
+                    """
+                    SELECT payload_json FROM events
+                    WHERE run_id = ? AND event_type = 'spec.validation_failed'
+                    ORDER BY event_seq DESC
+                    """,
+                    (run_id,),
+                ).fetchall()
+                payloads = [json.loads(row["payload_json"]) for row in rows]
+            else:
+                payloads = [
+                    event.payload
+                    for event in reversed(self.store.list_events(run_id))
+                    if event.event_type == "spec.validation_failed"
+                ]
+            for payload in payloads:
+                recorded_hash = payload.get("spec_hash")
+                if recorded_hash is None or recorded_hash == spec.content_hash:
+                    return True
+            return False
+
+        def _prepare(
+            snap: Mapping[str, Any], conn: sqlite3.Connection | None = None
+        ) -> tuple[GoalSpec, ApprovalRecord]:
             spec: GoalSpec | None = snap["spec"]
             if expected_target_hash is not None and (
                 spec is None or spec.content_hash != expected_target_hash
@@ -540,6 +569,14 @@ class RunControl:
                     f"Cannot confirm spec with unresolved blockers: {', '.join(blockers)}. "
                     "Resolve them via clarify or explicitly pass accept_risk=True with a reason."
                 )
+            if not accept_risk and _strict_validation_failed(spec, conn):
+                strict_violations = validate_goal_spec(spec)
+                if strict_violations:
+                    raise ValueError(
+                        "Cannot confirm GoalSpec with unresolved strict validation violations: "
+                        f"{'; '.join(strict_violations)}. "
+                        "Repair the spec or explicitly pass accept_risk=True with a reason."
+                    )
             decision = ApprovalDecision.ACCEPT_RISK if accept_risk else ApprovalDecision.APPROVED
             confirmed = spec.model_copy(update={"status": SpecStatus.CONFIRMED})
             record = ApprovalRecord(
@@ -579,7 +616,7 @@ class RunControl:
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             snap = self.store.get_run_in_tx(conn, run_id)
-            confirmed, record = _prepare(snap)
+            confirmed, record = _prepare(snap, conn)
             self.store.save_spec_in_tx(
                 conn,
                 run_id=run_id,

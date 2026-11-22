@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,11 @@ from olympus.core.contracts import (
     TaskPlan,
 )
 from olympus.core.dag import validate_design_spec, validate_goal_spec, validate_plan
+from olympus.core.store import RunStore
+from olympus.providers.base import LLMResponse, MockLLMProvider
+from olympus.stages.align import AlignStage
 from olympus.stages.design import triage_input
+from olympus.stages.orchestrate import _format_spec_context
 
 
 def _ears(
@@ -71,6 +76,7 @@ def _canonical_spec() -> GoalSpec:
         ],
         out_of_scope=["multi-tenant isolation", "bulk import"],
         constraints=["python 3.13"],
+        test_seams=["POST /items", "GET /items/{item_id}"],
     )
 
 
@@ -261,6 +267,122 @@ def test_goal_spec_gate_rejects_premature_implementation_leaks() -> None:
         }
     )
     assert validate_goal_spec(allowed) == []
+
+
+def test_goal_spec_gate_requires_public_test_seams_under_strict_ears() -> None:
+    missing = _canonical_spec().model_copy(update={"test_seams": []})
+    assert any("test_seams" in v for v in validate_goal_spec(missing))
+    assert validate_goal_spec(missing, strict_ears=False) == []
+
+    blank = _canonical_spec().model_copy(update={"test_seams": ["", "   "]})
+    assert any("test_seams" in v for v in validate_goal_spec(blank))
+
+
+def test_goal_spec_gate_applies_hygiene_to_test_seams() -> None:
+    spec = _canonical_spec().model_copy(
+        update={"test_seams": ["用户登录体验流畅", "src/api/routes.py"]}
+    )
+    violations = validate_goal_spec(spec)
+    assert any("Vague unquantified wording in test seam" in v for v in violations)
+    assert any("implementation leak in test seam" in v for v in violations)
+
+
+def test_align_stage_persists_and_renders_test_seams_under_strict_canonical(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "align-seams.db")
+    run_id = store.create_run(title="Seam-first align")
+    draft = {
+        "spec_id": "spec-seam",
+        "goal": "Operators manage inventory through a REST API",
+        "deliverable_kind": "rest_api",
+        "observable_surfaces": ["HTTP API"],
+        "actors": ["operator"],
+        "requirements": [
+            {
+                "id": "R1",
+                "description": "Create an item through POST /items",
+                "actor": "operator",
+                "ears_criteria": [
+                    {
+                        "id": "R1-C1",
+                        "pattern": "event_driven",
+                        "condition": "an operator posts an item",
+                        "outcome": "persist it and return HTTP 201 within 200 ms",
+                    }
+                ],
+            }
+        ],
+        "out_of_scope": ["bulk import"],
+        "constraints": ["python 3.13"],
+        "test_seams": ["POST /items", "GET /items/{item_id}"],
+    }
+    provider = MockLLMProvider(responses=[LLMResponse(content=json.dumps(draft))])
+    align = AlignStage(store=store, provider=provider, workspace_root=tmp_path)
+
+    spec = align.propose_spec(
+        run_id=run_id,
+        raw_goal="Operators manage inventory through a REST API",
+        strict_canonical=True,
+        max_steps=1,
+    )
+
+    assert spec.test_seams == ["POST /items", "GET /items/{item_id}"]
+    assert "- POST /items" in spec.to_markdown()
+    saved = store.get_run(run_id)["spec"]
+    assert saved is not None
+    assert saved.test_seams == spec.test_seams
+    assert saved.content_hash == spec.content_hash
+    strict_user_prompt = provider.recorded_requests[0][0][1].content
+    assert "highest-level public seams" in strict_user_prompt
+
+
+def test_strict_align_missing_test_seams_blocks_normal_confirm_spec(tmp_path: Path) -> None:
+    from olympus.core.control import RunControl
+
+    store = RunStore(tmp_path / "strict-align-block.db")
+    run_id = store.create_run(title="Strict align missing seams")
+    missing_seams_draft = _canonical_spec().model_dump(exclude={"content_hash", "status"})
+    missing_seams_draft["test_seams"] = []
+    provider = MockLLMProvider(
+        responses=[
+            LLMResponse(content=json.dumps(missing_seams_draft)),
+            LLMResponse(content=json.dumps(missing_seams_draft)),
+        ]
+    )
+    align = AlignStage(store=store, provider=provider, workspace_root=tmp_path)
+    align.propose_spec(
+        run_id=run_id,
+        raw_goal="Operators manage inventory through a REST API",
+        strict_canonical=True,
+        max_steps=1,
+    )
+
+    control = RunControl(store)
+    with pytest.raises(ValueError, match="test_seams"):
+        control.confirm_spec(run_id)
+
+    repaired = store.get_run(run_id)["spec"]
+    assert repaired is not None
+    store.save_spec(
+        run_id,
+        repaired.model_copy(update={"test_seams": ["POST /items"]}),
+        actor="zeus",
+    )
+    confirmed = control.confirm_spec(run_id)
+    assert confirmed.test_seams == ["POST /items"]
+
+
+def test_spec_context_freezes_test_seams_for_downstream_roles() -> None:
+    context = _format_spec_context(_canonical_spec())
+    seams_line = 'Test seams (verify behavior at these public boundaries): ["POST /items", '
+    assert seams_line + '"GET /items/{item_id}"]' in context
+
+    legacy = _canonical_spec().model_copy(update={"test_seams": []})
+    assert (
+        "Test seams (verify behavior at these public boundaries): []"
+        in _format_spec_context(legacy)
+    )
 
 
 def test_goal_spec_gate_reports_unresolved_blockers() -> None:

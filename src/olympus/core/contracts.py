@@ -173,12 +173,19 @@ class GoalSpec(FingerprintedModel):
     deliverable_kind: DeliverableKind | None = None
     observable_surfaces: list[str] = Field(default_factory=list)
     actors: list[str] = Field(default_factory=list)
+    test_seams: list[str] = Field(
+        default_factory=list,
+        description="Fewest, highest-level public seams (HTTP routes, CLI commands, public "
+        "APIs) where behavior is verified.",
+    )
 
     def _hash_payload(self) -> dict[str, Any]:
-        """Keep existing approvals valid when provenance is absent."""
+        """Drop empty optional fields so legacy approvals keep identical hashes."""
         payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
         if not self.agent_high_impact_assumptions:
             del payload["agent_high_impact_assumptions"]
+        if not self.test_seams:
+            del payload["test_seams"]
         return payload
 
     @model_validator(mode="after")
@@ -201,9 +208,12 @@ class GoalSpec(FingerprintedModel):
             "",
             self.goal,
             "",
-            "## Requirements",
-            "",
         ]
+        if self.test_seams:
+            lines.extend(["## Test seams", ""])
+            lines.extend(f"- {seam}" for seam in self.test_seams)
+            lines.append("")
+        lines.extend(["## Requirements", ""])
         for req in self.requirements:
             actor = f" [{req.actor}]" if req.actor else ""
             lines.append(f"### {req.id}{actor}")

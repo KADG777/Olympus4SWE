@@ -535,7 +535,7 @@ def test_review_marks_explicit_agent_assumptions_and_preserves_legacy_fingerprin
     store = RunStore(tmp_path / "test.db")
     run_id = _seed_gated_run(store)
     payload = store.get_run(run_id)["spec"].model_dump(
-        exclude={"content_hash", "status", "agent_high_impact_assumptions"}
+        exclude={"content_hash", "status", "agent_high_impact_assumptions", "test_seams"}
     )
     payload["assumptions"] = ["首版只开放给管理员", "高峰 200 QPS"]
     legacy = GoalSpec.model_validate(payload)

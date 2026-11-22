@@ -33,6 +33,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import RunControl, is_plan_bound_to_upstream
 from olympus.core.dag import (
+    VERTICAL_SLICE_TOPOLOGIES,
     PlanValidationError,
     compute_dispatchable_tasks,
     scopes_overlap,
@@ -79,7 +80,8 @@ if TYPE_CHECKING:
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
 Rules:
-1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable.
+1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable
+   (unless vertical tracer-bullet slicing applies).
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
 4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
@@ -104,10 +106,18 @@ Rules:
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
 Rules:
-1. Read relevant files first using absolute paths under the sandbox root.
-2. Only write or edit files inside your assigned write_scope.
-3. Run tests/checks with run_bash and observe actual outputs before finishing.
-4. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
+1. Work seam-first and vertically: write one failing seam test at the highest observable boundary
+   (public API, CLI, or route) for the first acceptance criterion, add the minimal clean
+   implementation that makes it pass, then repeat for the next criterion.
+2. Keep the implementation deep and minimal: add no speculative abstractions, wrappers, or
+   configuration layers for hypothetical callers, and write no implementation-coupled or
+   tautological tests that merely restate the code under test.
+3. Prefer native file read/search/edit tools, batching independent reads, searches, and edits in
+   one turn, instead of serial shell `cat`/`sed`/`grep`/`find` probes; reserve shell execution for
+   running tests, linters, and builds.
+4. Read relevant files first using absolute paths under the sandbox root, and only write or edit
+   files inside your assigned write_scope.
+5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding."""
 
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
@@ -171,7 +181,7 @@ def _copy_matching_scope(
 
 
 def _format_spec_context(spec: GoalSpec) -> str:
-    """Format constraints, assumptions, and resolved Stage 1 clarifications for Stage 2 roles."""
+    """Format constraints, assumptions, test seams, and clarifications for Stage 2 roles."""
     clarifications = [
         {"id": amb.id, "question": amb.question, "answer": amb.answer}
         for amb in spec.open_ambiguities
@@ -185,6 +195,8 @@ def _format_spec_context(spec: GoalSpec) -> str:
     lines = [
         f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
         f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+        "Test seams (verify behavior at these public boundaries): "
+        f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
         f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
     ]
     if unresolved:
@@ -436,6 +448,26 @@ Modular product decomposition (topology={topology}):
 """
 
 
+_VERTICAL_PLANNER_GUIDANCE = """
+Vertical tracer-bullet decomposition (topology={topology}):
+- If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
+  `kind='contract'` task owning those paths before Slice 1.
+- Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
+  the smallest vertical path that wires core storage/logic to one observable user-facing seam
+  named by GoalSpec.test_seams or observable_surfaces, with at least one executable
+  kind='command' seam check proving the path runs.
+- Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
+  each delivers exactly one observable capability end to end (its storage/logic plus seam
+  wiring) and carries its own executable kind='command' seam test.
+- NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
+  routes/templates/static wave, and no bulk test-only wave after unverified code waves.
+- NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,
+  4+ top-level scopes, or 4+ requirements across 4+ write scopes; split into vertical slices.
+- Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
+  have strictly disjoint write_scope.
+"""
+
+
 class _ReviewOutputError(ValueError):
     pass
 
@@ -543,8 +575,9 @@ class OrchestrateStage:
         """Generate and deterministically validate a TaskPlan.
 
         Accepts an approved DesignSpec (with or without a GoalSpec) or, for backward
-        compatibility, an approved GoalSpec alone. ``modular_product``/``tdd_first``
-        topologies decompose the design's modules into Wave 0/1/2 tasks.
+        compatibility, an approved GoalSpec alone. ``modular_product`` decomposes the design's
+        modules into Wave 0/1/2 tasks, while ``tdd_first``/``vertical_slices`` slice the design
+        into vertical tracer-bullet user stories.
         """
         snap = self.store.get_run(run_id)
         design: DesignSpec | None = snap["design"] if use_design else None
@@ -562,7 +595,14 @@ class OrchestrateStage:
         else:
             spec = self._require_confirmed_spec(run_id)
 
-        modular = topology in ("modular_product", "tdd_first") and design is not None
+        vertical = topology in VERTICAL_SLICE_TOPOLOGIES
+        modular = design is not None and (topology == "modular_product" or vertical)
+        if vertical:
+            guidance_block = _VERTICAL_PLANNER_GUIDANCE.format(topology=topology)
+        elif modular:
+            guidance_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+        else:
+            guidance_block = ""
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -592,7 +632,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
-            modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
             design_paths = [
                 p for mod in design.modules for p in mod.target_paths
             ] + list(design.shared_contract_paths)
@@ -609,7 +648,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             )
-            modular_block = ""
 
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
@@ -624,7 +662,7 @@ class OrchestrateStage:
             "Run these commands against the composed delivery after task execution. "
             "Omit conditions without a reliable executable check. Task checks are separate.\n"
             f"{context_block}"
-            f"{modular_block}"
+            f"{guidance_block}"
             f"{chr(10).join(binding_lines)}\n"
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
         )
@@ -638,13 +676,14 @@ class OrchestrateStage:
                 spec=spec,
                 design=design if modular else None,
                 workspace_root=self.workspace_root,
+                topology=topology,
             )
 
         def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
             raise PlanValidationError(violations)
 
         plan = loop.run_structured(
-            system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
+            system_prompt=_PLANNER_SYSTEM_PROMPT + guidance_block,
             user_prompt=base_prompt,
             model_cls=TaskPlan,
             max_validation_retries=2,

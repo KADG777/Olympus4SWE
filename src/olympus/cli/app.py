@@ -238,6 +238,9 @@ def cmd_workflows(
 def cmd_plan(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
     auto_approve: Annotated[bool, typer.Option("--auto-approve")] = False,
+    topology: Annotated[
+        str | None, typer.Option("--topology", help="Override workflow topology.")
+    ] = None,
     workspace: WorkspaceOpt = None,
     db: DbOpt = None,
     provider: ProviderOpt = "auto",
@@ -245,11 +248,28 @@ def cmd_plan(
     base_url: BaseUrlOpt = None,
 ) -> None:
     """Stage 2: Generate and validate TaskPlan DAG from confirmed GoalSpec."""
+    from olympus.graph import load_workflow
+
     ws = _resolve_workspace(workspace)
     store = RunStore(_resolve_db(ws, db))
+    effective_topology = topology
+    if effective_topology is None:
+        snap = store.get_run(run_id)
+        workflow_name = snap.get("workflow_name")
+        if workflow_name:
+            try:
+                effective_topology = load_workflow(str(workflow_name)).topology
+            except (FileNotFoundError, ValueError):
+                effective_topology = "minimal_patch"
+        else:
+            effective_topology = "minimal_patch"
     llm = build_provider(provider=provider, model=model, base_url=base_url)
     stage = OrchestrateStage(store=store, provider=llm, workspace_root=ws)
-    plan = stage.propose_plan(run_id=run_id, auto_approve=auto_approve)
+    plan = stage.propose_plan(
+        run_id=run_id,
+        auto_approve=auto_approve,
+        topology=effective_topology,
+    )
     typer.echo(json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
 
 
