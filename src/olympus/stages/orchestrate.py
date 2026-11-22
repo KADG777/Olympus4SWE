@@ -446,6 +446,24 @@ Modular product decomposition (topology={topology}):
 """
 
 
+_VERTICAL_PLANNER_GUIDANCE = """
+Vertical tracer-bullet decomposition (topology={topology}):
+- Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
+  the smallest vertical path that wires core storage/logic to one observable user-facing seam
+  named by GoalSpec.test_seams or observable_surfaces, with at least one executable
+  kind='command' seam check (CheckKind.COMMAND) proving the path runs.
+- Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
+  each delivers exactly one observable capability end to end (its storage/logic plus seam
+  wiring) and carries its own executable kind='command' seam test.
+- NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
+  routes/templates/static wave, and no bulk test-only wave after unverified code waves.
+- NEVER emit a catch-all mega-ticket that owns every design module or four or more write
+  scopes; split that work into vertical slices.
+- Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
+  have strictly disjoint write_scope.
+"""
+
+
 class _ReviewOutputError(ValueError):
     pass
 
@@ -553,8 +571,9 @@ class OrchestrateStage:
         """Generate and deterministically validate a TaskPlan.
 
         Accepts an approved DesignSpec (with or without a GoalSpec) or, for backward
-        compatibility, an approved GoalSpec alone. ``modular_product``/``tdd_first``
-        topologies decompose the design's modules into Wave 0/1/2 tasks.
+        compatibility, an approved GoalSpec alone. ``modular_product`` decomposes the design's
+        modules into Wave 0/1/2 tasks, while ``tdd_first``/``vertical_slices`` slice the design
+        into vertical tracer-bullet user stories.
         """
         snap = self.store.get_run(run_id)
         design: DesignSpec | None = snap["design"] if use_design else None
@@ -572,7 +591,11 @@ class OrchestrateStage:
         else:
             spec = self._require_confirmed_spec(run_id)
 
-        modular = topology in ("modular_product", "tdd_first") and design is not None
+        vertical = topology in ("tdd_first", "vertical_slices")
+        modular = design is not None and (topology == "modular_product" or vertical)
+        guidance_block = (
+            _VERTICAL_PLANNER_GUIDANCE.format(topology=topology) if vertical else ""
+        )
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -602,7 +625,8 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
-            modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+            if not vertical:
+                guidance_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
             design_paths = [
                 p for mod in design.modules for p in mod.target_paths
             ] + list(design.shared_contract_paths)
@@ -619,7 +643,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             )
-            modular_block = ""
 
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
@@ -634,7 +657,7 @@ class OrchestrateStage:
             "Run these commands against the composed delivery after task execution. "
             "Omit conditions without a reliable executable check. Task checks are separate.\n"
             f"{context_block}"
-            f"{modular_block}"
+            f"{guidance_block}"
             f"{chr(10).join(binding_lines)}\n"
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
         )
@@ -648,13 +671,14 @@ class OrchestrateStage:
                 spec=spec,
                 design=design if modular else None,
                 workspace_root=self.workspace_root,
+                topology=topology,
             )
 
         def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
             raise PlanValidationError(violations)
 
         plan = loop.run_structured(
-            system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
+            system_prompt=_PLANNER_SYSTEM_PROMPT + guidance_block,
             user_prompt=base_prompt,
             model_cls=TaskPlan,
             max_validation_retries=2,

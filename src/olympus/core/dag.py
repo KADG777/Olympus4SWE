@@ -835,14 +835,126 @@ def _validate_command_syntax_and_deps(
     return violations
 
 
+_VERTICAL_SLICE_TOPOLOGIES = frozenset({"tdd_first", "vertical_slices"})
+
+# A monolithic sink must be broad on every axis at once: path scope plus either requirement
+# spread or whole-design module ownership. One wide axis alone is a legitimate vertical slice.
+_MONOLITH_MIN_SCOPES = 4
+_MONOLITH_MIN_REQUIREMENTS = 4
+_MONOLITH_MIN_MODULES = 3
+
+
+def _has_executable_command(task: TaskNode) -> bool:
+    return any(
+        check.kind == CheckKind.COMMAND and (check.command or "").strip()
+        for check in task.acceptance_checks
+    )
+
+
+def _is_human_gate_task(task: TaskNode) -> bool:
+    return all(check.kind == CheckKind.HUMAN for check in task.acceptance_checks)
+
+
+def _monolithic_sink_reason(
+    task: TaskNode,
+    *,
+    module_ids: set[str],
+    requirement_ids: set[str],
+) -> str | None:
+    owned_modules = set(task.design_refs) & module_ids
+    owned_requirements = set(task.requirement_refs) & requirement_ids
+    scopes = {scope.strip().rstrip("/") for scope in task.write_scope}
+    wide_scope = len(scopes) >= _MONOLITH_MIN_SCOPES
+    wide_requirements = len(owned_requirements) >= _MONOLITH_MIN_REQUIREMENTS
+    wide_modules = len(owned_modules) >= _MONOLITH_MIN_MODULES
+    if not (wide_scope and (wide_requirements or wide_modules)):
+        return None
+    return (
+        f"owns {len(owned_modules)} design module(s), {len(owned_requirements)} requirement(s) "
+        f"across {len(scopes)} write scopes"
+    )
+
+
+def _validate_vertical_slices(
+    plan: TaskPlan,
+    spec: GoalSpec | None,
+    design: DesignSpec | None,
+    ancestors: dict[str, set[str]],
+) -> list[str]:
+    """0-token gate: every vertical slice ships its own executable seam verification."""
+    violations: list[str] = []
+    by_id = {task.task_id: task for task in plan.tasks}
+
+    for task in plan.tasks:
+        if task.kind not in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE):
+            continue
+        if _is_human_gate_task(task) or _has_executable_command(task):
+            continue
+        violations.append(
+            f"Vertical slice {task.task_id} ({task.kind.value}) has no executable kind='command' "
+            "acceptance check; every implementation slice must verify its user-facing seam "
+            "end to end (CheckKind.COMMAND)."
+        )
+
+    for task in plan.tasks:
+        if task.kind != TaskKind.TEST:
+            continue
+        deferred: list[str] = []
+        for ancestor_id in sorted(ancestors.get(task.task_id, set())):
+            upstream = by_id.get(ancestor_id)
+            if (
+                upstream is not None
+                and upstream.kind == TaskKind.IMPLEMENT
+                and not _is_human_gate_task(upstream)
+                and not _has_executable_command(upstream)
+            ):
+                deferred.append(ancestor_id)
+        if deferred:
+            violations.append(
+                f"Task {task.task_id} (test) horizontally defers verification: upstream "
+                f"implement task(s) {', '.join(deferred)} carry no executable kind='command' "
+                "check; move the seam test into each vertical slice."
+            )
+
+    if (
+        spec is not None
+        and design is not None
+        and len(spec.requirements) >= _MONOLITH_MIN_REQUIREMENTS
+        and len(design.modules) >= _MONOLITH_MIN_MODULES
+    ):
+        module_ids = {module.id for module in design.modules}
+        requirement_ids = {requirement.id for requirement in spec.requirements}
+        for task in plan.tasks:
+            if task.kind not in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE):
+                continue
+            if _is_human_gate_task(task):
+                continue
+            reason = _monolithic_sink_reason(
+                task, module_ids=module_ids, requirement_ids=requirement_ids
+            )
+            if reason is not None:
+                violations.append(
+                    f"Task {task.task_id} ({task.kind.value}) is an un-sliced monolithic sink: it "
+                    f"{reason}; split it into vertical user-story slices, each ending in its own "
+                    "executable seam check."
+                )
+
+    return violations
+
+
 def validate_plan(
     plan: TaskPlan,
     spec: GoalSpec | None = None,
     *,
     design: DesignSpec | None = None,
     workspace_root: Path | str | None = None,
+    topology: str | None = None,
 ) -> list[str]:
-    """Validate structural DAG properties, spec coverage, and concurrent write_scope isolation."""
+    """Validate structural DAG properties, spec coverage, and concurrent write_scope isolation.
+
+    ``topology`` enables the 0-token vertical-slicing gate for ``tdd_first``/``vertical_slices``;
+    any other value (including ``None``) leaves validation unchanged.
+    """
     violations: list[str] = []
     host_root_pattern: re.Pattern[str] | None = None
     host_root_display = ""
@@ -998,6 +1110,10 @@ def validate_plan(
 
     violations.extend(_validate_command_syntax_and_deps(plan.tasks, ancestors))
 
+    if topology in _VERTICAL_SLICE_TOPOLOGIES:
+        vertical_ancestors = ancestors if ancestors is not None else _build_ancestors(plan.tasks)
+        violations.extend(_validate_vertical_slices(plan, spec, design, vertical_ancestors))
+
     return violations
 
 
@@ -1007,8 +1123,15 @@ def assert_valid_plan(
     *,
     design: DesignSpec | None = None,
     workspace_root: Path | str | None = None,
+    topology: str | None = None,
 ) -> None:
-    violations = validate_plan(plan, spec=spec, design=design, workspace_root=workspace_root)
+    violations = validate_plan(
+        plan,
+        spec=spec,
+        design=design,
+        workspace_root=workspace_root,
+        topology=topology,
+    )
     if violations:
         raise PlanValidationError(violations)
 

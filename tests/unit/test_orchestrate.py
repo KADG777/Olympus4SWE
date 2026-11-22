@@ -33,6 +33,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.dag import PlanValidationError, validate_plan
 from olympus.core.store import RunStore
 from olympus.harness.driver import (
     ActiveTurnHandle,
@@ -631,6 +632,173 @@ def test_propose_plan_repairs_broken_inline_python_check_via_validation_loop(
     assert "[PLAN VALIDATION FAILED]" in calls[1]
     assert "invalid Python syntax" in calls[1]
     assert plan.tasks[0].acceptance_checks[0].command == "python -m pytest -q"
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_propose_plan_injects_vertical_tracer_bullet_guidance(
+    tmp_path: Path, topology: str
+) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        prompts.append(messages[0].content)
+        return LLMResponse(
+            content=json.dumps(
+                _plan_payload(
+                    spec_id=spec.spec_id,
+                    spec_hash=spec.content_hash,
+                    file_name="feature.py",
+                    checks=[
+                        {
+                            "id": "CHK-SEAM",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Exercise the seam",
+                            "command": "python -m pytest -q",
+                        }
+                    ],
+                )
+            )
+        )
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    plan = orch.propose_plan(run_id=run_id, topology=topology)
+    assert len(prompts) == 1
+    assert "Vertical tracer-bullet decomposition" in prompts[0]
+    assert "tracer bullet" in prompts[0].lower()
+    assert "depends_on" in prompts[0]
+    assert "CheckKind.COMMAND" in prompts[0]
+    assert plan.tasks[0].kind == TaskKind.IMPLEMENT
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_propose_plan_vertical_topologies_reject_slices_without_command(
+    tmp_path: Path, topology: str
+) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    review_only = {
+        "id": "CHK-REV",
+        "kind": CheckKind.INDEPENDENT_REVIEW.value,
+        "description": "Cold review only",
+    }
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        return LLMResponse(
+            content=json.dumps(
+                _plan_payload(
+                    spec_id=spec.spec_id,
+                    spec_hash=spec.content_hash,
+                    file_name="feature.py",
+                    checks=[review_only],
+                )
+            )
+        )
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    with pytest.raises(PlanValidationError, match="command"):
+        orch.propose_plan(run_id=run_id, topology=topology)
+
+    # The same code-only plan stays legal for the legacy minimal_patch topology.
+    legacy = orch.propose_plan(run_id=run_id)
+    assert legacy.tasks[0].acceptance_checks[0].kind == CheckKind.INDEPENDENT_REVIEW
+
+
+def test_propose_plan_legacy_topologies_keep_their_guidance(tmp_path: Path) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    spec_only_prompts: list[str] = []
+    modular_prompts: list[str] = []
+
+    def _plan_for(*, with_design: bool) -> dict[str, Any]:
+        task: dict[str, Any] = {
+            "task_id": "T1",
+            "title": "Implement the flag module",
+            "objective": "Create feature.py",
+            "requirement_refs": ["R1"],
+            "write_scope": ["src/feature.py"],
+            "acceptance_checks": [
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Smoke",
+                    "command": "python -m pytest -q",
+                }
+            ],
+        }
+        payload: dict[str, Any] = {
+            "plan_id": "plan-guidance",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [task],
+        }
+        if with_design:
+            task["design_refs"] = ["M1"]
+        return payload
+
+    def spec_only_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        spec_only_prompts.append(messages[0].content)
+        return LLMResponse(content=json.dumps(_plan_for(with_design=False)))
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=spec_only_responder),
+        workspace_root=tmp_path,
+    )
+    orch.propose_plan(run_id=run_id, topology="minimal_patch")
+    assert len(spec_only_prompts) == 1
+    assert "Vertical tracer-bullet decomposition" not in spec_only_prompts[0]
+
+    design = _contract_design(spec, shared_paths=[])
+    store.save_design(run_id, design, actor="design")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+    def modular_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        modular_prompts.append(messages[0].content)
+        return LLMResponse(content=json.dumps(_plan_for(with_design=True)))
+
+    modular_orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=modular_responder),
+        workspace_root=tmp_path,
+    )
+    modular_orch.propose_plan(run_id=run_id, topology="modular_product")
+    assert len(modular_prompts) == 1
+    assert "Modular product decomposition" in modular_prompts[0]
+    assert "Vertical tracer-bullet decomposition" not in modular_prompts[0]
+
 
 
 def test_timeout_retry_is_visible_while_an_independent_task_completes(tmp_path: Path) -> None:
@@ -3455,6 +3623,201 @@ def test_worker_system_prompt_is_harness_agnostic_seam_first_and_anti_bloat() ->
     assert "shell execution" in lowered
     for probe in ("`cat`", "`sed`", "`grep`", "`find`"):
         assert probe in prompt
+
+
+class _SliceDriver:
+    """Write each vertical slice's files into its sandbox without LLM turns."""
+
+    name = "slices"
+
+    def __init__(self, files: dict[str, dict[str, str]]) -> None:
+        self._files = files
+        self.turns: list[str] = []
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        task_id = request.task_id
+        assert task_id is not None and task_id in self._files
+        self.turns.append(task_id)
+        for rel_path, content in self._files[task_id].items():
+            target = request.workspace_path / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content=f"{task_id} implemented",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _vertical_slice_fixture() -> tuple[GoalSpec, DesignSpec, TaskPlan]:
+    spec = GoalSpec(
+        spec_id="spec-vertical",
+        goal="Grow an inventory through vertical slices",
+        requirements=[
+            {
+                "id": requirement_id,
+                "description": f"Deliver capability {requirement_id}",
+                "acceptance_criteria": ["Works end to end"],
+            }
+            for requirement_id in ("R1", "R2", "R3", "R4")
+        ],
+    )
+    design = DesignSpec.model_validate(
+        {
+            "design_id": "design-vertical",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "One storage core with two feature modules.",
+            "modules": [
+                {
+                    "id": "M1",
+                    "name": "Core",
+                    "responsibility": "Storage and entrypoint",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["store.py", "app.py"],
+                },
+                {
+                    "id": "M2",
+                    "name": "Items",
+                    "responsibility": "Item capability",
+                    "requirement_refs": ["R2", "R3"],
+                    "target_paths": ["feature_items.py"],
+                },
+                {
+                    "id": "M3",
+                    "name": "Count",
+                    "responsibility": "Count capability",
+                    "requirement_refs": ["R4"],
+                    "target_paths": ["feature_count.py"],
+                },
+            ],
+        }
+    )
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-vertical",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "design_id": design.design_id,
+            "design_hash": design.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1-skeleton",
+                    "title": "Runnable skeleton",
+                    "objective": "Wire storage into one observable seam",
+                    "requirement_refs": ["R1"],
+                    "design_refs": ["M1"],
+                    "write_scope": ["store.py", "app.py", "test_app.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Seam returns a missing item",
+                            "command": (
+                                "python3 -c 'import app; assert app.get_item(\"missing\") is None'"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T2-items",
+                    "title": "Items slice",
+                    "objective": "Deliver the item capability end to end",
+                    "requirement_refs": ["R2", "R3"],
+                    "design_refs": ["M2"],
+                    "depends_on": ["T1-skeleton"],
+                    "write_scope": ["feature_items.py", "test_feature_items.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T2-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Item round trips through storage",
+                            "command": (
+                                "python3 -c 'import feature_items; "
+                                "assert feature_items.add_item(\"a\", 1) == 1'"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T3-count",
+                    "title": "Count slice",
+                    "objective": "Deliver the count capability end to end",
+                    "requirement_refs": ["R4"],
+                    "design_refs": ["M3"],
+                    "depends_on": ["T1-skeleton"],
+                    "write_scope": ["feature_count.py", "test_feature_count.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T3-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Count reads the storage core",
+                            "command": (
+                                "python3 -c 'import feature_count; "
+                                "assert feature_count.count() == 0'"
+                            ),
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    return spec, design, plan
+
+
+def test_vertical_three_slice_tracer_bullet_dag_completes_end_to_end(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Vertical tracer bullet", mode=RunMode.EXECUTION)
+    spec, design, plan = _vertical_slice_fixture()
+    store.save_spec(run_id, spec)
+    align = AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path)
+    align.confirm_spec(run_id=run_id, approver="zeus")
+    assert validate_plan(plan, spec=spec, design=design, topology="vertical_slices") == []
+    _approve_plan(store, run_id, plan, design=design)
+
+    driver = _SliceDriver(
+        {
+            "T1-skeleton": {
+                "store.py": "ITEMS: dict[str, int] = {}\n",
+                "app.py": "from store import ITEMS\n\n\ndef get_item(key: str) -> int | None:\n"
+                "    return ITEMS.get(key)\n",
+                "test_app.py": "def test_skeleton() -> None:\n    assert True\n",
+            },
+            "T2-items": {
+                "feature_items.py": "from store import ITEMS\n\n\ndef add_item("
+                "key: str, value: int) -> int:\n    ITEMS[key] = value\n"
+                "    return ITEMS[key]\n",
+                "test_feature_items.py": "def test_items() -> None:\n    assert True\n",
+            },
+            "T3-count": {
+                "feature_count.py": "from store import ITEMS\n\n\ndef count() -> int:\n"
+                "    return len(ITEMS)\n",
+                "test_feature_count.py": "def test_count() -> None:\n    assert True\n",
+            },
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="slices"),
+        driver_registry=DriverRegistry({"slices": driver}),
+    )
+    final = stage.run_execution(run_id=run_id)
+    assert final["status"] == RunStatus.COMPLETED
+    assert {task.status for task in final["plan"].tasks} == {TaskStatus.ACCEPTED}
+    assert set(driver.turns) == {"T1-skeleton", "T2-items", "T3-count"}
+    assert driver.turns[0] == "T1-skeleton"
 
 
 

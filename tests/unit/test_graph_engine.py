@@ -10,6 +10,7 @@ from olympus.graph.engine import (
     END,
     START,
     Graph,
+    GraphPaused,
     GraphStateCollision,
     GraphVisitLimitError,
     Node,
@@ -235,3 +236,63 @@ def test_workflow_path_loading_and_unknown_node_types(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         load_workflow("no_such_workflow")
+
+
+def test_validate_plan_node_enforces_topology_from_workflow_state(tmp_path) -> None:
+    from olympus.core.contracts import GoalSpec, RequirementItem, TaskPlan
+    from olympus.core.store import RunStore
+    from olympus.graph.loader import WorkflowRuntime, _node_validate_plan
+    from olympus.providers.base import MockLLMProvider
+
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Topology gate")
+    spec = GoalSpec(
+        goal="Ship one vertical slice",
+        requirements=[
+            RequirementItem(
+                id="R1", description="Deliver the capability", acceptance_criteria=["Works"]
+            )
+        ],
+    )
+    store.save_spec(run_id, spec)
+    plan = TaskPlan.model_validate(
+        {
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Code-only wave",
+                    "objective": "Implement without a seam check",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["src/app.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "C1",
+                            "kind": "independent_review",
+                            "description": "Cold review only",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    store.save_plan(run_id, plan)
+    runtime = WorkflowRuntime(
+        store=store,
+        workspace_root=tmp_path,
+        artifacts_root=tmp_path / ".olympus",
+        provider=MockLLMProvider(),
+        topology="modular_product",
+    )
+
+    with pytest.raises(GraphPaused, match="command"):
+        _node_validate_plan(
+            {"run_id": run_id, "topology": "tdd_first", "_runtime": runtime}, {}
+        )
+    assert (
+        _node_validate_plan(
+            {"run_id": run_id, "topology": "modular_product", "_runtime": runtime}, {}
+        )
+        == {"route": "ok"}
+    )
