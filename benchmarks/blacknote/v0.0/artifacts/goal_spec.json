@@ -1,0 +1,276 @@
+{
+  "content_hash": "sha256:5890b579369df437c141ade9375e079606b99f404057af3411b5155d72d2e1e9",
+  "spec_id": "blacknote-goal-spec-v1",
+  "version": 2,
+  "goal": "为 AI 工程师构建一个类小红书的社区平台 BlackNote：用户可以发布并浏览关于 AI 新闻、工具、产品等主题的图文笔记，并通过点赞、收藏、评论进行互动讨论。",
+  "requirements": [
+    {
+      "id": "R1-account",
+      "description": "账号体系：AI 工程师用户可注册、登录、登出，并维护含专业背景（如方向、公司/学校、擅长领域）的个人主页。",
+      "acceptance_criteria": [
+        "使用合法邮箱+密码注册成功后，可用同一凭证登录并进入信息流首页",
+        "重复邮箱注册被拒绝并给出明确提示，错误率 0%",
+        "登出后访问需登录页面会被重定向回登录页",
+        "个人主页展示用户名、简介、已发布笔记列表，更新资料后刷新即见新内容"
+      ],
+      "source_ref": "Raw user goal: 目标用户是 AI 工程师",
+      "actor": "AI 工程师用户",
+      "ears_criteria": [
+        {
+          "id": "R1-AC1",
+          "pattern": "event_driven",
+          "condition": "当用户提交有效的注册信息时",
+          "outcome": "系统创建账号并自动登录，跳转到信息流首页"
+        },
+        {
+          "id": "R1-AC2",
+          "pattern": "unwanted_behavior",
+          "condition": "当注册邮箱已被占用或密码低于 8 位时",
+          "outcome": "系统拒绝注册并在 1 秒内返回可读的错误提示"
+        },
+        {
+          "id": "R1-AC3",
+          "pattern": "event_driven",
+          "condition": "当用户编辑并保存个人资料时",
+          "outcome": "个人主页在下次加载时展示更新后的内容"
+        }
+      ]
+    },
+    {
+      "id": "R2-note-crud",
+      "description": "笔记发布与管理：用户可创建以图片+文字为主体的笔记（主题涵盖 AI 新闻/工具/产品），并编辑、删除自己的笔记。",
+      "acceptance_criteria": [
+        "发布包含标题、正文、至少 0 张图片、至少 1 个话题标签的笔记后，该笔记出现在作者主页与信息流中",
+        "编辑笔记后详情页与信息流在下次加载时反映最新内容",
+        "删除笔记后，该笔记从信息流、搜索、他人收藏外的公开列表中不再可见（返回 404 或等价提示）",
+        "非作者尝试编辑/删除他人笔记时被拒绝，成功率 0%"
+      ],
+      "source_ref": "Raw user goal: 类似小红书 + 讨论 AI 新闻/工具/产品",
+      "actor": "内容发布者",
+      "ears_criteria": [
+        {
+          "id": "R2-AC1",
+          "pattern": "event_driven",
+          "condition": "当作者提交合法的笔记内容（标题≤100字、正文≤10000字、图片≤9张）时",
+          "outcome": "系统保存笔记并在信息流中对其可见"
+        },
+        {
+          "id": "R2-AC2",
+          "pattern": "unwanted_behavior",
+          "condition": "当提交的笔记缺少标题或全部字段为空时",
+          "outcome": "系统拒绝发布并提示具体缺失字段"
+        },
+        {
+          "id": "R2-AC3",
+          "pattern": "state_driven",
+          "condition": "而笔记处于草稿状态时",
+          "outcome": "该笔记仅作者本人可见，不进入公共信息流"
+        },
+        {
+          "id": "R2-AC4",
+          "pattern": "unwanted_behavior",
+          "condition": "当非作者用户尝试修改或删除该笔记时",
+          "outcome": "系统拒绝操作并返回权限不足提示"
+        }
+      ]
+    },
+    {
+      "id": "R3-feed-discovery",
+      "description": "信息流与发现：提供按话题分类（新闻/工具/产品等）、标签检索和时间排序的内容浏览体验。",
+      "acceptance_criteria": [
+        "信息流默认按发布时间倒序分页展示，每页不少于 10 条且滚动加载下一页可用",
+        "点击任一话题分类后，列表中 100% 的笔记属于该分类",
+        "关键词搜索命中笔记标题或正文，无匹配时返回明确的空结果态",
+        "首屏信息流在典型数据量（≤1万条笔记）下 P95 响应时间 ≤ 2 秒"
+      ],
+      "source_ref": "Raw user goal: 一起在这个平台讨论 AI 新闻/工具/产品等等",
+      "actor": "AI 工程师用户",
+      "ears_criteria": [
+        {
+          "id": "R3-AC1",
+          "pattern": "event_driven",
+          "condition": "当用户打开信息流首页时",
+          "outcome": "系统按发布时间倒序返回第一页公开笔记"
+        },
+        {
+          "id": "R3-AC2",
+          "pattern": "event_driven",
+          "condition": "当用户选择某个话题分类或标签时",
+          "outcome": "系统仅展示匹配该话题/标签的笔记"
+        },
+        {
+          "id": "R3-AC3",
+          "pattern": "optional_feature",
+          "condition": "如果用户关注了某作者",
+          "outcome": "系统提供仅含关注作者笔记的关注流入口"
+        }
+      ]
+    },
+    {
+      "id": "R4-interactions",
+      "description": "互动讨论：支持对笔记点赞、收藏以及多层评论回复，形成围绕 AI 话题的讨论区。",
+      "acceptance_criteria": [
+        "同一用户对同一笔记重复点赞不叠加计数（幂等），取消点赞后计数减一",
+        "评论提交后立即出现在该笔记详情页，且支持对评论的回复形成线程",
+        "收藏的笔记在用户个人收藏夹中可再次访问，数量与操作记录一致",
+        "点赞/收藏/评论计数在任意两个用户视图中保持一致（误差为 0）"
+      ],
+      "source_ref": "Raw user goal: 希望大家能一起在这个平台讨论",
+      "actor": "AI 工程师用户",
+      "ears_criteria": [
+        {
+          "id": "R4-AC1",
+          "pattern": "event_driven",
+          "condition": "当已登录用户对某笔记点赞时",
+          "outcome": "笔记点赞数加一并持久化，重复点赞保持计数不变"
+        },
+        {
+          "id": "R4-AC2",
+          "pattern": "event_driven",
+          "condition": "当用户在笔记下提交评论或回复时",
+          "outcome": "评论按时间顺序展示并关联到对应父评论"
+        },
+        {
+          "id": "R4-AC3",
+          "pattern": "unwanted_behavior",
+          "condition": "当未登录访客尝试点赞、收藏或评论时",
+          "outcome": "系统引导其登录后再操作，且不写入任何数据"
+        },
+        {
+          "id": "R4-AC4",
+          "pattern": "unwanted_behavior",
+          "condition": "当评论内容为空或超过 2000 字时",
+          "outcome": "系统拒绝提交并提示长度限制"
+        }
+      ]
+    },
+    {
+      "id": "R5-moderation",
+      "description": "基础内容治理：管理员可下架违规笔记、屏蔽违规评论，保证社区讨论质量。",
+      "acceptance_criteria": [
+        "管理员下架笔记后，普通用户与访客在任何列表和直接链接中均不可见该内容",
+        "管理员删除评论后该评论及其子回复不再展示",
+        "非管理员账号无法访问任何管理操作入口（越权成功率 0%）"
+      ],
+      "source_ref": "Raw user goal: 社区平台隐含的治理需求（保守最小化）",
+      "actor": "平台管理员",
+      "ears_criteria": [
+        {
+          "id": "R5-AC1",
+          "pattern": "event_driven",
+          "condition": "当管理员对笔记执行下架操作时",
+          "outcome": "该笔记对所有非管理员视图立即隐藏"
+        },
+        {
+          "id": "R5-AC2",
+          "pattern": "unwanted_behavior",
+          "condition": "当非管理员用户尝试调用管理功能时",
+          "outcome": "系统拒绝请求并记录该次越权尝试"
+        }
+      ]
+    }
+  ],
+  "out_of_scope": [
+    "移动端原生 App 与小程序",
+    "私信/即时通讯功能",
+    "付费订阅、打赏、广告等商业化能力",
+    "算法个性化推荐引擎（本期仅提供时间序/分类/搜索排序）",
+    "第三方社交账号 OAuth 登录",
+    "AI 模型在线推理或 playground 类工具集成",
+    "邮件通知、站内消息推送等非核心通知渠道（除非澄清确认）"
+  ],
+  "constraints": [
+    "工作区为全新 Greenfield 项目，README 声明其为 AI 工程师社区平台的起点，无历史实现约束",
+    "基于现有 pyproject.toml 的项目元数据推进，Python 版本要求 >= 3.11",
+    "所有公开内容（笔记、评论）须区分作者身份，写操作仅限已登录用户"
+  ],
+  "assumptions": [
+    "交付形态为可通过浏览器访问的 Web 应用（类小红书的图文信息流体验），而非仅 REST API 或 CLI",
+    "笔记主体为图文（图片+文字+话题标签），话题固定包含 AI 新闻 / AI 工具 / AI 产品 三类并支持自定义标签",
+    "MVP 阶段使用内置邮箱+密码账号体系，管理员角色通过预置账号存在",
+    "数据存储采用服务端持久化数据库，用户内容与互动数据在服务重启后不丢失"
+  ],
+  "agent_high_impact_assumptions": [
+    "交付形态为可通过浏览器访问的 Web 应用（类小红书的图文信息流体验），而非仅 REST API 或 CLI",
+    "笔记主体为图文（图片+文字+话题标签），话题固定包含 AI 新闻 / AI 工具 / AI 产品 三类并支持自定义标签",
+    "MVP 阶段使用内置邮箱+密码账号体系，管理员角色通过预置账号存在",
+    "数据存储采用服务端持久化数据库，用户内容与互动数据在服务重启后不丢失"
+  ],
+  "open_ambiguities": [
+    {
+      "id": "A1-surface",
+      "question": "平台首期交付形态是什么？是完整的 Web 网站（前端页面 + 后端服务），还是先只做后端 API，或是需要同时覆盖 Web 与移动端？",
+      "impact": "直接决定 deliverable_kind、可测试界面与工作量范围；若仅 API 则无需页面级验收标准。",
+      "options": [
+        "完整 Web 应用（推荐默认）",
+        "仅 REST API 服务",
+        "Web + 移动端多端"
+      ],
+      "default_assumption": "首期交付完整 Web 应用，移动端不在范围内",
+      "blocking": true,
+      "answer": "首期交付完整 Web 应用，移动端不在范围内"
+    },
+    {
+      "id": "A2-post-format",
+      "question": "“类小红书”的笔记形态如何定义：是否以图片为主的图文笔记即可，还是需要支持长文、链接分享、代码片段粘贴等更适合 AI 工程师的内容形式？",
+      "impact": "决定笔记数据模型、编辑器复杂度与 R2 的验收标准；代码块/链接支持会显著改变发布器设计。",
+      "options": [
+        "图文笔记（图+文+标签）",
+        "图文 + 代码块/Markdown",
+        "图文 + 外部链接卡片（新闻/产品跳转）"
+      ],
+      "default_assumption": "图文笔记为主，正文支持 Markdown 渲染",
+      "blocking": true,
+      "answer": "图文笔记为主，正文支持 Markdown 渲染"
+    },
+    {
+      "id": "A3-moderation-scope",
+      "question": "内容治理需要做到什么程度：仅需管理员手动下架/删除，还是需要举报机制、敏感词过滤或自动化审核？",
+      "impact": "决定是否新增举报流程与过滤规则模块，影响 R5 的范围与测试用例数量。",
+      "options": [
+        "仅管理员手动处理（当前假设）",
+        "增加用户举报入口",
+        "增加敏感词/自动过滤"
+      ],
+      "default_assumption": "MVP 仅保留管理员手动下架/删除，不做自动审核",
+      "blocking": false,
+      "answer": "MVP 仅保留管理员手动下架/删除，不做自动审核"
+    }
+  ],
+  "minority_notes": [
+    {
+      "id": "C1-product-breadth",
+      "perspective": "product",
+      "severity": "warning",
+      "summary": "“讨论 AI 新闻/工具/产品”可能暗示除社区发帖外还需新闻聚合/工具目录等结构化内容模块；当前 spec 将其收敛为话题分类下的用户笔记，若产品意图是聚合型内容库则需扩展 R3。",
+      "evidence_refs": [
+        "README.md"
+      ],
+      "resolved": false,
+      "resolution_note": null
+    },
+    {
+      "id": "C2-engineering-image-storage",
+      "perspective": "engineering",
+      "severity": "warning",
+      "summary": "图片上传引入文件存储与静态资源服务依赖；若环境不允许外部对象存储，需明确本地磁盘存储及大小上限（如单图 ≤5MB），否则 R2 的图片验收标准不可测。",
+      "evidence_refs": [
+        "pyproject.toml"
+      ],
+      "resolved": false,
+      "resolution_note": null
+    }
+  ],
+  "status": "confirmed",
+  "deliverable_kind": "web_app",
+  "observable_surfaces": [
+    "Web 用户界面（注册/登录、信息流、笔记详情、发布编辑、个人主页）",
+    "支撑前端的 Web 服务接口响应（页面与数据返回可被浏览器/HTTP 客户端观测）"
+  ],
+  "actors": [
+    "AI 工程师用户（普通注册用户）",
+    "内容发布者（创建并维护自己笔记的用户）",
+    "访客（未登录浏览者）",
+    "平台管理员"
+  ]
+}
