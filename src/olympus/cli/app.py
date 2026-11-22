@@ -8,6 +8,7 @@ from typing import Annotated
 
 import typer
 
+from olympus.cli.session_cmd import session_app
 from olympus.core.contracts import RunMode, new_id
 from olympus.core.control import RunControl
 from olympus.core.store import NotFoundError, RunStore
@@ -22,6 +23,7 @@ app = typer.Typer(
     help="Olympus4SWE Agent-Native SWE system CLI.",
     no_args_is_help=True,
 )
+app.add_typer(session_app, name="session")
 
 WorkspaceOpt = Annotated[
     Path | None,

@@ -377,6 +377,7 @@ class OrchestrateStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
+        sandbox_root: Path | str | None = None,
         execution_drivers: ExecutionDriversConfig | None = None,
         driver_registry: DriverRegistry | None = None,
         model_provider: Callable[[str], LLMProvider] | None = None,
@@ -402,6 +403,7 @@ class OrchestrateStage:
             if artifacts_root is not None
             else self.workspace_root / ".olympus" / "runs"
         )
+        self.sandbox_root = Path(sandbox_root).resolve() if sandbox_root is not None else None
 
     def _native_driver(
         self, run_id: str, model: str | None, *, review: bool = False
@@ -877,6 +879,7 @@ class OrchestrateStage:
         sandbox = create_sandbox(
             self.workspace_root,
             label=f"{run_id}-{leased.task_id}-a{leased.attempt}",
+            sandbox_root=self.sandbox_root,
         )
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 

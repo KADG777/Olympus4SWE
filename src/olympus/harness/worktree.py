@@ -48,11 +48,24 @@ def is_git_repo(path: Path) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
-def create_sandbox(repo_root: Path | str, *, label: str) -> SandboxHandle:
-    """Create an isolated git worktree when inside a git repo, else copy workspace."""
+def create_sandbox(
+    repo_root: Path | str,
+    *,
+    label: str,
+    sandbox_root: Path | str | None = None,
+) -> SandboxHandle:
+    """Create an isolated git worktree when inside a git repo, else copy workspace.
+
+    ``sandbox_root`` keeps sandbox worktrees outside the target repository (the headless
+    session CLI externalizes all mutable state this way).
+    """
     root = Path(repo_root).resolve()
     safe_label = "".join(c if c.isalnum() or c in "-_" else "-" for c in label)
-    sandbox_dir = root / ".olympus" / "sandboxes" / safe_label
+    sandbox_dir = (
+        Path(sandbox_root).resolve() / safe_label
+        if sandbox_root is not None
+        else root / ".olympus" / "sandboxes" / safe_label
+    )
     if sandbox_dir.exists():
         remove_sandbox(SandboxHandle(root, sandbox_dir, None, is_git_repo(root)))
 
