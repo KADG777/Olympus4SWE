@@ -38,17 +38,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-try:  # pragma: no cover - the real classes exist only in benchmark environments
+_HarborBaseAgent: Any = None
+_HarborAgentContext: Any = None
+
+try:  # pragma: no cover - optional benchmark dependency
     from harbor.agents.base import BaseAgent as _HarborBaseAgent
-    from harbor.environments.base import BaseEnvironment as _HarborBaseEnvironment
     from harbor.models.agent.context import AgentContext as _HarborAgentContext
 
     HARBOR_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised by the default pytest venv
+except Exception:  # pragma: no cover - default pytest venv without harbor
     HARBOR_AVAILABLE = False
-    _HarborBaseAgent = None  # type: ignore[assignment]
-    _HarborBaseEnvironment = None  # type: ignore[assignment]
-    _HarborAgentContext = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 

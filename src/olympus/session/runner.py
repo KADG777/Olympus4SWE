@@ -197,7 +197,7 @@ class SessionRunner:
             )
         try:
             definition = load_workflow(snap["workflow_name"])
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 -- surface workflow load failure as SessionEnvelope
             return SessionEnvelope.failure(
                 error=str(exc),
                 run_id=run_id,
@@ -427,7 +427,7 @@ class SessionRunner:
         try:
             runtime = self._runtime(run_id, effective)
             graph = build_graph(effective)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 -- surface graph/runtime setup failure as SessionEnvelope
             return self._fail(run_id, exc)
         snap = self.store.get_run(run_id)
         state: dict[str, Any] = {
