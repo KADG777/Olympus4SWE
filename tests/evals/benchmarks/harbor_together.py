@@ -23,15 +23,18 @@ is importable the adapter subclasses the real ``harbor.agents.base.BaseAgent``.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
+import os
 import posixpath
 import re
 import shlex
 import tarfile
 import time
-from collections.abc import Callable, Mapping
+import tomllib
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -40,6 +43,10 @@ from typing import Any
 
 _HarborBaseAgent: Any = None
 _HarborAgentContext: Any = None
+_HarborCapabilities: Any = None
+_HarborModelConnectionSpec: Any = None
+_HarborProviderAccess: Any = None
+_HarborModelApiFormat: Any = None
 
 try:  # pragma: no cover - optional benchmark dependency
     from harbor.agents.base import BaseAgent as _HarborBaseAgent
@@ -49,7 +56,27 @@ try:  # pragma: no cover - optional benchmark dependency
 except Exception:  # pragma: no cover - default pytest venv without harbor
     HARBOR_AVAILABLE = False
 
+try:  # pragma: no cover - old Harbor releases predate capability declarations
+    from harbor.agents.capabilities import AgentCapabilities as _HarborCapabilities
+except Exception:  # pragma: no cover - fallback capability record below
+    _HarborCapabilities = None
+
+try:  # pragma: no cover - connection specs ship with newer Harbor releases
+    from harbor.agents import agent_auth_resolution as _harbor_auth
+    from harbor.models import model_api_format as _harbor_api_format
+
+    _HarborModelConnectionSpec = _harbor_auth.ModelConnectionSpec
+    _HarborProviderAccess = _harbor_auth.ProviderAccess
+    _HarborModelApiFormat = _harbor_api_format.ModelApiFormat
+except Exception:  # pragma: no cover - old Harbor resolves connections natively
+    _HarborModelConnectionSpec = None
+
 log = logging.getLogger(__name__)
+
+OLYMPUS_AGENT_IMPORT_PATH = (
+    "tests.evals.benchmarks.harbor_together:UserEnabledOlympusAgent"
+)
+_REDACTED = "***REDACTED***"
 
 _SESSION_STATUSES = frozenset({"needs_input", "completed", "failed"})
 _STOP_WORDS = frozenset({"stop", "done", "finish", "finished", "terminate", "exit"})
@@ -76,6 +103,14 @@ class _FallbackAgentContext:
 
     def __init__(self, metadata: dict[str, Any] | None = None) -> None:
         self.metadata = metadata
+
+
+@dataclass(frozen=True)
+class _FallbackCapabilities:
+    """Capability record compatible with ``harbor.agents.capabilities``."""
+
+    base_url: bool = True
+    atif: bool = True
 
 
 class _FallbackBaseAgent:
@@ -105,8 +140,6 @@ class _FallbackBaseAgent:
 BaseAgent: Any = _HarborBaseAgent if HARBOR_AVAILABLE else _FallbackBaseAgent
 AgentContext: Any = _HarborAgentContext if HARBOR_AVAILABLE else _FallbackAgentContext
 
-
-# --------------------------------------------------------------------------- diff capture
 
 DEFAULT_REPO_ROOTS = (
     "/workspace /opt /home /app /repo /tmp /entire-cli /entireio-cli /no-magic"
@@ -369,9 +402,6 @@ async def discover_repo_root(
     return matches[-1].strip() if matches else None
 
 
-# --------------------------------------------------------------------------- session contract
-
-
 @dataclass(frozen=True)
 class SessionEnvelopeView:
     """Parsed subset of ``olympus session``'s JSON envelope."""
@@ -592,10 +622,74 @@ def build_user_agent(
     )
 
 
+_SENSITIVE_ENV_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|passwd|credential|authorization|auth)"
+)
+_URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^/@\s]+@", re.IGNORECASE)
+_URL_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:api[_-]?key|key|token|access_token|auth|password|secret)=)[^&\s]+"
+)
+
+
+def redact_base_url(value: str) -> str:
+    """Strip URL userinfo and sensitive query values from a persisted base URL."""
+    redacted = _URL_USERINFO_RE.sub(r"\g<scheme>***@", value)
+    return _URL_SECRET_QUERY_RE.sub(rf"\g<1>{_REDACTED}", redacted)
+
+
+def collect_redaction_secrets(
+    env: Mapping[str, str] | None = None,
+    *,
+    minimum_length: int = 8,
+) -> frozenset[str]:
+    """Values of sensitive environment variables that must not reach logs."""
+    secrets: set[str] = set()
+    sources: tuple[Mapping[str, str], ...] = (env or {}, os.environ)
+    for source in sources:
+        for key, value in source.items():
+            text = str(value or "")
+            if (
+                text
+                and len(text) >= minimum_length
+                and _SENSITIVE_ENV_RE.search(str(key))
+            ):
+                secrets.add(text)
+    return frozenset(secrets)
+
+
+def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
+    """Redact URL credentials/tokens and known secret values from ``text``."""
+    if not text:
+        return text
+    redacted = redact_base_url(text)
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        redacted = redacted.replace(secret, _REDACTED)
+    return redacted
+
+
 class UserEnabledOlympusAgent(BaseAgent):
     """Harbor agent wrapping ``olympus session start/reply`` with a user simulator."""
 
-    SUPPORTS_ATIF: bool = True
+    capabilities = (
+        _HarborCapabilities(base_url=True, atif=True)
+        if _HarborCapabilities is not None
+        else _FallbackCapabilities()
+    )
+    if _HarborModelConnectionSpec is not None:
+        MODEL_CONNECTION = _HarborModelConnectionSpec(
+            base_url_destination_names={"default": None},
+            supported_api_formats=[
+                _HarborModelApiFormat.OPENAI_CHAT_COMPLETIONS,
+                _HarborModelApiFormat.OPENAI_RESPONSES,
+                _HarborModelApiFormat.ANTHROPIC_MESSAGES,
+            ],
+            agent_provider_access=_HarborProviderAccess(
+                api_key_candidate_names=["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+                base_url_candidate_names=["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"],
+            ),
+        )
+    if _HarborCapabilities is None:
+        SUPPORTS_ATIF: bool = True
 
     def __init__(
         self,
@@ -672,6 +766,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         driver_name = (self._worker_driver or "").split("@", 1)[0].strip().lower()
         self._needs_pi = bool(install_pi) if install_pi is not None else driver_name == "pi"
         self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
+        self._redaction_secrets = collect_redaction_secrets(self._extra_env)
 
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
@@ -712,7 +807,6 @@ class UserEnabledOlympusAgent(BaseAgent):
         except Exception:  # noqa: BLE001 - version reporting must never fail a trial
             return "unknown"
 
-    # ------------------------------------------------------------------ setup
 
     async def setup(self, environment: Any) -> None:
         """Install Olympus (and optional Pi) into the task container, tag base."""
@@ -721,7 +815,8 @@ class UserEnabledOlympusAgent(BaseAgent):
         (self.logs_dir / "setup-install.txt").write_text(
             f"return_code={install.return_code}\n"
             f"timed_out={install.timed_out}\n"
-            f"stdout:\n{install.stdout}\n\nstderr:\n{install.stderr}\n",
+            f"stdout:\n{redact_text(install.stdout, self._redaction_secrets)}\n\n"
+            f"stderr:\n{redact_text(install.stderr, self._redaction_secrets)}\n",
             encoding="utf-8",
         )
         if install.return_code != 0:
@@ -790,8 +885,9 @@ class UserEnabledOlympusAgent(BaseAgent):
         )
         result = await self._exec(environment, script, cwd="/", timeout_sec=900, env={})
         (self.logs_dir / "setup-pi.txt").write_text(
-            f"return_code={result.return_code}\nstdout:\n{result.stdout}\n\n"
-            f"stderr:\n{result.stderr}\n",
+            f"return_code={result.return_code}\n"
+            f"stdout:\n{redact_text(result.stdout, self._redaction_secrets)}\n\n"
+            f"stderr:\n{redact_text(result.stderr, self._redaction_secrets)}\n",
             encoding="utf-8",
         )
         if result.return_code != 0:
@@ -801,7 +897,6 @@ class UserEnabledOlympusAgent(BaseAgent):
                 (result.stderr or result.stdout).strip()[-1000:],
             )
 
-    # ------------------------------------------------------------------ run
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         """Drive the multi-turn Olympus session against the simulated user."""
@@ -880,7 +975,6 @@ class UserEnabledOlympusAgent(BaseAgent):
             self._write_atif(final_status=final_status, turns=turns)
             self._populate_context(context, final_status=final_status, turns=turns)
 
-    # ------------------------------------------------------------------ session execution
 
     def _session_command(self, action: str, *, message: str) -> str:
         args = [self._olympus_bin, "session", action]
@@ -981,7 +1075,6 @@ class UserEnabledOlympusAgent(BaseAgent):
     def _budget_exhausted(self) -> bool:
         return (time.monotonic() - self._start_time) >= self._trial_budget_sec
 
-    # ------------------------------------------------------------------ user simulation
 
     def _resolve_user_agent(self) -> Any:
         if self._user_agent is not None:
@@ -1041,7 +1134,6 @@ class UserEnabledOlympusAgent(BaseAgent):
             json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
 
-    # ------------------------------------------------------------------ diff capture
 
     async def _capture_git_diff(self, environment: Any, *, turn: int) -> None:
         try:
@@ -1087,21 +1179,26 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._last_turn_diff = truncate_diff_for_user_sim(incremental)
         self._last_cumulative_diff = cumulative
 
-    # ------------------------------------------------------------------ artifacts
 
     def _write_turn_artifacts(self, turn: int, command: str, outcome: ExecOutcome) -> None:
         directory = self.logs_dir / f"command-{turn}"
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "command.txt").write_text(command + "\n", encoding="utf-8")
+        (directory / "command.txt").write_text(
+            redact_text(command, self._redaction_secrets) + "\n", encoding="utf-8"
+        )
         (directory / "return-code.txt").write_text(
             str(outcome.return_code), encoding="utf-8"
         )
         if outcome.timed_out:
             (directory / "timed-out.txt").write_text("1\n", encoding="utf-8")
         if outcome.stdout:
-            (directory / "stdout.txt").write_text(outcome.stdout, encoding="utf-8")
+            (directory / "stdout.txt").write_text(
+                redact_text(outcome.stdout, self._redaction_secrets), encoding="utf-8"
+            )
         if outcome.stderr:
-            (directory / "stderr.txt").write_text(outcome.stderr, encoding="utf-8")
+            (directory / "stderr.txt").write_text(
+                redact_text(outcome.stderr, self._redaction_secrets), encoding="utf-8"
+            )
 
     def _record_message(
         self,
@@ -1204,6 +1301,452 @@ class UserEnabledOlympusAgent(BaseAgent):
             log.debug("could not attach Olympus metadata to AgentContext")
 
 
+_SYSTEM_USER_MESSAGE_PREFIXES = (
+    "[Request interrupted",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<task-",
+    "Base directory",
+)
+
+
+@dataclass
+class _FallbackTaskConfig:
+    path: Path
+
+
+@dataclass
+class _FallbackEnvironmentConfig:
+    type: str | None = None
+    delete: bool = True
+    force_build: bool = False
+
+
+@dataclass
+class _FallbackAgentConfig:
+    import_path: str | None = None
+    model_name: str | None = None
+    base_url: str | None = None
+    override_timeout_sec: float | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class _FallbackTrialConfig:
+    task: _FallbackTaskConfig
+    trials_dir: Path
+    agent: _FallbackAgentConfig
+    environment: _FallbackEnvironmentConfig
+    trial_name: str = ""
+
+
+def _harbor_config_classes() -> tuple[Any, Any, Any, Any, Any]:
+    try:
+        from harbor.models import environment_type as harbor_environment_type
+        from harbor.models.trial import config as harbor_trial_config
+    except ImportError:
+        return (
+            _FallbackAgentConfig,
+            _FallbackEnvironmentConfig,
+            _FallbackTaskConfig,
+            _FallbackTrialConfig,
+            None,
+        )
+    return (
+        harbor_trial_config.AgentConfig,
+        harbor_trial_config.EnvironmentConfig,
+        harbor_trial_config.TaskConfig,
+        harbor_trial_config.TrialConfig,
+        harbor_environment_type.EnvironmentType,
+    )
+
+
+def _resolve_environment_type(
+    environment: str | None, environment_enum: Any
+) -> Any:
+    value = (environment or os.environ.get("SWT_SANDBOX") or "docker").strip().lower()
+    if environment_enum is None:
+        return value
+    try:
+        return environment_enum(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in environment_enum)
+        raise ValueError(
+            f"environment={value!r}; expected one of {allowed}"
+        ) from exc
+
+
+def _load_task_user_messages(task_dir: Path) -> list[str]:
+    analysis_path = task_dir / "analysis.json"
+    if analysis_path.is_file():
+        analysis: dict[str, Any] = {}
+        with suppress(OSError, json.JSONDecodeError):
+            loaded = json.loads(analysis_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                analysis = loaded
+        candidates = analysis.get("user_messages")
+        if isinstance(candidates, list):
+            return [
+                message
+                for message in candidates
+                if isinstance(message, str)
+                and not message.startswith("[Request interrupted")
+            ]
+    session_path = task_dir / "original_session.json"
+    if not session_path.is_file():
+        return []
+    try:
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    messages = session.get("messages") if isinstance(session, dict) else None
+    if not isinstance(messages, list):
+        return []
+    return [
+        message.get("content", "")
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and not message["content"].startswith(_SYSTEM_USER_MESSAGE_PREFIXES)
+    ]
+
+
+def _load_task_session_analysis(task_dir: Path, message_count: int) -> str:
+    prompt_path = task_dir / "user_simulation_prompt.md"
+    analysis = (
+        prompt_path.read_text(encoding="utf-8") if prompt_path.is_file() else ""
+    )
+    if message_count <= 0:
+        return analysis
+    low = max(1, (message_count + 1) // 2)
+    high = max(low + 1, (message_count * 3 + 1) // 2)
+    return analysis + (
+        "\n\n## Message Guidance (auto-generated)\n"
+        f"The real user sent {message_count} messages in the original session. "
+        f"Aim for **{low}–{high} messages** total. This is a soft target — send "
+        "fewer if the agent handles everything well, send more if it needs "
+        "correction. Do NOT treat any cap in the session analysis above as a hard "
+        "limit; use this range instead.\n"
+    )
+
+
+def _task_agent_kwargs(task_dir: Path) -> dict[str, Any]:
+    task_toml = task_dir / "task.toml"
+    if not task_toml.is_file():
+        return {}
+    try:
+        config = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    agent_section = config.get("agent") if isinstance(config, dict) else None
+    kwargs = agent_section.get("kwargs") if isinstance(agent_section, dict) else None
+    return dict(kwargs) if isinstance(kwargs, dict) else {}
+
+
+def build_olympus_trial_config(
+    task_dir: Path | str,
+    *,
+    model: str,
+    user_model: str | None = None,
+    user_api_key: str | None = None,
+    user_api_base: str | None = None,
+    agent_env: Mapping[str, str] | None = None,
+    trials_dir: Path | str | None = None,
+    swe_together_root: Path | str | None = None,
+    environment: str | None = None,
+    agent_timeout: float | None = None,
+    user_context_chars: int = 3000,
+    call_user_on_completion: bool = True,
+    user_temperature: float | None = 0.5,
+    force_build: bool = False,
+    base_url: str | None = None,
+    agent_kwargs: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build a Harbor ``TrialConfig`` that runs Olympus with SWE-Together's user sim."""
+    task = Path(task_dir).expanduser().resolve()
+    if not (task / "task.toml").is_file():
+        raise FileNotFoundError(f"not a SWE-Together task directory: {task}")
+    root = (
+        Path(swe_together_root).expanduser().resolve()
+        if swe_together_root
+        else task.parent.parent
+    )
+    original_messages = _load_task_user_messages(task)
+    sim_kwargs: dict[str, Any] = {
+        "user_model_name": user_model or model,
+        "user_api_key": user_api_key,
+        "user_api_base": user_api_base,
+        "original_user_messages": original_messages,
+        "session_analysis": _load_task_session_analysis(task, len(original_messages)),
+        "max_messages": None,
+        "user_context_chars": user_context_chars,
+        "call_user_on_completion": call_user_on_completion,
+    }
+    if user_temperature != 0.5:
+        sim_kwargs["user_temperature"] = user_temperature
+    if base_url is not None:
+        sim_kwargs["base_url"] = base_url
+    sim_kwargs.update(_task_agent_kwargs(task))
+    sim_kwargs.update(dict(agent_kwargs or {}))
+
+    (
+        AgentConfigClass,
+        EnvironmentConfigClass,
+        TaskConfigClass,
+        TrialConfigClass,
+        EnvironmentType,
+    ) = _harbor_config_classes()
+    env_type = _resolve_environment_type(environment, EnvironmentType)
+    agent_config = AgentConfigClass(
+        import_path=OLYMPUS_AGENT_IMPORT_PATH,
+        model_name=model,
+        base_url=base_url,
+        override_timeout_sec=agent_timeout,
+        kwargs=sim_kwargs,
+        env=dict(agent_env or {}),
+    )
+    environment_config = EnvironmentConfigClass(
+        type=env_type,
+        delete=True,
+        force_build=force_build,
+    )
+    return TrialConfigClass(
+        task=TaskConfigClass(path=task),
+        trials_dir=(
+            Path(trials_dir).expanduser().resolve() if trials_dir else root / "trials"
+        ),
+        agent=agent_config,
+        environment=environment_config,
+    )
+
+
+def discover_olympus_tasks(swe_together_root: Path | str) -> list[Path]:
+    """Return runnable SWE-Together task dirs (task.toml + instruction + test.sh)."""
+    tasks_dir = Path(swe_together_root).expanduser().resolve() / "tasks"
+    if not tasks_dir.is_dir():
+        return []
+    return sorted(
+        entry
+        for entry in tasks_dir.iterdir()
+        if entry.is_dir()
+        and (entry / "task.toml").is_file()
+        and (entry / "instruction.md").is_file()
+        and (entry / "tests" / "test.sh").is_file()
+    )
+
+
+def _select_task_dirs(
+    root: Path,
+    tasks: str | None,
+    explicit: Iterable[str] | None,
+) -> list[Path]:
+    if explicit:
+        selected = [Path(item).expanduser().resolve() for item in explicit]
+    elif tasks:
+        selected = [
+            (root / "tasks" / name.strip()).resolve()
+            for name in tasks.split(",")
+            if name.strip()
+        ]
+    else:
+        selected = discover_olympus_tasks(root)
+    missing = [path for path in selected if not (path / "task.toml").is_file()]
+    if missing:
+        raise SystemExit(
+            "task directories not found: " + ", ".join(str(path) for path in missing)
+        )
+    return selected
+
+
+async def launch_olympus_trials(
+    trial_configs: Iterable[Any], *, workers: int = 1
+) -> list[Any]:
+    """Run Olympus trials through Harbor's ``LocalOrchestrator``."""
+    try:
+        from harbor.orchestrators.local import LocalOrchestrator
+    except ImportError as exc:
+        raise RuntimeError(
+            "harbor.orchestrators.local is unavailable; install a Harbor build that "
+            "ships LocalOrchestrator (SWE-Together's external/harbor) to launch trials"
+        ) from exc
+    orchestrator = LocalOrchestrator(
+        trial_configs=list(trial_configs),
+        n_concurrent_trials=max(1, int(workers)),
+        metrics={},
+        quiet=True,
+    )
+    return await orchestrator.run()
+
+
+def _trial_reward(result: Any) -> float | None:
+    verifier = getattr(result, "verifier_result", None)
+    rewards = getattr(verifier, "rewards", None) if verifier is not None else None
+    if isinstance(rewards, dict):
+        rewards = rewards.get("reward")
+    if rewards is None:
+        return None
+    try:
+        return float(rewards)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trial_error(result: Any) -> str | None:
+    info = getattr(result, "exception_info", None)
+    return getattr(info, "exception_type", None) if info is not None else None
+
+
+def build_launcher_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Launch SWE-Together tasks with Olympus as the Harbor agent "
+            "(no dependency on run_eval.py's Claude Code default)."
+        )
+    )
+    parser.add_argument(
+        "--swe-together-root",
+        required=True,
+        type=Path,
+        help="SWE-Together checkout providing tasks/ and the user simulator.",
+    )
+    parser.add_argument("--tasks", help="Comma-separated task names (default: all).")
+    parser.add_argument(
+        "--task-dir",
+        action="append",
+        default=None,
+        help="Explicit task directory (repeatable; overrides --tasks).",
+    )
+    parser.add_argument("--model", required=True, help="Agent model, e.g. openai/gpt-4o.")
+    parser.add_argument("--user-model", default=None, help="Simulated-user model.")
+    parser.add_argument("--user-api-key", default=None, help="Simulated-user API key.")
+    parser.add_argument("--user-api-base", default=None, help="Simulated-user API base.")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Inference endpoint override passed to Olympus (AgentConfig.base_url).",
+    )
+    parser.add_argument(
+        "--trials-dir",
+        type=Path,
+        default=None,
+        help="Harbor trials root (default: <swe-together-root>/trials).",
+    )
+    parser.add_argument(
+        "--environment",
+        default=None,
+        help="Harbor environment type (default: $SWT_SANDBOX, else docker).",
+    )
+    parser.add_argument("--agent-timeout", type=float, default=None)
+    parser.add_argument("--user-context-chars", type=int, default=3000)
+    parser.add_argument("--user-temperature", type=float, default=0.5)
+    parser.add_argument(
+        "--no-call-user-on-completion",
+        action="store_true",
+        help="Stop after the first completed session instead of asking the user sim.",
+    )
+    parser.add_argument("--force-build", action="store_true")
+    parser.add_argument(
+        "--agent-kwargs",
+        default=None,
+        help="JSON object of extra UserEnabledOlympusAgent kwargs.",
+    )
+    parser.add_argument(
+        "--agent-env",
+        default=None,
+        help="JSON object of environment variables for Olympus inside the container.",
+    )
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--dry-run", action="store_true", help="Print configs and exit.")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    return parser
+
+
+def _trial_config_payload(task: Path, config: Any) -> dict[str, Any]:
+    env_type = getattr(config.environment, "type", None)
+    if hasattr(env_type, "value"):
+        env_type = env_type.value
+    return {
+        "task_dir": str(task),
+        "import_path": config.agent.import_path,
+        "model_name": config.agent.model_name,
+        "trials_dir": str(config.trials_dir),
+        "environment": env_type,
+    }
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_launcher_parser().parse_args(list(argv) if argv is not None else None)
+    root = args.swe_together_root.expanduser().resolve()
+    task_dirs = _select_task_dirs(root, args.tasks, args.task_dir)
+    if not task_dirs:
+        raise SystemExit(f"no runnable tasks found under {root / 'tasks'}")
+    extra_kwargs = json.loads(args.agent_kwargs) if args.agent_kwargs else {}
+    if not isinstance(extra_kwargs, dict):
+        raise SystemExit("--agent-kwargs must be a JSON object")
+    agent_env = json.loads(args.agent_env) if args.agent_env else {}
+    if not isinstance(agent_env, dict):
+        raise SystemExit("--agent-env must be a JSON object")
+    configs = [
+        build_olympus_trial_config(
+            task,
+            model=args.model,
+            user_model=args.user_model,
+            user_api_key=args.user_api_key,
+            user_api_base=args.user_api_base,
+            agent_env=agent_env,
+            trials_dir=args.trials_dir,
+            swe_together_root=root,
+            environment=args.environment,
+            agent_timeout=args.agent_timeout,
+            user_context_chars=args.user_context_chars,
+            call_user_on_completion=not args.no_call_user_on_completion,
+            user_temperature=args.user_temperature,
+            force_build=args.force_build,
+            base_url=args.base_url,
+            agent_kwargs=extra_kwargs,
+        )
+        for task in task_dirs
+    ]
+    if args.dry_run:
+        payload = [
+            _trial_config_payload(task, config)
+            for task, config in zip(task_dirs, configs, strict=True)
+        ]
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            for item in payload:
+                print(
+                    f"{item['task_dir']}  ->  {item['import_path']}  "
+                    f"model={item['model_name']}  env={item['environment']}"
+                )
+        return 0
+    results = asyncio.run(launch_olympus_trials(configs, workers=args.workers))
+    payload = [
+        {
+            "task": getattr(result, "task_name", None),
+            "trial": getattr(result, "trial_name", None),
+            "reward": _trial_reward(result),
+            "error": _trial_error(result),
+        }
+        for result in results
+    ]
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for item in payload:
+            print(
+                f"{str(item['reward']):>6}  {item['task']}  {item['trial']}"
+                + (f"  error={item['error']}" if item["error"] else "")
+            )
+    return 0 if all(item["error"] is None for item in payload) else 1
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -1215,20 +1758,33 @@ def _resolved_binary(stdout: str) -> str | None:
     return None
 
 
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
 __all__ = [
     "DEFAULT_REPO_ROOTS",
     "HARBOR_AVAILABLE",
+    "OLYMPUS_AGENT_IMPORT_PATH",
     "SessionEnvelopeView",
     "UserEnabledOlympusAgent",
     "build_diff_command",
     "build_install_script",
+    "build_launcher_parser",
+    "build_olympus_trial_config",
     "build_repo_discovery_command",
     "build_tag_command",
     "build_user_agent",
+    "collect_redaction_secrets",
     "default_project_root",
+    "discover_olympus_tasks",
     "discover_repo_root",
     "is_stop_decision",
+    "launch_olympus_trials",
+    "main",
     "parse_session_envelope",
+    "redact_base_url",
+    "redact_text",
     "split_diff_output",
     "stage_source_archive",
     "strip_junk",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 import tarfile
 from collections import deque
 from dataclasses import dataclass
@@ -21,15 +22,23 @@ from typing import Any
 import pytest
 
 from tests.evals.benchmarks.harbor_together import (
+    OLYMPUS_AGENT_IMPORT_PATH,
+    ExecOutcome,
     SessionEnvelopeView,
     UserEnabledOlympusAgent,
     build_install_script,
+    build_olympus_trial_config,
     is_stop_decision,
     parse_session_envelope,
+    redact_base_url,
+    redact_text,
     split_diff_output,
     stage_source_archive,
     strip_junk,
     validate_state_dir,
+)
+from tests.evals.benchmarks.harbor_together import (
+    main as launch_main,
 )
 from tests.evals.benchmarks.local_docker_judge import (
     CmdResult,
@@ -38,10 +47,11 @@ from tests.evals.benchmarks.local_docker_judge import (
     JudgeJob,
     apply_candidates,
     build_apply_script,
-    build_first_message,
-    build_judge_command,
     derive_judge_score,
+    install_local_docker_judge_backend,
+    judge_jobs,
     load_judge_inputs,
+    load_upstream_judge_module,
     parse_plan,
     run_judge_docker,
     run_stage2,
@@ -523,6 +533,49 @@ def test_static_helpers(tmp_path: Path) -> None:
     )
 
 
+def test_capabilities_declare_base_url_and_atif() -> None:
+    assert UserEnabledOlympusAgent.capabilities.base_url is True
+    assert UserEnabledOlympusAgent.capabilities.atif is True
+    assert UserEnabledOlympusAgent.SUPPORTS_ATIF is True
+
+
+def test_turn_artifacts_redact_base_url_credentials_and_env_secrets(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-live-secret-123456"
+    base_url = "https://user:hunter2@llm.example/v1?api_key=query-secret"
+    agent = UserEnabledOlympusAgent(
+        logs_dir=tmp_path / "logs",
+        model_name="openai/gpt-4o",
+        extra_env={"OPENAI_API_KEY": secret},
+        base_url=base_url,
+    )
+    command = f"olympus session start --message fix --base-url {base_url}"
+    agent._write_turn_artifacts(
+        0,
+        command,
+        ExecOutcome(
+            stdout=f"key={secret} url={base_url}",
+            stderr=f"leaked {secret}",
+            return_code=0,
+        ),
+    )
+
+    written_command = (tmp_path / "logs" / "command-0" / "command.txt").read_text()
+    written_stdout = (tmp_path / "logs" / "command-0" / "stdout.txt").read_text()
+    written_stderr = (tmp_path / "logs" / "command-0" / "stderr.txt").read_text()
+    for text in (written_command, written_stdout, written_stderr):
+        assert secret not in text
+        assert "hunter2" not in text
+        assert "query-secret" not in text
+    assert "--base-url" in written_command
+
+    assert redact_base_url(base_url) == (
+        "https://***@llm.example/v1?api_key=***REDACTED***"
+    )
+    assert redact_text(f"token={secret}", [secret]) == "token=***REDACTED***"
+
+
 # --------------------------------------------------------------------------- docker fakes
 
 
@@ -644,6 +697,68 @@ def test_docker_sandbox_write_failure_raises() -> None:
         asyncio.run(sandbox.write("/tmp/file", "data"))
 
 
+def test_docker_sandbox_uses_private_env_file_and_never_leaks_secrets() -> None:
+    secret = "sk-ant-secret-123456"
+    captured: dict[str, Any] = {}
+
+    def responder(argv: list[str]) -> Any:
+        if len(argv) > 1 and argv[1] == "run":
+            env_file = Path(argv[argv.index("--env-file") + 1])
+            captured["run_argv"] = list(argv)
+            captured["env_path"] = env_file
+            captured["env_exists"] = env_file.exists()
+            captured["env_mode"] = env_file.stat().st_mode & 0o777
+            captured["env_content"] = env_file.read_text()
+            return 0, "container-id\n", ""
+        return 0, "", ""
+
+    cli = DockerCli(runner=_FakeDockerRunner(responder))
+    asyncio.run(
+        DockerJudgeSandbox.create(
+            image="task-image:local",
+            name="judge-test",
+            envs={"ANTHROPIC_API_KEY": secret, "IS_SANDBOX": "1"},
+            cli=cli,
+        )
+    )
+
+    run_argv = captured["run_argv"]
+    assert "--env-file" in run_argv
+    assert "-e" not in run_argv
+    assert secret not in " ".join(run_argv)
+    assert captured["env_exists"] is True
+    assert captured["env_mode"] == 0o600
+    assert f"ANTHROPIC_API_KEY={secret}" in captured["env_content"]
+    assert captured["env_path"].exists() is False
+
+
+def test_docker_sandbox_kill_surfaces_non_zero_exit(caplog: pytest.LogCaptureFixture) -> None:
+    def responder(argv: list[str]) -> Any:
+        if len(argv) > 1 and argv[1] == "rm":
+            return 1, "", "Error: No such container"
+        return 0, "", ""
+
+    cli = DockerCli(runner=_FakeDockerRunner(responder))
+    sandbox = DockerJudgeSandbox(name="judge-test", image="img:local", cli=cli)
+    with caplog.at_level("WARNING"), pytest.raises(
+        RuntimeError, match="failed to remove container judge-test"
+    ):
+        asyncio.run(sandbox.kill())
+    assert any("exited 1" in record.message for record in caplog.records)
+
+
+def test_docker_sandbox_kill_surfaces_cli_exception() -> None:
+    def responder(argv: list[str]) -> Any:
+        if len(argv) > 1 and argv[1] == "rm":
+            return subprocess.TimeoutExpired(argv, 60)
+        return 0, "", ""
+
+    cli = DockerCli(runner=_FakeDockerRunner(responder))
+    sandbox = DockerJudgeSandbox(name="judge-test", image="img:local", cli=cli)
+    with pytest.raises(RuntimeError, match="failed to remove container judge-test"):
+        asyncio.run(sandbox.kill())
+
+
 # --------------------------------------------------------------------------- judge flow fakes
 
 
@@ -702,9 +817,25 @@ def _make_task_and_trial(tmp_path: Path) -> tuple[Path, Path, Path]:
     prompts.mkdir(parents=True)
     (prompts / "judge_phase1_system.md").write_text("PHASE1 PROMPT")
     (prompts / "judge_phase2_system.md").write_text("PHASE2 PROMPT")
+    (root / "eval" / "__init__.py").write_text("")
     behavior = root / "eval" / "user_behavior"
     behavior.mkdir(parents=True)
+    (behavior / "__init__.py").write_text("")
     (behavior / "run_batch.py").write_text("# stub user-behavior runner\n")
+    (behavior / "tag_messages.py").write_text("# stub message tagger\n")
+    (behavior / "user_metrics.py").write_text(
+        "def metrics_from_rows(rows):\n"
+        "    rows = rows or []\n"
+        "    tags = [row.get('tags', []) for row in rows]\n"
+        "    corrections = sum(1 for item in tags if 'correction' in item)\n"
+        "    nudges = sum(1 for item in tags if 'nudge' in item)\n"
+        "    return {\n"
+        "        'user_correction': None if not rows else corrections + 0.2 * nudges,\n"
+        "        'n_tagged_msgs': len(rows),\n"
+        "        'n_correction': None if not rows else corrections,\n"
+        "        'n_nudge': None if not rows else nudges,\n"
+        "    }\n"
+    )
 
     task = tmp_path / "tasks" / "task-a"
     (task / "tests").mkdir(parents=True)
@@ -827,7 +958,12 @@ def test_run_stage2_scores_correctly_and_runs_user_behavior(tmp_path: Path) -> N
         timeout: float,
     ) -> SimpleNamespace:
         behavior_calls.append(argv)
+        if "eval.user_behavior.tag_messages" in argv:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         plan = Path(argv[argv.index("--plan") + 1])
+        for entry in json.loads(plan.read_text()):
+            verdict = Path(entry["trial_dir"]) / "intent_coverage_verdict.json"
+            verdict.write_text(json.dumps({"coverage_rate": 1.0}))
         plan.with_suffix(".summary.json").write_text(json.dumps({"status_counts": {"ok": 1}}))
         return SimpleNamespace(returncode=0, stdout="done", stderr="")
 
@@ -836,6 +972,7 @@ def test_run_stage2_scores_correctly_and_runs_user_behavior(tmp_path: Path) -> N
             jobs=[JudgeJob(trial_dir=trial, task_dir=task)],
             swe_together_root=root,
             sandbox_factory=factory,
+            judge_command="echo fake judge",
             user_behavior_runner=user_behavior_runner,
         )
     )
@@ -843,7 +980,11 @@ def test_run_stage2_scores_correctly_and_runs_user_behavior(tmp_path: Path) -> N
     assert summary["status"] == "ok"
     assert summary["correctness"][0]["status"] == "ok"
     assert summary["user_behavior"]["summary"] == {"status_counts": {"ok": 1}}
-    assert behavior_calls and behavior_calls[0][1:3] == ["-m", "eval.user_behavior.run_batch"]
+    assert [call[1:3] for call in behavior_calls] == [
+        ["-m", "eval.user_behavior.run_batch"],
+        ["-m", "eval.user_behavior.tag_messages"],
+    ]
+    assert summary["user_correction"] == {str(trial.resolve()): None}
 
     verdict = json.loads((trial / "judge_verdict.json").read_text())
     assert verdict["judge_score"] == 0.6
@@ -854,12 +995,22 @@ def test_run_stage2_scores_correctly_and_runs_user_behavior(tmp_path: Path) -> N
     assert sandbox.killed is True
 
 
-def test_user_behavior_delegation_writes_plan_and_parses_summary(tmp_path: Path) -> None:
-    root = tmp_path / "swe"
-    module = root / "eval" / "user_behavior"
-    module.mkdir(parents=True)
-    (module / "run_batch.py").write_text("# stub\n")
-    captured: dict[str, Any] = {}
+def test_user_behavior_runs_coverage_and_tagging_with_user_correction(tmp_path: Path) -> None:
+    root, task, trial = _make_task_and_trial(tmp_path)
+    episode = trial / "agent" / "episode-1"
+    episode.mkdir(parents=True)
+    (episode / "user_decision.json").write_text(
+        json.dumps(
+            {
+                "turn": 1,
+                "action": "send_message",
+                "has_message": True,
+                "content": "The calculation has the sign backwards.",
+            }
+        )
+    )
+    calls: list[list[str]] = []
+    staged_roots: list[Path] = []
 
     def runner(
         argv: list[str],
@@ -869,26 +1020,306 @@ def test_user_behavior_delegation_writes_plan_and_parses_summary(tmp_path: Path)
         text: bool,
         timeout: float,
     ) -> SimpleNamespace:
-        captured["argv"] = argv
-        captured["cwd"] = cwd
-        plan = Path(argv[argv.index("--plan") + 1])
-        captured["plan"] = json.loads(plan.read_text())
-        plan.with_suffix(".summary.json").write_text(json.dumps({"results": [{"status": "ok"}]}))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls.append(argv)
+        if "eval.user_behavior.run_batch" in argv:
+            plan_path = Path(argv[argv.index("--plan") + 1])
+            for entry in json.loads(plan_path.read_text()):
+                verdict = Path(entry["trial_dir"]) / "intent_coverage_verdict.json"
+                verdict.write_text(
+                    json.dumps(
+                        {
+                            "trial_dir": entry["trial_dir"],
+                            "task_dir": entry["task_dir"],
+                            "coverage_rate": 1.0,
+                        }
+                    )
+                )
+            plan_path.with_suffix(".summary.json").write_text(
+                json.dumps({"status_counts": {"ok": 1}})
+            )
+            return SimpleNamespace(returncode=0, stdout="coverage", stderr="")
+        if "eval.user_behavior.tag_messages" in argv:
+            staged = Path(argv[argv.index("--trials-root") + 1])
+            staged_roots.append(staged)
+            for entry in staged.iterdir():
+                verdict = entry / "intent_coverage_verdict.json"
+                payload = json.loads(verdict.read_text())
+                payload["trial_msg_tags"] = [
+                    {"trial_idx": 1, "tags": ["correction", "request"], "frustration": 0}
+                ]
+                payload["user_correction"] = 1.0
+                verdict.write_text(json.dumps(payload))
+            return SimpleNamespace(returncode=0, stdout="tagged", stderr="")
+        raise AssertionError(f"unexpected argv: {argv}")
 
     result = run_user_behavior(
         swe_together_root=root,
-        jobs=[{"trial_dir": "/tmp/trial", "task_dir": "/tmp/task"}],
+        jobs=[{"trial_dir": trial, "task_dir": task}],
         workers=3,
         model="anthropic/claude-sonnet-4-6",
         runner=runner,
     )
 
     assert result["status"] == "ok"
-    assert result["summary"] == {"results": [{"status": "ok"}]}
-    assert captured["plan"][0]["trial_dir"] == "/tmp/trial"
-    assert "--workers" in captured["argv"]
-    assert captured["cwd"] == str(root.resolve())
+    assert result["summary"] == {"status_counts": {"ok": 1}}
+    assert [call[1:3] for call in calls] == [
+        ["-m", "eval.user_behavior.run_batch"],
+        ["-m", "eval.user_behavior.tag_messages"],
+    ]
+    assert "--workers" in calls[0] and "--workers" in calls[1]
+    assert all(call[0] == sys.executable for call in calls)
+    assert staged_roots and staged_roots[0].name.startswith("olympus-user-tagging-")
+    trial_key = str(trial.resolve())
+    assert result["user_correction"][trial_key] == 1.0
+    assert result["trials"][0]["expected_tags"] is True
+    assert result["trials"][0]["trial_msg_tags"] is True
+    assert result["trials"][0]["user_correction_persisted"] == 1.0
+    assert result["trials"][0]["user_correction_recomputed"] == 1.0
+    verdict = json.loads((trial / "intent_coverage_verdict.json").read_text())
+    assert verdict["trial_msg_tags"] == [
+        {"trial_idx": 1, "tags": ["correction", "request"], "frustration": 0}
+    ]
+    assert verdict["user_correction"] == 1.0
+
+
+def test_user_behavior_errors_when_tagging_leaves_user_correction_null(
+    tmp_path: Path,
+) -> None:
+    root, task, trial = _make_task_and_trial(tmp_path)
+    episode = trial / "agent" / "episode-1"
+    episode.mkdir(parents=True)
+    (episode / "user_decision.json").write_text(
+        json.dumps({"turn": 1, "action": "send_message", "has_message": True, "content": "fix it"})
+    )
+
+    def runner(
+        argv: list[str],
+        *,
+        cwd: str,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+    ) -> SimpleNamespace:
+        if "eval.user_behavior.run_batch" in argv:
+            plan_path = Path(argv[argv.index("--plan") + 1])
+            for entry in json.loads(plan_path.read_text()):
+                verdict = Path(entry["trial_dir"]) / "intent_coverage_verdict.json"
+                verdict.write_text(json.dumps({"coverage_rate": 1.0}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="tagging skipped", stderr="")
+
+    result = run_user_behavior(
+        swe_together_root=root,
+        jobs=[{"trial_dir": trial, "task_dir": task}],
+        runner=runner,
+    )
+
+    assert result["status"] == "error"
+    assert result["user_correction"][str(trial.resolve())] is None
+    assert any("user_correction is null" in error for error in result["errors"])
+
+
+def test_user_behavior_requires_the_upstream_message_tagger(tmp_path: Path) -> None:
+    root = tmp_path / "swe"
+    behavior = root / "eval" / "user_behavior"
+    behavior.mkdir(parents=True)
+    (behavior / "run_batch.py").write_text("# stub\n")
+    with pytest.raises(FileNotFoundError, match="message tagger"):
+        run_user_behavior(
+            swe_together_root=root,
+            jobs=[{"trial_dir": tmp_path / "trial", "task_dir": tmp_path / "task"}],
+        )
+
+
+_UPSTREAM_JUDGE_SOURCE = '''\
+import json
+from types import SimpleNamespace
+
+CALLS = []
+
+
+async def open_judge_sandbox(**kwargs):
+    raise AssertionError("install_local_docker_judge_backend must replace this")
+
+
+async def run_judge(task_name, trial_id, inputs, oauth_token, *, timeout_sec=0,
+                    max_turns=0, api_key=None):
+    CALLS.append({
+        "task_name": task_name,
+        "trial_id": trial_id,
+        "phase": inputs.phase,
+        "oauth_token": oauth_token,
+        "api_key": api_key,
+    })
+    sandbox = await open_judge_sandbox(
+        task_name=task_name, e2b_template="unused",
+        envs={"ANTHROPIC_API_KEY": "sk-test"}, timeout_sec=timeout_sec, buffer_sec=5,
+    )
+    await sandbox.write("/tmp/judge_inputs/README.md", inputs.readme)
+    result = await sandbox.run("judge --print", timeout=5)
+    raw = await sandbox.read("/tmp/judge_inputs/verdict.json")
+    await sandbox.kill()
+    return SimpleNamespace(
+        verdict=json.loads(raw),
+        stdout=result.stdout,
+        stderr=result.stderr,
+        exit_code=result.exit_code,
+        sandbox_id=sandbox.sandbox_id,
+        judge_model="fake-judge",
+        judge_backend="native",
+    )
+'''
+
+
+def test_judge_jobs_delegates_to_upstream_run_judge_with_docker_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, task, trial = _make_task_and_trial(tmp_path)
+    (root / "eval" / "correctness" / "sandbox.py").write_text(_UPSTREAM_JUDGE_SOURCE)
+    (root / "eval" / "correctness" / "__init__.py").write_text("")
+    secret = "sk-ant-upstream-secret"
+    docker_calls: list[list[str]] = []
+
+    def responder(argv: list[str]) -> Any:
+        docker_calls.append(list(argv))
+        if len(argv) > 1 and argv[1] == "exec" and "verdict.json" in argv[-1]:
+            verdict = {
+                "goal_results": [{"id": "g1", "met": True}],
+                "judge_score": 0.5,
+                "verdict": "partial",
+            }
+            return 0, json.dumps(verdict), ""
+        if len(argv) > 1 and argv[1] == "run":
+            return 0, "container-id\n", ""
+        return 0, "ok\n", ""
+
+    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+
+    results = asyncio.run(
+        judge_jobs(
+            jobs=[JudgeJob(trial_dir=trial, task_dir=task)],
+            swe_together_root=root,
+            docker_cli=DockerCli(runner=_FakeDockerRunner(responder)),
+        )
+    )
+
+    assert results[0]["status"] == "ok"
+    module = load_upstream_judge_module(root)
+    assert [
+        {
+            "task_name": "task-a",
+            "trial_id": "task-a__t1",
+            "phase": 2,
+            "oauth_token": "",
+            "api_key": secret,
+        }
+    ] == module.CALLS
+    assert module.open_judge_sandbox.__name__ == "open_judge_sandbox"
+    verdict = json.loads((trial / "judge_verdict.json").read_text())
+    assert verdict["judge_score"] == 0.6
+    assert verdict["judge_reported_score"] == 0.5
+    assert verdict["judge_backend"] == "native"
+    assert verdict["judge_model"] == "fake-judge"
+    run_argv = next(call for call in docker_calls if call[1] == "run")
+    assert "--env-file" in run_argv
+    assert all(secret not in " ".join(call) for call in docker_calls)
+
+
+def test_install_backend_returns_none_without_upstream_sources(tmp_path: Path) -> None:
+    root, _task, _trial = _make_task_and_trial(tmp_path)
+    assert load_upstream_judge_module(root) is None
+    assert (
+        install_local_docker_judge_backend(
+            swe_together_root=root,
+            cli=DockerCli(runner=_FakeDockerRunner(_ok_docker)),
+        )
+        is None
+    )
+
+
+def test_build_olympus_trial_config_matches_swe_together_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SWT_SANDBOX", raising=False)
+    root, task, trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix the append bug")
+    (task / "user_simulation_prompt.md").write_text("SIM PROMPT")
+    (task / "original_session.json").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "please fix the bug"},
+                    {"role": "assistant", "content": "on it"},
+                    {"role": "user", "content": "<command-name>skip"},
+                    {"role": "user", "content": "also add tests"},
+                ]
+            }
+        )
+    )
+
+    config = build_olympus_trial_config(
+        task,
+        model="openai/gpt-4o",
+        user_model="anthropic/claude-opus-4-6",
+        swe_together_root=root,
+        user_context_chars=1234,
+        agent_kwargs={"workflow": "full_sdlc_tdd", "max_turns": 3},
+    )
+
+    assert config.agent.import_path == OLYMPUS_AGENT_IMPORT_PATH
+    assert config.agent.import_path.endswith(":UserEnabledOlympusAgent")
+    assert config.agent.model_name == "openai/gpt-4o"
+    assert config.agent.base_url is None
+    assert config.task.path == task.resolve()
+    assert config.trials_dir == (root / "trials").resolve()
+    environment_type = getattr(config.environment.type, "value", config.environment.type)
+    assert environment_type == "docker"
+    assert config.agent.kwargs["user_model_name"] == "anthropic/claude-opus-4-6"
+    assert config.agent.kwargs["original_user_messages"] == [
+        "please fix the bug",
+        "also add tests",
+    ]
+    assert "SIM PROMPT" in config.agent.kwargs["session_analysis"]
+    assert "Message Guidance" in config.agent.kwargs["session_analysis"]
+    assert config.agent.kwargs["max_messages"] is None
+    assert config.agent.kwargs["user_context_chars"] == 1234
+    assert config.agent.kwargs["call_user_on_completion"] is True
+    assert config.agent.kwargs["workflow"] == "full_sdlc_tdd"
+    assert config.agent.kwargs["max_turns"] == 3
+
+
+def test_trial_launcher_dry_run_targets_olympus_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SWT_SANDBOX", raising=False)
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix the append bug")
+
+    code = launch_main(
+        [
+            "--swe-together-root",
+            str(root),
+            "--task-dir",
+            str(task),
+            "--model",
+            "openai/gpt-4o",
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "task_dir": str(task.resolve()),
+            "import_path": OLYMPUS_AGENT_IMPORT_PATH,
+            "model_name": "openai/gpt-4o",
+            "trials_dir": str((root / "trials").resolve()),
+            "environment": "docker",
+        }
+    ]
 
 
 # --------------------------------------------------------------------------- judge helper tests
@@ -934,14 +1365,6 @@ def test_judge_scripts_and_scoring_helpers() -> None:
     assert len(candidates) == 1
     assert "=== /workspace" not in candidates[0]
     assert candidates[0].startswith("diff --git a/app.py")
-
-    phase2_message = build_first_message(inputs_dir="/tmp/judge_inputs", phase=2)
-    assert "FROZEN" in phase2_message
-    assert "/tmp/judge_inputs/verdict.json" in phase2_message
-    assert build_first_message(inputs_dir="/tmp/judge_inputs", phase=1)
-    command = build_judge_command(phase=2, model="claude-opus-4-6")
-    assert "claude --print" in command
-    assert "--model claude-opus-4-6" in command
 
     rubric = {"completeness_goals": [{"id": "g1", "weight": 0.6}, {"id": "g2", "weight": 0.4}]}
     score, bucket = derive_judge_score(

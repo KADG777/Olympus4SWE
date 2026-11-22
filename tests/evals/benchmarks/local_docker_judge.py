@@ -1,31 +1,30 @@
 """Local-Docker Stage 2 backend for SWE-Together's correctness judge.
 
-The upstream judge (``eval/correctness``) requires an E2B or enroot sandbox.
-This module provides a thin ``DockerJudgeSandbox`` implementing the same
-``sandbox_id`` / ``write`` / ``run`` / ``read`` / ``kill`` protocol on top of
-the local Docker CLI, a faithful port of the Phase 1/2 judge flow
-(``run_judge_docker``), and a CLI that scores one or more SWE-Together trials
-without ever touching ``E2B_API_KEY``:
+Primary path: inject :class:`DockerJudgeSandbox` into the upstream
+``eval.correctness.sandbox.run_judge`` flow so stage 2 reuses SWE-Together's own
+patch normalisation, judge prompts, and provenance fields while running on the
+local Docker CLI instead of E2B/enroot. A minimal offline fallback keeps the
+unit tests independent of a SWE-Together checkout.
 
-* correctness — agent patch applied in a fresh container from the task image,
-  then the agentic judge runs and writes ``verdict.json``;
-* user behavior — the host-side ``User Correction`` tagging pipeline is
-  delegated to the upstream ``eval.user_behavior.run_batch`` module.
-
-Everything Harbor/SWE-Together-specific is confined to this file; core
-``olympus`` code stays benchmark-free.
+User behavior: the host-side ``User Correction`` pipeline runs both upstream
+``eval.user_behavior.run_batch`` (intent coverage) and
+``eval.user_behavior.tag_messages`` (per-message tags + derived
+``user_correction``) so a Stage 2 run never reports success with
+``user_correction=None`` while simulated-user messages exist.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import logging
 import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,12 +43,13 @@ JUDGE_TIMEOUT_SEC = 600
 JUDGE_MAX_TURNS = 50
 PHASE1_PROMPT = "judge_phase1_system.md"
 PHASE2_PROMPT = "judge_phase2_system.md"
-DEFAULT_PHASE2_PROMPT_PATH = (
-    "eval/correctness/prompts/judge_phase2_system.md"
-)
-DEFAULT_PHASE1_PROMPT_PATH = (
-    "eval/correctness/prompts/judge_phase1_system.md"
-)
+DEFAULT_PHASE2_PROMPT_PATH = "eval/correctness/prompts/judge_phase2_system.md"
+DEFAULT_PHASE1_PROMPT_PATH = "eval/correctness/prompts/judge_phase1_system.md"
+UPSTREAM_JUDGE_MODULE = "eval.correctness.sandbox"
+UPSTREAM_METRICS_MODULE = "eval.user_behavior.user_metrics"
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UPSTREAM_MODULES: dict[tuple[Path, str], Any] = {}
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,27 @@ class DockerCli:
         return await asyncio.to_thread(self.run, args, timeout=timeout)
 
 
+def _write_env_file(envs: Mapping[str, str]) -> str | None:
+    """Write a 0600 ``docker --env-file`` so secrets never appear in argv."""
+    if not envs:
+        return None
+    descriptor, path = tempfile.mkstemp(prefix="olympus-judge-env-", suffix=".env")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for key, value in envs.items():
+                if not _ENV_KEY_RE.fullmatch(key):
+                    raise ValueError(f"invalid environment variable name {key!r}")
+                text = str(value)
+                if "\n" in text or "\r" in text:
+                    raise ValueError(f"environment variable {key!r} contains a newline")
+                handle.write(f"{key}={text}\n")
+    except Exception:
+        with suppress(OSError):
+            os.unlink(path)
+        raise
+    return path
+
+
 class DockerJudgeSandbox:
     """Judge sandbox backed by one long-lived local Docker container."""
 
@@ -121,12 +142,16 @@ class DockerJudgeSandbox:
         docker = cli or DockerCli()
         container = name or f"olympus-judge-{uuid.uuid4().hex[:12]}"
         args = ["run", "-d", "--name", container]
-        for key, value in (envs or {}).items():
-            args.extend(["-e", f"{key}={value}"])
-        args.extend(
-            ["--entrypoint", "/bin/sh", image, "-c", "sleep infinity"]
-        )
-        proc = await docker.arun(args, timeout=180)
+        env_file = _write_env_file(envs or {})
+        if env_file is not None:
+            args.extend(["--env-file", env_file])
+        args.extend(["--entrypoint", "/bin/sh", image, "-c", "sleep infinity"])
+        try:
+            proc = await docker.arun(args, timeout=180)
+        finally:
+            if env_file is not None:
+                with suppress(OSError):
+                    os.unlink(env_file)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"docker run failed for {image!r}: "
@@ -141,7 +166,10 @@ class DockerJudgeSandbox:
             if probe.returncode == 0:
                 return sandbox
             if time.monotonic() >= deadline:
-                await sandbox.kill()
+                try:
+                    await sandbox.kill()
+                except RuntimeError as exc:
+                    log.warning("failed to remove unready container %s: %s", container, exc)
                 raise RuntimeError(
                     f"container {container!r} did not become ready within "
                     f"{ready_timeout_sec:.0f}s"
@@ -216,16 +244,148 @@ class DockerJudgeSandbox:
         return result.stdout
 
     async def kill(self) -> None:
-        with suppress(Exception):
-            await self._cli.arun(["rm", "-f", self.sandbox_id], timeout=60)
+        try:
+            proc = await self._cli.arun(["rm", "-f", self.sandbox_id], timeout=60)
+        except Exception as exc:
+            log.warning("docker rm -f %s failed: %s", self.sandbox_id, exc)
+            raise RuntimeError(
+                f"failed to remove container {self.sandbox_id}: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+            log.warning(
+                "docker rm -f %s exited %s: %s",
+                self.sandbox_id,
+                proc.returncode,
+                detail,
+            )
+            raise RuntimeError(
+                f"failed to remove container {self.sandbox_id} "
+                f"(exit {proc.returncode}): {detail}"
+            )
 
 
-# --------------------------------------------------------------------------- judge inputs
+def _evict_foreign_eval_modules(root: Path) -> None:
+    for name in list(sys.modules):
+        if name != "eval" and not name.startswith("eval."):
+            continue
+        origin = getattr(sys.modules[name], "__file__", None)
+        if not origin:
+            continue
+        try:
+            Path(origin).resolve().relative_to(root)
+        except ValueError:
+            del sys.modules[name]
+
+
+def _import_upstream(
+    swe_together_root: Path | str, module_name: str, relative_path: str
+) -> Any | None:
+    root = Path(swe_together_root).expanduser().resolve()
+    if not (root / relative_path).is_file():
+        return None
+    key = (root, module_name)
+    cached = _UPSTREAM_MODULES.get(key)
+    if cached is not None:
+        return cached
+    _evict_foreign_eval_modules(root)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    module = importlib.import_module(module_name)
+    _UPSTREAM_MODULES[key] = module
+    return module
+
+
+def load_upstream_judge_module(swe_together_root: Path | str) -> Any | None:
+    """Import upstream ``eval.correctness.sandbox`` (``None`` when absent)."""
+    try:
+        return _import_upstream(
+            swe_together_root, UPSTREAM_JUDGE_MODULE, "eval/correctness/sandbox.py"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"found upstream judge sources under {swe_together_root} but could not "
+            "import eval.correctness.sandbox; run with the SWE-Together virtualenv "
+            "(it provides dirhash, llm_config, and patch_normalize)"
+        ) from exc
+
+
+class DockerJudgeBackend:
+    """Patch upstream ``open_judge_sandbox`` to hand out ``DockerJudgeSandbox``."""
+
+    def __init__(
+        self,
+        module: Any,
+        *,
+        image_resolver: Callable[[str], str],
+        cli: DockerCli | None = None,
+        extra_envs: Mapping[str, str] | None = None,
+    ) -> None:
+        self.module = module
+        self._original = module.open_judge_sandbox
+        self._image_resolver = image_resolver
+        self._cli = cli
+        self._extra_envs = dict(extra_envs or {"IS_SANDBOX": "1"})
+        module.open_judge_sandbox = self.open_sandbox
+
+    async def open_sandbox(
+        self,
+        *,
+        task_name: str,
+        e2b_template: str,
+        envs: dict[str, str],
+        timeout_sec: int,
+        buffer_sec: int,
+    ) -> DockerJudgeSandbox:
+        del e2b_template, timeout_sec
+        image = await asyncio.to_thread(self._image_resolver, task_name)
+        return await DockerJudgeSandbox.create(
+            image=image,
+            name=f"olympus-judge-{_slug(task_name)}-{uuid.uuid4().hex[:8]}",
+            envs={**self._extra_envs, **(envs or {})},
+            cli=self._cli,
+            ready_timeout_sec=max(30.0, float(buffer_sec or 0)),
+        )
+
+    def restore(self) -> None:
+        self.module.open_judge_sandbox = self._original
+
+    def __enter__(self) -> DockerJudgeBackend:
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.restore()
+
+
+def install_local_docker_judge_backend(
+    *,
+    swe_together_root: Path | str,
+    task_dirs: Mapping[str, Path | str] | None = None,
+    image: str | None = None,
+    cli: DockerCli | None = None,
+) -> DockerJudgeBackend | None:
+    """Inject ``DockerJudgeSandbox`` into upstream ``run_judge`` (no E2B key).
+
+    Returns ``None`` when the SWE-Together checkout has no ``eval/correctness``
+    sources (offline unit-test fallback).
+    """
+    module = load_upstream_judge_module(swe_together_root)
+    if module is None:
+        return None
+    root = Path(swe_together_root).expanduser().resolve()
+    tasks = {str(name): Path(path) for name, path in (task_dirs or {}).items()}
+    docker = cli or DockerCli()
+
+    def resolve_image(task_name: str) -> str:
+        task_dir = tasks.get(task_name) or root / "tasks" / task_name
+        return task_docker_image(task_dir, image=image, cli=docker)
+
+    return DockerJudgeBackend(module, image_resolver=resolve_image, cli=docker)
 
 
 @dataclass
 class JudgeInputs:
-    """Mirror of ``eval.correctness.sandbox.JudgeInputs`` (subset)."""
+    """Mirror of ``eval.correctness.sandbox.JudgeInputs``."""
 
     readme: str = ""
     user_sim_prompt: str = ""
@@ -364,14 +524,10 @@ def load_judge_inputs(
 
 
 def _infer_swe_together_root(task_dir: Path) -> Path:
-    """Walk up from ``tasks/<task>`` to the benchmark checkout root."""
     for parent in [task_dir, *task_dir.parents]:
         if (parent / "eval" / "correctness" / "prompts").is_dir():
             return parent
     return task_dir.parent
-
-
-# --------------------------------------------------------------------------- patch normalisation
 
 
 _BANNER_RE = re.compile(r"^=== .* ===$")
@@ -464,7 +620,7 @@ def _restore_trailing_context(diff: str) -> str:
 
 
 def apply_candidates(diff: str) -> list[str]:
-    """Normalised patch candidates, mirroring ``src/patch_normalize.py``."""
+    """Normalised patch candidates, mirroring upstream ``patch_normalize``."""
     if not diff.strip():
         return []
     base = _strip_banners_and_unapplyable(diff)
@@ -479,9 +635,6 @@ def apply_candidates(diff: str) -> list[str]:
         if missing:
             candidates.append("\n".join([*lines, *([" "] * missing)]) + "\n")
     return candidates
-
-
-# --------------------------------------------------------------------------- judge flow
 
 
 def build_apply_script(*, candidates: int, repo_hint: str = "", skip_apply: bool = False) -> str:
@@ -533,69 +686,6 @@ def build_apply_script(*, candidates: int, repo_hint: str = "", skip_apply: bool
     )
 
 
-def build_first_message(
-    *,
-    inputs_dir: str,
-    phase: int,
-    oracle_present: bool = True,
-    repo_hint: str = "/workspace",
-) -> str:
-    if phase == 1:
-        if oracle_present:
-            return (
-                f"Begin by reading {inputs_dir}/README.md and "
-                f"{inputs_dir}/user_simulation_prompt.md to understand the task. "
-                f"Then read {inputs_dir}/oracle.patch (the reference solution, "
-                f"already applied to {repo_hint}) and explore the workspace. "
-                f"Decompose the task into completeness goals and write the FROZEN "
-                f"rubric to {inputs_dir}/canonical_goals.json."
-            )
-        return (
-            f"Begin by reading {inputs_dir}/README.md and "
-            f"{inputs_dir}/user_simulation_prompt.md to understand the task. "
-            f"This task has NO canonical oracle patch. Read "
-            f"{inputs_dir}/user_dialogue.md for the user's stated intent, derive "
-            f"goals from it and from {inputs_dir}/test.sh, and write the FROZEN "
-            f"rubric to {inputs_dir}/canonical_goals.json."
-        )
-    return (
-        f"Begin by reading {inputs_dir}/canonical_goals.json — this is the FROZEN "
-        f"rubric. DO NOT re-derive goals; for each goal in the rubric, mark "
-        f"met:true/false with concrete evidence. Then read {inputs_dir}/README.md "
-        f"and {inputs_dir}/user_simulation_prompt.md for context, inspect the "
-        f"agent's patch at {inputs_dir}/agent.patch (already applied to "
-        f"{repo_hint}), explore the workspace, and optionally run tests. Write "
-        f"your verdict to {inputs_dir}/verdict.json."
-    )
-
-
-def build_judge_command(
-    *,
-    inputs_dir: str = "/tmp/judge_inputs",
-    phase: int = 2,
-    timeout_sec: int = JUDGE_TIMEOUT_SEC,
-    max_turns: int = JUDGE_MAX_TURNS,
-    model: str | None = None,
-    oracle_present: bool = True,
-    repo_hint: str = "/workspace",
-) -> str:
-    """Default headless ``claude --print`` invocation inside the sandbox."""
-    first_message = build_first_message(
-        inputs_dir=inputs_dir,
-        phase=phase,
-        oracle_present=oracle_present,
-        repo_hint=repo_hint,
-    )
-    model_arg = f"--model {shlex.quote(model)} " if model else ""
-    return (
-        'export PATH="$HOME/.local/bin:/root/.local/bin:$PATH"; '
-        f"timeout {int(timeout_sec)} claude --print --max-turns {int(max_turns)} "
-        f"{model_arg}--dangerously-skip-permissions --setting-sources user "
-        f'--append-system-prompt "$(cat {inputs_dir}/judge_system.md)" '
-        f"{shlex.quote(first_message)}"
-    )
-
-
 def _judge_envs(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     source = os.environ if environ is None else environ
     keys = (
@@ -607,17 +697,6 @@ def _judge_envs(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     envs = {key: source[key] for key in keys if source.get(key)}
     envs["IS_SANDBOX"] = "1"
     return envs
-
-
-async def _ensure_judge_cli(sandbox: Any) -> CmdResult:
-    prefix = 'export PATH="$HOME/.local/bin:/root/.local/bin:$PATH"; '
-    check = await sandbox.run(prefix + "command -v claude || true", timeout=10)
-    if check.stdout.strip():
-        return check
-    install = await sandbox.run(
-        "curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.108", timeout=300
-    )
-    return install
 
 
 async def run_judge_docker(
@@ -633,7 +712,12 @@ async def run_judge_docker(
     sandbox_factory: Callable[..., Any] | None = None,
     envs: Mapping[str, str] | None = None,
 ) -> JudgeRunResult:
-    """Run one judge phase in a fresh local-Docker container, then clean up."""
+    """Offline fallback judge flow; the upstream ``run_judge`` path is primary."""
+    if judge_command is None:
+        raise ValueError(
+            "the offline judge fallback requires judge_command; run with a "
+            "SWE-Together checkout so upstream eval.correctness.sandbox.run_judge is used"
+        )
     inputs_dir = "/tmp/judge_inputs"
     tests_dir = f"{inputs_dir}/tests"
     output_filename = "canonical_goals.json" if inputs.phase == 1 else "verdict.json"
@@ -703,19 +787,7 @@ async def run_judge_docker(
             user="root",
         )
 
-        command = judge_command
-        if command is None:
-            await _ensure_judge_cli(sandbox)
-            command = build_judge_command(
-                inputs_dir=inputs_dir,
-                phase=inputs.phase,
-                timeout_sec=timeout_sec,
-                max_turns=max_turns,
-                model=model,
-                oracle_present=bool(inputs.oracle_patch.strip()),
-                repo_hint=repo_hint or "/workspace",
-            )
-        result = await sandbox.run(command, timeout=timeout_sec + 60, cwd="/tmp")
+        result = await sandbox.run(judge_command, timeout=timeout_sec + 60, cwd="/tmp")
         try:
             verdict = json.loads(await sandbox.read(f"{inputs_dir}/{output_filename}"))
             if not isinstance(verdict, dict):
@@ -745,7 +817,7 @@ async def run_judge_docker(
         if sandbox is not None:
             try:
                 await sandbox.kill()
-            except Exception as exc:  # pragma: no cover - cleanup is best-effort
+            except Exception as exc:
                 log.warning("sandbox kill failed for %s: %s", container, exc)
 
 
@@ -755,7 +827,104 @@ async def _default_sandbox_factory(
     return await DockerJudgeSandbox.create(image=image, name=name, envs=envs)
 
 
-# --------------------------------------------------------------------------- task images
+async def run_judge_task(
+    *,
+    task_name: str,
+    trial_id: str,
+    inputs: JudgeInputs,
+    swe_together_root: Path | str,
+    image: str | None = None,
+    timeout_sec: int = JUDGE_TIMEOUT_SEC,
+    max_turns: int = JUDGE_MAX_TURNS,
+    model: str | None = None,
+    judge_command: str | None = None,
+    sandbox_factory: Callable[..., Any] | None = None,
+    task_dirs: Mapping[str, Path | str] | None = None,
+    docker_cli: DockerCli | None = None,
+) -> JudgeRunResult:
+    """Run the upstream judge through ``DockerJudgeSandbox`` when available."""
+    if judge_command is None and sandbox_factory is None:
+        backend = install_local_docker_judge_backend(
+            swe_together_root=swe_together_root,
+            task_dirs=task_dirs,
+            image=image,
+            cli=docker_cli,
+        )
+        if backend is not None:
+            return await _run_upstream_judge(
+                backend,
+                task_name=task_name,
+                trial_id=trial_id,
+                inputs=inputs,
+                timeout_sec=timeout_sec,
+                max_turns=max_turns,
+                model=model,
+            )
+    resolved_image = image
+    if resolved_image is None:
+        task_dir = (task_dirs or {}).get(task_name) or _default_task_dir(
+            swe_together_root, task_name
+        )
+        resolved_image = await asyncio.to_thread(task_docker_image, task_dir)
+    return await run_judge_docker(
+        task_name=task_name,
+        trial_id=trial_id,
+        inputs=inputs,
+        image=resolved_image,
+        timeout_sec=timeout_sec,
+        max_turns=max_turns,
+        model=model,
+        judge_command=judge_command,
+        sandbox_factory=sandbox_factory,
+    )
+
+
+async def _run_upstream_judge(
+    backend: DockerJudgeBackend,
+    *,
+    task_name: str,
+    trial_id: str,
+    inputs: JudgeInputs,
+    timeout_sec: int,
+    max_turns: int,
+    model: str | None,
+) -> JudgeRunResult:
+    previous_model = os.environ.get("SWT_JUDGE_MODEL")
+    if model:
+        os.environ["SWT_JUDGE_MODEL"] = model
+    try:
+        result = await backend.module.run_judge(
+            task_name,
+            trial_id,
+            inputs,
+            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
+            timeout_sec=timeout_sec,
+            max_turns=max_turns,
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+        )
+    finally:
+        backend.restore()
+        if model:
+            if previous_model is None:
+                os.environ.pop("SWT_JUDGE_MODEL", None)
+            else:
+                os.environ["SWT_JUDGE_MODEL"] = previous_model
+    verdict = result.verdict
+    if not isinstance(verdict, dict):
+        verdict = {"error": "non_dict_verdict", "value": verdict}
+    return JudgeRunResult(
+        verdict=dict(verdict),
+        stdout=getattr(result, "stdout", "") or "",
+        stderr=getattr(result, "stderr", "") or "",
+        exit_code=int(getattr(result, "exit_code", 0) or 0),
+        sandbox_id=str(getattr(result, "sandbox_id", "")),
+        judge_model=str(getattr(result, "judge_model", "") or ""),
+        judge_backend=str(getattr(result, "judge_backend", "docker") or "docker"),
+    )
+
+
+def _default_task_dir(swe_together_root: Path | str, task_name: str) -> Path:
+    return Path(swe_together_root).expanduser().resolve() / "tasks" / task_name
 
 
 def task_docker_image(
@@ -813,37 +982,81 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9_.-]+", "-", value.lower()).strip("-") or "task"
 
 
-# --------------------------------------------------------------------------- user behavior
+def _trial_sim_message_count(trial_dir: Path) -> int:
+    count = 0
+    for decision in sorted((trial_dir / "agent").glob("episode-*/user_decision.json")):
+        try:
+            payload = json.loads(decision.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("has_message") and str(payload.get("content") or "").strip():
+            count += 1
+    return count
 
 
-def run_user_behavior(
-    *,
-    swe_together_root: Path | str,
-    jobs: Sequence[Mapping[str, Any]],
-    workers: int = 5,
-    model: str | None = None,
-    force: bool = False,
-    python: str | None = None,
-    timeout: float = 3600,
-    runner: Callable[..., Any] | None = None,
-) -> dict[str, Any]:
-    """Delegate ``User Correction`` tagging to upstream ``eval.user_behavior``."""
-    root = Path(swe_together_root).expanduser().resolve()
-    module = root / "eval" / "user_behavior" / "run_batch.py"
-    if not module.exists():
-        raise FileNotFoundError(f"SWE-Together user-behavior runner not found: {module}")
-    workspace = Path(tempfile.mkdtemp(prefix="olympus-user-behavior-"))
-    plan_path = workspace / "plan.json"
-    plan = [
-        {
-            "trial_dir": str(job["trial_dir"]),
-            "task_dir": str(job["task_dir"]),
-            "out_name": job.get("out_name", "intent_coverage_verdict.json"),
-            **({"force": True} if force else {}),
+def _local_metrics_from_rows(rows: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    if not rows:
+        return {
+            "user_correction": None,
+            "n_tagged_msgs": 0,
+            "n_correction": None,
+            "n_nudge": None,
         }
-        for job in jobs
-    ]
-    plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    tags = [row.get("tags", []) for row in rows]
+    corrections = sum(1 for item in tags if "correction" in item)
+    nudges = sum(1 for item in tags if "nudge" in item)
+    return {
+        "user_correction": round(corrections + 0.2 * nudges, 4),
+        "n_tagged_msgs": len(rows),
+        "n_correction": corrections,
+        "n_nudge": nudges,
+    }
+
+
+def metrics_from_rows(
+    swe_together_root: Path | str, rows: Sequence[Mapping[str, Any]] | None
+) -> dict[str, Any]:
+    """Derive ``user_correction`` via upstream ``user_metrics`` when present."""
+    try:
+        module = _import_upstream(
+            swe_together_root,
+            UPSTREAM_METRICS_MODULE,
+            "eval/user_behavior/user_metrics.py",
+        )
+    except Exception as exc:
+        log.warning("upstream user_metrics import failed, using local formula: %s", exc)
+        module = None
+    if module is not None:
+        return module.metrics_from_rows(rows)
+    return _local_metrics_from_rows(rows)
+
+
+def _stage_trial_links(trial_dirs: Sequence[Path], parent: Path) -> Path:
+    staged = Path(tempfile.mkdtemp(prefix="olympus-user-tagging-", dir=parent))
+    used: set[str] = set()
+    for index, trial in enumerate(trial_dirs):
+        name = trial.name or f"trial-{index}"
+        candidate = name
+        suffix = 1
+        while candidate in used:
+            suffix += 1
+            candidate = f"{name}-{suffix}"
+        used.add(candidate)
+        os.symlink(trial, staged / candidate, target_is_directory=True)
+    return staged
+
+
+def _run_coverage_batch(
+    *,
+    root: Path,
+    plan_path: Path,
+    workers: int,
+    model: str | None,
+    force: bool,
+    python: str | None,
+    timeout: float,
+    runner: Callable[..., Any] | None,
+) -> dict[str, Any]:
     argv = [
         python or sys.executable,
         "-m",
@@ -867,13 +1080,187 @@ def run_user_behavior(
         "status": "ok" if proc.returncode == 0 else "error",
         "return_code": proc.returncode,
         "plan": str(plan_path),
+        "argv": argv,
         "stdout_tail": (proc.stdout or "")[-2000:],
         "stderr_tail": (proc.stderr or "")[-2000:],
         "summary": summary,
     }
 
 
-# --------------------------------------------------------------------------- batch scoring
+def _run_tagging_batch(
+    *,
+    root: Path,
+    workspace: Path,
+    trial_dirs: Sequence[Path],
+    workers: int,
+    model: str | None,
+    force: bool,
+    python: str | None,
+    timeout: float,
+    runner: Callable[..., Any] | None,
+) -> dict[str, Any]:
+    module = root / "eval" / "user_behavior" / "tag_messages.py"
+    if not module.exists():
+        raise FileNotFoundError(f"SWE-Together message tagger not found: {module}")
+    staged = _stage_trial_links(trial_dirs, workspace)
+    argv = [
+        python or sys.executable,
+        "-m",
+        "eval.user_behavior.tag_messages",
+        "--trials-root",
+        str(staged),
+        "--workers",
+        str(workers),
+    ]
+    if model:
+        argv.extend(["--model", model])
+    if force:
+        argv.append("--force")
+    invoke = runner or subprocess.run
+    try:
+        proc = invoke(argv, cwd=str(root), capture_output=True, text=True, timeout=timeout)
+    finally:
+        with suppress(OSError):
+            shutil.rmtree(staged)
+    return {
+        "status": "ok" if proc.returncode == 0 else "error",
+        "return_code": proc.returncode,
+        "argv": argv,
+        "stdout_tail": (proc.stdout or "")[-2000:],
+        "stderr_tail": (proc.stderr or "")[-2000:],
+    }
+
+
+def run_user_behavior(
+    *,
+    swe_together_root: Path | str,
+    jobs: Sequence[Mapping[str, Any]],
+    workers: int = 5,
+    model: str | None = None,
+    force: bool = False,
+    python: str | None = None,
+    timeout: float = 3600,
+    runner: Callable[..., Any] | None = None,
+    tag_model: str | None = None,
+) -> dict[str, Any]:
+    """Run upstream intent coverage and message tagging; report ``user_correction``."""
+    root = Path(swe_together_root).expanduser().resolve()
+    coverage_module = root / "eval" / "user_behavior" / "run_batch.py"
+    tag_module = root / "eval" / "user_behavior" / "tag_messages.py"
+    if not coverage_module.exists():
+        raise FileNotFoundError(f"SWE-Together user-behavior runner not found: {coverage_module}")
+    if not tag_module.exists():
+        raise FileNotFoundError(f"SWE-Together message tagger not found: {tag_module}")
+    workspace = Path(tempfile.mkdtemp(prefix="olympus-user-behavior-"))
+    plan_path = workspace / "plan.json"
+    plan = [
+        {
+            "trial_dir": str(job["trial_dir"]),
+            "task_dir": str(job["task_dir"]),
+            "out_name": job.get("out_name", "intent_coverage_verdict.json"),
+            **({"force": True} if force else {}),
+        }
+        for job in jobs
+    ]
+    plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    coverage = _run_coverage_batch(
+        root=root,
+        plan_path=plan_path,
+        workers=workers,
+        model=model,
+        force=force,
+        python=python,
+        timeout=timeout,
+        runner=runner,
+    )
+    trial_dirs = list(
+        dict.fromkeys(
+            Path(job["trial_dir"]).expanduser().resolve() for job in jobs
+        )
+    )
+    tagging = _run_tagging_batch(
+        root=root,
+        workspace=workspace,
+        trial_dirs=trial_dirs,
+        workers=workers,
+        model=tag_model if tag_model is not None else model,
+        force=force,
+        python=python,
+        timeout=timeout,
+        runner=runner,
+    )
+    trials: list[dict[str, Any]] = []
+    errors: list[str] = []
+    user_correction: dict[str, float | None] = {}
+    for job in jobs:
+        trial = Path(job["trial_dir"]).expanduser().resolve()
+        task = Path(job["task_dir"]).expanduser().resolve()
+        out_name = str(job.get("out_name", "intent_coverage_verdict.json"))
+        verdict: dict[str, Any] = {}
+        verdict_path = trial / out_name
+        if verdict_path.exists():
+            try:
+                loaded = json.loads(verdict_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    verdict = loaded
+            except (OSError, json.JSONDecodeError):
+                verdict = {}
+        rows = verdict.get("trial_msg_tags")
+        metrics = metrics_from_rows(root, rows)
+        persisted = verdict.get("user_correction")
+        expected = _trial_sim_message_count(trial) > 0
+        recomputed = metrics.get("user_correction")
+        record = {
+            "trial_dir": str(trial),
+            "task_dir": str(task),
+            "out_name": out_name,
+            "expected_tags": expected,
+            "trial_msg_tags": isinstance(rows, list),
+            "n_tagged_msgs": metrics.get("n_tagged_msgs", 0),
+            "user_correction": recomputed if recomputed is not None else persisted,
+            "user_correction_persisted": persisted,
+            "user_correction_recomputed": recomputed,
+        }
+        if expected and (not isinstance(rows, list) or record["user_correction"] is None):
+            hint = (
+                " (tag_messages only reads intent_coverage_verdict.json)"
+                if out_name != "intent_coverage_verdict.json"
+                else ""
+            )
+            errors.append(
+                f"{trial.name}: simulated-user messages exist but user_correction is "
+                f"null{hint}"
+            )
+        if (
+            isinstance(rows, list)
+            and persisted is not None
+            and recomputed is not None
+            and abs(float(persisted) - float(recomputed)) > 1e-9
+        ):
+            errors.append(
+                f"{trial.name}: persisted user_correction {persisted} != "
+                f"upstream metrics {recomputed}"
+            )
+        user_correction[str(trial)] = record["user_correction"]
+        trials.append(record)
+    status = (
+        "ok"
+        if coverage["return_code"] == 0 and tagging["return_code"] == 0 and not errors
+        else "error"
+    )
+    return {
+        "status": status,
+        "return_code": coverage["return_code"],
+        "plan": str(plan_path),
+        "argv": coverage["argv"],
+        "stdout_tail": coverage["stdout_tail"],
+        "stderr_tail": coverage["stderr_tail"],
+        "summary": coverage["summary"],
+        "tagging": tagging,
+        "trials": trials,
+        "user_correction": user_correction,
+        "errors": errors,
+    }
 
 
 def derive_judge_score(
@@ -928,8 +1315,13 @@ async def judge_jobs(
     judge_command: str | None = None,
     sandbox_factory: Callable[..., Any] | None = None,
     auto_rubric: bool = False,
+    docker_cli: DockerCli | None = None,
 ) -> list[dict[str, Any]]:
-    """Score every job's patch in its own fresh Docker container."""
+    """Score every job's patch through upstream ``run_judge`` on local Docker."""
+    task_dirs = {
+        job.task_dir.expanduser().resolve().name: job.task_dir.expanduser().resolve()
+        for job in jobs
+    }
     results: list[dict[str, Any]] = []
     for job in jobs:
         trial = job.trial_dir.resolve()
@@ -973,16 +1365,19 @@ async def judge_jobs(
                     result["reason"] = "phase 1 has neither an oracle patch nor dialogue"
                     results.append(result)
                     continue
-                phase1 = await run_judge_docker(
+                phase1 = await run_judge_task(
                     task_name=task.name,
                     trial_id=trial.name,
                     inputs=phase1_inputs,
-                    image=task_docker_image(task, image=image),
+                    swe_together_root=swe_together_root,
+                    image=image,
                     timeout_sec=timeout_sec,
                     max_turns=max_turns,
                     model=model,
                     judge_command=judge_command,
                     sandbox_factory=sandbox_factory,
+                    task_dirs=task_dirs,
+                    docker_cli=docker_cli,
                 )
                 if "error" in phase1.verdict:
                     result["status"] = "phase1_error"
@@ -1000,16 +1395,19 @@ async def judge_jobs(
                 swe_together_root=swe_together_root,
             )
             started = time.monotonic()
-            judged = await run_judge_docker(
+            judged = await run_judge_task(
                 task_name=task.name,
                 trial_id=trial.name,
                 inputs=inputs,
-                image=task_docker_image(task, image=image),
+                swe_together_root=swe_together_root,
+                image=image,
                 timeout_sec=timeout_sec,
                 max_turns=max_turns,
                 model=model,
                 judge_command=judge_command,
                 sandbox_factory=sandbox_factory,
+                task_dirs=task_dirs,
+                docker_cli=docker_cli,
             )
             elapsed = round(time.monotonic() - started, 1)
             verdict = dict(judged.verdict)
@@ -1043,7 +1441,8 @@ async def judge_jobs(
             verdict["judge_elapsed_sec"] = elapsed
             verdict["sandbox_id"] = judged.sandbox_id
             verdict["judge_exit_code"] = judged.exit_code
-            verdict["judge_backend"] = "docker"
+            verdict["judge_backend"] = judged.judge_backend
+            verdict["judge_model"] = judged.judge_model
             verdict["judge_phase"] = phase
             verdict["rubric_n_goals"] = len(rubric.get("completeness_goals", []))
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -1054,7 +1453,7 @@ async def judge_jobs(
             result["judge_score"] = verdict.get("judge_score")
             result["verdict"] = verdict.get("verdict")
             result["elapsed_sec"] = elapsed
-        except Exception as exc:  # noqa: BLE001 - one bad trial must not stop the batch
+        except Exception as exc:  # noqa: BLE001 -- one bad trial must not stop the batch
             result["status"] = "error"
             result["error"] = f"{type(exc).__name__}: {exc}"[:2000]
             log.warning("judge failed for %s: %s", trial.name, result["error"])
@@ -1080,6 +1479,8 @@ async def run_stage2(
     user_behavior_model: str | None = None,
     user_behavior_force: bool = False,
     user_behavior_runner: Callable[..., Any] | None = None,
+    user_behavior_tag_model: str | None = None,
+    docker_cli: DockerCli | None = None,
 ) -> dict[str, Any]:
     """Run Stage 2 correctness and (optionally) User Correction locally."""
     correctness = await judge_jobs(
@@ -1094,6 +1495,7 @@ async def run_stage2(
         judge_command=judge_command,
         sandbox_factory=sandbox_factory,
         auto_rubric=auto_rubric,
+        docker_cli=docker_cli,
     )
     behavior: dict[str, Any] | None = None
     if user_behavior and jobs:
@@ -1111,10 +1513,12 @@ async def run_stage2(
             model=user_behavior_model,
             force=user_behavior_force,
             runner=user_behavior_runner,
+            tag_model=user_behavior_tag_model,
         )
     return {
         "correctness": correctness,
         "user_behavior": behavior,
+        "user_correction": behavior.get("user_correction") if behavior else None,
         "status": (
             "ok"
             if all(item.get("status") != "error" for item in correctness)
@@ -1124,15 +1528,12 @@ async def run_stage2(
     }
 
 
-# --------------------------------------------------------------------------- CLI
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Judge SWE-Together trials locally on Docker (no E2B_API_KEY): "
-            "eval/correctness via DockerJudgeSandbox plus eval/user_behavior "
-            "User Correction tagging."
+            "eval/correctness via upstream run_judge + DockerJudgeSandbox, "
+            "plus eval/user_behavior coverage and User Correction tagging."
         )
     )
     parser.add_argument(
@@ -1161,22 +1562,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-turns", type=int, default=JUDGE_MAX_TURNS, help="Judge agent turn budget."
     )
-    parser.add_argument("--model", default=None, help="Judge Claude model passed to `claude`.")
+    parser.add_argument("--model", default=None, help="Judge Claude model (SWT_JUDGE_MODEL).")
     parser.add_argument(
         "--judge-command",
         default=None,
-        help="Override the in-container judge command (advanced/testing).",
+        help="Force the offline fallback with this in-container judge command.",
     )
     parser.add_argument(
         "--skip-user-behavior",
         action="store_true",
-        help="Skip the eval/user_behavior User Correction pass.",
+        help="Skip the eval/user_behavior coverage + tagging pass.",
     )
     parser.add_argument(
         "--user-behavior-workers", type=int, default=5, help="Concurrent tagging calls."
     )
     parser.add_argument(
-        "--user-behavior-model", default=None, help="Model for the User Correction tagger."
+        "--user-behavior-model", default=None, help="Model for the coverage judge."
+    )
+    parser.add_argument(
+        "--user-behavior-tag-model", default=None, help="Model for the User Correction tagger."
     )
     parser.add_argument(
         "--user-behavior-force", action="store_true", help="Re-tag existing verdicts."
@@ -1225,6 +1629,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         }
                         for job in jobs
                     ],
+                    "judge_backend": (
+                        "upstream" if load_upstream_judge_module(root) is not None else "fallback"
+                    ),
                     "user_behavior": not args.skip_user_behavior,
                 },
                 indent=2,
@@ -1247,6 +1654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             user_behavior_workers=args.user_behavior_workers,
             user_behavior_model=args.user_behavior_model,
             user_behavior_force=args.user_behavior_force,
+            user_behavior_tag_model=args.user_behavior_tag_model,
         )
     )
     if args.json:
@@ -1261,26 +1669,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         behavior = summary.get("user_behavior")
         if behavior is not None:
             print(f"user_behavior: {behavior.get('status')}")
+            for trial in behavior.get("trials", []):
+                print(
+                    f"{trial.get('user_correction')!s:>16}  "
+                    f"user_correction  {trial.get('trial_dir', '')}"
+                )
     return 0 if summary["status"] == "ok" else 1
 
 
 __all__ = [
     "CmdResult",
     "DockerCli",
+    "DockerJudgeBackend",
     "DockerJudgeSandbox",
     "JudgeInputs",
     "JudgeJob",
     "JudgeRunResult",
     "apply_candidates",
     "build_apply_script",
-    "build_first_message",
-    "build_judge_command",
+    "build_parser",
     "derive_judge_score",
+    "install_local_docker_judge_backend",
     "judge_jobs",
     "load_judge_inputs",
+    "load_upstream_judge_module",
     "main",
+    "metrics_from_rows",
     "parse_plan",
     "run_judge_docker",
+    "run_judge_task",
     "run_stage2",
     "run_user_behavior",
     "task_docker_image",
