@@ -3,8 +3,10 @@
  *
  * Fast in-loop feedback for `write` / `edit` calls whose target escapes the
  * task's authorized write scope or hits a forbidden shared-contract glob.
- * The deterministic post-flight Diff Gate in Olympus remains authoritative:
- * this extension only helps the model self-correct early.
+ * With OLYMPUS_PI_STRICT_SCOPE=0 (no concurrent siblings) adjacent
+ * non-forbidden repo edits are allowed; escapes and forbidden globs stay
+ * hard-blocked. The deterministic post-flight Diff Gate in Olympus remains
+ * authoritative: this extension only helps the model self-correct early.
  */
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,6 +22,9 @@ function readList(name: string): string[] {
 
 const writeScope = readList("OLYMPUS_PI_WRITE_SCOPE");
 const forbiddenGlobs = readList("OLYMPUS_PI_FORBIDDEN_GLOBS");
+// Strict scope stays on for concurrent waves; single-task/serial turns still hard-block
+// workspace escapes and forbiddenGlobs but may touch adjacent non-forbidden repo files.
+const strictScope = process.env.OLYMPUS_PI_STRICT_SCOPE !== "0";
 const workspaceRoot = process.cwd();
 
 function globToRegExp(pattern: string): RegExp {
@@ -118,6 +123,9 @@ export default function (pi: ExtensionAPI) {
         block: true,
         reason: `Olympus scope guard: '${relative}' matches forbidden shared-contract glob '${forbidden}'.`,
       };
+    }
+    if (!strictScope) {
+      return;
     }
     if (!writeScope.some((pattern) => contains(relative, pattern))) {
       return {

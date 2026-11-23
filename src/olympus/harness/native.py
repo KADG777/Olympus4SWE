@@ -58,7 +58,7 @@ class NativeDriver:
             toolkit = WorkspaceToolkit(
                 request.workspace_path,
                 read_only=request.read_only,
-                allowed_write_scope=request.write_scope,
+                allowed_write_scope=request.write_scope if request.strict_scope else None,
                 forbidden_write_scope=request.forbidden_globs,
                 env_root=request.env_root,
             )

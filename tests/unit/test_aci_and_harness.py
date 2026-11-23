@@ -12,12 +12,15 @@ from pathlib import Path
 import olympus.tools.aci as aci_module
 from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
+from olympus.harness.diff_gate import evaluate_sandbox_changes, run_diff_gate
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
     absorb_verification_artifacts,
     capture_sandbox_diff,
+    clean_ephemeral_artifacts,
     collect_sandbox_changes,
     create_sandbox,
+    is_ephemeral_artifact,
     load_sandbox_baseline,
     remove_sandbox,
     save_sandbox_baseline,
@@ -273,6 +276,119 @@ def test_absorb_verification_artifacts_hides_only_out_of_scope_side_effects(
         absorbed = absorb_verification_artifacts(handle, baseline, write_scope=["feature.py"])
 
         assert collect_sandbox_changes(handle, absorbed) == ["contract.txt", "feature.py"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_ephemeral_artifact_patterns_cover_conservative_junk_only() -> None:
+    for rel in (
+        "feature.py.backup",
+        "pkg/module.bak",
+        "notes.orig",
+        "scratch.tmp",
+        "notes.txt~",
+        ".notes.swp",
+        ".DS_Store",
+        "pkg/__pycache__/mod.cpython-313.pyc",
+        "mod.pyc",
+        ".pytest_cache/CACHEDIR.TAG",
+    ):
+        assert is_ephemeral_artifact(rel) is True, rel
+    for rel in ("feature.py", "docs/notes.md", "pkg/__init__.py", "src/rogue.py"):
+        assert is_ephemeral_artifact(rel) is False, rel
+
+
+def test_clean_ephemeral_artifacts_removes_only_new_untracked_junk(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    (repo / "legacy.bak").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "legacy.bak"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "tracked junk-like file"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="task-junk")
+    try:
+        ws = handle.workspace_path
+        (ws / "existing.tmp").write_text("pre-existing\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "feature.py.backup").write_text("old\n", encoding="utf-8")
+        (ws / "notes.txt~").write_text("old\n", encoding="utf-8")
+        (ws / "pkg" / "__pycache__").mkdir(parents=True)
+        (ws / "pkg" / "__pycache__" / "mod.cpython-313.pyc").write_text("x", encoding="utf-8")
+        (ws / ".pytest_cache").mkdir()
+        (ws / ".pytest_cache" / "CACHEDIR.TAG").write_text("x", encoding="utf-8")
+        (ws / "legacy.bak").write_text("tracked-mod\n", encoding="utf-8")
+
+        removed = clean_ephemeral_artifacts(handle, baseline)
+
+        assert removed == [
+            ".pytest_cache/CACHEDIR.TAG",
+            "feature.py.backup",
+            "notes.txt~",
+            "pkg/__pycache__/mod.cpython-313.pyc",
+        ]
+        assert not (ws / "feature.py.backup").exists()
+        assert not (ws / "pkg" / "__pycache__" / "mod.cpython-313.pyc").exists()
+        assert (ws / "feature.py").is_file()
+        assert (ws / "existing.tmp").read_text(encoding="utf-8") == "pre-existing\n"
+        assert (ws / "legacy.bak").read_text(encoding="utf-8") == "tracked-mod\n"
+        assert collect_sandbox_changes(handle, baseline) == ["feature.py", "legacy.bak"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_diff_gate_strict_scope_separates_forbidden_from_expected_scope(tmp_path: Path) -> None:
+    changed = ["feature.py", "pkg/__init__.py", "contracts/api.py"]
+
+    strict = evaluate_sandbox_changes(
+        changed,
+        allowed_write_scope=["feature.py"],
+        forbidden_globs=["contracts/"],
+    )
+    assert strict.rejected is True
+    assert [(v.path, v.reason) for v in strict.violations] == [
+        ("contracts/api.py", "forbidden"),
+        ("pkg/__init__.py", "outside_write_scope"),
+    ]
+    assert strict.advisory_out_of_scope == ()
+    assert strict.strict_scope is True
+
+    advisory = evaluate_sandbox_changes(
+        changed,
+        allowed_write_scope=["feature.py"],
+        forbidden_globs=["contracts/"],
+        strict_scope=False,
+    )
+    assert advisory.rejected is True
+    assert [(v.path, v.reason) for v in advisory.violations] == [("contracts/api.py", "forbidden")]
+    assert advisory.advisory_out_of_scope == ("pkg/__init__.py",)
+    assert advisory.strict_scope is False
+    assert "pkg/__init__.py" in advisory.rejection_message()
+
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-gate")
+    try:
+        ws = handle.workspace_path
+        (ws / "pkg").mkdir()
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "pkg" / "__init__.py").write_text("FLAG = True\n", encoding="utf-8")
+        relaxed = run_diff_gate(
+            handle,
+            baseline,
+            allowed_write_scope=["feature.py"],
+            forbidden_globs=[],
+            strict_scope=False,
+        )
+        assert relaxed.rejected is False
+        assert relaxed.advisory_out_of_scope == ("pkg/__init__.py",)
+        strict_gate = run_diff_gate(
+            handle,
+            baseline,
+            allowed_write_scope=["feature.py"],
+            forbidden_globs=[],
+        )
+        assert strict_gate.rejected is True
+        assert strict_gate.rejection_message().count("outside authorized write_scope") == 1
     finally:
         remove_sandbox(handle)
 

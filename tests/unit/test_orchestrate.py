@@ -74,10 +74,11 @@ def _confirmed_run(
     *,
     criteria: list[str] | None = None,
     budget_policy: BudgetPolicy | None = None,
+    mode: RunMode = RunMode.SIMULATION,
 ) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
     run_id = store.create_run(
-        title="Manifest run", mode=RunMode.SIMULATION, budget_policy=budget_policy
+        title="Manifest run", mode=mode, budget_policy=budget_policy
     )
     spec = GoalSpec(
         spec_id="spec-manifest",
@@ -1139,6 +1140,7 @@ class _DirectWriteWorker:
 
     def __init__(self, files: dict[str, dict[str, str]]) -> None:
         self._files = files
+        self.prompts: dict[str, str] = {}
 
     def steer(self, guidance: str, *, source: str) -> bool:
         del guidance, source
@@ -1155,6 +1157,8 @@ class _DirectWriteWorker:
         on_handle: Any = None,
     ) -> TurnOutcome:
         del on_event, on_handle
+        if request.task_id is not None:
+            self.prompts[request.task_id] = request.user_prompt
         for rel, content in self._files[request.task_id].items():
             target = request.workspace_path / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1226,7 +1230,7 @@ def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_pa
     orch = OrchestrateStage(
         store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
     )
-    snap = orch.run_execution(run_id=run_id)
+    snap = orch.run_execution(run_id=run_id, strict_scope=True)
 
     assert snap["status"] == RunStatus.COMPLETED
     task = snap["plan"].tasks[0]
@@ -1283,7 +1287,7 @@ def test_diff_gate_rejects_untracked_file_outside_write_scope(tmp_path: Path) ->
     orch = OrchestrateStage(
         store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
     )
-    snap = orch.run_execution(run_id=run_id)
+    snap = orch.run_execution(run_id=run_id, strict_scope=True)
 
     assert snap["status"] == RunStatus.AWAITING_HUMAN
     task = snap["plan"].tasks[0]
@@ -1458,7 +1462,7 @@ def test_diff_gate_validates_non_git_sandbox_without_crashing(tmp_path: Path) ->
     orch = OrchestrateStage(
         store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
     )
-    snap = orch.run_execution(run_id=run_id)
+    snap = orch.run_execution(run_id=run_id, strict_scope=True)
 
     assert snap["status"] == RunStatus.COMPLETED
     assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
@@ -1501,7 +1505,7 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
     orch = OrchestrateStage(
         store=store, provider=MockLLMProvider(responder=responder), workspace_root=tmp_path
     )
-    snap = orch.run_execution(run_id=run_id)
+    snap = orch.run_execution(run_id=run_id, strict_scope=True)
 
     task = snap["plan"].tasks[0]
     assert task.status == TaskStatus.BLOCKED
@@ -1523,6 +1527,185 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
     assert (docs / "notes.md").is_file()
     assert (docs / "legacy.txt").is_file()
     assert not (docs / "notes-renamed.md").exists()
+
+
+def test_single_task_adjacent_edit_is_advisory_and_promoted(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "add", "pkg/__init__.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "pkg"], cwd=tmp_path, check=True, capture_output=True)
+
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["pkg/flag.py"],
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Adjacent re-export makes the flag importable",
+                "command": (
+                    "python3 -c 'import pkg; assert pkg.FLAG is True; "
+                    "import pkg.flag; assert pkg.flag.FLAG is True'"
+                ),
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    prompts: dict[str, str] = {}
+    worker = _DirectWriteWorker(
+        {
+            "T1": {
+                "pkg/flag.py": "FLAG = True\n",
+                "pkg/__init__.py": "from pkg.flag import FLAG\n",
+            }
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry({"direct": worker}),
+    )
+    out = stage.run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert out["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert _gate_rejections(store, run_id) == []
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "pkg" / "flag.py").is_file()
+    assert (overlay / "pkg" / "__init__.py").read_text(encoding="utf-8") == (
+        "from pkg.flag import FLAG\n"
+    )
+    # The adjacent non-forbidden edit is promoted to the real workspace on acceptance.
+    assert (pkg / "__init__.py").read_text(encoding="utf-8") == "from pkg.flag import FLAG\n"
+    assert (pkg / "flag.py").is_file()
+    assert "pkg/__init__.py" in prompts["T1"]
+    assert "Authorized out-of-declared-scope adjacent edits" in prompts["T1"]
+    assert "pkg/__init__.py" in prompts["T1"].split("Authorized out-of-declared-scope")[1]
+    assert "no concurrent sibling task shares this run wave" in worker.prompts["T1"]
+
+
+def test_concurrent_wave_enforces_strict_scope_and_sibling_forbidden_globs(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _parallel_plan(spec, scopes={"T1": ["t1.py"], "T2": ["t2.py"]})
+    plan = plan.model_copy(
+        update={"tasks": [t.model_copy(update={"max_cycles": 1}) for t in plan.tasks]}
+    )
+    _approve_plan(store, run_id, plan)
+    worker = _DirectWriteWorker(
+        {
+            "T1": {"t1.py": "T1 = True\n", "pkg/__init__.py": "T1 = True\n", "t2.py": "CLOBBER\n"},
+            "T2": {"t2.py": "T2 = True\n"},
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry({"direct": worker}),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    tasks = {task.task_id: task for task in out["plan"].tasks}
+    assert tasks["T1"].status == TaskStatus.BLOCKED
+    assert tasks["T2"].status == TaskStatus.ACCEPTED
+    rejections = _gate_rejections(store, run_id)
+    assert len(rejections) == 1
+    payload = rejections[0].payload
+    assert payload["task_id"] == "T1"
+    assert payload["strict_scope"] is True
+    assert payload["advisory_out_of_scope"] == []
+    assert payload["forbidden_globs"] == ["t2.py"]
+    assert payload["violating_paths"] == ["pkg/__init__.py", "t2.py"]
+    assert {
+        (violation["path"], violation["reason"]) for violation in payload["violations"]
+    } == {
+        ("pkg/__init__.py", "outside_write_scope"),
+        ("t2.py", "forbidden"),
+    }
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "t2.py").read_text(encoding="utf-8") == "T2 = True\n"
+    assert not (overlay / "t1.py").exists()
+    assert not (overlay / "pkg").exists()
+
+
+def test_ephemeral_junk_cleaned_before_diff_gate_is_logged_and_not_promoted(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        checks=[
+            {
+                "id": "CHK-1",
+                "kind": CheckKind.COMMAND.value,
+                "description": "Feature flag module imports",
+                "command": "python3 -c 'import feature; assert feature.FLAG is True'",
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    prompts: dict[str, str] = {}
+    worker = _DirectWriteWorker(
+        {
+            "T1": {
+                "feature.py": "FLAG = True\n",
+                "feature.py.backup": "stale\n",
+                "scratch.tmp": "stale\n",
+                "pkg/__pycache__/mod.cpython-313.pyc": "bytecode",
+            }
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry({"direct": worker}),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert out["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert _gate_rejections(store, run_id) == []
+    cleaned = [
+        e
+        for e in store.list_events(run_id)
+        if e.event_type == "task.ephemeral_artifacts_cleaned"
+    ]
+    assert len(cleaned) == 1
+    assert cleaned[0].payload["removed_paths"] == [
+        "feature.py.backup",
+        "pkg/__pycache__/mod.cpython-313.pyc",
+        "scratch.tmp",
+    ]
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (overlay / "feature.py").is_file()
+    assert not (overlay / "feature.py.backup").exists()
+    assert not (overlay / "scratch.tmp").exists()
+    assert not (overlay / "pkg").exists()
+    prompt = prompts["T1"]
+    assert "feature.py" in prompt
+    assert "feature.py.backup" not in prompt
+    assert "scratch.tmp" not in prompt
 
 
 AttemptAction = Callable[[int, Path, str], None]
@@ -1622,7 +1805,9 @@ def test_retained_sandbox_enables_in_place_repair_on_diff_gate_retry(tmp_path: P
         (ws / "feature.py").write_text("FLAG = 2\n", encoding="utf-8")
 
     worker = _AttemptWorker([repair])
-    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+    snap = _retained_stage(store, tmp_path, worker).run_execution(
+        run_id=run_id, strict_scope=True
+    )
 
     assert snap["status"] == RunStatus.COMPLETED
     task = snap["plan"].tasks[0]
@@ -1664,7 +1849,9 @@ def test_retained_sandbox_never_rebaselines_out_of_scope_violations(tmp_path: Pa
         assert (ws / "scratch.db").is_file()
 
     worker = _AttemptWorker([stray, leave_stray])
-    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+    snap = _retained_stage(store, tmp_path, worker).run_execution(
+        run_id=run_id, strict_scope=True
+    )
 
     assert snap["status"] == RunStatus.AWAITING_HUMAN
     task = snap["plan"].tasks[0]
@@ -1858,7 +2045,7 @@ def test_run_cancellation_reclaims_retained_sandbox_and_temp_dir(tmp_path: Path)
 
     worker = _AttemptWorker([stray])
     stage = _retained_stage(store, tmp_path, worker)
-    snap = stage.run_execution(run_id=run_id)
+    snap = stage.run_execution(run_id=run_id, strict_scope=True)
     assert snap["status"] == RunStatus.AWAITING_HUMAN
     sandbox = worker.sandboxes[0]
     tmp_dir = tmp_path / ".olympus" / "sandbox_tmp" / sandbox.name
@@ -2549,7 +2736,7 @@ def test_diff_gate_rejects_tracked_ignored_dir_and_posix_backslash_filename(
             execution_drivers=ExecutionDriversConfig(worker_driver="audit"),
             driver_registry=DriverRegistry({"audit": OutOfScopeDriver(rel)}),
         )
-        out = stage.run_execution(run_id=run_id)
+        out = stage.run_execution(run_id=run_id, strict_scope=True)
         assert out["plan"].tasks[0].status == TaskStatus.BLOCKED
         rejections = [
             e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"
@@ -3370,7 +3557,9 @@ def test_retained_sandbox_diff_gate_blocks_worker_committed_out_of_scope_file(
         else:
             assert (ws / "out-of-scope.txt").is_file()
 
-    snap = _retained_stage(store, tmp_path, _AttemptWorker([worker])).run_execution(run_id=run_id)
+    snap = _retained_stage(store, tmp_path, _AttemptWorker([worker])).run_execution(
+        run_id=run_id, strict_scope=True
+    )
     rejections = [
         (event.payload["attempt"], event.payload["violating_paths"])
         for event in _gate_rejections(store, run_id)

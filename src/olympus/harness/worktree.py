@@ -10,10 +10,24 @@ import stat
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, sandbox_tmp_path
 from olympus.tools.aci import build_sandbox_env as build_sandbox_env
+
+EPHEMERAL_ARTIFACT_PATTERNS: tuple[str, ...] = (
+    "*.backup",
+    "*.bak",
+    "*.orig",
+    "*.tmp",
+    "*~",
+    ".*.swp",
+    ".DS_Store",
+    "**/__pycache__/**",
+    "*.pyc",
+    "**/.pytest_cache/**",
+)
 
 
 @dataclass(frozen=True)
@@ -523,6 +537,73 @@ def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) ->
     }
     changed.update(rel for rel in before if rel not in current)
     return sorted(changed)
+
+
+def is_ephemeral_artifact(rel: str) -> bool:
+    """Return True when ``rel`` matches a conservative temporary/backup junk pattern."""
+    parts = PurePosixPath(rel.replace("\\", "/")).parts
+    if not parts:
+        return False
+    name = parts[-1]
+    for pattern in EPHEMERAL_ARTIFACT_PATTERNS:
+        if pattern.startswith("**/") and pattern.endswith("/**"):
+            segment = pattern[3:-3]
+            if segment and segment in parts[:-1]:
+                return True
+        elif fnmatchcase(name, pattern):
+            return True
+    return False
+
+
+_EPHEMERAL_WALK_SKIP = frozenset({".git", ".venv", ".olympus", "node_modules"})
+
+
+def _untracked_paths(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
+    """List untracked files, including ignored dirs such as ``__pycache__``."""
+    ws = handle.workspace_path
+    if baseline.is_git and is_git_repo(ws):
+        proc = _run_git(ws, "ls-files", "--others", "-z")
+        if proc.returncode == 0:
+            return [rel for rel in proc.stdout.split("\0") if rel]
+    paths: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(ws):
+        dirnames[:] = sorted(d for d in dirnames if d not in _EPHEMERAL_WALK_SKIP)
+        for name in sorted(filenames):
+            rel = (Path(dirpath) / name).relative_to(ws).as_posix()
+            paths.append(rel)
+    return paths
+
+
+def clean_ephemeral_artifacts(
+    handle: SandboxHandle, baseline: SandboxBaseline
+) -> list[str]:
+    """Delete newly created untracked junk files and return their sorted relative paths.
+
+    Only files absent from both the pre-worker ``baseline`` and the git ``base_commit`` are
+    considered, so tracked files and pre-existing sandbox files are never removed.
+    """
+    before = baseline.mapping()
+    base_commit = baseline.base_commit or handle.base_commit
+    ws = handle.workspace_path
+    removed: list[str] = []
+    for raw_rel in sorted(_untracked_paths(handle, baseline)):
+        rel = raw_rel.replace("\\", "/")
+        if rel in before:
+            continue
+        if _is_tracked_at_base(ws, base_commit, rel):
+            continue
+        if not is_ephemeral_artifact(rel):
+            continue
+        target = ws / rel
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            else:
+                continue
+        except OSError:
+            continue
+        removed.append(rel)
+    return removed
 
 
 def sync_upstream_files(
