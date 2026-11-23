@@ -82,8 +82,11 @@ def normalize_token_usage(payload: Any) -> dict[str, Any] | None:
             if not isinstance(entry, Mapping):
                 continue
             actor_counters = _counters(entry)
+            raw_calls = entry.get("calls")
+            if raw_calls is None:
+                raw_calls = entry.get("llm_calls")
             by_actor[str(actor)] = {
-                "calls": _as_non_negative_int(entry.get("calls")),
+                "calls": _as_non_negative_int(raw_calls),
                 **actor_counters,
                 "total_tokens": _total(actor_counters),
             }
@@ -123,17 +126,86 @@ def merge_token_usage(
     return current_usage
 
 
+def subtract_token_usage(
+    current: Mapping[str, Any] | None,
+    previous: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the non-negative delta ``current - previous`` for one cumulative run."""
+    curr = normalize_token_usage(current) if current is not None else None
+    if curr is None:
+        return None
+    prev = normalize_token_usage(previous) if previous is not None else None
+    if prev is None:
+        return curr
+    counters = {
+        name: max(0, curr[name] - prev[name]) for name in _TOKEN_FIELDS
+    }
+    by_actor: dict[str, dict[str, Any]] = {}
+    prev_actors = prev.get("by_actor") or {}
+    for actor, entry in (curr.get("by_actor") or {}).items():
+        prev_entry = prev_actors.get(actor) or {}
+        actor_counters = {
+            name: max(0, entry[name] - _as_non_negative_int(prev_entry.get(name)))
+            for name in _TOKEN_FIELDS
+        }
+        actor_calls = max(0, entry["calls"] - _as_non_negative_int(prev_entry.get("calls")))
+        if actor_calls or _total(actor_counters):
+            by_actor[actor] = {
+                "calls": actor_calls,
+                **actor_counters,
+                "total_tokens": _total(actor_counters),
+            }
+    llm_calls = max(0, curr["llm_calls"] - prev["llm_calls"])
+    return normalize_token_usage(
+        {"llm_calls": llm_calls, **counters, "by_actor": by_actor}
+    )
+
+
+def sum_token_usage(items: Iterable[Mapping[str, Any] | None]) -> dict[str, Any] | None:
+    """Sum distinct run or step-delta token-usage snapshots into one canonical record."""
+    counters = {name: 0 for name in _TOKEN_FIELDS}
+    llm_calls = 0
+    actors: dict[str, dict[str, int]] = {}
+    saw_any = False
+    for item in items:
+        normalized = normalize_token_usage(item) if item is not None else None
+        if normalized is None:
+            continue
+        saw_any = True
+        llm_calls += normalized["llm_calls"]
+        for name in _TOKEN_FIELDS:
+            counters[name] += normalized[name]
+        for actor, entry in normalized["by_actor"].items():
+            agg = actors.setdefault(
+                actor, {"calls": 0, **{name: 0 for name in _TOKEN_FIELDS}}
+            )
+            agg["calls"] += entry["calls"]
+            for name in _TOKEN_FIELDS:
+                agg[name] += entry[name]
+    if not saw_any:
+        return None
+    by_actor = {
+        actor: {**entry, "total_tokens": _total(entry)}
+        for actor, entry in actors.items()
+    }
+    return normalize_token_usage(
+        {"llm_calls": llm_calls, **counters, "by_actor": by_actor}
+    )
+
+
 def token_usage_context_fields(usage: Mapping[str, Any] | None) -> dict[str, int]:
     """Map Olympus counters onto Harbor ``AgentContext`` token fields.
 
-    Harbor defines ``n_input_tokens`` as *including* cached tokens, so the
-    cache-read counter is added to the input counter rather than double-counted.
+    Harbor defines ``n_input_tokens`` as *including* cached tokens (both cache
+    read and cache write, matching Harbor's own Pi adapter), while
+    ``n_cache_tokens`` reports cache reads.
     """
     if not usage:
         return {}
     return {
         "n_input_tokens": _as_non_negative_int(usage.get("input_tokens"))
-        + _as_non_negative_int(usage.get("cache_read_tokens")),
+        + _as_non_negative_int(usage.get("cache_read_tokens"))
+        + _as_non_negative_int(usage.get("cache_write_tokens")),
         "n_output_tokens": _as_non_negative_int(usage.get("output_tokens")),
         "n_cache_tokens": _as_non_negative_int(usage.get("cache_read_tokens")),
     }
@@ -268,6 +340,8 @@ __all__ = [
     "merge_token_usage",
     "normalize_token_usage",
     "parse_budget_settled_stdout",
+    "subtract_token_usage",
+    "sum_token_usage",
     "token_usage_context_fields",
     "usage_from_context_fields",
     "zero_token_usage",

@@ -2458,3 +2458,101 @@ def test_interact_bridge_retries_pi_error_failed_timeout_and_subprocess_timeout(
             bridge.run()
         assert run_mock.call_count == 2
         assert client.ask_user.call_count == 0
+
+
+def test_interact_populate_context_reports_step_deltas_and_sums_distinct_runs(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    agent = OlympusInteractAgent(logs_dir=logs)
+
+    # Step 1 (plan, run-1): cumulative 100 in / 20 out / 40 cache_r
+    (logs / "olympus-interact-step-01.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "session.envelope",
+                "envelope": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "token_usage": {
+                        "llm_calls": 1,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_tokens": 40,
+                        "cache_write_tokens": 0,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    agent._last_step_role = "plan"
+    ctx1 = SimpleNamespace(metadata=None)
+    agent.populate_context_post_run(ctx1)
+    assert (ctx1.n_input_tokens, ctx1.n_output_tokens, ctx1.n_cache_tokens) == (140, 20, 40)
+
+    # Step 2 (execute, run-1): cumulative 160 in / 35 out / 100 cache_r -> delta 120 in, 15 out
+    (logs / "olympus-interact-step-02.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "session.envelope",
+                "envelope": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "token_usage": {
+                        "llm_calls": 2,
+                        "input_tokens": 160,
+                        "output_tokens": 35,
+                        "cache_read_tokens": 100,
+                        "cache_write_tokens": 0,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    agent._last_step_role = "execute"
+    ctx2 = SimpleNamespace(metadata=None)
+    agent.populate_context_post_run(ctx2)
+    assert (ctx2.n_input_tokens, ctx2.n_output_tokens, ctx2.n_cache_tokens) == (120, 15, 60)
+
+    # Step 3 (handoff): no LLM calls -> must NOT report token deltas to Harbor context
+    agent._last_step_role = "handoff"
+    ctx3 = SimpleNamespace(metadata=None)
+    agent.populate_context_post_run(ctx3)
+    assert not hasattr(ctx3, "n_input_tokens")
+
+    # Step 4 (second distinct run-2): 50 in / 10 out -> delta 50/10, trial total sums run-1 + run-2
+    (logs / "olympus-interact-step-04.jsonl").write_text(
+        json.dumps(
+            {
+                "event": "session.envelope",
+                "envelope": {
+                    "run_id": "run-2",
+                    "status": "completed",
+                    "token_usage": {
+                        "llm_calls": 1,
+                        "input_tokens": 50,
+                        "output_tokens": 10,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    agent._last_step_role = "plan"
+    ctx4 = SimpleNamespace(metadata=None)
+    agent.populate_context_post_run(ctx4)
+    assert (ctx4.n_input_tokens, ctx4.n_output_tokens, ctx4.n_cache_tokens) == (50, 10, 0)
+    # Harbor summing step contexts equals true total across both runs (140+120+50 = 310)
+    assert ctx1.n_input_tokens + ctx2.n_input_tokens + ctx4.n_input_tokens == 310
+    assert ctx4.metadata["token_usage"]["input_tokens"] == 210
+    assert ctx4.metadata["token_usage"]["cache_read_tokens"] == 100
+    assert ctx4.metadata["token_usage"]["output_tokens"] == 45
+    assert ctx4.metadata["token_usage"]["total_tokens"] == 355

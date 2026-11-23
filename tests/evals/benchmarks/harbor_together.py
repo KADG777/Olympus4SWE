@@ -1070,6 +1070,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._conversation: list[dict[str, Any]] = []
         self._sim_user: Any | None = None
         self._token_usage: dict[str, Any] | None = None
+        self._last_turn_had_usage = False
 
     @staticmethod
     def name() -> str:
@@ -1402,7 +1403,7 @@ class UserEnabledOlympusAgent(BaseAgent):
                 detail[:2000] or "olympus session produced no JSON envelope"
             )
         self._run_id = envelope.run_id or self._run_id
-        self._record_token_usage(envelope)
+        self._last_turn_had_usage = self._record_token_usage(envelope)
         await self._capture_git_diff(environment, turn=turn)
         self._record_message(
             role="agent",
@@ -1422,19 +1423,21 @@ class UserEnabledOlympusAgent(BaseAgent):
         )
         return envelope
 
-    def _record_token_usage(self, envelope: SessionEnvelopeView) -> None:
+    def _record_token_usage(self, envelope: SessionEnvelopeView) -> bool:
         usage = normalize_token_usage(envelope.raw.get("token_usage"))
         if usage is not None:
             self._token_usage = merge_token_usage(self._token_usage, usage)
+            return True
+        return False
 
     async def _finalize_token_usage(
         self, environment: Any, envelope: SessionEnvelopeView | None
     ) -> None:
         """Attach usage from the last envelope, else recover it from the event store."""
         try:
-            if envelope is not None:
-                self._record_token_usage(envelope)
-            if self._token_usage is None:
+            if envelope is not None and self._record_token_usage(envelope):
+                self._last_turn_had_usage = True
+            if self._token_usage is None or not self._last_turn_had_usage:
                 recovered = await self._recover_token_usage(environment)
                 self._token_usage = merge_token_usage(self._token_usage, recovered)
         finally:

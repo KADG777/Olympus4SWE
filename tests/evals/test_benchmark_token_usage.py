@@ -187,3 +187,46 @@ def test_budget_settled_command_is_empty_when_store_missing(tmp_path: Path) -> N
         ["/bin/sh", "-c", command], capture_output=True, text=True, check=True
     )
     assert parse_budget_settled_stdout(result.stdout) is None
+
+
+def test_normalize_accepts_session_envelope_llm_calls_and_context_includes_cache_write() -> None:
+    from olympus.session.contracts import (
+        ActorTokenUsage,
+        SessionEnvelope,
+        SessionStatus,
+        TokenUsageSummary,
+    )
+
+    envelope = SessionEnvelope(
+        run_id="run-real-1",
+        status=SessionStatus.COMPLETED,
+        token_usage=TokenUsageSummary(
+            llm_calls=4,
+            input_tokens=1000,
+            output_tokens=200,
+            reasoning_tokens=60,
+            cache_read_tokens=500,
+            cache_write_tokens=40,
+            total_tokens=1740,
+            cache_hit_rate=round(500 / 1500, 4),
+            by_actor={
+                "align:proposer": ActorTokenUsage(
+                    llm_calls=4,
+                    input_tokens=1000,
+                    output_tokens=200,
+                    reasoning_tokens=60,
+                    cache_read_tokens=500,
+                    cache_write_tokens=40,
+                    total_tokens=1740,
+                )
+            },
+        ),
+    )
+    normalized = normalize_token_usage(envelope.model_dump(mode="json")["token_usage"])
+    assert normalized is not None
+    assert normalized["by_actor"]["align:proposer"]["calls"] == 4
+    assert token_usage_context_fields(normalized) == {
+        "n_input_tokens": 1540,
+        "n_output_tokens": 200,
+        "n_cache_tokens": 500,
+    }

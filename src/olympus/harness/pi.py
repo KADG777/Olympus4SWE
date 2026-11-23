@@ -95,7 +95,9 @@ def _binary_cache_key(resolved: str) -> _BinaryCacheKey:
 def _collect_redaction_secrets(
     env: Mapping[str, str], extra_secrets: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
-    values: set[str] = {s for s in extra_secrets if s and len(s) >= 8}
+    values: set[str] = {
+        s.strip() for s in extra_secrets if s and s.strip() and s.strip() != "keyless"
+    }
     for key, val in env.items():
         if val and len(val) >= 8 and _SECRET_ENV_RE.search(key):
             values.add(val)
@@ -295,25 +297,52 @@ def _normalize_thinking_level(value: str | None) -> str | None:
     return normalized
 
 
-def _strip_known_model_prefix(model: str | None, pi_provider: str | None) -> str:
-    """Drop a leading provider prefix only when it names a known provider.
+def _strip_provider_prefix(model: str | None, pi_provider: str | None) -> str:
+    """Drop a leading ``<pi_provider>/`` prefix while preserving catalog IDs verbatim.
 
-    ``gateway-x/gateway-model`` passed to native Pi provider ``gateway-x``
-    becomes ``gateway-model``; ``openai/gpt-4o`` / ``anthropic/claude-*`` are
-    stripped the same way. Any other prefix is preserved verbatim.
+    For example ``--pi-provider openrouter --model openai/gpt-4.1`` preserves
+    ``openai/gpt-4.1`` because ``openai/`` is part of OpenRouter's model ID,
+    whereas ``openrouter/openai/gpt-4.1`` strips only ``openrouter/``.
     """
     cleaned = (model or "").strip()
-    if not cleaned:
+    if not cleaned or not pi_provider or not pi_provider.strip():
         return cleaned
-    candidates: list[str] = []
-    if pi_provider and pi_provider.strip():
-        candidates.append(f"{pi_provider.strip().lower()}/")
-    candidates.extend(("openai/", "anthropic/"))
-    lowered = cleaned.lower()
-    for prefix in candidates:
-        if lowered.startswith(prefix) and cleaned[len(prefix) :].strip():
-            return cleaned[len(prefix) :]
+    prefix = f"{pi_provider.strip().lower()}/"
+    if cleaned.lower().startswith(prefix) and cleaned[len(prefix) :].strip():
+        return cleaned[len(prefix) :]
     return cleaned
+
+
+def _link_ambient_pi_state(cfg_dir: Path, env: Mapping[str, str]) -> None:
+    """Expose the user's ambient Pi auth/settings via read-only symlinks.
+
+    When Olympus synthesizes an ephemeral ``PI_CODING_AGENT_DIR`` solely for a
+    ``models.json`` override (e.g. ``--context-window`` without a gateway key),
+    Pi would otherwise miss saved credentials in ``~/.pi/agent/auth.json``.
+    Symlinking avoids copying or serializing any credential material.
+    """
+    home_raw = (env.get("HOME") or "").strip()
+    ambient_dir = (Path(home_raw) if home_raw else Path.home()) / ".pi" / "agent"
+    if not ambient_dir.is_dir():
+        return
+    for name in ("auth.json", "settings.json"):
+        source = ambient_dir / name
+        target = cfg_dir / name
+        if source.is_file() and not target.exists():
+            with suppress(OSError):
+                os.symlink(source, target)
+
+
+def _binding_secrets(binding: ExternalGatewayBinding, env: Mapping[str, str]) -> list[str]:
+    """Collect every non-empty credential value referenced by a gateway binding."""
+    secrets: list[str] = []
+    if binding.api_key and binding.api_key.strip():
+        secrets.append(binding.api_key.strip())
+    if binding.api_key_env:
+        env_val = (env.get(binding.api_key_env) or "").strip()
+        if env_val:
+            secrets.append(env_val)
+    return secrets
 
 
 def _prepare_gateway_config(
@@ -330,8 +359,8 @@ def _prepare_gateway_config(
 
     * A caller-provided ``PI_CODING_AGENT_DIR`` is respected untouched.
     * A configured ``pi_provider`` passes through natively (no ``models.json``)
-      unless a custom gateway binding or a context-window override needs an
-      ephemeral provider-override config.
+      unless an explicit custom gateway binding or a context-window override
+      needs an ephemeral provider-override config.
     * Without a ``pi_provider`` the legacy ``olympus-gateway`` provider is
       synthesized as before.
 
@@ -349,14 +378,18 @@ def _prepare_gateway_config(
         binder = getattr(provider, "external_gateway_binding", None)
         if callable(binder):
             maybe = binder(model)
-            if isinstance(maybe, ExternalGatewayBinding):
+            if isinstance(maybe, ExternalGatewayBinding) and maybe.is_custom_endpoint:
                 binding = maybe
         if binding is None:
-            binding = resolve_external_gateway_from_env(env, model)
-        if binding is not None:
-            model_id = _strip_known_model_prefix(binding.model_id, effective_pi_provider)
-        else:
-            model_id = _strip_known_model_prefix(model, effective_pi_provider)
+            env_binding = resolve_external_gateway_from_env(env, model)
+            if env_binding is not None and env_binding.is_custom_endpoint:
+                binding = env_binding
+        raw_model = (
+            (model or "").strip()
+            or str(getattr(provider, "model_name", "") or "").strip()
+            or (binding.model_id if binding is not None else "")
+        )
+        model_id = _strip_provider_prefix(raw_model, effective_pi_provider)
         if binding is None and effective_context_window is None:
             # Pure native Pi passthrough: Pi's built-in catalog for the provider
             # already carries baseUrl, apiKey wiring, model metadata, and limits.
@@ -370,8 +403,7 @@ def _prepare_gateway_config(
             else:
                 env["OLYMPUS_PI_GATEWAY_KEY"] = binding.api_key or "keyless"
                 api_key_ref = "$OLYMPUS_PI_GATEWAY_KEY"
-                if binding.api_key:
-                    extra_secrets.append(binding.api_key)
+            extra_secrets.extend(_binding_secrets(binding, env))
             override["baseUrl"] = binding.base_url
             override["apiKey"] = api_key_ref
         if effective_context_window is not None and model_id:
@@ -380,6 +412,8 @@ def _prepare_gateway_config(
             }
         cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
         os.chmod(cfg_dir, 0o700)
+        if binding is None:
+            _link_ambient_pi_state(cfg_dir, env)
         models_doc = {"providers": {effective_pi_provider: override}}
         models_file = cfg_dir / "models.json"
         models_file.write_text(
@@ -402,14 +436,12 @@ def _prepare_gateway_config(
     if legacy_binding is None:
         return None, model, None, ()
 
-    legacy_secrets: list[str] = []
+    legacy_secrets: list[str] = _binding_secrets(legacy_binding, env)
     if legacy_binding.api_key_env:
         api_key_ref = f"${legacy_binding.api_key_env}"
     else:
         env["OLYMPUS_PI_GATEWAY_KEY"] = legacy_binding.api_key or "keyless"
         api_key_ref = "$OLYMPUS_PI_GATEWAY_KEY"
-        if legacy_binding.api_key:
-            legacy_secrets.append(legacy_binding.api_key)
 
     model_entry: dict[str, Any] = {"id": legacy_binding.model_id}
     if effective_context_window is not None:

@@ -135,8 +135,19 @@ def _resolve_endpoints(
     elif shorthand_base:
         own_keys = _shorthand_keys(spec, env)
         keys = list(seed_keys) if seed_keys else own_keys
+        is_builtin_default = (
+            spec.id in {"openai", "anthropic"}
+            and base_override is None
+            and _env_value(env, spec.base_url_env) is None
+        )
         targets.extend(
-            _targets_for(shorthand_base, keys, dict(spec.headers), allow_keyless=allow_keyless)
+            _targets_for(
+                shorthand_base,
+                keys,
+                dict(spec.headers),
+                allow_keyless=allow_keyless,
+                is_custom_endpoint=not is_builtin_default,
+            )
         )
 
     return _dedupe_targets(targets)
@@ -170,16 +181,30 @@ def _targets_for(
     headers: Mapping[str, str],
     *,
     allow_keyless: bool,
+    is_custom_endpoint: bool = True,
 ) -> list[EndpointTarget]:
     url = base_url.strip().rstrip("/")
     if not url:
         return []
     if keys:
         return [
-            EndpointTarget(api_key=key, base_url=url, headers=dict(headers)) for key in keys
+            EndpointTarget(
+                api_key=key,
+                base_url=url,
+                headers=dict(headers),
+                is_custom_endpoint=is_custom_endpoint,
+            )
+            for key in keys
         ]
     if allow_keyless:
-        return [EndpointTarget(api_key="", base_url=url, headers=dict(headers))]
+        return [
+            EndpointTarget(
+                api_key="",
+                base_url=url,
+                headers=dict(headers),
+                is_custom_endpoint=is_custom_endpoint,
+            )
+        ]
     return []
 
 

@@ -51,12 +51,16 @@ try:
     from .token_usage import (
         merge_token_usage,
         normalize_token_usage,
+        subtract_token_usage,
+        sum_token_usage,
         token_usage_context_fields,
     )
 except ImportError:  # Imported as a top-level module by standalone tooling.
     from token_usage import (  # type: ignore[no-redef]
         merge_token_usage,
         normalize_token_usage,
+        subtract_token_usage,
+        sum_token_usage,
         token_usage_context_fields,
     )
 
@@ -329,10 +333,13 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             raw_env = dict(kwargs.pop("extra_env"))
         self._interact = InteractOptions.from_kwargs(kwargs, model_name=model_name)
         self._step_index = 0
+        self._last_step_role: str | None = None
         self._run_id: str | None = None
         self._installed_olympus_bin: str | None = None
         self._installed_pi_bin: str | None = None
         self._token_usage: dict[str, Any] | None = None
+        self._run_token_usage: dict[str, dict[str, Any]] = {}
+        self._reported_run_usage: dict[str, dict[str, Any]] = {}
         super().__init__(
             logs_dir=logs_dir if logs_dir is not None else Path.cwd() / "logs",
             model_name=model_name,
@@ -415,6 +422,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         self._step_index += 1
         options = self._interact
         role = classify_step(instruction, self._step_index, options.step_roles)
+        self._last_step_role = role
         mode = {
             _PLAN_ONLY_ROLE: "plan_only",
             _EXECUTE_ROLE: "execute",
@@ -428,9 +436,21 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             return
         await self._run_bridge_step(role, instruction, environment)
 
+    def _record_run_usage(
+        self, run_id: str | None, usage_payload: Any
+    ) -> None:
+        usage = normalize_token_usage(usage_payload)
+        if usage is None:
+            return
+        key = (run_id or self._run_id or "__default__").strip() or "__default__"
+        merged = merge_token_usage(self._run_token_usage.get(key), usage)
+        if merged is not None:
+            self._run_token_usage[key] = merged
+        self._token_usage = sum_token_usage(self._run_token_usage.values())
+
     def populate_context_post_run(self, context: Any) -> None:
         summaries: list[dict[str, Any]] = []
-        usage = self._token_usage
+        step_run_ids: dict[str, str | None] = {}
         for path in sorted(Path(self.logs_dir).glob("olympus-interact-step-*.jsonl")):
             turns, status, run_id = 0, None, None
             try:
@@ -449,41 +469,70 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                     envelope = record.get("envelope") or {}
                     status = envelope.get("status") or status
                     run_id = envelope.get("run_id") or run_id
-                    usage = merge_token_usage(usage, envelope.get("token_usage"))
+                    self._record_run_usage(run_id, envelope.get("token_usage"))
+            step_tag = path.stem[len("olympus-interact-") :]
+            step_run_ids[step_tag] = run_id
             summaries.append(
                 {"step": path.stem, "turns": turns, "status": status, "run_id": run_id}
             )
-        usage = merge_token_usage(usage, self._read_token_usage_artifact())
-        if not summaries and usage is None:
+        self._read_token_usage_artifact(step_run_ids)
+        total_usage = sum_token_usage(self._run_token_usage.values())
+        self._token_usage = total_usage
+        if not summaries and total_usage is None:
             return
         metadata = dict(getattr(context, "metadata", None) or {})
         metadata["olympus_interact"] = {
             "steps": summaries,
             "run_id": self._run_id,
         }
-        if usage is not None:
-            metadata["token_usage"] = usage
-            for name, value in token_usage_context_fields(usage).items():
-                with suppress(Exception):
-                    setattr(context, name, value)
+        if total_usage is not None:
+            metadata["token_usage"] = total_usage
+            if self._last_step_role != _HANDOFF_ROLE:
+                deltas: list[dict[str, Any] | None] = []
+                for key, current in self._run_token_usage.items():
+                    previous = self._reported_run_usage.get(key)
+                    delta = subtract_token_usage(current, previous)
+                    if delta is not None:
+                        deltas.append(delta)
+                    self._reported_run_usage[key] = current
+                step_delta = sum_token_usage(deltas)
+                if step_delta is not None:
+                    for name, value in token_usage_context_fields(step_delta).items():
+                        with suppress(Exception):
+                            setattr(context, name, value)
         context.metadata = metadata
 
-    def _read_token_usage_artifact(self) -> dict[str, Any] | None:
-        """Merge ``token_usage.json`` exported by the in-container bridge, if any."""
+    def _read_token_usage_artifact(
+        self, step_run_ids: dict[str, str | None] | None = None
+    ) -> dict[str, Any] | None:
+        """Merge ``token_usage*.json`` exported by the in-container bridge, per run_id."""
         logs = Path(self.logs_dir)
-        candidates = [logs / "token_usage.json"]
-        candidates.extend(sorted(logs.glob("token_usage-step-*.json")))
-        usage: dict[str, Any] | None = None
-        for path in candidates:
-            if not path.is_file():
-                continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(payload, dict):
-                usage = merge_token_usage(usage, payload)
-        return usage
+        step_files = sorted(logs.glob("token_usage-step-*.json"))
+        mapping = step_run_ids or {}
+        if step_files:
+            for path in step_files:
+                if not path.is_file():
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                step_tag = path.stem[len("token_usage-") :]
+                run_id = payload.get("run_id") or mapping.get(step_tag)
+                self._record_run_usage(str(run_id) if run_id else None, payload)
+        elif not self._run_token_usage:
+            fallback = logs / "token_usage.json"
+            if fallback.is_file():
+                try:
+                    payload = json.loads(fallback.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    run_id = payload.get("run_id")
+                    self._record_run_usage(str(run_id) if run_id else None, payload)
+        return sum_token_usage(self._run_token_usage.values())
 
     def _pi_install_requested(self) -> bool:
         options = self._interact
@@ -819,9 +868,10 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         run_id = (summary or {}).get("run_id")
         if run_id:
             self._run_id = str(run_id)
-        usage = normalize_token_usage((summary or {}).get("token_usage"))
-        if usage is not None:
-            self._token_usage = merge_token_usage(self._token_usage, usage)
+        self._record_run_usage(
+            str(run_id) if run_id else self._run_id,
+            (summary or {}).get("token_usage"),
+        )
 
     def _bridge_argv(
         self, role: str, remote_instruction: str, trajectory: str

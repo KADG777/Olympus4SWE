@@ -42,6 +42,7 @@ class EndpointTarget:
     api_key: str
     base_url: str
     headers: dict[str, str] = field(default_factory=dict)
+    is_custom_endpoint: bool = True
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class ExternalGatewayBinding:
     model_id: str
     api_key: str = ""
     api_key_env: str | None = None
+    is_custom_endpoint: bool = True
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -192,6 +194,7 @@ class PooledProvider:
             base_url=endpoint.base_url.strip(),
             model_id=chosen,
             api_key=endpoint.api_key,
+            is_custom_endpoint=endpoint.is_custom_endpoint,
         )
 
     def complete(

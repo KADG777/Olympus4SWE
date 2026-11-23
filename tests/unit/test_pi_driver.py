@@ -2514,3 +2514,168 @@ else:
     )
     assert "GROUNDED_DRAFT" in capture.read_text(encoding="utf-8")
     assert result.result == "grounded"
+
+
+def test_pi_driver_native_provider_ignores_builtin_default_endpoint_and_preserves_openrouter_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.factory import build_provider
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "capture.json"
+    fake = tmp_path / "fake-pi-native-check"
+    fake.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if "--help" in sys.argv:
+    print("--mode json")
+    sys.exit(0)
+cfg_dir = os.environ.get("PI_CODING_AGENT_DIR")
+auth_link = None
+models_json = None
+if cfg_dir:
+    p = Path(cfg_dir)
+    if (p / "models.json").is_file():
+        models_json = (p / "models.json").read_text(encoding="utf-8")
+    if (p / "auth.json").is_symlink():
+        auth_link = str(os.readlink(p / "auth.json"))
+Path({str(capture_file)!r}).write_text(
+    json.dumps({{
+        "argv": sys.argv[1:],
+        "cfg_dir": cfg_dir,
+        "models_json": models_json,
+        "auth_link": auth_link,
+    }}),
+    encoding="utf-8",
+)
+msg = {{"role": "assistant", "stopReason": "stop", "content": [{{"type": "text", "text": "ok"}}],
+        "usage": {{"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}}}}
+print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    fake_home = tmp_path / "home"
+    ambient_pi = fake_home / ".pi" / "agent"
+    ambient_pi.mkdir(parents=True)
+    ambient_auth = ambient_pi / "auth.json"
+    ambient_auth.write_text('{"openrouter": {"apiKey": "saved-key"}}\n', encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OLYMPUS_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient-openai-12345678")
+
+    # Built-in default OpenAI provider (no --base-url) must NOT hijack a native pi_provider.
+    builtin_provider = build_provider(provider="openai", model="openai/gpt-4.1")
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(
+            binary=str(fake),
+            provider=builtin_provider,
+            pi_provider="openrouter",
+            thinking_level="high",
+            context_window=262144,
+        )
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="",
+                user_prompt="hi",
+                actor="worker",
+                read_only=True,
+                model="openai/gpt-4.1",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "openrouter"
+    # Finding #3: OpenRouter catalog ID 'openai/gpt-4.1' must NOT lose 'openai/'.
+    assert argv[argv.index("--model") + 1] == "openai/gpt-4.1"
+    # Finding #1: Built-in OpenAI endpoint must NOT be written into openrouter override.
+    doc = json.loads(captured["models_json"])
+    override = doc["providers"]["openrouter"]
+    assert "baseUrl" not in override
+    assert "apiKey" not in override
+    assert override["modelOverrides"] == {"openai/gpt-4.1": {"contextWindow": 262144}}
+    # Finding #2: Ambient ~/.pi/agent/auth.json is symlinked (not copied), and still intact.
+    assert captured["auth_link"] == str(ambient_auth)
+    assert ambient_auth.is_file()
+    assert not Path(captured["cfg_dir"]).exists()
+
+
+def test_pi_driver_redacts_short_and_custom_env_binding_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.auth import ExternalGatewayBinding
+
+    class _CustomBindingProvider:
+        model_name = "demo-model"
+
+        def external_gateway_binding(self, model: str | None = None) -> ExternalGatewayBinding:
+            del model
+            return ExternalGatewayBinding(
+                api="openai-completions",
+                base_url="https://custom.example/v1",
+                model_id="demo-model",
+                api_key_env="MY_CUSTOM_CRED_VAR",
+                is_custom_endpoint=True,
+            )
+
+    short_secret = "k9x2z"
+    monkeypatch.setenv("MY_CUSTOM_CRED_VAR", short_secret)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    trace = tmp_path / "trace.jsonl"
+    fake = tmp_path / "fake-pi-short-secret"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+if "--help" in sys.argv:
+    print("--mode json")
+    sys.exit(0)
+sec = os.environ["MY_CUSTOM_CRED_VAR"]
+print("stderr leak " + sec, file=sys.stderr, flush=True)
+msg = {
+    "role": "assistant",
+    "stopReason": "error",
+    "errorMessage": "auth failed: " + sec,
+    "content": [],
+}
+print(json.dumps({"type": "message_end", "message": msg}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    _reset_pi_availability_cache()
+    try:
+        outcome = PiDriver(
+            binary=str(fake),
+            provider=_CustomBindingProvider(),
+            pi_provider="custom-prov",
+        ).run_turn(
+            DriverTurnRequest(
+                workspace_path=tmp_path,
+                env_root=tmp_path,
+                actor="worker",
+                system_prompt="",
+                user_prompt="hi",
+                read_only=True,
+                model="demo-model",
+                trace_path=trace,
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is False
+    assert short_secret not in outcome.stop_reason
+    assert short_secret not in trace.read_text(encoding="utf-8")

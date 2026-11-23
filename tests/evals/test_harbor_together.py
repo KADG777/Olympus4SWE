@@ -2079,7 +2079,7 @@ def test_token_usage_persisted_to_artifact_context_and_trajectory(tmp_path: Path
     artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
     assert artifact == expected
     assert context.metadata["token_usage"] == expected
-    assert context.n_input_tokens == 1500
+    assert context.n_input_tokens == 1510
     assert context.n_output_tokens == 200
     assert context.n_cache_tokens == 500
     trajectory = json.loads((tmp_path / "logs" / "trajectory.json").read_text())
@@ -2253,3 +2253,48 @@ def test_launcher_parser_accepts_setup_timeout_alias() -> None:
         ]
     )
     assert args.override_setup_timeout_sec == 1200.0
+
+
+def test_token_usage_recovers_from_db_when_later_turn_drops_envelope(
+    tmp_path: Path,
+) -> None:
+    turn0 = _envelope(
+        "needs_input",
+        "Proceed?",
+        pause_kind="clarify",
+        token_usage={
+            "llm_calls": 1,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 50,
+            "cache_write_tokens": 0,
+        },
+    )
+    # Turn 1 produces no valid JSON envelope (e.g. timed out after settling extra tokens in DB).
+    handler = _SessionHandler(
+        [turn0, "unparseable timeout output"],
+        budget_rows=[
+            [
+                "align:proposer",
+                {"used": 1, "input_tokens": 100, "output_tokens": 20, "cache_read_tokens": 50},
+            ],
+            [
+                "build:worker",
+                {"used": 2, "input_tokens": 200, "output_tokens": 40, "cache_read_tokens": 100},
+            ],
+        ],
+    )
+    agent, environment = _make_agent(
+        tmp_path, handler, _StubUser(["Go ahead"]), call_user_on_completion=False
+    )
+    context = SimpleNamespace(metadata=None)
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, context))
+
+    artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
+    assert artifact["llm_calls"] == 2
+    assert artifact["input_tokens"] == 300
+    assert artifact["output_tokens"] == 60
+    assert artifact["cache_read_tokens"] == 150
+    assert context.n_input_tokens == 450
