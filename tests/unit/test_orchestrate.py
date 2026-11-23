@@ -5594,6 +5594,55 @@ def test_stdin_python_probe_syntax_error_is_classified_as_broken(tmp_path: Path)
     assert event["dropped_unverified"] == 1
 
 
+def test_dotfile_literal_promotion_and_anchored_syntax_traceback(tmp_path: Path) -> None:
+    from olympus.stages.orchestrate import (
+        _copy_matching_scope,
+        _probe_is_broken,
+        _restore_tree_paths,
+        _snapshot_tree_paths,
+    )
+
+    # 1. Dotfile ".config" must not collide with sibling "config".
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / ".config").write_text("DOTFILE\n", encoding="utf-8")
+    (src / "config").write_text("SIBLING\n", encoding="utf-8")
+    _copy_matching_scope(src, dst, [".config"])
+    assert (dst / ".config").read_text(encoding="utf-8") == "DOTFILE\n"
+    assert not (dst / "config").exists()
+
+    # 2. Symlink snapshot & restore preserves existing symlink target on rollback.
+    target_file = dst / "real.txt"
+    target_file.write_text("TARGET\n", encoding="utf-8")
+    link = dst / "link.txt"
+    link.symlink_to("real.txt")
+    snap = _snapshot_tree_paths(dst, ["link.txt"])
+    link.unlink()
+    link.write_text("OVERWRITTEN\n", encoding="utf-8")
+    _restore_tree_paths(dst, snap)
+    assert link.is_symlink() and str(link.readlink()) == "real.txt"
+
+    # 3. Anchored traceback header ignores source-line literals of File "...".
+    stdin_probe_with_literal = (
+        '  File "<stdin>", line 1\n'
+        '    msg = \'File "worker.py"\' def broken(:\n'
+        "SyntaxError: invalid syntax\n"
+    )
+    assert _probe_is_broken(command="python3 -", returncode=1, output=stdin_probe_with_literal)
+    worker_err_with_literal = (
+        '  File "<string>", line 1, in <module>\n'
+        "    import worker\n"
+        '  File "/ws/worker.py", line 1\n'
+        '    msg = \'File "<stdin>"\' def broken(:\n'
+        "SyntaxError: invalid syntax\n"
+    )
+    assert not _probe_is_broken(
+        command="python3 -c 'import worker'", returncode=1, output=worker_err_with_literal
+    )
+
+
 
 
 

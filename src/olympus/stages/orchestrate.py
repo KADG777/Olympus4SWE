@@ -14,7 +14,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event, Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ValidationError
 
@@ -210,7 +210,10 @@ def _copy_matching_scope(
     glob_patterns: list[str] = []
     if write_scope is not None:
         for pattern in write_scope:
-            norm = pattern.replace("\\", "/").lstrip("./")
+            norm = pattern.replace("\\", "/")
+            while norm.startswith("./"):
+                norm = norm[2:]
+            norm = norm.lstrip("/")
             candidate = src_root / norm
             if candidate.is_file() or candidate.is_symlink():
                 exact_rels.add(norm)
@@ -238,25 +241,30 @@ def _copy_matching_scope(
         shutil.copy2(p, dst)
 
 
+_TreeSnapshotEntry = tuple[Literal["file"], bytes, int] | tuple[Literal["symlink"], str] | None
+
+
 def _snapshot_tree_paths(
     root: Path, rel_paths: Sequence[str]
-) -> dict[str, tuple[bytes, int] | None]:
-    """Record pre-promotion bytes & mode (or None if absent) for atomic rollback on OSError."""
-    saved: dict[str, tuple[bytes, int] | None] = {}
+) -> dict[str, _TreeSnapshotEntry]:
+    """Record pre-promotion file/symlink state (or None if absent) for rollback on OSError."""
+    saved: dict[str, _TreeSnapshotEntry] = {}
     for rel in sorted(set(rel_paths)):
         target = root / rel
-        if target.is_file() and not target.is_symlink():
-            saved[rel] = (target.read_bytes(), target.stat().st_mode)
+        if target.is_symlink():
+            saved[rel] = ("symlink", os.readlink(target))
+        elif target.is_file():
+            saved[rel] = ("file", target.read_bytes(), target.stat().st_mode)
         else:
             saved[rel] = None
     return saved
 
 
 def _restore_tree_paths(
-    root: Path, saved: Mapping[str, tuple[bytes, int] | None]
+    root: Path, saved: Mapping[str, _TreeSnapshotEntry]
 ) -> None:
-    """Restore pre-promotion file state on promotion failure."""
-    # First remove files that did not exist before promotion (including under new dirs).
+    """Restore pre-promotion file and symlink state on promotion failure."""
+    # First remove entries that did not exist before promotion (including under new dirs).
     for rel, state in sorted(saved.items(), reverse=True):
         if state is not None:
             continue
@@ -270,17 +278,24 @@ def _restore_tree_paths(
                 except OSError:
                     break
                 parent = parent.parent
-    # Then restore previously existing files and modes.
+    # Then restore previously existing files, modes, and symlinks.
     for rel, state in sorted(saved.items()):
         if state is None:
             continue
-        data, mode = state
         target = root / rel
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target, ignore_errors=True)
+        elif target.is_symlink():
+            target.unlink(missing_ok=True)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(mode)
+        if state[0] == "symlink":
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
+            target.symlink_to(state[1])
+        else:
+            _, data, mode = state
+            target.write_bytes(data)
+            target.chmod(mode)
 
 
 _FREEZE_CONSTRAINT_RE = re.compile(
@@ -668,7 +683,9 @@ _REPRO_OUTPUT_BUDGET = 2_000
 _SECRET_ENV_NAME = re.compile(
     r"(?i)(token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)"
 )
-_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)"')
+_TRACEBACK_FILE_RE = re.compile(
+    r'^(?:  )?File "([^"]+)", line \d+(?:, in .*)?$', re.MULTILINE
+)
 _BROKEN_PROBE_EXIT_CODES = frozenset({126, 127})
 _PROBE_ENV_ALLOWLIST = frozenset(
     {
@@ -2238,10 +2255,23 @@ class OrchestrateStage:
                     next_deletions.update(deleted_paths)
                     save_accepted_deletions(self._run_dir(run_id), next_deletions)
                 except OSError as exc:
-                    _restore_tree_paths(overlay_dir, overlay_backup)
-                    save_accepted_deletions(self._run_dir(run_id), prev_deletions)
+                    rollback_errors: list[str] = []
                     if workspace_backup is not None:
-                        _restore_tree_paths(self.workspace_root, workspace_backup)
+                        try:
+                            _restore_tree_paths(self.workspace_root, workspace_backup)
+                        except OSError as rb_exc:
+                            rollback_errors.append(f"workspace rollback: {rb_exc}")
+                    try:
+                        _restore_tree_paths(overlay_dir, overlay_backup)
+                    except OSError as rb_exc:
+                        rollback_errors.append(f"overlay rollback: {rb_exc}")
+                    try:
+                        save_accepted_deletions(self._run_dir(run_id), prev_deletions)
+                    except OSError as rb_exc:
+                        rollback_errors.append(f"deletions rollback: {rb_exc}")
+                    reason = f"Failed to promote task changes: {exc}"
+                    if rollback_errors:
+                        reason = f"{reason} (rollback errors: {'; '.join(rollback_errors)})"
                     _write_manifest_md(
                         art_dir=art_dir,
                         task=verifying,
@@ -2254,7 +2284,7 @@ class OrchestrateStage:
                         self._fail_or_requeue(
                             run_id=run_id,
                             task=verifying,
-                            reason=f"Failed to promote task changes: {exc}",
+                            reason=reason,
                             checks=final_checks,
                         )
                     )
