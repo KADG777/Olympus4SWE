@@ -312,13 +312,24 @@ export const STATUS_BADGE_LABELS: Record<string, string> = {
 };
 
 export const PENDING_ACTION_CTA: Record<NonNullable<PendingAction>, string> = {
-  clarify: "Answer Clarifications",
-  approve_spec: "Review GoalSpec",
-  approve_design: "Review Design",
+  clarify: "Answer in Drawer",
+  approve_spec: "Review Spec",
+  approve_design: "Approve Design",
   approve_plan: "Approve Plan",
   resolve_blocker: "Resolve Blocker",
   review_delivery: "Review Delivery",
 };
+
+/** Mirror backend `_default_workflow_for(workspace_mode, task_type)`. */
+export function resolveDefaultWorkflow(workspaceMode: WorkspaceMode, taskType: TaskType): string {
+  if (workspaceMode === "spec_only" || taskType === "blueprint") {
+    return "product_blueprint";
+  }
+  if (taskType === "fix") {
+    return "repo_fast_patch";
+  }
+  return "full_sdlc_tdd";
+}
 
 export function boardBadgeVariant(ballHolder: BallHolder, statusBadge: string): Variant {
   if (statusBadge === "failed" || statusBadge === "blocked") return "bad";

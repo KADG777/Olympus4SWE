@@ -30,6 +30,7 @@ import type {
   RunListResponse,
   RunProjection,
   RunSummary,
+  TaskType,
   WorkspaceMode,
   WorkspaceSummary,
 } from "../api/types";
@@ -130,6 +131,14 @@ export type AttemptDetail =
   | { status: "loaded"; artifacts: RecordedAttemptArtifacts };
 
 export interface NewRunForm {
+  workspaceMode: WorkspaceMode;
+  workspaceId: string;
+  customWorkspaceRoot: string;
+  greenfieldPath: string;
+  contextWorkspaceId: string;
+  baseRef: string;
+  scopePaths: string;
+  taskType: TaskType;
   demoId: string;
   title: string;
   workflow: string;
@@ -141,6 +150,10 @@ export interface NewRunForm {
   input: string;
 }
 
+export type NewRunSubmitResult =
+  | { ok: true; runId: string }
+  | { ok: false; error: string };
+
 export interface WorkbenchState {
   activeSurface: ActiveSurface;
   workspaces: WorkspaceSummary[];
@@ -151,6 +164,7 @@ export interface WorkbenchState {
   showArchived: boolean;
   openTabs: string[];
   quickDrawerRunId: string | null;
+  newRunOpenSeq: number;
   allRuns: RunSummary[];
   runs: RunSummary[];
   pantheon: PantheonSeatSummary[];
@@ -190,7 +204,7 @@ const byId = <T extends HTMLElement = HTMLElement>(id: string): T | null =>
   document.getElementById(id) as T | null;
 
 /** Resolve an RFC 6901 JSON pointer inside an artifact. */
-function resolvePointer(artifact: unknown, ref: string): { parts: string[]; value: unknown } {
+export function resolvePointer(artifact: unknown, ref: string): { parts: string[]; value: unknown } {
   const parts = ref
     .slice(1)
     .split("/")
@@ -200,6 +214,57 @@ function resolvePointer(artifact: unknown, ref: string): { parts: string[]; valu
     artifact,
   );
   return { parts, value };
+}
+
+/** Build a revision-pinned approval snapshot and retain matching origin locators. */
+export function buildApprovalSnapshot(
+  projection: RunProjection,
+  previousSnapshot: ApprovalSnapshot | null,
+  previousOrigins: Partial<Record<ApprovalAction, ApprovalOrigin>>,
+): {
+  snapshot: ApprovalSnapshot;
+  origins: Partial<Record<ApprovalAction, ApprovalOrigin>>;
+} | null {
+  if (
+    previousSnapshot?.runId === projection.run_id &&
+    previousSnapshot.revision > projection.state_revision
+  ) {
+    return null;
+  }
+  const reviews = new Map<ApprovalAction, ApprovalBinding>();
+  for (const [action, review] of Object.entries(projection.approval_reviews || {})) {
+    if (!(action in APPROVAL_LABELS)) continue;
+    const artifact = projection[review.artifact] as ReviewArtifact | null | undefined;
+    if (artifact?.content_hash !== review.target_hash) continue;
+    reviews.set(action as ApprovalAction, {
+      artifact,
+      baseline: review.baseline ?? null,
+      reviewKey: JSON.stringify([
+        review.target_hash,
+        review.baseline?.content_hash,
+        review.comparison_gap,
+        review.sections,
+        review.unchanged_sections,
+      ]),
+      command: {
+        action: action as ApprovalAction,
+        target_hash: review.target_hash,
+        expected_state_revision: projection.state_revision,
+      },
+    });
+  }
+  const sameRun = previousSnapshot?.runId === projection.run_id;
+  const origins: Partial<Record<ApprovalAction, ApprovalOrigin>> = {};
+  for (const [action, binding] of reviews) {
+    const origin = previousOrigins[action];
+    if (origin && sameRun && previousSnapshot?.reviews.get(action)?.reviewKey === binding.reviewKey) {
+      origins[action] = origin;
+    }
+  }
+  return {
+    snapshot: { runId: projection.run_id, revision: projection.state_revision, reviews },
+    origins,
+  };
 }
 
 export class Workbench {
@@ -235,6 +300,7 @@ export class Workbench {
       showArchived: false,
       openTabs: initialTabs,
       quickDrawerRunId: null,
+      newRunOpenSeq: 0,
       allRuns: [],
       runs: [],
       pantheon: [],
@@ -719,40 +785,10 @@ export class Workbench {
 
   private syncApprovals(projection: RunProjection): void {
     const s = this.state;
-    const previous = s.approvalSnapshot;
-    if (previous?.runId === projection.run_id && previous.revision > projection.state_revision) return;
-    const reviews = new Map<ApprovalAction, ApprovalBinding>();
-    for (const [action, review] of Object.entries(projection.approval_reviews || {})) {
-      if (!(action in APPROVAL_LABELS)) continue;
-      const artifact = projection[review.artifact] as ReviewArtifact | null | undefined;
-      if (artifact?.content_hash !== review.target_hash) continue;
-      reviews.set(action as ApprovalAction, {
-        artifact,
-        baseline: review.baseline ?? null,
-        reviewKey: JSON.stringify([
-          review.target_hash,
-          review.baseline?.content_hash,
-          review.comparison_gap,
-          review.sections,
-          review.unchanged_sections,
-        ]),
-        command: {
-          action: action as ApprovalAction,
-          target_hash: review.target_hash,
-          expected_state_revision: projection.state_revision,
-        },
-      });
-    }
-    const sameRun = previous?.runId === projection.run_id;
-    const origins: Partial<Record<ApprovalAction, ApprovalOrigin>> = {};
-    for (const [action, binding] of reviews) {
-      const origin = s.approvalOrigins[action];
-      if (origin && sameRun && previous?.reviews.get(action)?.reviewKey === binding.reviewKey) {
-        origins[action] = origin;
-      }
-    }
-    s.approvalOrigins = origins;
-    s.approvalSnapshot = { runId: projection.run_id, revision: projection.state_revision, reviews };
+    const next = buildApprovalSnapshot(projection, s.approvalSnapshot, s.approvalOrigins);
+    if (!next) return;
+    s.approvalOrigins = next.origins;
+    s.approvalSnapshot = next.snapshot;
   }
 
   /** Drop stale inspector selections and pin the task the dock is showing. */
@@ -1237,9 +1273,15 @@ export class Workbench {
 
   async openNewRun(): Promise<void> {
     this.state.workflowNode = null;
-    byId<HTMLDialogElement>("new-run-dialog")?.showModal();
+    this.state.newRunOpenSeq += 1;
+    this.commit();
+    const dialog = byId<HTMLDialogElement>("new-run-dialog");
+    if (dialog && !dialog.open) dialog.showModal();
     try {
-      await this.loadNewRunOptions();
+      await Promise.all([
+        this.loadNewRunOptions(),
+        this.refreshWorkspaces().catch(() => undefined),
+      ]);
     } catch {
       this.toast("加载工作流或提供方失败");
     }
@@ -1251,26 +1293,47 @@ export class Workbench {
     this.commit(false);
   }
 
-  async submitNewRun(form: NewRunForm): Promise<boolean> {
+  async submitNewRun(form: NewRunForm): Promise<NewRunSubmitResult> {
     const s = this.state;
     const rawInput = form.input.trim();
     if (!rawInput) {
-      this.toast("请先填写需求原文或导入文件");
-      return false;
+      return { ok: false, error: "请先填写需求原文或导入文件" };
     }
+    const demoId = form.demoId.trim();
+    const selectedDemo = demoId ? s.options?.demos.find((item) => item.id === demoId) : undefined;
+    const mode = demoId ? "brownfield" : form.workspaceMode;
+
+    if (!demoId && mode === "greenfield" && !form.greenfieldPath.trim()) {
+      return { ok: false, error: "Greenfield 模式必须填写目标目录路径" };
+    }
+    if (
+      !demoId &&
+      mode === "brownfield" &&
+      form.workspaceId === "__custom__" &&
+      !form.customWorkspaceRoot.trim()
+    ) {
+      return { ok: false, error: "请填写现有本地仓库目录路径" };
+    }
+
     const provider = form.provider || "auto";
     const model = form.model.trim();
     const providerConfig: NonNullable<CreateRunBody["provider_config"]> =
       provider === "auto" ? {} : { provider };
     if (model) providerConfig.model = model;
-    const demoId = form.demoId.trim();
-    const selectedDemo = demoId ? s.options?.demos.find((item) => item.id === demoId) : undefined;
+
     const payload: CreateRunBody = {
       raw_input: rawInput,
       title: form.title.trim() || rawInput.slice(0, 60),
-      workflow_name: form.workflow || "product_blueprint",
+      workspace_mode: mode,
+      task_type: form.taskType,
       provider_config: providerConfig,
     };
+
+    const workflowOverride = form.workflow.trim();
+    if (workflowOverride) {
+      payload.workflow_name = workflowOverride;
+    }
+
     const overrides = [
       ["worker_driver", form.workerDriver],
       ["reviewer_driver", form.reviewerDriver],
@@ -1280,33 +1343,64 @@ export class Workbench {
       const value = raw.trim();
       if (value) payload[name] = value;
     }
+
     if (demoId) {
       payload.demo_id = demoId;
       if (selectedDemo && Array.isArray(selectedDemo.constraints)) {
         payload.constraints = selectedDemo.constraints;
       }
-    } else if (s.selectedWorkspaceId) {
-      payload.workspace_id = s.selectedWorkspaceId;
+      if (!workflowOverride && selectedDemo?.default_workflow) {
+        payload.workflow_name = selectedDemo.default_workflow;
+      }
+    } else if (mode === "brownfield") {
+      if (form.workspaceId === "__custom__") {
+        payload.workspace_root = form.customWorkspaceRoot.trim();
+      } else if (form.workspaceId.trim()) {
+        payload.workspace_id = form.workspaceId.trim();
+      } else if (s.selectedWorkspaceId) {
+        payload.workspace_id = s.selectedWorkspaceId;
+      }
+      const baseRef = form.baseRef.trim();
+      if (baseRef) payload.base_ref = baseRef;
+      const scopePaths = form.scopePaths
+        .split(/[\n,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (scopePaths.length) payload.scope_paths = scopePaths;
+    } else if (mode === "greenfield") {
+      payload.workspace_root = form.greenfieldPath.trim();
+    } else if (mode === "spec_only") {
+      if (form.contextWorkspaceId.trim()) {
+        payload.workspace_id = form.contextWorkspaceId.trim();
+      }
     }
-    if (s.submitting) return false;
+
+    if (s.submitting) return { ok: false, error: "正在提交中，请稍候" };
     s.submitting = true;
     this.renderConnection();
     let runId: string;
     try {
       runId = (await createRun(payload)).run_id;
     } catch (error) {
-      this.toast(`创建请求失败：${(error as Error).message}`);
-      return false;
+      return { ok: false, error: (error as Error).message || "未知错误" };
     } finally {
       s.submitting = false;
       this.renderConnection();
     }
+
     s.selectedTaskId = null;
     s.workflowNode = null;
+    await this.refreshRuns().catch(() => undefined);
+    if (s.activeSurface === "board") {
+      const created = s.allRuns.find((run) => run.run_id === runId);
+      if (s.selectedWorkspaceId && created && created.workspace_id !== s.selectedWorkspaceId) {
+        this.selectWorkspace(created.workspace_id || null);
+      }
+    } else {
+      this.loadRun(runId);
+    }
     this.toast(`已接收编排 ${runId}`);
-    this.loadRun(runId);
-    this.refreshRuns().catch(() => undefined);
-    return true;
+    return { ok: true, runId };
   }
 
   private renderConnection(): void {

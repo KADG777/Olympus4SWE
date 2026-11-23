@@ -8,6 +8,7 @@ import { InspectorDock } from "./components/InspectorDock";
 import { ClarifyPanel, IntentCard } from "./components/IntentClarify";
 import { OracleBoard } from "./components/OracleBoard";
 import { PantheonDock } from "./components/PantheonDock";
+import { QuickRulingDrawer } from "./components/QuickRulingDrawer";
 import { StageHeader } from "./components/StageHeader";
 import { ThreadRail } from "./components/ThreadRail";
 import { TopologyView } from "./components/TopologyView";
@@ -99,6 +100,7 @@ export function App({ workbench }: { workbench: Workbench }) {
             workbench={workbench}
             state={state}
             footerSlot={<PantheonDock workbench={workbench} state={state} />}
+            onQuickRule={(runId) => workbench.openQuickDrawer(runId)}
           />
         ) : (
           <main id="stage" className="scroller">
@@ -124,6 +126,7 @@ export function App({ workbench }: { workbench: Workbench }) {
         <DockResizer cockpit={cockpit} />
         <InspectorDock workbench={workbench} state={state} />
       </div>
+      <QuickRulingDrawer workbench={workbench} state={state} />
       <WorkspaceDialog workbench={workbench} state={state} />
       <NewRunDialog workbench={workbench} state={state} />
       <HitlDialog workbench={workbench} state={state} />

@@ -131,18 +131,26 @@ function OriginPanel({ origin }: { origin: ApprovalOrigin | undefined }) {
   );
 }
 
-function ApprovalReviewCard({
+export function ApprovalReviewCard({
   workbench,
   action,
   review,
   artifact,
   origin,
+  onLocate: onLocateOverride,
+  onOpenTaskGraph: onOpenTaskGraphOverride,
+  onApprove: onApproveOverride,
+  disabled = false,
 }: {
-  workbench: Workbench;
+  workbench?: Workbench;
   action: ApprovalAction;
   review: ApprovalReview;
   artifact: ReviewArtifact;
   origin: ApprovalOrigin | undefined;
+  onLocate?: (ref: string, baseline: boolean) => void;
+  onOpenTaskGraph?: (targetHash: string) => void;
+  onApprove?: (action: ApprovalAction) => void;
+  disabled?: boolean;
 }) {
   const title = APPROVAL_LABELS[action];
   const visible = (sections: ReviewSection[]) =>
@@ -151,7 +159,18 @@ function ApprovalReviewCard({
   const unchanged = visible(review.unchanged_sections || []);
   const baseline = review.baseline;
   const button = APPROVAL_BUTTONS[action];
-  const onLocate = (ref: string, old: boolean) => workbench.showApprovalOrigin(action, ref, old);
+  const onLocate = (ref: string, old: boolean) => {
+    if (onLocateOverride) onLocateOverride(ref, old);
+    else workbench?.showApprovalOrigin(action, ref, old);
+  };
+  const onOpenTaskGraph = () => {
+    if (onOpenTaskGraphOverride) onOpenTaskGraphOverride(review.target_hash);
+    else workbench?.openTaskGraph(review.target_hash);
+  };
+  const onApprove = () => {
+    if (onApproveOverride) onApproveOverride(action);
+    else void workbench?.approve(action);
+  };
   return (
     <article className="approval-review" data-review-action={action} aria-labelledby={`review-${action}`}>
       <h3 id={`review-${action}`} tabIndex={-1}>
@@ -185,7 +204,7 @@ function ApprovalReviewCard({
             type="button"
             className="btn"
             data-review-plan-graph=""
-            onClick={() => workbench.openTaskGraph(review.target_hash)}
+            onClick={onOpenTaskGraph}
           >
             查看任务依赖图
           </button>
@@ -207,7 +226,8 @@ function ApprovalReviewCard({
           className="btn btn-primary"
           id={button.id}
           data-approve={action}
-          onClick={() => void workbench.approve(action)}
+          disabled={disabled}
+          onClick={onApprove}
         >
           {button.label}
         </button>

@@ -1,9 +1,30 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 
-import { WORKFLOW_SELECT_LABELS, WORKFLOW_SUMMARY } from "../lib/labels";
+import type { TaskType, WorkspaceMode } from "../api/types";
+import {
+  resolveDefaultWorkflow,
+  TASK_TYPE_LABELS,
+  WORKFLOW_SELECT_LABELS,
+  WORKFLOW_SUMMARY,
+  WORKSPACE_MODE_LABELS,
+} from "../lib/labels";
 import type { NewRunForm, Workbench, WorkbenchState } from "../state/workbench";
 
 const FILE_NOTE = "支持 .md / .txt / .json / .yaml / .yml";
+const CUSTOM_PATH_VALUE = "__custom__";
+
+const SCOPE_OPTIONS: { id: WorkspaceMode; label: string; hint: string }[] = [
+  { id: "brownfield", label: WORKSPACE_MODE_LABELS.brownfield, hint: "Existing repository" },
+  { id: "greenfield", label: WORKSPACE_MODE_LABELS.greenfield, hint: "New empty directory" },
+  { id: "spec_only", label: WORKSPACE_MODE_LABELS.spec_only, hint: "Blueprint only" },
+];
+
+const TASK_TYPE_OPTIONS: { id: TaskType; label: string }[] = [
+  { id: "feature", label: TASK_TYPE_LABELS.feature },
+  { id: "fix", label: TASK_TYPE_LABELS.fix },
+  { id: "refactor", label: TASK_TYPE_LABELS.refactor },
+  { id: "blueprint", label: TASK_TYPE_LABELS.blueprint },
+];
 
 /**
  * Thin wrapper over a native `<dialog closedby="any">`: the platform owns modality, focus trap,
@@ -63,6 +84,14 @@ export function NativeDialog({
 }
 
 const EMPTY_FORM: NewRunForm = {
+  workspaceMode: "brownfield",
+  workspaceId: "",
+  customWorkspaceRoot: "",
+  greenfieldPath: "",
+  contextWorkspaceId: "",
+  baseRef: "",
+  scopePaths: "",
+  taskType: "feature",
   demoId: "",
   title: "",
   workflow: "",
@@ -77,74 +106,132 @@ const EMPTY_FORM: NewRunForm = {
 export function NewRunDialog({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
   const [form, setForm] = useState<NewRunForm>(EMPTY_FORM);
   const [fileNote, setFileNote] = useState(FILE_NOTE);
+  const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const formRef = useRef(form);
-  formRef.current = form;
+  const fileReadSeq = useRef(0);
+  const lastOpenSeq = useRef(0);
+
   const options = state.options;
   const workflows = options?.workflows || [];
   const demos = options?.demos || [];
   const providers = options?.providers || [];
+  const workspaces = state.workspaces || [];
 
-  // Default to the planning-only blueprint once the catalog arrives.
+  // Pre-fill brownfield workspace from the active board workspace filter ONLY when the modal opens.
   useEffect(() => {
-    if (!options) return;
-    setForm((current) =>
-      current.workflow
-        ? current
-        : {
-            ...current,
-            workflow: options.workflows.some((wf) => wf.name === "product_blueprint")
-              ? "product_blueprint"
-              : options.workflows[0]?.name || "",
-          },
-    );
-  }, [options]);
+    if (state.newRunOpenSeq === 0 || state.newRunOpenSeq === lastOpenSeq.current) return;
+    lastOpenSeq.current = state.newRunOpenSeq;
+    setError(null);
+    setForm((current) => {
+      const preferredWorkspace =
+        state.selectedWorkspaceId &&
+        workspaces.some((ws) => ws.workspace_id === state.selectedWorkspaceId)
+          ? state.selectedWorkspaceId
+          : current.workspaceId &&
+              current.workspaceId !== CUSTOM_PATH_VALUE &&
+              workspaces.some((ws) => ws.workspace_id === current.workspaceId)
+            ? current.workspaceId
+            : workspaces[0]?.workspace_id || "";
+      return {
+        ...current,
+        workspaceId: preferredWorkspace,
+      };
+    });
+  }, [state.newRunOpenSeq, state.selectedWorkspaceId, workspaces]);
 
-  const set = (patch: Partial<NewRunForm>) => setForm((current) => ({ ...current, ...patch }));
-  const selectedWorkflow = workflows.find((workflow) => workflow.name === form.workflow);
-  const workflowMeta = selectedWorkflow
-    ? `${WORKFLOW_SUMMARY[selectedWorkflow.name] || selectedWorkflow.description || "无描述"} · 编写代码：${
-        selectedWorkflow.stop_after === "execute"
-          ? "是（沙盒执行 + 验收）"
-          : `否（止步于 ${selectedWorkflow.stop_after || "plan"}）`
-      }`
-    : "";
+  // If workspaces finish loading while workspaceId is still unset, pick the default without clobbering user choice.
+  useEffect(() => {
+    if (!workspaces.length) return;
+    setForm((current) => {
+      if (current.workspaceId) return current;
+      const preferred =
+        state.selectedWorkspaceId &&
+        workspaces.some((ws) => ws.workspace_id === state.selectedWorkspaceId)
+          ? state.selectedWorkspaceId
+          : workspaces[0]?.workspace_id || "";
+      return preferred ? { ...current, workspaceId: preferred } : current;
+    });
+  }, [workspaces, state.selectedWorkspaceId]);
+
+  const set = (patch: Partial<NewRunForm>) => {
+    setError(null);
+    setForm((current) => ({ ...current, ...patch }));
+  };
+
+  const closeDialog = () => {
+    const dialog = document.getElementById("new-run-dialog") as HTMLDialogElement | null;
+    if (dialog?.open) dialog.close();
+  };
+
+  const autoWorkflow = resolveDefaultWorkflow(
+    form.demoId ? "brownfield" : form.workspaceMode,
+    form.taskType,
+  );
   const demo = demos.find((item) => item.id === form.demoId);
+  const effectiveWorkflowName =
+    form.workflow || (demo?.default_workflow ? demo.default_workflow : autoWorkflow);
+  const effectiveWorkflow = workflows.find((workflow) => workflow.name === effectiveWorkflowName);
+  const workflowSummaryText =
+    WORKFLOW_SUMMARY[effectiveWorkflowName] || effectiveWorkflow?.description || "";
+  const workflowWriteNote = effectiveWorkflow
+    ? effectiveWorkflow.stop_after === "execute"
+      ? "沙盒执行 + 验收"
+      : `止步于 ${effectiveWorkflow.stop_after || "plan"}`
+    : effectiveWorkflowName === "product_blueprint"
+      ? "仅规划，不改代码"
+      : "沙盒执行 + 验收";
+
   const demoNote = demo
     ? [
         demo.workspace_summary || "独立隔离 git 工作区",
         (demo.constraints || []).length ? `初始约束：${demo.constraints.join("；")}` : "",
-        (demo.clarification_hints || []).length ? `建议澄清参考：${demo.clarification_hints.join(" / ")}` : "",
+        (demo.clarification_hints || []).length
+          ? `建议澄清参考：${demo.clarification_hints.join(" / ")}`
+          : "",
       ]
         .filter(Boolean)
         .join(" · ")
     : "";
 
+  const selectedWorkspace = workspaces.find((ws) => ws.workspace_id === form.workspaceId);
+
   const applyDemo = (demoId: string) => {
     const preset = demos.find((item) => item.id === demoId);
     if (!preset) {
-      set({ demoId });
+      set({ demoId: "", workflow: "" });
       return;
     }
     set({
       demoId,
+      workspaceMode: "brownfield",
       title: preset.title || "",
       input: preset.raw_input || "",
-      ...(preset.default_workflow && workflows.some((wf) => wf.name === preset.default_workflow)
-        ? { workflow: preset.default_workflow }
-        : {}),
+      workflow:
+        preset.default_workflow && workflows.some((wf) => wf.name === preset.default_workflow)
+          ? preset.default_workflow
+          : "",
     });
   };
 
-  const fileReadSeq = useRef(0);
-
-  const onClose = async (choice: string) => {
-    if (choice !== "create") return;
-    const created = await workbench.submitNewRun(formRef.current);
-    if (!created) return;
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    const result = await workbench.submitNewRun(form);
+    if (!result.ok) {
+      setError(`创建请求失败：${result.error}`);
+      return;
+    }
     fileReadSeq.current += 1;
-    setForm((current) => ({ ...current, demoId: "", input: "", title: "", model: "" }));
+    setForm((current) => ({
+      ...EMPTY_FORM,
+      workspaceMode: current.workspaceMode,
+      workspaceId: state.selectedWorkspaceId || workspaces[0]?.workspace_id || "",
+      taskType: current.taskType,
+      provider: current.provider,
+    }));
     setFileNote(FILE_NOTE);
+    setError(null);
+    closeDialog();
   };
 
   const onFile = () => {
@@ -166,31 +253,212 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
   };
 
   return (
-    <NativeDialog id="new-run-dialog" labelledBy="new-run-dialog-title" onClose={(choice) => void onClose(choice)}>
-      <form method="dialog" id="new-run-form">
-        <h2 className="dialog-title" id="new-run-dialog-title">
-          新建编排
-        </h2>
-        <p className="dialog-desc">
-          从一句话需求或既有文档启动一条受控编排线程。每个关口都会停下等待真人批准，不会自动越过。
-        </p>
-        <div className="form-field">
-          <label className="dialog-label" htmlFor="new-run-demo">
-            Benchmark 预设样本（可选）
-          </label>
-          <select id="new-run-demo" className="field" value={form.demoId} onChange={(event) => applyDemo(event.target.value)}>
-            {options ? <option value="">空白需求（自由输入 · 主仓库工作区）</option> : null}
-            {demos.map((item) => (
-              <option value={item.id} key={item.id}>
-                {item.label || item.title || item.id}
-              </option>
-            ))}
-          </select>
+    <NativeDialog
+      id="new-run-dialog"
+      labelledBy="new-run-dialog-title"
+      lightDismissFallback
+      onClose={() => setError(null)}
+    >
+      <form id="new-run-form" className="oracle-modal-form" onSubmit={(e) => void handleSubmit(e)}>
+        <div className="oracle-modal-head">
+          <div>
+            <h2 className="dialog-title" id="new-run-dialog-title">
+              Issue Oracle
+            </h2>
+            <p className="dialog-desc">
+              声明目标作用域与任务类型后发起受控编排。每个人工关口都会在 Oracle Board 停下等待裁决。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-quiet"
+            aria-label="关闭 Issue Oracle 对话框"
+            onClick={closeDialog}
+          >
+            ×
+          </button>
         </div>
-        <p className="dialog-desc" id="new-run-demo-note" hidden={!demoNote}>
-          {demoNote}
-        </p>
-        <div className="form-grid">
+
+        {demo ? (
+          <div className="oracle-demo-active" id="new-run-demo-banner">
+            <span>{`Benchmark sample active: ${demo.label || demo.title || demo.id}`}</span>
+            <button
+              type="button"
+              className="btn btn-quiet"
+              id="btn-clear-demo"
+              onClick={() => applyDemo("")}
+            >
+              Clear sample
+            </button>
+          </div>
+        ) : null}
+
+        <section className="oracle-step" aria-label="Step 1: Scope">
+          <div className="oracle-step-head">
+            <span className="oracle-step-title">1. Scope</span>
+            <span className="oracle-step-hint">
+              {form.workspaceMode === "brownfield"
+                ? "在既有本地仓库上执行受控变更"
+                : form.workspaceMode === "greenfield"
+                  ? "指向新建或空目录，自动注册为 Workspace"
+                  : "仅产出规格与任务蓝图，不修改代码文件"}
+            </span>
+          </div>
+          <div className="seg-group" role="group" aria-label="Target Scope">
+            {SCOPE_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className="seg-option"
+                data-scope-mode={option.id}
+                aria-pressed={form.workspaceMode === option.id ? "true" : "false"}
+                onClick={() => set({ workspaceMode: option.id, demoId: "" })}
+              >
+                <span>{option.label}</span>
+                <span className="seg-option-sub">{option.hint}</span>
+              </button>
+            ))}
+          </div>
+
+          {form.workspaceMode === "brownfield" && !demo ? (
+            <>
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="new-run-workspace">
+                  Target Workspace
+                </label>
+                <select
+                  id="new-run-workspace"
+                  className="field"
+                  value={form.workspaceId}
+                  onChange={(event) => set({ workspaceId: event.target.value })}
+                >
+                  {!workspaces.length ? (
+                    <option value="">Default server workspace</option>
+                  ) : null}
+                  {workspaces.map((ws) => (
+                    <option value={ws.workspace_id} key={ws.workspace_id}>
+                      {`${ws.name} — ${ws.root_path}`}
+                    </option>
+                  ))}
+                  <option value={CUSTOM_PATH_VALUE}>Custom local path…</option>
+                </select>
+              </div>
+              {form.workspaceId === CUSTOM_PATH_VALUE ? (
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-workspace-root">
+                    Existing Directory Path
+                  </label>
+                  <input
+                    id="new-run-workspace-root"
+                    className="field"
+                    type="text"
+                    placeholder="/path/to/existing/repository"
+                    value={form.customWorkspaceRoot}
+                    onChange={(event) => set({ customWorkspaceRoot: event.target.value })}
+                  />
+                </div>
+              ) : null}
+              <div className="form-grid">
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-base-ref">
+                    Base Ref (optional)
+                  </label>
+                  <input
+                    id="new-run-base-ref"
+                    className="field"
+                    type="text"
+                    placeholder={selectedWorkspace?.default_branch || "e.g. main"}
+                    value={form.baseRef}
+                    onChange={(event) => set({ baseRef: event.target.value })}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-scope-paths">
+                    Scope Paths (optional)
+                  </label>
+                  <input
+                    id="new-run-scope-paths"
+                    className="field"
+                    type="text"
+                    placeholder="src/api, tests/unit"
+                    value={form.scopePaths}
+                    onChange={(event) => set({ scopePaths: event.target.value })}
+                  />
+                </div>
+              </div>
+            </>
+          ) : null}
+
+          {form.workspaceMode === "greenfield" && !demo ? (
+            <div className="form-field">
+              <label className="dialog-label" htmlFor="new-run-greenfield-path">
+                New Target Directory Path
+              </label>
+              <input
+                id="new-run-greenfield-path"
+                className="field"
+                type="text"
+                placeholder="/path/to/new-project"
+                value={form.greenfieldPath}
+                onChange={(event) => set({ greenfieldPath: event.target.value })}
+              />
+            </div>
+          ) : null}
+
+          {form.workspaceMode === "spec_only" && !demo ? (
+            <div className="form-field">
+              <label className="dialog-label" htmlFor="new-run-context-workspace">
+                Read-Only Context Workspace (optional)
+              </label>
+              <select
+                id="new-run-context-workspace"
+                className="field"
+                value={form.contextWorkspaceId}
+                onChange={(event) => set({ contextWorkspaceId: event.target.value })}
+              >
+                <option value="">None (workspace-less blueprint)</option>
+                {workspaces.map((ws) => (
+                  <option value={ws.workspace_id} key={ws.workspace_id}>
+                    {`${ws.name} — ${ws.root_path}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+        </section>
+
+        <section className="oracle-step" aria-label="Step 2: Task Type">
+          <div className="oracle-step-head">
+            <span className="oracle-step-title">2. Task Type</span>
+            <span className="oracle-step-hint">决定默认工作流与 Stage 1 对齐策略</span>
+          </div>
+          <div className="seg-group" role="group" aria-label="Task Type">
+            {TASK_TYPE_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className="seg-option"
+                data-task-type={option.id}
+                aria-pressed={form.taskType === option.id ? "true" : "false"}
+                onClick={() => set({ taskType: option.id })}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <p className="oracle-workflow-summary" id="new-run-workflow-meta">
+            {form.workflow ? "Workflow override: " : "Auto workflow: "}
+            <strong>{effectiveWorkflowName}</strong>
+            {` · ${workflowWriteNote}`}
+            {workflowSummaryText ? ` — ${workflowSummaryText}` : ""}
+          </p>
+        </section>
+
+        <section className="oracle-step" aria-label="Step 3: Intent">
+          <div className="oracle-step-head">
+            <span className="oracle-step-title">3. Intent</span>
+            <span className="oracle-step-hint">描述目标、可观察面与约束，或导入本地文档</span>
+          </div>
           <div className="form-field">
             <label className="dialog-label" htmlFor="new-run-title">
               标题（可选）
@@ -199,140 +467,195 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
               id="new-run-title"
               className="field"
               type="text"
-              placeholder="例如：校园候补递补加固"
+              placeholder="例如：Fix hooks write_scope bypass"
               value={form.title}
               onChange={(event) => set({ title: event.target.value })}
             />
           </div>
           <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-workflow">
-              工作流
+            <label className="dialog-label" htmlFor="new-run-input">
+              需求原文
             </label>
-            <select
-              id="new-run-workflow"
+            <textarea
+              id="new-run-input"
               className="field"
-              value={form.workflow}
-              onChange={(event) => set({ workflow: event.target.value })}
-            >
-              {workflows.map((workflow) => (
-                <option value={workflow.name} key={workflow.name}>
-                  {WORKFLOW_SELECT_LABELS[workflow.name] || `${workflow.name} · ${workflow.topology || "topology"}`}
-                </option>
-              ))}
-            </select>
+              rows={5}
+              placeholder="描述目标、可观察面、范围与约束…"
+              value={form.input}
+              onChange={(event) => set({ input: event.target.value })}
+            />
           </div>
-          <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-provider">
-              模型提供方
-            </label>
-            <select
-              id="new-run-provider"
-              className="field"
-              value={form.provider}
-              onChange={(event) => set({ provider: event.target.value })}
+          <div className="dialog-file-row">
+            <button
+              type="button"
+              className="btn"
+              id="btn-new-run-file"
+              onClick={() => fileInput.current?.click()}
             >
-              {options ? (
-                <>
-                  <option value="auto">auto · 自动选择已配置提供方</option>
-                  {providers.map((provider) => (
-                    <option value={provider.id} key={provider.id}>
-                      {`${provider.id} ${provider.configured ? "(已配置)" : "(未配置->Mock)"}`}
+              导入本地文件
+            </button>
+            <input
+              type="file"
+              id="new-run-file"
+              accept=".md,.txt,.json,.yaml,.yml"
+              hidden
+              ref={fileInput}
+              onChange={onFile}
+            />
+            <span className="card-note" id="new-run-file-note">
+              {fileNote}
+            </span>
+          </div>
+        </section>
+
+        <div className="dialog-disclosures">
+          <details className="dialog-disclosure" id="new-run-advanced">
+            <summary>Advanced Runtime Overrides</summary>
+            <div className="dialog-disclosure-body">
+              <div className="form-grid">
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-workflow">
+                    工作流覆盖
+                  </label>
+                  <select
+                    id="new-run-workflow"
+                    className="field"
+                    value={form.workflow}
+                    onChange={(event) => set({ workflow: event.target.value })}
+                  >
+                    <option value="">{`Auto (${autoWorkflow})`}</option>
+                    {workflows.map((workflow) => (
+                      <option value={workflow.name} key={workflow.name}>
+                        {WORKFLOW_SELECT_LABELS[workflow.name] ||
+                          `${workflow.name} · ${workflow.topology || "topology"}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-provider">
+                    模型提供方
+                  </label>
+                  <select
+                    id="new-run-provider"
+                    className="field"
+                    value={form.provider}
+                    onChange={(event) => set({ provider: event.target.value })}
+                  >
+                    {options ? (
+                      <>
+                        <option value="auto">auto · 自动选择已配置提供方</option>
+                        {providers.map((provider) => (
+                          <option value={provider.id} key={provider.id}>
+                            {`${provider.id} ${provider.configured ? "(已配置)" : "(未配置->Mock)"}`}
+                          </option>
+                        ))}
+                        <option value="mock">mock · 确定性模拟</option>
+                      </>
+                    ) : null}
+                  </select>
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-model">
+                    模型（可选）
+                  </label>
+                  <input
+                    id="new-run-model"
+                    className="field"
+                    type="text"
+                    placeholder="留空使用提供方默认模型"
+                    value={form.model}
+                    onChange={(event) => set({ model: event.target.value })}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-worker-driver">
+                    执行驱动（可选）
+                  </label>
+                  <input
+                    id="new-run-worker-driver"
+                    className="field"
+                    type="text"
+                    placeholder="留空使用环境配置"
+                    value={form.workerDriver}
+                    onChange={(event) => set({ workerDriver: event.target.value })}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-reviewer-driver">
+                    审查驱动（可选）
+                  </label>
+                  <input
+                    id="new-run-reviewer-driver"
+                    className="field"
+                    type="text"
+                    placeholder="留空使用环境配置"
+                    value={form.reviewerDriver}
+                    onChange={(event) => set({ reviewerDriver: event.target.value })}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-monitor-model">
+                    监控模型（可选）
+                  </label>
+                  <input
+                    id="new-run-monitor-model"
+                    className="field"
+                    type="text"
+                    placeholder="留空使用环境配置"
+                    value={form.monitorModel}
+                    onChange={(event) => set({ monitorModel: event.target.value })}
+                  />
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <details className="dialog-disclosure" id="new-run-benchmark-disclosure">
+            <summary>Load Benchmark Sample</summary>
+            <div className="dialog-disclosure-body">
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="new-run-demo">
+                  Benchmark 预设样本（可选）
+                </label>
+                <select
+                  id="new-run-demo"
+                  className="field"
+                  value={form.demoId}
+                  onChange={(event) => applyDemo(event.target.value)}
+                >
+                  {options ? <option value="">无（使用上方自定义作用域）</option> : null}
+                  {demos.map((item) => (
+                    <option value={item.id} key={item.id}>
+                      {item.label || item.title || item.id}
                     </option>
                   ))}
-                  <option value="mock">mock · 确定性模拟</option>
-                </>
-              ) : null}
-            </select>
-          </div>
-          <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-model">
-              模型（可选）
-            </label>
-            <input
-              id="new-run-model"
-              className="field"
-              type="text"
-              placeholder="留空使用提供方默认模型"
-              value={form.model}
-              onChange={(event) => set({ model: event.target.value })}
-            />
-          </div>
-          <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-worker-driver">
-              执行驱动（可选）
-            </label>
-            <input
-              id="new-run-worker-driver"
-              className="field"
-              type="text"
-              placeholder="留空使用环境配置"
-              value={form.workerDriver}
-              onChange={(event) => set({ workerDriver: event.target.value })}
-            />
-          </div>
-          <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-reviewer-driver">
-              审查驱动（可选）
-            </label>
-            <input
-              id="new-run-reviewer-driver"
-              className="field"
-              type="text"
-              placeholder="留空使用环境配置"
-              value={form.reviewerDriver}
-              onChange={(event) => set({ reviewerDriver: event.target.value })}
-            />
-          </div>
-          <div className="form-field">
-            <label className="dialog-label" htmlFor="new-run-monitor-model">
-              监控模型（可选）
-            </label>
-            <input
-              id="new-run-monitor-model"
-              className="field"
-              type="text"
-              placeholder="留空使用环境配置"
-              value={form.monitorModel}
-              onChange={(event) => set({ monitorModel: event.target.value })}
-            />
-          </div>
+                </select>
+              </div>
+              <p className="dialog-desc" id="new-run-demo-note" hidden={!demoNote}>
+                {demoNote}
+              </p>
+            </div>
+          </details>
         </div>
-        <p className="dialog-desc" id="new-run-workflow-meta">
-          {workflowMeta}
-        </p>
-        <label className="dialog-label" htmlFor="new-run-input">
-          需求原文
-        </label>
-        <textarea
-          id="new-run-input"
-          className="field"
-          rows={8}
-          placeholder="描述目标、可观察面、范围与约束…"
-          value={form.input}
-          onChange={(event) => set({ input: event.target.value })}
-        />
-        <div className="dialog-file-row">
-          <button type="button" className="btn" id="btn-new-run-file" onClick={() => fileInput.current?.click()}>
-            导入本地文件
-          </button>
-          <input
-            type="file"
-            id="new-run-file"
-            accept=".md,.txt,.json,.yaml,.yml"
-            hidden
-            ref={fileInput}
-            onChange={onFile}
-          />
-          <span className="card-note" id="new-run-file-note">
-            {fileNote}
-          </span>
-        </div>
+
+        {error ? (
+          <p className="dialog-error" id="new-run-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+
         <div className="dialog-actions">
-          <button type="submit" className="btn btn-quiet" value="cancel">
+          <button type="button" className="btn btn-quiet" onClick={closeDialog}>
             取消
           </button>
-          <button type="submit" className="btn btn-primary" id="new-run-submit" value="create" disabled={state.submitting}>
-            创建并启动
+          <button
+            type="submit"
+            className="btn btn-primary"
+            id="new-run-submit"
+            disabled={state.submitting}
+          >
+            {state.submitting ? "正在提交…" : "Issue Oracle · 创建并启动"}
           </button>
         </div>
       </form>
