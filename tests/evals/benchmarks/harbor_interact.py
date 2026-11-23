@@ -442,6 +442,28 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             for key, value in self.extra_env.items()
             if key.startswith(GATEWAY_ENV_PREFIXES)
         }
+        provider_key = (self._interact.provider or "").casefold()
+        env_groups: tuple[tuple[str, str], ...] = (
+            (("OPENAI_API_KEY", "OPENAI_BASE_URL"),)
+            if provider_key == "openai"
+            else (
+                (("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),)
+                if provider_key == "anthropic"
+                else (
+                    ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+                    ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+                )
+            )
+        )
+        for api_key_var, base_url_var in env_groups:
+            if api_key_var not in env:
+                host_key = os.environ.get(api_key_var, "").strip()
+                if host_key:
+                    env[api_key_var] = host_key
+            if base_url_var not in env:
+                host_base = (self._interact.base_url or os.environ.get(base_url_var, "")).strip()
+                if host_base:
+                    env[base_url_var] = host_base
         return env or None
 
     async def _install_olympus(self, environment: Any) -> None:

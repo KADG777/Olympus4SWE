@@ -2131,3 +2131,20 @@ def test_interact_install_pi_uploads_and_extracts_local_bundle(tmp_path: Path) -
     asyncio.run(agent.setup(env))
     assert any(dst == "/tmp/olympus-pi-bundle.tar.gz" for _src, dst, _text in env.uploads)
     assert agent._installed_pi_bin == "/opt/olympus/pi/bin/pi"
+
+
+def test_interact_gateway_env_falls_back_to_host_provider_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "sk-interact-host-secret-777"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    agent = _agent(
+        tmp_path,
+        model_name="openai/gpt-4o",
+        base_url="https://gateway.example/v1",
+    )
+    gw_env = agent._gateway_env()
+    assert gw_env is not None
+    assert gw_env["OPENAI_API_KEY"] == secret
+    assert gw_env["OPENAI_BASE_URL"] == "https://gateway.example/v1"
