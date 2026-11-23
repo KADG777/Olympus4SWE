@@ -31,6 +31,7 @@ class DriverTurnRequest(StrictModel):
     lease_generation: int | None = None
     read_only: bool = False
     disable_tools: bool = False
+    strict_scope: bool = True
     write_scope: list[str] = Field(default_factory=list)
     forbidden_globs: list[str] = Field(default_factory=list)
     max_steps: int | None = Field(default=None, ge=1)

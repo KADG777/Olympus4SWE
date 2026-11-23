@@ -63,7 +63,9 @@ from olympus.harness.worktree import (
     archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
+    clean_ephemeral_artifacts,
     create_sandbox,
+    is_ephemeral_artifact,
     load_sandbox_baseline,
     remove_run_sandboxes,
     remove_sandbox,
@@ -129,7 +131,8 @@ Rules:
    one turn, instead of serial shell `cat`/`sed`/`grep`/`find` probes; reserve shell execution for
    running tests, linters, and builds.
 4. Read relevant files first using absolute paths under the sandbox root, and only write or edit
-   files inside your assigned write_scope.
+   files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
+   non-forbidden integration edits.
 5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding."""
 
@@ -139,9 +142,11 @@ Inspect the GoalSpec requirements, out_of_scope boundaries, TaskNode objective, 
 command check outputs (plus read-only workspace inspection if needed).
 Rules:
 1. Check for spec drift, out_of_scope additions, stub code, edge-case bugs, and security risks.
-2. Respect TaskNode.write_scope as a hard boundary: judge ONLY work achievable within this
-   TaskNode's objective and write_scope. Never reject a task for missing deliverables or test files
-   outside its write_scope (those belong to other tasks in the DAG).
+2. Respect TaskNode.write_scope as a hard boundary for requested deliverables: judge ONLY work
+   achievable within this TaskNode's objective and write_scope. Never reject a task for missing
+   deliverables or test files outside its write_scope (those belong to other tasks in the DAG).
+   Adjacent non-forbidden files listed as authorized out-of-declared-scope edits are intentional
+   integration changes: audit them for regressions, never reject them for scope alone.
 3. Classify each finding strictly as 'important' (blocks pass), 'nit', or 'pre_existing'.
 4. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
    genuinely satisfies the task and no 'important' defects remain.
@@ -857,6 +862,7 @@ class OrchestrateStage:
         art_dir: Path,
         reviewer: tuple[AgentDriver, str | None],
         design: DesignSpec | None = None,
+        advisory_out_of_scope: Sequence[str] = (),
     ) -> ReviewVerdict:
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
@@ -881,6 +887,13 @@ class OrchestrateStage:
             f"Changed files (per-file summary):\n{diff_summary}\n\n"
             f"Diff (inline{' truncated' if diff_truncated else ''}):\n{inline_diff}\n"
         )
+        advisory_ctx = (
+            "\nAuthorized out-of-declared-scope adjacent edits (non-forbidden; this task ran "
+            "without concurrent siblings; audit for regressions, do not reject for scope alone): "
+            f"{json.dumps(list(advisory_out_of_scope), ensure_ascii=False)}\n"
+            if advisory_out_of_scope
+            else ""
+        )
         if diff_truncated:
             diff_ctx += (
                 f"\nThe inline diff above was truncated at {_INLINE_DIFF_BUDGET} characters. "
@@ -894,6 +907,7 @@ class OrchestrateStage:
             f"TaskNode: {task_summary}\n"
             f"Hard write_scope boundary (do NOT require edits to files outside these paths): "
             f"{json.dumps(task.write_scope, ensure_ascii=False)}\n"
+            f"{advisory_ctx}"
             f"Relevant requirements: {reqs_json}\n"
             f"{spec_ctx}\n"
             f"{design_ctx}"
@@ -1060,6 +1074,8 @@ class OrchestrateStage:
         on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
         on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
         on_run_paused: Callable[[], None] | None = None,
+        strict_scope: bool = True,
+        sibling_write_scopes: Sequence[str] = (),
     ) -> TaskNode:
         leased = self.store.acquire_task_lease(run_id, task_id, actor="chronos")
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
@@ -1085,6 +1101,9 @@ class OrchestrateStage:
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
                 else ()
+            )
+            hard_forbidden = tuple(
+                dict.fromkeys((*forbidden_contracts, *sibling_write_scopes))
             )
             if sandbox.reused:
                 task_baseline = load_sandbox_baseline(sandbox)
@@ -1128,12 +1147,22 @@ class OrchestrateStage:
                 else "Execution discipline: keep exploration focused, implement edits early, "
                 "verify with targeted commands, and stop once all acceptance checks pass.\n"
             )
+            scope_note = (
+                "\nScope note: no concurrent sibling task shares this run wave. Besides "
+                "write_scope, adjacent NON-FORBIDDEN repo files needed for integration "
+                "(e.g. a package `__init__.py` re-export) may be created or edited; workspace "
+                "escapes and forbidden paths stay hard-blocked.\n"
+                if not strict_scope
+                else "\nScope note: concurrent wave active. Strictly stay inside write_scope; "
+                "sibling task scopes and forbidden shared contracts are hard-blocked.\n"
+            )
             worker_prompt = (
                 f"Sandbox workspace root: {sandbox.workspace_path}\n"
                 f"Task {leased.task_id}: {leased.title}\n"
                 f"Objective: {leased.objective}\n"
                 f"{step_guidance}"
                 f"Allowed write_scope (relative): {json.dumps(leased.write_scope)}\n"
+                f"{scope_note}"
                 f"{spec_ctx}\n"
                 f"{design_ctx}"
                 f"{handoff_block}"
@@ -1151,8 +1180,9 @@ class OrchestrateStage:
                 actor=f"hephaestus:{leased.task_id}",
                 task_id=leased.task_id,
                 lease_generation=leased.lease_generation,
+                strict_scope=strict_scope,
                 write_scope=leased.write_scope,
-                forbidden_globs=list(forbidden_contracts),
+                forbidden_globs=list(hard_forbidden),
                 max_steps=worker_max_steps,
                 trace_path=art_dir / "worker.jsonl",
                 model=model,
@@ -1180,7 +1210,7 @@ class OrchestrateStage:
                     store=self.store,
                     run_id=run_id,
                     baseline=task_baseline,
-                    forbidden_globs=list(forbidden_contracts),
+                    forbidden_globs=list(hard_forbidden),
                 )
             worker_error = None
             try:
@@ -1270,11 +1300,28 @@ class OrchestrateStage:
                     )
                 )
 
+            removed_artifacts = clean_ephemeral_artifacts(sandbox, task_baseline)
+            if removed_artifacts:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type="task.ephemeral_artifacts_cleaned",
+                    actor="chronos",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "removed_paths": removed_artifacts,
+                    },
+                )
+                diff_text = capture_sandbox_diff(sandbox, task_baseline)
+                diff_file.write_text(diff_text, encoding="utf-8")
+
             gate = run_diff_gate(
                 sandbox,
                 task_baseline,
                 allowed_write_scope=verifying.write_scope,
-                forbidden_globs=forbidden_contracts,
+                forbidden_globs=hard_forbidden,
+                strict_scope=strict_scope,
             )
             if gate.rejected:
                 self.store.append_event(
@@ -1285,6 +1332,7 @@ class OrchestrateStage:
                     payload={
                         "task_id": verifying.task_id,
                         "attempt": verifying.attempt,
+                        "strict_scope": gate.strict_scope,
                         "violating_paths": [v.path for v in gate.violations],
                         "violations": [
                             {
@@ -1296,6 +1344,7 @@ class OrchestrateStage:
                         ],
                         "allowed_write_scope": list(gate.allowed_write_scope),
                         "forbidden_globs": list(gate.forbidden_globs),
+                        "advisory_out_of_scope": list(gate.advisory_out_of_scope),
                         "changed_paths": list(gate.changed_paths),
                     },
                 )
@@ -1380,6 +1429,7 @@ class OrchestrateStage:
                     art_dir=art_dir,
                     reviewer=reviewer,
                     design=design,
+                    advisory_out_of_scope=gate.advisory_out_of_scope,
                 )
             except BudgetExhaustedError as exc:
                 return retain(
@@ -1462,10 +1512,23 @@ class OrchestrateStage:
                     return self._return_interrupted_task(run_id, verifying)
                 raise
 
-            _copy_matching_scope(sandbox.workspace_path, overlay_dir, verifying.write_scope)
+            promotion_paths = list(verifying.write_scope)
+            seen_paths = set(promotion_paths)
+            promotion_policy = WorkspacePolicy(
+                allowed_write_scope=verifying.write_scope,
+                forbidden_write_scope=hard_forbidden,
+            )
+            for rel in gate.changed_paths:
+                if rel in seen_paths or is_ephemeral_artifact(rel):
+                    continue
+                if promotion_policy.forbidden_match(rel) is not None:
+                    continue
+                seen_paths.add(rel)
+                promotion_paths.append(rel)
+            _copy_matching_scope(sandbox.workspace_path, overlay_dir, promotion_paths)
             if mode == RunMode.EXECUTION and apply_to_workspace:
                 _copy_matching_scope(
-                    sandbox.workspace_path, self.workspace_root, verifying.write_scope
+                    sandbox.workspace_path, self.workspace_root, promotion_paths
                 )
             _write_manifest_md(
                 art_dir=art_dir,
@@ -1568,8 +1631,13 @@ class OrchestrateStage:
         apply_to_workspace: bool = False,
         worker_max_steps: int | None = None,
         serial_execution: bool = False,
+        strict_scope: bool | None = None,
     ) -> dict[str, Any]:
-        """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
+        """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules.
+
+        ``strict_scope`` defaults to ``None`` (auto): enforced only for waves with concurrent
+        sibling tasks. Explicit ``True``/``False`` overrides that heuristic.
+        """
         spec = self._require_confirmed_spec(run_id)
         registry = self.driver_registry.with_factories(
             default_driver_factories(
@@ -1724,6 +1792,18 @@ class OrchestrateStage:
                     candidates = pick_dispatchable(ready, capacity)
                     if candidates and snap["budget_ledger"].can_reserve(policy):
                         for task in candidates:
+                            wave_peers = [*in_flight.values(), *candidates]
+                            task_strict_scope = (
+                                strict_scope
+                                if strict_scope is not None
+                                else not effective_serial and len(wave_peers) > 1
+                            )
+                            sibling_write_scopes = tuple(
+                                scope
+                                for peer in wave_peers
+                                if peer.task_id != task.task_id
+                                for scope in peer.write_scope
+                            )
                             handoff = (
                                 _format_handoff_context(plan, current_task_id=task.task_id)
                                 if effective_serial
@@ -1746,6 +1826,8 @@ class OrchestrateStage:
                                 on_handle_registered=register_wave_handle,
                                 on_handle_finished=unregister_wave_handle,
                                 on_run_paused=cancel_wave_peers,
+                                strict_scope=task_strict_scope,
+                                sibling_write_scopes=sibling_write_scopes,
                             )
                             in_flight[future] = task
                 if in_flight:

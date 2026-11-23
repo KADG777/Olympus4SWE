@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from olympus.harness.driver import (
     resolve_driver_spec,
 )
 from olympus.harness.pi import (
+    _SCOPE_GUARD_PATH,
     PiDriver,
     PiNotAvailableError,
     _reset_pi_availability_cache,
@@ -303,6 +305,7 @@ def main():
         {
             "write_scope": os.environ.get("OLYMPUS_PI_WRITE_SCOPE"),
             "forbidden_globs": os.environ.get("OLYMPUS_PI_FORBIDDEN_GLOBS"),
+            "strict_scope": os.environ.get("OLYMPUS_PI_STRICT_SCOPE"),
             "cwd": os.getcwd(),
         },
     )
@@ -879,6 +882,7 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
     )
     env = json.loads(env_file.read_text(encoding="utf-8"))
     assert json.loads(env["write_scope"]) == ["feature.py"]
+    assert env["strict_scope"] == "0"
 
     attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
     tool_entries = [
@@ -917,6 +921,8 @@ def test_pi_worker_out_of_scope_edit_rejected_by_diff_gate(
     monkeypatch.setenv("OLYMPUS_PI_BIN", str(fake))
     monkeypatch.setenv("FAKE_PI_WRITE_FILE", "docs/secret.md")
     monkeypatch.setenv("FAKE_PI_WRITE_CONTENT", "leaked\n")
+    env_file = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_PI_ENV_FILE", str(env_file))
 
     stage = OrchestrateStage(
         store=store,
@@ -924,7 +930,7 @@ def test_pi_worker_out_of_scope_edit_rejected_by_diff_gate(
         workspace_root=tmp_path,
         execution_drivers=ExecutionDriversConfig(worker_driver="pi"),
     )
-    snap = stage.run_execution(run_id=run_id)
+    snap = stage.run_execution(run_id=run_id, strict_scope=True)
 
     task = snap["plan"].tasks[0]
     assert task.status == TaskStatus.BLOCKED
@@ -939,6 +945,8 @@ def test_pi_worker_out_of_scope_edit_rejected_by_diff_gate(
     assert rejections[0].payload["allowed_write_scope"] == ["feature.py"]
     assert not [e for e in events if e.event_type == "review.verdict_recorded"]
     assert not [e for e in events if e.event_type == "check.command_completed"]
+    env = json.loads(env_file.read_text(encoding="utf-8"))
+    assert env["strict_scope"] == "1"
 
     attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1"
     assert (attempt_dir / "diff.patch").is_file()
@@ -946,6 +954,91 @@ def test_pi_worker_out_of_scope_edit_rejected_by_diff_gate(
     assert not list(attempt_dir.glob("verdict-cycle-*.json"))
     overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
     assert not (overlay / "docs" / "secret.md").exists()
+
+
+_GUARD_RUNNER_SOURCE = """
+import { pathToFileURL } from "node:url";
+process.chdir(process.env.OLYMPUS_GUARD_WORKSPACE);
+const mod = await import(pathToFileURL(process.env.OLYMPUS_GUARD_PATH).href);
+let handler = null;
+mod.default({ on: (event, fn) => { if (event === "tool_call") handler = fn; } });
+const results = [];
+for (const [toolName, target] of JSON.parse(process.env.OLYMPUS_GUARD_CALLS)) {
+  const result = await handler({ toolName, input: { path: target } });
+  results.push(result && result.block ? { block: true, reason: result.reason } : { block: false });
+}
+console.log(JSON.stringify(results));
+"""
+
+
+def _run_scope_guard(
+    tmp_path: Path,
+    *,
+    strict: bool,
+    write_scope: Sequence[str],
+    forbidden_globs: Sequence[str],
+    calls: Sequence[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    if shutil.which("node") is None:
+        pytest.skip("node is required to execute pi_scope_guard.ts")
+    workspace = tmp_path / "guard-ws"
+    workspace.mkdir(parents=True)
+    runner = tmp_path / "guard_runner.mjs"
+    runner.write_text(_GUARD_RUNNER_SOURCE, encoding="utf-8")
+    env = {
+        **os.environ,
+        "OLYMPUS_GUARD_PATH": str(_SCOPE_GUARD_PATH),
+        "OLYMPUS_GUARD_WORKSPACE": str(workspace),
+        "OLYMPUS_GUARD_CALLS": json.dumps([list(call) for call in calls]),
+        "OLYMPUS_PI_STRICT_SCOPE": "1" if strict else "0",
+        "OLYMPUS_PI_WRITE_SCOPE": json.dumps(list(write_scope)),
+        "OLYMPUS_PI_FORBIDDEN_GLOBS": json.dumps(list(forbidden_globs)),
+    }
+    proc = subprocess.run(
+        ["node", str(runner)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_pi_scope_guard_hard_blocks_escape_and_forbidden_and_relaxes_expected_scope(
+    tmp_path: Path,
+) -> None:
+    relaxed = _run_scope_guard(
+        tmp_path / "relaxed",
+        strict=False,
+        write_scope=["feature.py"],
+        forbidden_globs=["contracts/", "sibling.py"],
+        calls=[
+            ("write", "feature.py"),
+            ("write", "pkg/__init__.py"),
+            ("edit", "docs/notes.md"),
+            ("write", "contracts/api.py"),
+            ("write", "sibling.py"),
+            ("write", "../escape.py"),
+        ],
+    )
+    assert [result["block"] for result in relaxed] == [False, False, False, True, True, True]
+    assert "forbidden shared-contract glob" in relaxed[3]["reason"]
+    assert "forbidden shared-contract glob" in relaxed[4]["reason"]
+    assert "escapes the sandbox workspace" in relaxed[5]["reason"]
+
+    strict = _run_scope_guard(
+        tmp_path / "strict",
+        strict=True,
+        write_scope=["feature.py"],
+        forbidden_globs=["contracts/"],
+        calls=[("write", "feature.py"), ("write", "pkg/__init__.py")],
+    )
+    assert strict[0] == {"block": False}
+    assert strict[1]["block"] is True
+    assert "outside write_scope" in strict[1]["reason"]
 
 
 def test_missing_pi_binary_fails_before_task_lease_or_review(
