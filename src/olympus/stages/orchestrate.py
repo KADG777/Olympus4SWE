@@ -6,8 +6,9 @@ import json
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,8 @@ from olympus.core.contracts import (
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
+    ReviewAxis,
+    ReviewFinding,
     ReviewSeverity,
     ReviewVerdict,
     RunMode,
@@ -58,6 +61,7 @@ from olympus.harness.native import NativeDriver
 from olympus.harness.structured import run_structured_turn
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
+    SandboxBaseline,
     SandboxHandle,
     absorb_verification_artifacts,
     archive_sandbox_recovery,
@@ -137,20 +141,34 @@ Rules:
    fix every Important finding before concluding."""
 
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
-You have ZERO prior conversation history with the implementer.
+You have ZERO prior conversation history with the implementer. You are strictly read-only: inspect,
+probe, but never edit repository files.
 Inspect the GoalSpec requirements, out_of_scope boundaries, TaskNode objective, git diff, and actual
 command check outputs (plus read-only workspace inspection if needed).
-Rules:
-1. Check for spec drift, out_of_scope additions, stub code, edge-case bugs, and security risks.
-2. Respect TaskNode.write_scope as a hard boundary for requested deliverables: judge ONLY work
+Two-axis rules:
+1. Every finding MUST set `axis`:
+   - `axis="spec"`: a broken requirement, out-of-scope addition, or runtime/edge-case defect.
+   - `axis="standards"`: repo conventions, smells, or style. Always `severity="nit"` and always a
+     concrete `file_path` plus `line`.
+2. An `axis="spec"` finding may be `severity="important"` ONLY when it includes:
+   - `requirement_ref`: the exact GoalSpec requirement id it breaks, and
+   - `repro_command`: one self-contained shell command that runs from the sandbox repo root,
+     exits NON-ZERO while the defect exists, and exits ZERO once it is fixed.
+   The command must not modify repository files. If you cannot produce such a command, report the
+   finding as `severity="nit"` prose instead of inventing an unproven blocker.
+3. Chronos deterministically re-runs every Axis A `important` `repro_command` in the sandbox and
+   drops any finding whose command exits 0 (disproven), is missing, times out, hits a broken probe
+   (SyntaxError in inline `python -c`, exit 126/127, command not found), or is on the standards
+   axis.
+4. Respect TaskNode.write_scope as a hard boundary for requested deliverables: judge ONLY work
    achievable within this TaskNode's objective and write_scope. Never reject a task for missing
    deliverables or test files outside its write_scope (those belong to other tasks in the DAG).
    Adjacent non-forbidden files listed as authorized out-of-declared-scope edits are intentional
    integration changes: audit them for regressions, never reject them for scope alone.
-3. Classify each finding strictly as 'important' (blocks pass), 'nit', or 'pre_existing'.
-4. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
-   genuinely satisfies the task and no 'important' defects remain.
-5. Output ONLY a single JSON object conforming to ReviewVerdict."""
+5. Classify each non-standards finding strictly as 'important' (blocks pass), 'nit', or
+   'pre_existing'. Set passed=false whenever an 'important' Axis A defect exists; set passed=true
+   only if implementation genuinely satisfies the task and no 'important' defects remain.
+6. Output ONLY a single JSON object conforming to ReviewVerdict."""
 
 
 def _plan_binding(
@@ -367,9 +385,17 @@ def _write_manifest_md(
                 f"- passed: {verdict.passed}",
                 f"- summary: {verdict.summary}",
                 f"- findings: {len(verdict.findings)}",
+                f"- dropped_unverified: {verdict.dropped_unverified_count}",
                 "",
             ]
         )
+        for finding in verdict.findings:
+            lines.append(
+                f"- [{finding.axis.value}/{finding.severity.value}] "
+                f"{finding.file_path}:{finding.line or '-'} {finding.message} "
+                f"(verified={finding.verified}, repro={finding.repro_command or '-'})"
+            )
+        lines.append("")
     lines.extend(["## Acceptance checks", ""])
     for check in checks:
         state = "passed" if check.passed else "not passed"
@@ -490,6 +516,106 @@ Vertical tracer-bullet decomposition (topology={topology}):
 - Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
   have strictly disjoint write_scope.
 """
+
+
+_REPRO_TIMEOUT_SECONDS = 30.0
+_REPRO_OUTPUT_BUDGET = 2_000
+_PROBE_GUARD_BUDGET = 4 * 1024 * 1024
+_SECRET_ENV_NAME = re.compile(
+    r"(?i)(token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)"
+)
+_INLINE_PYTHON_C = re.compile(r"\bpython[\d.]*\b[^\n]*\s-c\s")
+_BROKEN_PROBE_EXIT_CODES = frozenset({126, 127})
+
+
+@dataclass(frozen=True)
+class _ReproResult:
+    """Outcome of one sandboxed reviewer repro command."""
+
+    returncode: int | None
+    output: str
+    broken: bool
+
+
+def _redact_probe_output(text: str, env: Mapping[str, str]) -> str:
+    """Strip secret-looking environment values, then bound the captured output."""
+    redacted = text
+    for name, value in env.items():
+        if len(value) >= 8 and _SECRET_ENV_NAME.search(name):
+            redacted = redacted.replace(value, "***")
+    if len(redacted) > _REPRO_OUTPUT_BUDGET:
+        redacted = f"{redacted[:_REPRO_OUTPUT_BUDGET]}\n... (truncated)"
+    return redacted
+
+
+def _probe_is_broken(*, command: str, returncode: int | None, output: str) -> bool:
+    """Recognize command failures that prove a broken probe, not a reproduced defect."""
+    if returncode is None:
+        return True
+    if returncode in _BROKEN_PROBE_EXIT_CODES:
+        return True
+    if returncode == 2 and "syntax error" in output.lower():
+        return True
+    return "SyntaxError" in output and _INLINE_PYTHON_C.search(command) is not None
+
+
+def _snapshot_probe_guard(sandbox: SandboxHandle) -> dict[str, bytes]:
+    """Save current bytes of worker-touched files so probes cannot corrupt them."""
+    workspace = sandbox.workspace_path
+    saved: dict[str, bytes] = {}
+    total = 0
+    for rel, fingerprint in snapshot_sandbox_state(sandbox).mapping().items():
+        if fingerprint is None:
+            continue
+        path = workspace / rel
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if total + len(data) > _PROBE_GUARD_BUDGET:
+            break
+        saved[rel] = data
+        total += len(data)
+    return saved
+
+
+def _restore_probe_guard(sandbox: SandboxHandle, saved: Mapping[str, bytes]) -> None:
+    """Restore any guarded file a verification probe modified or deleted."""
+    workspace = sandbox.workspace_path
+    for rel, data in saved.items():
+        path = workspace / rel
+        try:
+            if path.is_file() and path.read_bytes() == data:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError:
+            continue
+
+
+def _format_rejection_reason(verdict: ReviewVerdict) -> str:
+    """Render verified blockers with the exact failing command and observed output."""
+    lines = [f"Review rejected: {verdict.summary}"]
+    for finding in verdict.findings:
+        if finding.severity != ReviewSeverity.IMPORTANT:
+            continue
+        header = (
+            f"[important/{finding.axis.value}] {finding.file_path}:"
+            f"{finding.line or '-'} {finding.message}"
+        )
+        if finding.requirement_ref:
+            header += f" (requirement_ref={finding.requirement_ref})"
+        lines.append(header)
+        if finding.repro_command:
+            lines.append(f"  failing repro_command: {finding.repro_command}")
+        if finding.verification_output:
+            lines.append("  observed output:")
+            lines.extend(
+                f"    {line}" for line in finding.verification_output.splitlines()
+            )
+    return "\n".join(lines)
 
 
 class _ReviewOutputError(ValueError):
@@ -863,6 +989,7 @@ class OrchestrateStage:
         reviewer: tuple[AgentDriver, str | None],
         design: DesignSpec | None = None,
         advisory_out_of_scope: Sequence[str] = (),
+        resolved_repro_commands: Sequence[str] = (),
     ) -> ReviewVerdict:
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
@@ -872,8 +999,16 @@ class OrchestrateStage:
             if incremental and task.last_error
             else ""
         )
+        resolved_ctx = (
+            "\nChronos 0-token re-check: these previously verified failing repro commands "
+            f"NOW PASS after the repair: {json.dumps(list(resolved_repro_commands))}\n"
+            "Audit only for REGRESSIONS in the incremental diff. Do not re-report these "
+            "resolved defects unless you supply a new repro_command that fails right now.\n"
+            if resolved_repro_commands
+            else ""
+        )
         task_summary = task.model_dump_json(
-            include={"task_id", "title", "objective", "write_scope"}
+            include={"task_id", "title", "objective", "requirement_refs", "write_scope"}
         )
         reqs_json = json.dumps(
             [r.model_dump(mode="json") for r in relevant_reqs], ensure_ascii=False
@@ -914,6 +1049,7 @@ class OrchestrateStage:
             f"Out of scope (MUST NOT be added): {oos_json}\n"
             f"Incremental review cycle={task.review_cycle + 1} (incremental_only={incremental})\n"
             f"{prior_ctx}\n"
+            f"{resolved_ctx}"
             f"Command check outputs:\n{check_summary}\n\n"
             f"{diff_ctx}\n"
             f"Set task_id='{task.task_id}', attempt={task.attempt}, "
@@ -973,27 +1109,230 @@ class OrchestrateStage:
                 "incremental_only": incremental,
             }
         )
-        (art_dir / f"verdict-cycle-{task.review_cycle + 1}.json").write_text(
+        (art_dir / f"argus-verdict-cycle-{task.review_cycle + 1}.json").write_text(
             verdict.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return verdict
+
+    def _run_repro_command(
+        self, *, command: str, sandbox: SandboxHandle
+    ) -> _ReproResult:
+        """Execute one reviewer repro command inside the sandbox with bounded output."""
+        env = build_sandbox_env(sandbox.workspace_path, host_root=self.workspace_root)
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=sandbox.workspace_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_REPRO_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            captured = "\n".join(
+                part
+                for part in (
+                    exc.stdout if isinstance(exc.stdout, str) else "",
+                    exc.stderr if isinstance(exc.stderr, str) else "",
+                )
+                if part
+            )
+            output = _redact_probe_output(
+                f"probe timed out after {_REPRO_TIMEOUT_SECONDS:g}s\n{captured}".strip(),
+                env,
+            )
+            return _ReproResult(returncode=None, output=output, broken=True)
+        except OSError as exc:
+            return _ReproResult(
+                returncode=None,
+                output=f"probe could not start: {type(exc).__name__}",
+                broken=True,
+            )
+        combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+        return _ReproResult(
+            returncode=proc.returncode,
+            output=_redact_probe_output(combined, env),
+            broken=_probe_is_broken(
+                command=command, returncode=proc.returncode, output=combined
+            ),
+        )
+
+    def _verify_review_verdict(
+        self,
+        *,
+        run_id: str,
+        task: TaskNode,
+        sandbox: SandboxHandle,
+        verdict: ReviewVerdict,
+        task_baseline: SandboxBaseline,
+        art_dir: Path,
+    ) -> tuple[ReviewVerdict, SandboxBaseline]:
+        """Deterministically keep only run-proven Axis A blockers from an Argus verdict."""
+        guard = _snapshot_probe_guard(sandbox)
+        findings: list[ReviewFinding] = []
+        verified_commands: list[str] = []
+        dropped = 0
+        standards_count = 0
+        try:
+            for index, finding in enumerate(verdict.findings, start=1):
+                if finding.severity != ReviewSeverity.IMPORTANT:
+                    findings.append(finding)
+                    continue
+                if finding.axis == ReviewAxis.STANDARDS:
+                    standards_count += 1
+                    findings.append(
+                        finding.model_copy(
+                            update={
+                                "severity": ReviewSeverity.NIT,
+                                "verified": None,
+                                "verification_output": None,
+                            }
+                        )
+                    )
+                    continue
+                command = (finding.repro_command or "").strip()
+                if not command:
+                    dropped += 1
+                    findings.append(
+                        finding.model_copy(
+                            update={
+                                "severity": ReviewSeverity.NIT,
+                                "verified": False,
+                                "verification_output": "dropped: no repro_command supplied",
+                            }
+                        )
+                    )
+                    continue
+                result = self._run_repro_command(command=command, sandbox=sandbox)
+                (art_dir / f"verify-cycle-{task.review_cycle + 1}-{index}.log").write_text(
+                    f"finding: {finding.id}\ncommand: {command}\n"
+                    f"exit_code: {result.returncode}\nbroken_probe: {result.broken}\n"
+                    f"--- output ---\n{result.output}\n",
+                    encoding="utf-8",
+                )
+                if result.broken or result.returncode == 0:
+                    dropped += 1
+                    reason = (
+                        "dropped: broken reviewer probe"
+                        if result.broken
+                        else "dropped: repro_command exited 0 (disproven)"
+                    )
+                    findings.append(
+                        finding.model_copy(
+                            update={
+                                "severity": ReviewSeverity.NIT,
+                                "verified": False,
+                                "verification_output": f"{reason}\n{result.output}".strip(),
+                            }
+                        )
+                    )
+                    continue
+                findings.append(
+                    finding.model_copy(
+                        update={"verified": True, "verification_output": result.output}
+                    )
+                )
+                if command not in verified_commands:
+                    verified_commands.append(command)
+        finally:
+            _restore_probe_guard(sandbox, guard)
+        task_baseline = absorb_verification_artifacts(
+            sandbox, task_baseline, write_scope=task.write_scope
+        )
+        save_sandbox_baseline(sandbox, task_baseline)
+        passed = not any(f.severity == ReviewSeverity.IMPORTANT for f in findings)
+        verified_verdict = verdict.model_copy(
+            update={
+                "findings": findings,
+                "passed": passed,
+                "dropped_unverified_count": dropped,
+                "summary": (
+                    verdict.summary
+                    if not dropped and not standards_count
+                    else f"{verdict.summary} [chronos: dropped={dropped}, "
+                    f"standards={standards_count}]"
+                ),
+            }
         )
         self.store.append_event(
             run_id=run_id,
             stage="verify",
-            event_type="review.verdict_recorded",
-            actor="argus",
+            event_type="review.verdict_verified",
+            actor="chronos",
             payload={
                 "task_id": task.task_id,
                 "attempt": task.attempt,
-                "passed": verdict.passed,
-                "important_count": sum(
-                    1 for f in verdict.findings if f.severity == ReviewSeverity.IMPORTANT
+                "review_cycle": task.review_cycle + 1,
+                "passed": passed,
+                "verified_important": sum(
+                    1
+                    for f in findings
+                    if f.severity == ReviewSeverity.IMPORTANT and f.verified is True
                 ),
-                "nit_count": sum(
-                    1 for f in verdict.findings if f.severity == ReviewSeverity.NIT
-                ),
+                "dropped_unverified": dropped,
+                "standards_count": standards_count,
+                "verified_repro_commands": list(verified_commands),
             },
         )
-        return verdict
+        return verified_verdict, task_baseline
+
+    def _recheck_verified_repro_commands(
+        self,
+        *,
+        run_id: str,
+        task: TaskNode,
+        sandbox: SandboxHandle,
+        task_baseline: SandboxBaseline,
+        art_dir: Path,
+    ) -> tuple[list[str], SandboxBaseline]:
+        """0-token pre-check: re-run the previous cycle's proven failing commands."""
+        guard = _snapshot_probe_guard(sandbox)
+        failures: list[str] = []
+        results: list[dict[str, Any]] = []
+        try:
+            for index, command in enumerate(task.verified_repro_commands, start=1):
+                result = self._run_repro_command(command=command, sandbox=sandbox)
+                passed = result.returncode == 0
+                (art_dir / f"recheck-cycle-{task.review_cycle + 1}-{index}.log").write_text(
+                    f"command: {command}\nexit_code: {result.returncode}\n"
+                    f"--- output ---\n{result.output}\n",
+                    encoding="utf-8",
+                )
+                results.append(
+                    {"command": command, "exit_code": result.returncode, "passed": passed}
+                )
+                if not passed:
+                    observed = (
+                        f"exit {result.returncode}"
+                        if result.returncode is not None
+                        else "timeout"
+                    )
+                    failures.append(
+                        f"Previously verified defect still reproduces: `{command}` "
+                        f"({observed})\n{result.output[-800:]}"
+                    )
+        finally:
+            _restore_probe_guard(sandbox, guard)
+        task_baseline = absorb_verification_artifacts(
+            sandbox, task_baseline, write_scope=task.write_scope
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="verify",
+            event_type="review.repro_rechecked",
+            actor="chronos",
+            payload={
+                "task_id": task.task_id,
+                "attempt": task.attempt,
+                "review_cycle": task.review_cycle + 1,
+                "passed": not failures,
+                "short_circuited": bool(failures),
+                "llm_calls": 0,
+                "results": results,
+            },
+        )
+        return failures, task_baseline
 
     def _run_worker_turn(
         self,
@@ -1413,7 +1752,48 @@ class OrchestrateStage:
                     )
                 )
 
-            # Run cold-start independent review if check or default policy requires it
+            # 0-token pre-check: re-run the prior cycle's proven failing repro commands
+            # before spending any reviewer tokens.
+            resolved_repro_commands: list[str] = []
+            if verifying.review_cycle > 0 and verifying.verified_repro_commands:
+                repro_failures, task_baseline = self._recheck_verified_repro_commands(
+                    run_id=run_id,
+                    task=verifying,
+                    sandbox=sandbox,
+                    task_baseline=task_baseline,
+                    art_dir=art_dir,
+                )
+                save_sandbox_baseline(sandbox, task_baseline)
+                if repro_failures:
+                    _write_manifest_md(
+                        art_dir=art_dir,
+                        task=verifying,
+                        diff_text=diff_text,
+                        checks=updated_checks,
+                        verdict=None,
+                        receipt=loop_res.receipt,
+                    )
+                    return retain(
+                        self._fail_or_requeue(
+                            run_id=run_id,
+                            task=verifying,
+                            reason="\n".join(repro_failures),
+                            checks=updated_checks,
+                            verified_repro_commands=list(verifying.verified_repro_commands),
+                        )
+                    )
+                resolved_repro_commands = list(verifying.verified_repro_commands)
+                verifying = self.store.update_task_with_lease(
+                    run_id,
+                    verifying.task_id,
+                    expected_lease_generation=verifying.lease_generation,
+                    mutator=lambda t: t.model_copy(
+                        update={"verified_repro_commands": []}
+                    ),
+                    actor="chronos",
+                    event_type="review.repro_commands_cleared",
+                )
+
             check_summary = "\n".join(
                 f"- {c.id} ({c.kind.value}): passed={c.passed}" for c in updated_checks
             )
@@ -1430,6 +1810,7 @@ class OrchestrateStage:
                     reviewer=reviewer,
                     design=design,
                     advisory_out_of_scope=gate.advisory_out_of_scope,
+                    resolved_repro_commands=resolved_repro_commands,
                 )
             except BudgetExhaustedError as exc:
                 return retain(
@@ -1456,13 +1837,39 @@ class OrchestrateStage:
                         run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
                     )
                 )
+
+            verdict, task_baseline = self._verify_review_verdict(
+                run_id=run_id,
+                task=verifying,
+                sandbox=sandbox,
+                verdict=verdict,
+                task_baseline=task_baseline,
+                art_dir=art_dir,
+            )
+            (art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json").write_text(
+                verdict.model_dump_json(indent=2), encoding="utf-8"
+            )
+            self.store.append_event(
+                run_id=run_id,
+                stage="verify",
+                event_type="review.verdict_recorded",
+                actor="argus",
+                payload={
+                    "task_id": verifying.task_id,
+                    "attempt": verifying.attempt,
+                    "passed": verdict.passed,
+                    "important_count": sum(
+                        1
+                        for f in verdict.findings
+                        if f.severity == ReviewSeverity.IMPORTANT
+                    ),
+                    "nit_count": sum(
+                        1 for f in verdict.findings if f.severity == ReviewSeverity.NIT
+                    ),
+                    "dropped_unverified_count": verdict.dropped_unverified_count,
+                },
+            )
             if not verdict.passed:
-                important_lines = [
-                    f"[{f.severity.value}] {f.file_path}:{f.line or '-'} {f.message}"
-                    for f in verdict.findings
-                    if f.severity == ReviewSeverity.IMPORTANT
-                ]
-                err_msg = f"Review rejected: {verdict.summary}\n" + "\n".join(important_lines)
                 _write_manifest_md(
                     art_dir=art_dir,
                     task=verifying,
@@ -1475,8 +1882,15 @@ class OrchestrateStage:
                     self._fail_or_requeue(
                         run_id=run_id,
                         task=verifying,
-                        reason=err_msg,
+                        reason=_format_rejection_reason(verdict),
                         checks=updated_checks,
+                        verified_repro_commands=[
+                            f.repro_command
+                            for f in verdict.findings
+                            if f.severity == ReviewSeverity.IMPORTANT
+                            and f.verified is True
+                            and f.repro_command
+                        ],
                     )
                 )
 
@@ -1498,6 +1912,7 @@ class OrchestrateStage:
                             "acceptance_checks": final_checks,
                             "last_error": None,
                             "worktree_path": None,
+                            "verified_repro_commands": [],
                         }
                     ),
                     actor="chronos",
@@ -1550,24 +1965,26 @@ class OrchestrateStage:
         task: TaskNode,
         reason: str,
         checks: list[AcceptanceCheck],
+        verified_repro_commands: Sequence[str] | None = None,
     ) -> TaskNode:
         next_cycle = task.review_cycle + 1
         exhausted = next_cycle >= task.max_cycles
         next_status = TaskStatus.BLOCKED if exhausted else TaskStatus.READY
         event_type = "task.blocked" if exhausted else "task.requeued"
+        update: dict[str, Any] = {
+            "status": next_status,
+            "review_cycle": next_cycle,
+            "acceptance_checks": checks,
+            "last_error": reason,
+            "worktree_path": None,
+        }
+        if verified_repro_commands is not None:
+            update["verified_repro_commands"] = list(verified_repro_commands)
         return self.store.update_task_with_lease(
             run_id,
             task.task_id,
             expected_lease_generation=task.lease_generation,
-            mutator=lambda t: t.model_copy(
-                update={
-                    "status": next_status,
-                    "review_cycle": next_cycle,
-                    "acceptance_checks": checks,
-                    "last_error": reason,
-                    "worktree_path": None,
-                }
-            ),
+            mutator=lambda t: t.model_copy(update=update),
             actor="chronos",
             event_type=event_type,
         )
