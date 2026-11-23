@@ -676,6 +676,32 @@ def sync_upstream_files(
     base_commit = baseline.base_commit or handle.base_commit
     ws = handle.workspace_path
     synced_rels: list[str] = []
+    # Apply upstream deletions FIRST so file-to-directory replacements (e.g. foo -> foo/bar.py)
+    # unlink the old regular file before copying overlay children into the new directory.
+    for rel in sorted(set(deleted_paths)):
+        if any(
+            part in IGNORED_DIR_NAMES or part == ".olympus"
+            for part in PurePosixPath(rel).parts
+        ):
+            continue
+        if policy.allows_relative_path(rel):
+            continue
+        if rel in current_map and current_map[rel] != merged.get(rel):
+            continue
+        if rel in merged and rel not in current_map:
+            continue
+        current = _file_fingerprint(ws / rel)
+        if current is None:
+            continue
+        if rel in merged:
+            if current != merged[rel]:
+                continue
+        elif not _is_tracked_at_base(ws, base_commit, rel):
+            continue
+        target = ws / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+            synced_rels.append(rel)
     if overlay_dir.is_dir():
         for src in sorted(overlay_dir.rglob("*")):
             if not src.is_file():
@@ -701,30 +727,6 @@ def sync_upstream_files(
             dst = ws / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-            synced_rels.append(rel)
-    for rel in sorted(set(deleted_paths)):
-        if any(
-            part in IGNORED_DIR_NAMES or part == ".olympus"
-            for part in PurePosixPath(rel).parts
-        ):
-            continue
-        if policy.allows_relative_path(rel):
-            continue
-        if rel in current_map and current_map[rel] != merged.get(rel):
-            continue
-        if rel in merged and rel not in current_map:
-            continue
-        current = _file_fingerprint(ws / rel)
-        if current is None:
-            continue
-        if rel in merged:
-            if current != merged[rel]:
-                continue
-        elif not _is_tracked_at_base(ws, base_commit, rel):
-            continue
-        target = ws / rel
-        if target.is_symlink() or target.is_file():
-            target.unlink()
             synced_rels.append(rel)
     if synced_rels:
         updated_map = _current_fingerprints(handle, baseline)
@@ -853,6 +855,7 @@ def remove_deleted_paths(
     rel_paths: Sequence[str],
     *,
     forbidden_write_scope: Sequence[str] = (),
+    ignore_errors: bool = True,
 ) -> None:
     """Remove deleted or renamed source paths from a sandbox, overlay, or workspace root."""
     if not rel_paths or not dst_root.exists():
@@ -880,4 +883,6 @@ def remove_deleted_paths(
                         break
                     parent = parent.parent
         except OSError:
+            if not ignore_errors:
+                raise
             continue

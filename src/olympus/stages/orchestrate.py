@@ -205,26 +205,82 @@ def _copy_matching_scope(
     """Copy non-ignored files from src_root to dst_root, respecting write_scope and forbidden."""
     if not src_root.exists():
         return
-    # Share the tool-gating matcher so glob scopes deliver exactly what they authorize.
+    ignored = IGNORED_DIR_NAMES | {".olympus"}
+    exact_rels: set[str] = set()
+    glob_patterns: list[str] = []
+    if write_scope is not None:
+        for pattern in write_scope:
+            norm = pattern.replace("\\", "/").lstrip("./")
+            candidate = src_root / norm
+            if candidate.is_file() or candidate.is_symlink():
+                exact_rels.add(norm)
+            else:
+                glob_patterns.append(pattern)
     policy = WorkspacePolicy(
-        allowed_write_scope=write_scope,
+        allowed_write_scope=glob_patterns if write_scope is not None else None,
         forbidden_write_scope=list(forbidden_write_scope),
     )
     for p in sorted(src_root.rglob("*")):
         if not p.is_file():
             continue
         rel_path = p.relative_to(src_root)
-        ignored = IGNORED_DIR_NAMES | {".olympus"}
         if any(part in ignored for part in rel_path.parts):
             continue
         rel = rel_path.as_posix()
         if forbidden_write_scope and policy.forbidden_match(rel) is not None:
             continue
-        if write_scope is not None and not policy.allows_relative_path(rel):
+        if write_scope is not None and rel not in exact_rels and (
+            not glob_patterns or not policy.allows_relative_path(rel)
+        ):
             continue
         dst = dst_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, dst)
+
+
+def _snapshot_tree_paths(
+    root: Path, rel_paths: Sequence[str]
+) -> dict[str, tuple[bytes, int] | None]:
+    """Record pre-promotion bytes & mode (or None if absent) for atomic rollback on OSError."""
+    saved: dict[str, tuple[bytes, int] | None] = {}
+    for rel in sorted(set(rel_paths)):
+        target = root / rel
+        if target.is_file() and not target.is_symlink():
+            saved[rel] = (target.read_bytes(), target.stat().st_mode)
+        else:
+            saved[rel] = None
+    return saved
+
+
+def _restore_tree_paths(
+    root: Path, saved: Mapping[str, tuple[bytes, int] | None]
+) -> None:
+    """Restore pre-promotion file state on promotion failure."""
+    # First remove files that did not exist before promotion (including under new dirs).
+    for rel, state in sorted(saved.items(), reverse=True):
+        if state is not None:
+            continue
+        target = root / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != root and parent.is_relative_to(root):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+    # Then restore previously existing files and modes.
+    for rel, state in sorted(saved.items()):
+        if state is None:
+            continue
+        data, mode = state
+        target = root / rel
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(mode)
 
 
 _FREEZE_CONSTRAINT_RE = re.compile(
@@ -612,7 +668,6 @@ _REPRO_OUTPUT_BUDGET = 2_000
 _SECRET_ENV_NAME = re.compile(
     r"(?i)(token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)"
 )
-_INLINE_PYTHON_C = re.compile(r"\bpython[\d.]*\b[^\n]*\s-c\s")
 _TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)"')
 _BROKEN_PROBE_EXIT_CODES = frozenset({126, 127})
 _PROBE_ENV_ALLOWLIST = frozenset(
@@ -664,15 +719,16 @@ def _redact_probe_output(text: str, env: Mapping[str, str]) -> str:
 
 def _probe_is_broken(*, command: str, returncode: int | None, output: str) -> bool:
     """Recognize command failures that prove a broken probe, not a reproduced defect."""
+    del command
     if returncode is None:
         return True
     if returncode in _BROKEN_PROBE_EXIT_CODES:
         return True
     if returncode == 2 and "syntax error" in output.lower():
         return True
-    if "SyntaxError" in output and _INLINE_PYTHON_C.search(command) is not None:
+    if "SyntaxError" in output:
         files = _TRACEBACK_FILE_RE.findall(output)
-        return bool(files) and files[-1] == "<string>"
+        return bool(files) and files[-1] in ("<string>", "<stdin>")
     return False
 
 
@@ -1659,8 +1715,10 @@ class OrchestrateStage:
                     deleted_paths=accepted_deletions,
                 )
             else:
-                _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
+                # Apply upstream deletions FIRST so file-to-directory replacements (e.g.
+                # foo -> foo/bar.py) unlink the old HEAD file before copying overlay files.
                 remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
+                _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
                 task_baseline = snapshot_sandbox_state(sandbox)
             save_sandbox_baseline(sandbox, task_baseline)
             rework_ctx = (
@@ -2141,25 +2199,21 @@ class OrchestrateStage:
                     interrupted.set()
                     retain_sandbox = run_status == RunStatus.PAUSED
                     return self._return_interrupted_task(run_id, verifying)
+                touched_paths = [*promotion_paths, *deleted_paths]
+                prev_deletions = load_accepted_deletions(self._run_dir(run_id))
+                overlay_backup = _snapshot_tree_paths(overlay_dir, touched_paths)
+                workspace_backup = (
+                    _snapshot_tree_paths(self.workspace_root, touched_paths)
+                    if mode == RunMode.EXECUTION and apply_to_workspace
+                    else None
+                )
                 try:
-                    remove_deleted_paths(
-                        overlay_dir, deleted_paths, forbidden_write_scope=hard_forbidden
-                    )
-                    if promotion_paths:
-                        _copy_matching_scope(
-                            sandbox.workspace_path,
-                            overlay_dir,
-                            promotion_paths,
-                        )
-                    persisted_deletions = load_accepted_deletions(self._run_dir(run_id))
-                    persisted_deletions.difference_update(recreated_paths)
-                    persisted_deletions.update(deleted_paths)
-                    save_accepted_deletions(self._run_dir(run_id), persisted_deletions)
                     if mode == RunMode.EXECUTION and apply_to_workspace:
                         remove_deleted_paths(
                             self.workspace_root,
                             deleted_paths,
                             forbidden_write_scope=hard_forbidden,
+                            ignore_errors=False,
                         )
                         if promotion_paths:
                             _copy_matching_scope(
@@ -2167,7 +2221,27 @@ class OrchestrateStage:
                                 self.workspace_root,
                                 promotion_paths,
                             )
+                    remove_deleted_paths(
+                        overlay_dir,
+                        deleted_paths,
+                        forbidden_write_scope=hard_forbidden,
+                        ignore_errors=False,
+                    )
+                    if promotion_paths:
+                        _copy_matching_scope(
+                            sandbox.workspace_path,
+                            overlay_dir,
+                            promotion_paths,
+                        )
+                    next_deletions = set(prev_deletions)
+                    next_deletions.difference_update(recreated_paths)
+                    next_deletions.update(deleted_paths)
+                    save_accepted_deletions(self._run_dir(run_id), next_deletions)
                 except OSError as exc:
+                    _restore_tree_paths(overlay_dir, overlay_backup)
+                    save_accepted_deletions(self._run_dir(run_id), prev_deletions)
+                    if workspace_backup is not None:
+                        _restore_tree_paths(self.workspace_root, workspace_backup)
                     _write_manifest_md(
                         art_dir=art_dir,
                         task=verifying,

@@ -5362,6 +5362,238 @@ def test_propose_plan_strips_prefilled_acceptance_check_outcomes(tmp_path: Path)
     assert check.evidence_ref is None
 
 
+def test_promotion_rolls_back_overlay_and_deletions_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "keep.py").write_text("KEEP = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "keep.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add keep.py"], cwd=tmp_path, check=True, capture_output=True
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["keep.py", "added.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def mutate(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "keep.py").unlink()
+        (ws / "added.py").write_text("ADDED = True\n", encoding="utf-8")
+
+    real_copy = orchestrate_module._copy_matching_scope
+
+    def fail_on_overlay(src: Path, dst: Path, write_scope: list[str] | None) -> None:
+        if dst.name == "accepted_overlay":
+            raise OSError("simulated overlay write error")
+        real_copy(src, dst, write_scope)
+
+    monkeypatch.setattr(orchestrate_module, "_copy_matching_scope", fail_on_overlay)
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([mutate]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (tmp_path / "keep.py").read_text(encoding="utf-8") == "KEEP = 1\n"
+    assert not (tmp_path / "added.py").exists()
+    assert not (overlay / "added.py").exists()
+    assert not (tmp_path / ".olympus" / "runs" / run_id / "accepted_deletions.json").exists()
+
+
+def test_downstream_dag_task_starts_cleanly_after_upstream_file_to_dir_replacement(
+    tmp_path: Path,
+) -> None:
+    from olympus.core.contracts import AcceptanceCheck
+
+    _init_repo(tmp_path)
+    (tmp_path / "foo").write_text("LEGACY_FILE = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "foo"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add foo file"], cwd=tmp_path, check=True, capture_output=True
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    base_plan = _parallel_plan(
+        spec, scopes={"T1": ["foo", "foo/**"], "T2": ["downstream.py"]}
+    )
+    plan = base_plan.model_copy(
+        update={
+            "tasks": [
+                base_plan.tasks[0],
+                base_plan.tasks[1].model_copy(
+                    update={
+                        "depends_on": ["T1"],
+                        "max_cycles": 1,
+                        "acceptance_checks": [
+                            AcceptanceCheck(
+                                id="C2",
+                                kind=CheckKind.COMMAND,
+                                description="Downstream sees foo/bar.py",
+                                command="test -f foo/bar.py && test -f downstream.py",
+                            )
+                        ],
+                    }
+                ),
+            ]
+        }
+    )
+    _approve_plan(store, run_id, plan)
+
+    class _ReplaceWorker(_DirectWriteWorker):
+        def run_turn(self, request: DriverTurnRequest, **kw: Any) -> TurnOutcome:
+            ws = request.workspace_path
+            if request.task_id == "T1":
+                (ws / "foo").unlink()
+                (ws / "foo").mkdir()
+                (ws / "foo" / "bar.py").write_text("BAR = True\n", encoding="utf-8")
+            return super().run_turn(request, **kw)
+
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry(
+            {"direct": _ReplaceWorker({"T1": {}, "T2": {"downstream.py": "OK = True\n"}})}
+        ),
+    )
+    snap = stage.run_execution(run_id=run_id, apply_to_workspace=True)
+    assert snap["status"] == RunStatus.COMPLETED
+    assert (tmp_path / "foo" / "bar.py").read_text(encoding="utf-8") == "BAR = True\n"
+    assert (tmp_path / "downstream.py").read_text(encoding="utf-8") == "OK = True\n"
+
+
+def test_literal_bracket_path_promotes_without_glob_colliding_siblings(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "app" / "[id]").mkdir(parents=True)
+    (tmp_path / "app" / "i").mkdir(parents=True)
+    (tmp_path / "app" / "[id]" / "page.tsx").write_text("OLD_DYNAMIC\n", encoding="utf-8")
+    (tmp_path / "app" / "i" / "page.tsx").write_text("BASE_I\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add bracket and sibling routes"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    # Uncommitted host edit in app/i/page.tsx must not be clobbered by literal [id] promotion.
+    (tmp_path / "app" / "i" / "page.tsx").write_text("LOCAL_I_EDIT\n", encoding="utf-8")
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["app/**"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def edit_dynamic(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "app" / "[id]" / "page.tsx").write_text("NEW_DYNAMIC\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([edit_dynamic]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert (tmp_path / "app" / "[id]" / "page.tsx").read_text(encoding="utf-8") == "NEW_DYNAMIC\n"
+    assert (tmp_path / "app" / "i" / "page.tsx").read_text(encoding="utf-8") == "LOCAL_I_EDIT\n"
+
+
+def test_stdin_python_probe_syntax_error_is_classified_as_broken(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+    provider, _ = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Broken stdin probe",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": "printf 'def broken(:\\n' | python3 -",
+                        "message": "Probe with stdin SyntaxError",
+                    }
+                ],
+            }
+        ]
+    )
+
+    def write_feature(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_feature]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    event = next(
+        e.payload for e in store.list_events(run_id) if e.event_type == "review.verdict_verified"
+    )
+    assert event["verified_important"] == 0
+    assert event["dropped_unverified"] == 1
+
+
 
 
 
