@@ -20,6 +20,7 @@ from typing import Any
 
 from olympus.core.contracts import (
     ApprovalTarget,
+    DesignSpec,
     GoalSpec,
     RunMode,
     RunStatus,
@@ -27,7 +28,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import RunControl
+from olympus.core.control import RunControl, is_design_bound_to_spec
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
@@ -416,7 +417,10 @@ class SessionRunner:
             return self._continue(run_id, definition)
 
         if intent.action in ("revise", "reopen"):
-            return self._revise(run_id, definition, snap, intent.feedback or text)
+            feedback = intent.feedback or text
+            if pause_kind == PauseKind.BLOCKED and intent.action == "revise":
+                return self._recover_blocked(run_id, definition, snap, feedback)
+            return self._revise(run_id, definition, snap, feedback)
 
         fallback_kind = pause_kind or PauseKind.APPROVAL
         focus = self._pause_message(
@@ -721,6 +725,63 @@ class SessionRunner:
             start_from="align",
             definition=definition,
         )
+
+    def _recover_blocked(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+    ) -> SessionEnvelope:
+        """Apply a human hint received while blocked and restart at a safe node."""
+        clean = hint.strip()
+        if not clean:
+            return self._emit_pause(
+                run_id,
+                PauseKind.BLOCKED,
+                node=None,
+                reason="Recovery hint was empty.",
+                message="Recovery hint was empty; describe the path, symbol, or correction.",
+            )
+        try:
+            self.control.request_revision(run_id=run_id, feedback=clean, actor="human")
+        except (ValueError, ConcurrencyConflictError) as exc:
+            return self._emit_pause(
+                run_id, PauseKind.BLOCKED, node=None, reason=str(exc), message=str(exc)
+            )
+        entry = self._recovery_entry(run_id, snap)
+        augmented = self._augment_input(run_id, snap, clean, "User recovery hint")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={"raw_input": augmented, "feedback": clean, "recovery_node": entry},
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=augmented,
+            start_from=entry,
+            definition=definition,
+        )
+
+    def _recovery_entry(self, run_id: str, snap: dict[str, Any]) -> str:
+        """Resume from ``plan`` only when an approved spec and design can bind it."""
+        spec: GoalSpec | None = snap["spec"]
+        design: DesignSpec | None = snap["design"]
+        if (
+            spec is None
+            or design is None
+            or not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            )
+            or not is_design_bound_to_spec(self.store, run_id, snap)
+        ):
+            return "align"
+        return "plan"
 
     def _workflow_for_run(
         self, run_id: str, snap: dict[str, Any]

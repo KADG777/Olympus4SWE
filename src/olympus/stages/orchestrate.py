@@ -39,7 +39,7 @@ from olympus.core.dag import (
     scopes_overlap,
     validate_plan,
 )
-from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.harness.activity import LiveActivity, milestone_fields
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.diff_gate import run_diff_gate
@@ -103,7 +103,14 @@ Rules:
 8. Exploration limit: inspect at most 3 existing files from Observed workspace files; if design
    paths do not exist yet (greenfield), emit TaskPlan JSON directly without running glob/grep.
 9. Output ONLY a single raw JSON object starting with '{' matching TaskPlan (NEVER call an
-   invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys)."""
+   invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys).
+10. Ground checks in observed reality: acceptance_checks commands MUST only use paths named by
+    the Observed workspace files, the task's own write_scope, and tools/packages actually
+    available in the environment. NEVER invent uninstalled third-party packages, never
+    reference a test directory that neither exists nor is created inside the task's write_scope,
+    and never assume a module/runner exists without observing it. When a task creates its own
+    test file, target that exact path; otherwise prefer inline 'python -c' assertions that
+    import only artifacts the task itself delivers."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
@@ -572,6 +579,20 @@ class OrchestrateStage:
             )
         return design
 
+    def _latest_human_guidance(self, run_id: str) -> str:
+        """Return the most recent human recovery/revision hint recorded on the run."""
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return ""
+        for event in reversed(events):
+            if event.event_type != "session.continued":
+                continue
+            feedback = event.payload.get("feedback")
+            if isinstance(feedback, str) and feedback.strip():
+                return feedback.strip()
+        return ""
+
     def propose_plan(
         self,
         *,
@@ -666,9 +687,17 @@ class OrchestrateStage:
                 else ""
             )
 
+        guidance = self._latest_human_guidance(run_id)
+        human_guidance_block = (
+            "Latest human recovery guidance (honor it and ground checks in it):\n"
+            f"{guidance}\n\n"
+            if guidance
+            else ""
+        )
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
             f"{inventory}\n"
+            f"{human_guidance_block}"
             f"Note: acceptance_checks[*].command will run in an isolated sandbox worktree "
             f"(cwd = sandbox root). NEVER reference '{self.workspace_root}' inside commands.\n"
             f"Remember: acceptance_checks[*].kind MUST be one of "
