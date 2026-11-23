@@ -840,8 +840,9 @@ class _PiTurn:
             step = self._steps
             self._total_input_tokens += input_tokens
             self._total_output_tokens += output_tokens
-            if message.get("stopReason") == "error":
-                self._saw_error_message = True
+            # Track whether the *latest* assistant message errored so a transient
+            # transport error that Pi retries and recovers from does not fail the turn.
+            self._saw_error_message = message.get("stopReason") == "error"
         text = _assistant_text(message)
         if text:
             self._final_content = text

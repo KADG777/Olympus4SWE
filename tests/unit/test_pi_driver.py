@@ -1739,3 +1739,49 @@ def test_stage_driver_honors_parse_retries_when_validation_retries_zero(tmp_path
     assert driver.requests[0].disable_tools is False
     assert driver.requests[1].disable_tools is True
     assert spec.goal.startswith("Expose a calculator module")
+
+
+def test_pi_driver_recovers_after_transient_error_message_retried_by_pi(tmp_path: Path) -> None:
+    fake = tmp_path / "fake-pi-retry"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+if "--help" in sys.argv:
+    print("--mode json rpc")
+    sys.exit(0)
+for raw in sys.stdin:
+    cmd = json.loads(raw)
+    if cmd.get("type") == "prompt":
+        print(json.dumps({"type": "response", "command": "prompt", "success": True}), flush=True)
+        print(json.dumps({
+            "type": "message_end",
+            "message": {"role": "assistant", "stopReason": "error", "content": [], "usage": {}},
+        }), flush=True)
+        print(json.dumps({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "stop",
+                "content": [{"type": "text", "text": '{"ok": true}'}],
+                "usage": {"input": 10, "output": 5},
+            },
+        }), flush=True)
+        print(json.dumps({"type": "agent_settled", "aborted": False}), flush=True)
+        break
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    outcome = PiDriver(binary=str(fake)).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="align:proposer",
+            system_prompt="",
+            user_prompt="test",
+            read_only=True,
+        )
+    )
+    assert outcome.completed is True
+    assert outcome.stop_reason == "final_response"
+    assert outcome.final_content == '{"ok": true}'
