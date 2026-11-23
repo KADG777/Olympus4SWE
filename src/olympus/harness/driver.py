@@ -111,27 +111,32 @@ class ExecutionDriversConfig(StrictModel):
         return cls.model_validate(values)
 
 
-def _is_mock_provider(provider: LLMProvider | None) -> bool:
-    if provider is None:
+def _is_external_driver_eligible(provider: LLMProvider | None) -> bool:
+    """Allow ``auto`` to choose Pi only for real remote providers (never test doubles)."""
+    if provider is None or isinstance(provider, MockLLMProvider):
+        return False
+    if str(getattr(provider, "provider_name", "") or "").strip().lower() == "mock":
+        return False
+    if bool(getattr(provider, "supports_external_driver", False)):
         return True
-    if isinstance(provider, MockLLMProvider):
-        return True
-    return str(getattr(provider, "provider_name", "") or "").strip().lower() == "mock"
+    from olympus.providers.auth import PooledProvider
+
+    return isinstance(provider, PooledProvider)
 
 
 def resolve_driver_spec(spec: str, *, provider: LLMProvider | None) -> str:
     """Resolve ``auto``/``auto@<model>`` against the provider kind and Pi availability.
 
     ``auto`` becomes ``pi`` (carrying the explicit or provider model) only on a
-    real provider when the cached Pi probe succeeds. Mock providers and missing
-    binaries fall back to ``native`` so offline tests and zero-Node environments
-    keep working. Explicit specs pass through untouched, preserving strict
-    ``pi`` failure and ``native`` routing semantics.
+    real remote provider when the cached Pi probe succeeds. Mock/in-process test
+    providers and missing binaries fall back to ``native`` so offline tests and
+    zero-Node environments keep working. Explicit specs pass through untouched,
+    preserving strict ``pi`` failure and ``native`` routing semantics.
     """
     name, _, raw_model = spec.partition("@")
     if name != "auto":
         return spec
-    if _is_mock_provider(provider):
+    if not _is_external_driver_eligible(provider):
         return "native"
     from olympus.harness.pi import pi_available
 

@@ -587,19 +587,49 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
     async def _install_pi(self, environment: Any) -> None:
         options = self._interact
         prefix = shlex.quote(PI_PREFIX)
-        command = (
-            "set -e; "
-            "if ! command -v npm >/dev/null 2>&1; then "
-            "  if command -v apt-get >/dev/null 2>&1; then "
-            "    apt-get update -qq && apt-get install -y -qq nodejs npm; "
-            "  else echo 'npm is required to install the pi CLI' >&2; exit 1; fi; "
-            "fi; "
-            f"npm install -g --ignore-scripts --prefix {prefix} "
-            f"{shlex.quote(options.pi_package)} && "
-            f"{shlex.quote(PI_PREFIX + '/bin/pi')} --version"
+        pkg = shlex.quote(options.pi_package)
+        command = "\n".join(
+            [
+                "set -eu",
+                'PI_BIN=""',
+                'if command -v pi >/dev/null 2>&1 && pi --version >/dev/null 2>&1; then',
+                "  PI_BIN=$(command -v pi)",
+                'elif [ -x "$HOME/.local/bin/pi" ] && '
+                '"$HOME/.local/bin/pi" --version >/dev/null 2>&1; then',
+                '  PI_BIN="$HOME/.local/bin/pi"',
+                f'elif [ -x {shlex.quote(PI_PREFIX + "/bin/pi")} ] && '
+                f'{shlex.quote(PI_PREFIX + "/bin/pi")} --version >/dev/null 2>&1; then',
+                f"  PI_BIN={shlex.quote(PI_PREFIX + '/bin/pi')}",
+                "elif command -v curl >/dev/null 2>&1 && "
+                f'[ {pkg} = "@earendil-works/pi-coding-agent" ]; then',
+                "  curl -fsSL https://pi.dev/install.sh | sh >/dev/null 2>&1",
+                '  PI_BIN="$HOME/.local/bin/pi"',
+                "else",
+                "  if ! command -v npm >/dev/null 2>&1; then",
+                "    if command -v apt-get >/dev/null 2>&1; then",
+                "      apt-get update -qq && apt-get install -y -qq nodejs npm",
+                "    else",
+                "      echo 'npm is required to install the pi CLI' >&2; exit 1",
+                "    fi",
+                "  fi",
+                f"  npm install -g --ignore-scripts --prefix {prefix} {pkg}",
+                f"  PI_BIN={shlex.quote(PI_PREFIX + '/bin/pi')}",
+                "fi",
+                'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
+                '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
+                '  ln -sf "$PI_BIN" /usr/local/bin/pi',
+                "fi",
+                '"$PI_BIN" --version >/dev/null 2>&1',
+                'echo "$PI_BIN"',
+            ]
         )
-        await self._exec(environment, command, timeout_sec=1800)
-        self._installed_pi_bin = f"{PI_PREFIX}/bin/pi"
+        result = await self._exec(environment, command, timeout_sec=1800)
+        candidates = [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip().startswith("/")
+        ]
+        self._installed_pi_bin = candidates[-1] if candidates else f"{PI_PREFIX}/bin/pi"
 
     @staticmethod
     def _project_root() -> Path:

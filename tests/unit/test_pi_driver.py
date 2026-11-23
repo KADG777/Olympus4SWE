@@ -1174,6 +1174,7 @@ class _StageProvider:
     """Non-mock provider whose call count proves whether a stage used the native loop."""
 
     provider_name = "openai"
+    supports_external_driver = True
 
     def __init__(self, model_name: str = "stage-model") -> None:
         self.model_name = model_name
@@ -1329,6 +1330,79 @@ def _git_status_clean(root: Path) -> bool:
     return proc.stdout.strip() == ""
 
 
+def test_pi_driver_synthesizes_ephemeral_gateway_models_json_without_secret_literals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "pi-capture.json"
+    fake_pi = tmp_path / "fake-pi"
+    fake_pi.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "if '--help' in sys.argv:\n"
+        "    print('  --mode <mode>  Output mode: text, json, or rpc')\n"
+        "    raise SystemExit(0)\n"
+        "cfg_dir = os.environ.get('PI_CODING_AGENT_DIR', '')\n"
+        "models_file = Path(cfg_dir, 'models.json') if cfg_dir else None\n"
+        "models_json = models_file.read_text(encoding='utf-8') if models_file else ''\n"
+        "payload = {'argv': sys.argv[1:], 'cfg_dir': cfg_dir, 'models_json': models_json}\n"
+        f"Path({str(capture_file)!r}).write_text(json.dumps(payload), encoding='utf-8')\n"
+        "msg = {\n"
+        "    'type': 'message_end',\n"
+        "    'message': {\n"
+        "        'role': 'assistant',\n"
+        "        'content': [{'type': 'text', 'text': 'ok'}],\n"
+        "        'usage': {'input': 5, 'output': 2},\n"
+        "    },\n"
+        "}\n"
+        "for line in sys.stdin:\n"
+        "    if '\"prompt\"' in line:\n"
+        "        print(json.dumps(msg), flush=True)\n"
+        "        print(json.dumps({'type': 'agent_settled', 'aborted': False}), flush=True)\n"
+        "        break\n",
+        encoding="utf-8",
+    )
+    fake_pi.chmod(0o755)
+    secret = "sk-ephemeral-gateway-secret-012345"
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(binary=str(fake_pi))
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="Return ok.",
+                user_prompt="ping",
+                actor="align:proposer",
+                read_only=True,
+                model="openai/custom-model-v1",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "olympus-gateway"
+    assert argv[argv.index("--model") + 1] == "custom-model-v1"
+    assert secret not in captured["models_json"]
+    doc = json.loads(captured["models_json"])
+    provider_cfg = doc["providers"]["olympus-gateway"]
+    assert provider_cfg["api"] == "openai-completions"
+    assert provider_cfg["baseUrl"] == "https://gateway.example/v1"
+    assert provider_cfg["apiKey"] == "$OPENAI_API_KEY"
+    assert provider_cfg["models"] == [{"id": "custom-model-v1"}]
+    assert not Path(captured["cfg_dir"]).exists()
+    assert not (workspace / ".olympus").exists()
+
+
 def test_execution_drivers_config_defaults_to_auto_and_accepts_legacy_snapshots() -> None:
     default = ExecutionDriversConfig()
     assert default.stage_driver == "auto"
@@ -1369,6 +1443,7 @@ def test_resolve_driver_spec_auto_matrix(
     _reset_pi_availability_cache()
     try:
         assert resolve_driver_spec("auto", provider=mock) == "native"
+        assert resolve_driver_spec("auto", provider=object()) == "native"  # type: ignore[arg-type] -- custom test double stays native
         assert resolve_driver_spec("auto", provider=provider) == "pi@stage-model"
         assert resolve_driver_spec("auto@review-model", provider=provider) == "pi@review-model"
         assert resolve_driver_spec("pi", provider=provider) == "pi"
@@ -1426,6 +1501,7 @@ def test_align_stage_auto_runs_pi_read_only_and_leaves_workspace_untouched(
     assert argv[argv.index("--model") + 1] == "stage-model"
     assert _workspace_files(workspace) == before
     assert _git_status_clean(workspace)
+    assert not (workspace / ".olympus").exists()
     ledger = store.get_run(run_id)["budget_ledger"]
     assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
     saved = store.get_run(run_id)["spec"]
@@ -1492,6 +1568,7 @@ def test_design_and_plan_stages_auto_run_pi_read_only(
     assert argv[argv.index("--exclude-tools") + 1] == "bash,write,edit,powershell"
     assert _workspace_files(workspace) == before
     assert _git_status_clean(workspace)
+    assert not (workspace / ".olympus").exists()
     snap = store.get_run(run_id)
     assert snap["design"] is not None and snap["plan"] is not None
 

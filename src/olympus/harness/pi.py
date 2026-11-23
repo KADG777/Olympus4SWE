@@ -8,12 +8,14 @@ pumped on a dedicated reader thread, tool milestones are normalized onto the
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -192,6 +194,104 @@ def _non_negative_int(value: Any) -> int:
         return 0
 
 
+def _read_only_tmp_dir(request: DriverTurnRequest) -> Path | None:
+    """Keep temp dirs outside the repository for read-only turns on the repo root."""
+    if not request.read_only:
+        return None
+    ws = request.workspace_path.resolve()
+    host = request.env_root.resolve()
+    if ws != host and not ws.is_relative_to(host):
+        return None
+    safe_actor = "".join(c if c.isalnum() or c in "-_" else "-" for c in request.actor) or "stage"
+    if request.trace_path is not None:
+        trace_parent = request.trace_path.resolve().parent
+        if not trace_parent.is_relative_to(ws):
+            return trace_parent / ".pi_tmp" / safe_actor
+    digest = hashlib.sha256(str(ws).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "olympus-pi-readonly-tmp" / f"{digest}-{safe_actor}"
+
+
+def _build_pi_env(request: DriverTurnRequest) -> dict[str, str]:
+    return build_sandbox_env(
+        request.workspace_path,
+        host_root=request.env_root,
+        tmp_dir=_read_only_tmp_dir(request),
+    )
+
+
+def _strip_provider_prefix(model: str) -> tuple[str | None, str]:
+    cleaned = model.strip()
+    if "/" not in cleaned:
+        return None, cleaned
+    prefix, rest = cleaned.split("/", 1)
+    lowered = prefix.strip().lower()
+    if lowered in {"openai", "anthropic"} and rest.strip():
+        return lowered, rest.strip()
+    return None, cleaned
+
+
+def _prepare_gateway_config(
+    env: dict[str, str], model: str | None
+) -> tuple[str | None, str | None, Path | None]:
+    """Synthesize an ephemeral ``PI_CODING_AGENT_DIR/models.json`` for custom gateways.
+
+    Pi ignores ``OPENAI_BASE_URL``/``ANTHROPIC_BASE_URL`` and rejects custom model IDs
+    unless declared in ``models.json``. Credentials stay as ``$ENV_VAR`` references
+    so no API keys are ever written to disk.
+    """
+    if not model or not model.strip() or env.get("PI_CODING_AGENT_DIR"):
+        return None, model, None
+    prefix, model_id = _strip_provider_prefix(model)
+    anthropic_base = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    openai_base = (env.get("OPENAI_BASE_URL") or "").strip()
+    anthropic_key = (
+        "$ANTHROPIC_API_KEY"
+        if (env.get("ANTHROPIC_API_KEY") or "").strip()
+        else ("$ANTHROPIC_AUTH_TOKEN" if (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip() else "")
+    )
+    openai_key = "$OPENAI_API_KEY" if (env.get("OPENAI_API_KEY") or "").strip() else ""
+
+    api: str | None = None
+    base_url = ""
+    api_key_ref = ""
+    if prefix == "anthropic" or (prefix is None and anthropic_base and not openai_base):
+        if anthropic_base and anthropic_key:
+            api = "anthropic-messages"
+            base_url = anthropic_base
+            api_key_ref = anthropic_key
+    elif openai_base and openai_key:
+        api = "openai-completions"
+        base_url = openai_base
+        api_key_ref = openai_key
+    elif anthropic_base and anthropic_key:
+        api = "anthropic-messages"
+        base_url = anthropic_base
+        api_key_ref = anthropic_key
+
+    if api is None:
+        return None, model, None
+
+    cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
+    os.chmod(cfg_dir, 0o700)
+    models_doc = {
+        "providers": {
+            "olympus-gateway": {
+                "baseUrl": base_url,
+                "api": api,
+                "apiKey": api_key_ref,
+                "models": [{"id": model_id}],
+            }
+        }
+    }
+    models_file = cfg_dir / "models.json"
+    models_file.write_text(json.dumps(models_doc, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(models_file, 0o600)
+    env["PI_CODING_AGENT_DIR"] = str(cfg_dir)
+    env.setdefault("PI_OFFLINE", "1")
+    env.setdefault("PI_SKIP_VERSION_CHECK", "1")
+    return "olympus-gateway", model_id, cfg_dir
+
+
 def _safe_argv(command: list[str]) -> list[str]:
     """Redact prompts/API keys so the on-disk trace stays introspectable but compact."""
     safe: list[str] = []
@@ -289,6 +389,9 @@ class _PiTurn:
         self._prompt_error = ""
         self._saw_error_message = False
         self._returncode: int | None = None
+        self._gateway_provider: str | None = None
+        self._gateway_model: str | None = request.model
+        self._gateway_config_dir: Path | None = None
 
     @property
     def supports_steer(self) -> bool:
@@ -387,9 +490,13 @@ class _PiTurn:
         )
 
     def _spawn(self) -> None:
-        env = build_sandbox_env(self._request.workspace_path, host_root=self._request.env_root)
+        env = _build_pi_env(self._request)
         env["OLYMPUS_PI_WRITE_SCOPE"] = json.dumps(self._request.write_scope)
         env["OLYMPUS_PI_FORBIDDEN_GLOBS"] = json.dumps(self._request.forbidden_globs)
+        provider_name, model_id, cfg_dir = _prepare_gateway_config(env, self._request.model)
+        self._gateway_provider = provider_name
+        self._gateway_model = model_id
+        self._gateway_config_dir = cfg_dir
         command = self._build_command()
         self._trace.append(
             {
@@ -430,8 +537,10 @@ class _PiTurn:
         ]
         if request.system_prompt.strip():
             command += ["--append-system-prompt", request.system_prompt]
-        if request.model:
-            command += ["--model", request.model]
+        if self._gateway_provider:
+            command += ["--provider", self._gateway_provider]
+        if self._gateway_model:
+            command += ["--model", self._gateway_model]
         if request.read_only:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
         else:
@@ -495,6 +604,9 @@ class _PiTurn:
             if stream is not None:
                 with suppress(Exception):
                     stream.close()
+        if self._gateway_config_dir is not None:
+            shutil.rmtree(self._gateway_config_dir, ignore_errors=True)
+            self._gateway_config_dir = None
 
     def _escalate_cancel(self) -> None:
         if self._closed.wait(self._cancel_grace_seconds):
@@ -889,7 +1001,7 @@ class PiDriver:
         on_event: DriverEvent | None = None,
         on_handle: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
-        env = build_sandbox_env(request.workspace_path, host_root=request.env_root)
+        env = _build_pi_env(request)
         supports_rpc = _probe_rpc_support(self._binary, env)
         turn = _PiTurn(
             request=request,

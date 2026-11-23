@@ -45,6 +45,8 @@ def sandbox_tmp_path(
 def build_sandbox_env(
     workspace_root: Path | str,
     host_root: Path | str | None = None,
+    *,
+    tmp_dir: Path | str | None = None,
 ) -> dict[str, str]:
     """Build an isolated subprocess environment bound to sandbox paths and target .venv."""
     ws = Path(workspace_root).resolve()
@@ -82,10 +84,10 @@ def build_sandbox_env(
             if entry and entry not in python_roots:
                 python_roots.append(entry)
     env["PYTHONPATH"] = os.pathsep.join(python_roots)
-    tmp_dir = sandbox_tmp_path(ws, host)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    resolved_tmp = Path(tmp_dir).resolve() if tmp_dir is not None else sandbox_tmp_path(ws, host)
+    resolved_tmp.mkdir(parents=True, exist_ok=True)
     for name in SANDBOX_TMP_ENV_VARS:
-        env[name] = str(tmp_dir)
+        env[name] = str(resolved_tmp)
     return env
 
 

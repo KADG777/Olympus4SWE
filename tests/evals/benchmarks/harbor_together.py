@@ -1015,14 +1015,33 @@ class UserEnabledOlympusAgent(BaseAgent):
         return await self._exec(environment, script, cwd="/", timeout_sec=900, env={})
 
     async def _install_pi(self, environment: Any) -> None:
+        pkg = shlex.quote(self._pi_package)
         script = "\n".join(
             [
                 "set -eu",
-                "if command -v pi >/dev/null 2>&1; then command -v pi; exit 0; fi",
-                "if ! command -v npm >/dev/null 2>&1; then "
-                'echo "npm unavailable; Pi CLI not installed" >&2; exit 0; fi',
-                f"npm install -g --ignore-scripts {shlex.quote(self._pi_package)}",
-                "command -v pi",
+                'PI_BIN=""',
+                'if command -v pi >/dev/null 2>&1 && pi --version >/dev/null 2>&1; then',
+                "  PI_BIN=$(command -v pi)",
+                'elif [ -x "$HOME/.local/bin/pi" ] && '
+                '"$HOME/.local/bin/pi" --version >/dev/null 2>&1; then',
+                '  PI_BIN="$HOME/.local/bin/pi"',
+                "elif command -v curl >/dev/null 2>&1 && "
+                f'[ {pkg} = "@earendil-works/pi-coding-agent" ]; then',
+                "  curl -fsSL https://pi.dev/install.sh | sh >/dev/null 2>&1",
+                '  PI_BIN="$HOME/.local/bin/pi"',
+                "elif command -v npm >/dev/null 2>&1; then",
+                f"  npm install -g --ignore-scripts {pkg}",
+                "  PI_BIN=$(command -v pi)",
+                "else",
+                '  echo "curl and npm unavailable; Pi CLI not installed" >&2',
+                "  exit 0",
+                "fi",
+                'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
+                '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
+                '  ln -sf "$PI_BIN" /usr/local/bin/pi',
+                "fi",
+                '"$PI_BIN" --version >/dev/null 2>&1',
+                'echo "$PI_BIN"',
             ]
         )
         result = await self._exec(environment, script, cwd="/", timeout_sec=900, env={})
@@ -1042,6 +1061,10 @@ class UserEnabledOlympusAgent(BaseAgent):
                     result.stderr or result.stdout or "", self._redaction_secrets
                 ).strip()[-1000:],
             )
+            return
+        resolved = _resolved_binary(result.stdout)
+        if resolved:
+            self._extra_env.setdefault("OLYMPUS_PI_BIN", resolved)
 
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
