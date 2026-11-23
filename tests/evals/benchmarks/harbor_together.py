@@ -578,6 +578,12 @@ def _split_model_name(name: str | None) -> tuple[str | None, str | None]:
     return None, cleaned or None
 
 
+def _driver_uses_pi(value: str | None) -> bool:
+    """Return True when a driver setting resolves to Pi after ``auto`` probing."""
+    name = (value or "").split("@", 1)[0].strip().lower()
+    return name in {"auto", "pi"}
+
+
 def default_project_root() -> Path:
     """Repository root of this checkout (``pyproject.toml`` + ``src/olympus``)."""
     return Path(__file__).resolve().parents[3]
@@ -809,8 +815,9 @@ class UserEnabledOlympusAgent(BaseAgent):
         # Olympus passthrough
         workflow: str = "full_sdlc_tdd",
         gate_policy: str = "interactive_minimal",
-        worker_driver: str | None = None,
-        reviewer_driver: str | None = None,
+        stage_driver: str | None = "auto",
+        worker_driver: str | None = "auto",
+        reviewer_driver: str | None = "auto",
         monitor_model: str | None = None,
         provider: str | None = None,
         model: str | None = None,
@@ -854,6 +861,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         derived_provider, derived_model = _split_model_name(model_name)
         self._workflow = str(workflow or "full_sdlc_tdd")
         self._gate_policy = str(gate_policy or "interactive_minimal")
+        self._stage_driver = stage_driver.strip() if stage_driver else None
         self._worker_driver = worker_driver.strip() if worker_driver else None
         self._reviewer_driver = reviewer_driver.strip() if reviewer_driver else None
         self._monitor_model = monitor_model.strip() if monitor_model else None
@@ -875,8 +883,16 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._olympus_source = olympus_source
         self._olympus_bin = olympus_bin.strip() or "olympus"
         self._pi_package = pi_package.strip()
-        driver_name = (self._worker_driver or "").split("@", 1)[0].strip().lower()
-        self._needs_pi = bool(install_pi) if install_pi is not None else driver_name == "pi"
+        driver_settings = (
+            self._stage_driver,
+            self._worker_driver,
+            self._reviewer_driver,
+        )
+        self._needs_pi = (
+            bool(install_pi)
+            if install_pi is not None
+            else any(_driver_uses_pi(value) for value in driver_settings)
+        )
         self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
@@ -1018,8 +1034,10 @@ class UserEnabledOlympusAgent(BaseAgent):
         )
         if result.return_code != 0:
             log.warning(
-                "Pi CLI installation failed (worker_driver=%s): %s",
+                "Pi CLI installation failed (stage=%s worker=%s reviewer=%s): %s",
+                self._stage_driver,
                 self._worker_driver,
+                self._reviewer_driver,
                 redact_text(
                     result.stderr or result.stdout or "", self._redaction_secrets
                 ).strip()[-1000:],
@@ -1133,6 +1151,7 @@ class UserEnabledOlympusAgent(BaseAgent):
             ("--provider", self._provider),
             ("--model", self._model),
             ("--base-url", self._base_url),
+            ("--stage-driver", self._stage_driver),
             ("--worker-driver", self._worker_driver),
             ("--reviewer-driver", self._reviewer_driver),
             ("--monitor-model", self._monitor_model),

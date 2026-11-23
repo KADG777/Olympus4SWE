@@ -284,6 +284,9 @@ def test_turn0_start_mid_session_clarification_clean_patch_and_stop(tmp_path: Pa
     assert "--workspace /workspace" in start
     assert "--workflow full_sdlc_tdd" in start
     assert "--gate-policy interactive_minimal" in start
+    assert "--stage-driver auto" in start
+    assert "--worker-driver auto" in start
+    assert "--reviewer-driver auto" in start
     assert "--provider anthropic" in start
     assert "--model claude-sonnet-4-6" in start
 
@@ -478,6 +481,99 @@ def test_setup_installs_pi_for_pi_worker_driver(tmp_path: Path) -> None:
 
     assert any("npm install -g --ignore-scripts" in cmd for cmd in environment.commands())
     assert (tmp_path / "logs" / "setup-pi.txt").exists()
+
+
+def test_setup_installs_pi_by_default_for_auto_drivers(tmp_path: Path) -> None:
+    handler = _SessionHandler([])
+    agent, environment = _make_agent(tmp_path, handler, _StubUser([]))
+
+    assert agent._stage_driver == "auto"
+    assert agent._worker_driver == "auto"
+    assert agent._reviewer_driver == "auto"
+    assert agent._needs_pi is True
+
+    asyncio.run(agent.setup(environment))
+
+    assert any("npm install -g --ignore-scripts" in cmd for cmd in environment.commands())
+    assert (tmp_path / "logs" / "setup-pi.txt").exists()
+
+
+def test_native_driver_overrides_and_install_pi_false_skip_pi(tmp_path: Path) -> None:
+    handler = _SessionHandler([])
+    native_agent, native_environment = _make_agent(
+        tmp_path / "native",
+        handler,
+        _StubUser([]),
+        stage_driver="native",
+        worker_driver="native",
+        reviewer_driver="native",
+    )
+    asyncio.run(native_agent.setup(native_environment))
+    assert native_agent._needs_pi is False
+    assert not any("npm install" in cmd for cmd in native_environment.commands())
+
+    handler = _SessionHandler([])
+    disabled_agent, disabled_environment = _make_agent(
+        tmp_path / "disabled", handler, _StubUser([]), install_pi=False
+    )
+    asyncio.run(disabled_agent.setup(disabled_environment))
+    assert disabled_agent._needs_pi is False
+    assert not any("npm install" in cmd for cmd in disabled_environment.commands())
+
+
+def test_session_turn_forwards_gateway_env_without_leaking_into_artifacts(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-gateway-secret-987654"
+    gateway = "https://gateway.example/v1"
+    handler = _SessionHandler([_envelope("completed", "Done.")])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        _StubUser([]),
+        call_user_on_completion=False,
+        extra_env={"OPENAI_API_KEY": secret, "OPENAI_BASE_URL": gateway},
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, SimpleNamespace(metadata=None)))
+
+    session_calls = [
+        call for call in environment.exec_calls if "session start" in call.command
+    ]
+    assert len(session_calls) == 1
+    assert session_calls[0].env["OPENAI_API_KEY"] == secret
+    assert session_calls[0].env["OPENAI_BASE_URL"] == gateway
+    assert secret not in session_calls[0].command
+    leaked = [
+        str(path.relative_to(tmp_path / "logs"))
+        for path in (tmp_path / "logs").rglob("*")
+        if path.is_file() and secret in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert not leaked, leaked
+
+
+def test_trial_config_does_not_embed_active_gateway_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix bug")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-host-openai-secret-111")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-host-anthropic-secret-222")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+
+    config = build_olympus_trial_config(
+        task, model="openai/gpt-4o", swe_together_root=root
+    )
+
+    serialized = (
+        config.model_dump_json()
+        if hasattr(config, "model_dump_json")
+        else json.dumps(config.agent.kwargs)
+    )
+    assert "sk-host-openai-secret-111" not in serialized
+    assert "sk-host-anthropic-secret-222" not in serialized
+    assert config.agent.env == {}
 
 
 def test_parse_session_envelope_ignores_noise_and_prefers_last_envelope() -> None:

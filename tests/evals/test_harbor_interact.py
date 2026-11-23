@@ -176,12 +176,20 @@ class FakeMcpServer:
         tool_error: str | None = None,
         http_error: int | None = None,
         default_reply: str | None = None,
+        expire_after_tool_calls: int | None = None,
+        expiry_mode: str = "http",
     ) -> None:
         self.replies = list(replies or [])
         self.mode = mode
         self.tool_error = tool_error
         self.http_error = http_error
         self.default_reply = default_reply
+        self.expire_after_tool_calls = expire_after_tool_calls
+        self.expiry_mode = expiry_mode
+        self.session_generation = 0
+        self.active_session: str | None = None
+        self.tool_call_count = 0
+        self.expired = False
         self.questions: list[tuple[str, str]] = []
         self.requests: list[dict[str, Any]] = []
         self.init_notified = False
@@ -214,6 +222,9 @@ class FakeMcpServer:
                 method = body.get("method")
                 if method == "initialize":
                     protocol = (body.get("params") or {}).get("protocolVersion")
+                    outer.session_generation += 1
+                    outer.active_session = f"fake-session-{outer.session_generation}"
+                    outer.expired = outer.expire_after_tool_calls == 0
                     self._send(
                         200,
                         {
@@ -225,7 +236,7 @@ class FakeMcpServer:
                                 "serverInfo": {"name": "fake-user", "version": "0"},
                             },
                         },
-                        session="fake-session-1",
+                        session=outer.active_session,
                     )
                     return
                 if method == "notifications/initialized":
@@ -235,8 +246,19 @@ class FakeMcpServer:
                     self.end_headers()
                     return
                 if method == "tools/call":
-                    if headers.get("mcp-session-id") != "fake-session-1":
+                    session = headers.get("mcp-session-id")
+                    if session is None:
                         self._send(400, {"error": "missing mcp-session-id"})
+                        return
+                    if session != outer.active_session or outer.expired:
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": body.get("id"),
+                            "error": {"code": -32600, "message": "Session not found"},
+                        }
+                        self._send(
+                            200 if outer.expiry_mode == "jsonrpc" else 404, payload
+                        )
                         return
                     if outer.http_error:
                         self._send(outer.http_error, {"error": "simulated transport failure"})
@@ -261,6 +283,12 @@ class FakeMcpServer:
                             "isError": False,
                         }
                     self._send(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": result})
+                    outer.tool_call_count += 1
+                    if (
+                        outer.expire_after_tool_calls is not None
+                        and outer.tool_call_count >= outer.expire_after_tool_calls
+                    ):
+                        outer.expired = True
                     return
                 self._send(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": {}})
 
@@ -530,6 +558,32 @@ if command != "session":
 
 subcommand = argv[1]
 state = load()
+infra_path = state_dir / "fake-infra.json"
+
+
+def take_infra_failure():
+    try:
+        payload = json.loads(infra_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {"remaining": int(os.environ.get("FAKE_OLYMPUS_INFRA_RETRIES", "0"))}
+    if int(payload.get("remaining", 0)) <= 0:
+        return False
+    payload["remaining"] = int(payload["remaining"]) - 1
+    try:
+        infra_path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+if subcommand in ("start", "reply") and take_infra_failure():
+    emit(
+        "needs_input",
+        pause_kind="blocked",
+        message=(
+            "Task execution blocked: T1: provider_error: The read operation timed out"
+        ),
+    )
 if subcommand == "start":
     state = {"run_id": "run-fake-1", "phase": "clarify", "goal": message}
     save(state)
@@ -809,7 +863,9 @@ class FakeEnvironment:
         timeout_sec: int | None = None,
         user: Any = None,
     ) -> Any:
-        self.commands.append({"command": command, "cwd": cwd, "timeout_sec": timeout_sec})
+        self.commands.append(
+            {"command": command, "cwd": cwd, "env": env, "timeout_sec": timeout_sec}
+        )
         return self.handler(command, cwd, env, timeout_sec)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -907,6 +963,78 @@ def test_mcp_client_maps_transport_errors() -> None:
             McpError, match="MCP HTTP 500"
         ):
             client.ask_user("Will this fail?")
+    finally:
+        server.close()
+
+
+def test_mcp_client_reconnects_transparently_after_expired_http_session() -> None:
+    server = FakeMcpServer(replies=["first answer", "second answer"], expire_after_tool_calls=1)
+    try:
+        with McpHttpClient(server.url) as client:
+            assert client.ask_user("First question?") == "first answer"
+            assert client.ask_user("Second question?") == "second answer"
+        assert [question for _, question in server.questions] == [
+            "First question?",
+            "Second question?",
+        ]
+        assert server.session_generation == 2
+        tool_calls = [
+            request
+            for request in server.requests
+            if request["body"].get("method") == "tools/call"
+        ]
+        assert [
+            call["headers"].get("mcp-session-id") for call in tool_calls
+        ] == ["fake-session-1", "fake-session-1", "fake-session-2"]
+        assert [
+            request["body"].get("method") for request in server.requests
+        ].count("initialize") == 2
+    finally:
+        server.close()
+
+
+def test_mcp_client_reconnects_on_jsonrpc_session_not_found() -> None:
+    server = FakeMcpServer(
+        replies=["before expiry", "after expiry"],
+        expire_after_tool_calls=1,
+        expiry_mode="jsonrpc",
+    )
+    try:
+        with McpHttpClient(server.url) as client:
+            assert client.ask_user("Before?") == "before expiry"
+            assert client.ask_user("After?") == "after expiry"
+        assert server.session_generation == 2
+        assert [question for _, question in server.questions] == ["Before?", "After?"]
+    finally:
+        server.close()
+
+
+def test_mcp_client_does_not_reconnect_for_tool_errors_or_other_http_failures() -> None:
+    session_tool_error = FakeMcpServer(tool_error="session not found")
+    try:
+        with McpHttpClient(session_tool_error.url) as client, pytest.raises(McpToolError):
+            client.ask_user("Is this an expiry?")
+        assert session_tool_error.session_generation == 1
+    finally:
+        session_tool_error.close()
+
+    server_error = FakeMcpServer(http_error=500)
+    try:
+        with McpHttpClient(server_error.url) as client, pytest.raises(
+            McpError, match="MCP HTTP 500"
+        ):
+            client.ask_user("Will this fail?")
+        assert server_error.session_generation == 1
+    finally:
+        server_error.close()
+
+
+def test_mcp_client_surfaces_second_failure_after_reconnect() -> None:
+    server = FakeMcpServer(expire_after_tool_calls=0)
+    try:
+        with McpHttpClient(server.url) as client, pytest.raises(McpError, match="404"):
+            client.ask_user("Always expired?")
+        assert server.session_generation == 2
     finally:
         server.close()
 
@@ -1467,6 +1595,192 @@ def test_bridge_run_id_write_failure_exits_session_failed(tmp_path: Path) -> Non
         server.close()
 
 
+def test_bridge_retries_infrastructure_block_without_asking_maintainer(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    plan_path = tmp_path / "plan.md"
+    trajectory = tmp_path / "trajectory.jsonl"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=["AMB-1: raise ValueError('zero')", "Looks good, ship it."]
+    )
+    try:
+        args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, plan_path
+        ) + [
+            "--goal",
+            "Build a calculator library",
+            "--infra-retries",
+            "2",
+            "--infra-retry-backoff",
+            "0",
+        ]
+        process, summary = _run_bridge(args, env={"FAKE_OLYMPUS_INFRA_RETRIES": "1"})
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert summary["turns"] == 2
+        questions = [question for _, question in server.questions]
+        assert len(questions) == 2
+        assert all(
+            "provider_error" not in question and "timed out" not in question
+            for question in questions
+        )
+        retries = [
+            record
+            for record in _jsonl_events(trajectory)
+            if record["event"] == "session.infra_retry"
+        ]
+        assert len(retries) == 1
+        assert retries[0]["attempt"] == 1
+        assert retries[0]["step_mode"] == "plan_only"
+        assert plan_path.is_file()
+    finally:
+        server.close()
+
+
+def test_bridge_execute_retries_infrastructure_block_without_asking_maintainer(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    plan_path = tmp_path / "plan.md"
+    trajectory = tmp_path / "trajectory.jsonl"
+    base_file = tmp_path / "base_commit.txt"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=[
+            "AMB-1: raise ValueError('zero').",
+            "Looks good, ship it.",
+            "Looks good, ship it.",
+        ]
+    )
+    try:
+        plan_args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, plan_path
+        ) + ["--goal", "Build a calculator library"]
+        process, _ = _run_bridge(plan_args)
+        assert process.returncode == 0, process.stdout + process.stderr
+
+        reply_file = tmp_path / "implement.md"
+        reply_file.write_text(UPSTREAM_IMPLEMENT_INSTRUCTION, encoding="utf-8")
+        execute_args = _bridge_common(
+            "execute",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            plan_path,
+            base_commit_file=base_file,
+        ) + [
+            "--reply-file",
+            str(reply_file),
+            "--infra-retries",
+            "2",
+            "--infra-retry-backoff",
+            "0",
+        ]
+        process, summary = _run_bridge(
+            execute_args, env={"FAKE_OLYMPUS_INFRA_RETRIES": "1"}
+        )
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        assert summary["turns"] == 1
+        assert (repo / "calculator.py").is_file()
+        questions = [question for _, question in server.questions]
+        assert all(
+            "provider_error" not in question and "timed out" not in question
+            for question in questions
+        )
+        retries = [
+            record
+            for record in _jsonl_events(trajectory)
+            if record["event"] == "session.infra_retry"
+        ]
+        assert len(retries) == 1
+        assert retries[0]["step_mode"] == "execute"
+    finally:
+        server.close()
+
+
+def test_bridge_fails_cleanly_when_infrastructure_retries_exhaust(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    trajectory = tmp_path / "trajectory.jsonl"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer()
+    try:
+        args = _bridge_common(
+            "plan",
+            fake,
+            repo,
+            state,
+            server,
+            trajectory,
+            tmp_path / "plan.md",
+        ) + [
+            "--goal",
+            "Build a calculator library",
+            "--infra-retries",
+            "2",
+            "--infra-retry-backoff",
+            "0",
+        ]
+        process, summary = _run_bridge(args, env={"FAKE_OLYMPUS_INFRA_RETRIES": "10"})
+        assert process.returncode == EXIT_SESSION_FAILED
+        assert summary["status"] == "error"
+        assert "infrastructure" in summary["error"].casefold()
+        assert server.questions == []
+        records = _jsonl_events(trajectory)
+        retries = [
+            record for record in records if record["event"] == "session.infra_retry"
+        ]
+        assert len(retries) == 2
+        assert [record["attempt"] for record in retries] == [1, 2]
+        assert any(record["event"] == "bridge.failed" for record in records)
+    finally:
+        server.close()
+
+
+def test_bridge_forwards_stage_driver_to_session_cli(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    trajectory = tmp_path / "trajectory.jsonl"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=["AMB-1: raise ValueError('zero').", "Looks good, ship it."]
+    )
+    try:
+        args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, tmp_path / "plan.md"
+        ) + [
+            "--goal",
+            "Build a calculator library",
+            "--stage-driver",
+            "pi",
+            "--worker-driver",
+            "native",
+        ]
+        process, summary = _run_bridge(args)
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+        invocations = [
+            json.loads(line)
+            for line in (state / "fake-invocations.jsonl").read_text().splitlines()
+        ]
+        session_argv = next(
+            invocation["argv"]
+            for invocation in invocations
+            if invocation["argv"][0] == "session"
+        )
+        assert session_argv[session_argv.index("--stage-driver") + 1] == "pi"
+        assert session_argv[session_argv.index("--worker-driver") + 1] == "native"
+    finally:
+        server.close()
+
+
 # --------------------------------------------------------------------------- adapter setup
 
 
@@ -1506,9 +1820,15 @@ def test_setup_bundles_olympus_bridge_and_pi(tmp_path: Path) -> None:
     assert agent._installed_pi_bin == "/tmp/pi-cli/bin/pi"
 
 
-def test_setup_defaults_to_project_source_without_pi(tmp_path: Path) -> None:
+def test_setup_defaults_to_project_source_without_pi_when_disabled(tmp_path: Path) -> None:
     environment = FakeEnvironment()
-    agent = _agent(tmp_path)
+    agent = _agent(
+        tmp_path,
+        stage_driver="native",
+        worker_driver="native",
+        reviewer_driver="native",
+        install_pi="false",
+    )
     asyncio.run(agent.setup(environment))
     assert (
         PROJECT_SRC / "olympus",
@@ -1517,6 +1837,33 @@ def test_setup_defaults_to_project_source_without_pi(tmp_path: Path) -> None:
     commands = "\n".join(record["command"] for record in environment.commands)
     assert "npm install" not in commands
     assert "pip install" in commands
+
+
+def test_setup_installs_pi_by_default_for_auto_drivers(tmp_path: Path) -> None:
+    environment = FakeEnvironment()
+    agent = _agent(tmp_path)
+    options = agent.interact_options
+    assert options.stage_driver == "auto"
+    assert options.worker_driver == "auto"
+    assert options.reviewer_driver == "auto"
+    asyncio.run(agent.setup(environment))
+    commands = "\n".join(record["command"] for record in environment.commands)
+    assert "npm install" in commands
+    assert "@earendil-works/pi-coding-agent" in commands
+    assert agent._installed_pi_bin == "/tmp/pi-cli/bin/pi"
+
+
+def test_setup_respects_explicit_native_driver_overrides(tmp_path: Path) -> None:
+    environment = FakeEnvironment()
+    agent = _agent(
+        tmp_path,
+        stage_driver="native",
+        worker_driver="native",
+        reviewer_driver="native",
+    )
+    asyncio.run(agent.setup(environment))
+    commands = "\n".join(record["command"] for record in environment.commands)
+    assert "npm install" not in commands
 
 
 # --------------------------------------------------------------------------- adapter run
@@ -1580,6 +1927,58 @@ def test_run_splits_harbor_model_name_into_provider_and_model(tmp_path: Path) ->
     command = environment.commands[-1]["command"]
     assert "--provider anthropic" in command
     assert "--model claude-test" in command
+
+
+def test_run_forwards_auto_and_explicit_stage_driver(tmp_path: Path) -> None:
+    environment = FakeEnvironment(handler=_ok_bridge("plan"))
+    agent = _agent(tmp_path)
+    asyncio.run(agent.run(PLAN_INSTRUCTION, environment, _context()))
+    command = environment.commands[-1]["command"]
+    assert "--stage-driver auto" in command
+    assert "--worker-driver auto" in command
+    assert "--reviewer-driver auto" in command
+
+    override_env = FakeEnvironment(handler=_ok_bridge("plan"))
+    override_agent = _agent(
+        tmp_path,
+        stage_driver="pi@model-stage",
+        worker_driver="native",
+        reviewer_driver="native",
+    )
+    asyncio.run(override_agent.run(PLAN_INSTRUCTION, override_env, _context()))
+    override_command = override_env.commands[-1]["command"]
+    assert "--stage-driver pi@model-stage" in override_command
+    assert "--worker-driver native" in override_command
+    assert "--reviewer-driver native" in override_command
+
+
+def test_run_bridge_step_forwards_gateway_env_without_leaking(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-gateway-secret-123456"
+    gateway = "https://gateway.example/v1"
+    environment = FakeEnvironment(handler=_ok_bridge("plan", run_id="run-9"))
+    agent = _agent(
+        tmp_path,
+        extra_env={
+            "OPENAI_API_KEY": secret,
+            "OPENAI_BASE_URL": gateway,
+            "ANTHROPIC_API_KEY": "sk-ant-gateway-123456",
+            "UNRELATED": "ignored",
+        },
+    )
+    asyncio.run(agent.run(PLAN_INSTRUCTION, environment, _context()))
+    bridge_calls = [
+        call for call in environment.commands if "interact_bridge.py" in call["command"]
+    ]
+    assert bridge_calls
+    env = bridge_calls[-1]["env"]
+    assert env["OPENAI_API_KEY"] == secret
+    assert env["OPENAI_BASE_URL"] == gateway
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-gateway-123456"
+    assert "UNRELATED" not in env
+    assert secret not in bridge_calls[-1]["command"]
+    assert agent._redact(f"key={secret} url={gateway}") == f"key=*** url={gateway}"
 
 
 def test_run_handoff_executes_instruction_script(tmp_path: Path) -> None:

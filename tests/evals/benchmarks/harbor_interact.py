@@ -29,6 +29,18 @@ except Exception:  # pragma: no cover - the fallback branch runs in core pytest
     _HarborCapabilities = None
     _HarborExecResult = None
 
+try:  # pragma: no cover - connection specs ship with newer Harbor releases
+    from harbor.agents import agent_auth_resolution as _harbor_auth
+    from harbor.models import model_api_format as _harbor_api_format
+
+    _HarborModelConnectionSpec = _harbor_auth.ModelConnectionSpec
+    _HarborProviderAccess = _harbor_auth.ProviderAccess
+    _HarborModelApiFormat = _harbor_api_format.ModelApiFormat
+except Exception:  # pragma: no cover - old Harbor releases resolve natively
+    _HarborModelConnectionSpec = None
+    _HarborProviderAccess = None
+    _HarborModelApiFormat = None
+
 try:
     from .interact_bridge import DEFAULT_INITIAL_QUESTION, redact_text
 except ImportError:  # Imported as a top-level module by standalone tooling.
@@ -37,6 +49,7 @@ except ImportError:  # Imported as a top-level module by standalone tooling.
 VERSION = "0.1.0"
 BRIDGE_DIR = "/tmp/olympus-bridge"
 PI_PREFIX = "/tmp/pi-cli"
+GATEWAY_ENV_PREFIXES = ("OPENAI_", "ANTHROPIC_")
 _PLAN_ONLY_ROLE = "plan"
 _EXECUTE_ROLE = "execute"
 _HANDOFF_ROLE = "handoff"
@@ -126,6 +139,12 @@ def _as_optional_bool(value: Any) -> bool | None:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _driver_uses_pi(value: str | None) -> bool:
+    """Return True when a driver setting resolves to Pi after ``auto`` probing."""
+    name = (value or "").split("@", 1)[0].strip().lower()
+    return name in {"auto", "pi"}
+
+
 @dataclass(frozen=True)
 class InteractOptions:
     """Everything Harbor may pass through ``-ak key=value`` to the session CLI."""
@@ -135,8 +154,9 @@ class InteractOptions:
     provider: str | None = None
     model: str | None = None
     base_url: str | None = None
-    worker_driver: str | None = None
-    reviewer_driver: str | None = None
+    stage_driver: str | None = "auto"
+    worker_driver: str | None = "auto"
+    reviewer_driver: str | None = "auto"
     monitor_model: str | None = None
     max_turns_per_step: int = 8
     workspace_path: str = "/app"
@@ -247,6 +267,19 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         if _HarborCapabilities is not None
         else _FallbackCapabilities()
     )
+    if _HarborModelConnectionSpec is not None:
+        MODEL_CONNECTION = _HarborModelConnectionSpec(
+            base_url_destination_names={"default": None},
+            supported_api_formats=[
+                _HarborModelApiFormat.OPENAI_CHAT_COMPLETIONS,
+                _HarborModelApiFormat.OPENAI_RESPONSES,
+                _HarborModelApiFormat.ANTHROPIC_MESSAGES,
+            ],
+            agent_provider_access=_HarborProviderAccess(
+                api_key_candidate_names=["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+                base_url_candidate_names=["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"],
+            ),
+        )
     DEFAULT_SETUP_TIMEOUT_SEC: ClassVar[float] = 900.0
 
     def __init__(
@@ -398,8 +431,17 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         options = self._interact
         if options.install_pi is not None:
             return options.install_pi
-        driver = (options.worker_driver or "").strip().lower()
-        return driver == "pi" or driver.startswith("pi@")
+        drivers = (options.stage_driver, options.worker_driver, options.reviewer_driver)
+        return any(_driver_uses_pi(driver) for driver in drivers)
+
+    def _gateway_env(self) -> dict[str, str] | None:
+        """Gateway credentials forwarded to the in-container Pi agent, never logged."""
+        env = {
+            key: value
+            for key, value in self.extra_env.items()
+            if key.startswith(GATEWAY_ENV_PREFIXES)
+        }
+        return env or None
 
     async def _install_olympus(self, environment: Any) -> None:
         options = self._interact
@@ -598,7 +640,9 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             / f"olympus-interact-{step_tag}.jsonl"
         )
         argv = self._bridge_argv(role, remote_instruction, trajectory)
-        result = await environment.exec(shlex.join(argv), timeout_sec=None)
+        result = await environment.exec(
+            shlex.join(argv), timeout_sec=None, env=self._gateway_env()
+        )
         summary = self._parse_bridge_summary(result.stdout)
         if result.return_code != 0 or (summary or {}).get("status") != "ok":
             error = (summary or {}).get("error") or (
@@ -657,6 +701,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             ("--provider", options.provider),
             ("--model", options.model),
             ("--base-url", options.base_url),
+            ("--stage-driver", options.stage_driver),
             ("--worker-driver", options.worker_driver),
             ("--reviewer-driver", options.reviewer_driver),
             ("--monitor-model", options.monitor_model),

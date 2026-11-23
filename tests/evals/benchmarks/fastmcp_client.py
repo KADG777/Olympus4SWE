@@ -27,6 +27,14 @@ class McpError(RuntimeError):
     """Transport, protocol, or JSON-RPC failure while talking to an MCP server."""
 
 
+class McpHttpError(McpError):
+    """The MCP server answered a request with a non-success HTTP status."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        super().__init__(message)
+
+
 class McpToolError(McpError):
     """The MCP server reported ``isError: true`` for a tool call."""
 
@@ -34,6 +42,24 @@ class McpToolError(McpError):
         self.tool = tool
         self.message = message
         super().__init__(f"MCP tool {tool!r} failed: {message}")
+
+
+_SESSION_EXPIRY_MARKERS = ("session not found", "-32600")
+
+
+def is_session_expiry_error(exc: McpError) -> bool:
+    """Return True when ``exc`` reports an expired MCP transport session.
+
+    Streamable-HTTP servers signal an expired session either with HTTP ``404``
+    or with JSON-RPC error code ``-32600`` (``Session not found``). Tool-level
+    errors never qualify even when their text mentions sessions.
+    """
+    if isinstance(exc, McpToolError):
+        return False
+    if isinstance(exc, McpHttpError) and exc.status_code == 404:
+        return True
+    message = str(exc).casefold()
+    return any(marker in message for marker in _SESSION_EXPIRY_MARKERS)
 
 
 def parse_sse_messages(text: str) -> list[dict[str, Any]]:
@@ -187,6 +213,20 @@ class McpHttpClient:
     def _rpc(self, method: str, params: dict[str, Any]) -> Any:
         if self.protocol_version is None:
             self.initialize()
+        active_session = self.session_id is not None
+        try:
+            return self._rpc_once(method, params)
+        except McpError as exc:
+            if not active_session or not is_session_expiry_error(exc):
+                raise
+        # The server expired our session mid-trial: re-handshake once and retry
+        # the same request transparently. A second failure propagates.
+        self.session_id = None
+        self.protocol_version = None
+        self.initialize()
+        return self._rpc_once(method, params)
+
+    def _rpc_once(self, method: str, params: dict[str, Any]) -> Any:
         response = self._post(
             {
                 "jsonrpc": "2.0",
@@ -231,7 +271,9 @@ class McpHttpClient:
                 content_type = (response.headers.get("content-type") or "").lower()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")[:2000]
-            raise McpError(f"MCP HTTP {exc.code} from {self.url}: {body}") from exc
+            raise McpHttpError(
+                exc.code, f"MCP HTTP {exc.code} from {self.url}: {body}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise McpError(f"MCP connection to {self.url} failed: {exc.reason}") from exc
         except OSError as exc:
@@ -280,7 +322,9 @@ __all__ = [
     "DEFAULT_PROTOCOL_VERSION",
     "McpError",
     "McpHttpClient",
+    "McpHttpError",
     "McpToolError",
     "extract_tool_text",
+    "is_session_expiry_error",
     "parse_sse_messages",
 ]
