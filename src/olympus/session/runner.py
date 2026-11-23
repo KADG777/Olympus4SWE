@@ -20,6 +20,7 @@ from typing import Any
 
 from olympus.core.contracts import (
     ApprovalTarget,
+    DesignSpec,
     GoalSpec,
     RunMode,
     RunStatus,
@@ -27,7 +28,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import RunControl
+from olympus.core.control import RunControl, is_design_bound_to_spec
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
@@ -75,6 +76,7 @@ class SessionConfig:
     provider: str = "auto"
     model: str | None = None
     base_url: str | None = None
+    stage_driver: str | None = None
     worker_driver: str | None = None
     reviewer_driver: str | None = None
     monitor_model: str | None = None
@@ -415,7 +417,10 @@ class SessionRunner:
             return self._continue(run_id, definition)
 
         if intent.action in ("revise", "reopen"):
-            return self._revise(run_id, definition, snap, intent.feedback or text)
+            feedback = intent.feedback or text
+            if pause_kind == PauseKind.BLOCKED and intent.action == "revise":
+                return self._recover_blocked(run_id, definition, snap, feedback)
+            return self._revise(run_id, definition, snap, feedback)
 
         fallback_kind = pause_kind or PauseKind.APPROVAL
         focus = self._pause_message(
@@ -440,6 +445,7 @@ class SessionRunner:
 
     def _drivers_config(self) -> ExecutionDriversConfig:
         return ExecutionDriversConfig.resolve(
+            stage_driver=self.config.stage_driver,
             worker_driver=self.config.worker_driver,
             reviewer_driver=self.config.reviewer_driver,
             monitor_model=self.config.monitor_model,
@@ -523,10 +529,27 @@ class SessionRunner:
     def _runtime(self, run_id: str, definition: WorkflowDefinition) -> WorkflowRuntime:
         snap = self.store.get_run(run_id)
         recorded_drivers = snap.get("execution_drivers")
-        drivers = (
+        base_drivers = (
             ExecutionDriversConfig.model_validate(recorded_drivers)
             if recorded_drivers
             else self._drivers_config()
+        )
+        explicit_overrides = {
+            field: value
+            for field, value in (
+                ("stage_driver", self.config.stage_driver),
+                ("worker_driver", self.config.worker_driver),
+                ("reviewer_driver", self.config.reviewer_driver),
+                ("monitor_model", self.config.monitor_model),
+            )
+            if value is not None
+        }
+        drivers = (
+            ExecutionDriversConfig.model_validate(
+                {**base_drivers.model_dump(mode="json"), **explicit_overrides}
+            )
+            if explicit_overrides
+            else base_drivers
         )
         policy_name = self._resolved_gate_policy(run_id)
         policy = (
@@ -534,11 +557,12 @@ class SessionRunner:
             if policy_name == GatePolicyName.INTERACTIVE_MINIMAL
             else None
         )
+        active_provider = self._provider(run_id)
         return WorkflowRuntime(
             store=self.store,
             workspace_root=self.workspace_root,
             artifacts_root=self.artifacts_root,
-            provider=self._provider(run_id),
+            provider=active_provider,
             auto_approve=False,
             approver=f"session:{policy_name.value}",
             topology=definition.topology,
@@ -547,7 +571,9 @@ class SessionRunner:
             sandbox_root=self.sandbox_root,
             execution_drivers=drivers,
             driver_registry=DriverRegistry().with_factories(
-                default_driver_factories(store=self.store, run_id=run_id)
+                default_driver_factories(
+                    store=self.store, run_id=run_id, provider=active_provider
+                )
             ),
             model_provider=self._model_provider,
         )
@@ -716,9 +742,85 @@ class SessionRunner:
         return self._drive(
             run_id=run_id,
             raw_input=augmented,
-            start_from="align",
+            start_from=self._stage_node_name(definition, "align_goal"),
             definition=definition,
         )
+
+    def _recover_blocked(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+    ) -> SessionEnvelope:
+        """Apply a human hint received while blocked and restart at a safe node."""
+        clean = hint.strip()
+        if not clean:
+            return self._emit_pause(
+                run_id,
+                PauseKind.BLOCKED,
+                node=None,
+                reason="Recovery hint was empty.",
+                message="Recovery hint was empty; describe the path, symbol, or correction.",
+            )
+        try:
+            self.control.request_revision(run_id=run_id, feedback=clean, actor="human")
+        except (ValueError, ConcurrencyConflictError) as exc:
+            return self._emit_pause(
+                run_id, PauseKind.BLOCKED, node=None, reason=str(exc), message=str(exc)
+            )
+        entry = self._recovery_entry(run_id, definition, snap)
+        augmented = self._augment_input(run_id, snap, clean, "User recovery hint")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={"raw_input": augmented, "feedback": clean, "recovery_node": entry},
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=augmented,
+            start_from=entry,
+            definition=definition,
+        )
+
+    @staticmethod
+    def _find_node_by_type(definition: WorkflowDefinition, node_type: str) -> str | None:
+        return next((node.name for node in definition.nodes if node.type == node_type), None)
+
+    @classmethod
+    def _stage_node_name(cls, definition: WorkflowDefinition, node_type: str) -> str:
+        found = cls._find_node_by_type(definition, node_type)
+        if found is not None:
+            return found
+        return definition.nodes[0].name
+
+    def _recovery_entry(
+        self, run_id: str, definition: WorkflowDefinition, snap: dict[str, Any]
+    ) -> str:
+        """Resume from the plan node when upstream spec/design bindings are valid."""
+        spec: GoalSpec | None = snap["spec"]
+        design: DesignSpec | None = snap["design"]
+        align_node = self._stage_node_name(definition, "align_goal")
+        plan_node = self._find_node_by_type(definition, "pm_decompose")
+        has_design_stage = self._find_node_by_type(definition, "design_spec") is not None
+        if (
+            plan_node is None
+            or spec is None
+            or not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            )
+        ):
+            return align_node
+        if has_design_stage and (
+            design is None or not is_design_bound_to_spec(self.store, run_id, snap)
+        ):
+            return align_node
+        return plan_node
 
     def _workflow_for_run(
         self, run_id: str, snap: dict[str, Any]
@@ -726,20 +828,18 @@ class SessionRunner:
         """Reload the workflow the run was started with, custom YAML included.
 
         ``reply`` accepts an explicit ``--workflow`` path; it must name the same
-        workflow the run recorded. When the flag is omitted, the path persisted by
-        ``start`` wins so custom YAML workflows survive the pause/resume boundary.
+        workflow the run recorded. When the flag is omitted, the workflow persisted by
+        ``start`` (custom YAML path or built-in name) wins across pause/resume.
         """
         recorded_name = str(snap["workflow_name"])
         requested_path = _yaml_workflow_path(self.config.workflow)
         if requested_path is not None:
             candidate: str | Path = requested_path
-        else:
+        elif not self.config.workflow_explicit:
             recorded_path = self._recorded_workflow_path(run_id)
-            candidate = (
-                recorded_path
-                if recorded_path is not None and not self.config.workflow_explicit
-                else self.config.workflow
-            )
+            candidate = recorded_path if recorded_path is not None else recorded_name
+        else:
+            candidate = self.config.workflow
         definition = load_workflow(candidate)
         if definition.name != recorded_name:
             raise ValueError(
@@ -839,7 +939,7 @@ class SessionRunner:
         return self._drive(
             run_id=run_id,
             raw_input=augmented,
-            start_from="align",
+            start_from=self._stage_node_name(definition, "align_goal"),
             definition=definition,
         )
 

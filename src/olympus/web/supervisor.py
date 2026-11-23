@@ -356,16 +356,19 @@ class RunSupervisor:
                 else ExecutionDriversConfig.resolve()
             )
             provider_config = snap.get("provider_config") or {"provider": "mock"}
+            active_provider = self.resolve_provider(run_id)
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
                 artifacts_root=self.artifacts_root,
-                provider=self.resolve_provider(run_id),
+                provider=active_provider,
                 auto_approve=auto_approve,
                 topology=definition.topology,
                 execution_drivers=driver_config,
                 driver_registry=self.driver_registry.with_factories(
-                    default_driver_factories(store=self.store, run_id=run_id)
+                    default_driver_factories(
+                        store=self.store, run_id=run_id, provider=active_provider
+                    )
                 ),
                 model_provider=lambda model: self._builder({**provider_config, "model": model}),
                 monitor_provider=self.monitor_provider,

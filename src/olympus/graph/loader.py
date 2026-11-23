@@ -94,7 +94,7 @@ class WorkflowRuntime:
     auto_approve: bool = False
     approver: str = "zeus"
     enable_critique: bool = False
-    max_steps: int = 10
+    max_steps: int = 16
     worker_max_steps: int | None = None
     apply_to_workspace: bool = False
     topology: str = "modular_product"
@@ -132,6 +132,8 @@ def _align_stage(runtime: WorkflowRuntime) -> AlignStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         trace_dir=runtime.artifacts_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
     )
 
 
@@ -141,6 +143,8 @@ def _design_stage(runtime: WorkflowRuntime) -> DesignStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         artifacts_root=runtime.artifacts_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
     )
 
 

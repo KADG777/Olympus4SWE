@@ -170,6 +170,8 @@ _NEGATED_REVISION_PATTERNS = tuple(
         r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never|no\s+need\s+to|stop)\b[^.!?,;\n]{0,40}\b(?:change|modify|edit|revise|rework|redo|touch|reopen|alter|update)\b",
         r"\bno\s+(?:changes?|modifications?|edits?|revisions?|further\s+work)\b",
         r"\bleave\s+(?:it|everything|this|that)\s+as\s+is\b",
+        r"\bkeep\s+(?:it|everything|this|that|all)\s+(?:as\s+is|unchanged|the\s+same)\b",
+        r"\bstay\s+(?:as\s+is|unchanged)\b",
         r"\bnothing\s+(?:else\s+)?to\s+(?:change|fix|do|modify|update)\b",
     )
 )
@@ -188,9 +190,161 @@ _EXPLICIT_ANSWER_LINE = re.compile(
 )
 _ACTIONABLE_CHARS = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
 
+_DEFAULT_ACCEPTANCE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\b(?:use|using|accept|accepting|apply|applying|take|taking|adopt|adopting|"
+        r"go\s+with|going\s+with|proceed\s+with|proceeding\s+with|follow|following|"
+        r"stick\s+with|sticking\s+with|ok\s+with|okay\s+with|fine\s+with)\b[^.!?\n]{0,60}"
+        r"\b(?:defaults?|default\s+assumptions?|recommendations?|recommended\s+"
+        r"(?:answers?|options?|choices?|defaults?|assumptions?)|"
+        r"your\s+(?:best\s+)?(?:defaults?|recommendations?|assumptions?))\b",
+        r"\b(?:go\s+with|proceed\s+with|stick\s+with)\s+(?:the\s+|your\s+)?"
+        r"(?:defaults?|recommendations?)\b",
+        r"^\s*(?:the\s+|your\s+)?(?:defaults?|default\s+(?:assumptions?|answers?|choices?)|"
+        r"recommendations?)\s*[.!]?\s*$",
+    )
+)
+_QUESTION_PREFIX_RE = re.compile(
+    r"^\s*(?:what|which|why|how|who|when|where|should\s+we|can\s+you\s+explain|"
+    r"could\s+you\s+explain|tell\s+me\s+what|list\s+(?:the|your)|show\s+me)\b"
+)
+_CONDITIONAL_DEFAULTS_RE = re.compile(
+    r"\b(?:if|unless|whether|suppose|supposing|what\s+if|in\s+case)\b[^.!?\n]{0,60}"
+    r"\b(?:defaults?|assumptions?|recommendations?)\b"
+)
+_DEFAULT_ACCEPTANCE_CJK = (
+    "按默认",
+    "按推荐",
+    "按你的默认",
+    "按你的推荐",
+    "按照默认",
+    "按照推荐",
+    "用默认",
+    "用推荐",
+    "用你的默认",
+    "用你的推荐",
+    "采用默认",
+    "采用推荐",
+    "使用默认",
+    "使用推荐",
+    "默认方案继续",
+    "默认方案推进",
+    "推荐方案继续",
+    "推荐方案推进",
+)
+_NEGATED_DEFAULTS_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\b(?:do\s+not|don'?t|never|cannot|can'?t|won'?t|will\s+not|shouldn'?t|"
+        r"should\s+not|no\s+need\s+to|stop)\b[^.!?\n]{0,60}\b(?:defaults?|assumptions?|"
+        r"recommendations?)\b",
+        r"\bnot\s+(?:your\s+)?(?:defaults?|recommendations?|assumptions?)\b",
+        r"\bno\s+defaults?\b",
+    )
+)
+_NEGATED_DEFAULTS_CJK = (
+    "不要默认",
+    "不要按默认",
+    "不要用默认",
+    "不要采用默认",
+    "不要使用默认",
+    "别按默认",
+    "别用默认",
+    "不用默认",
+    "不要按推荐",
+    "不要用推荐",
+    "别按推荐",
+    "不采用推荐",
+    "不要你的默认",
+    "不用你的推荐",
+    "不按默认",
+    "不按推荐",
+)
+
 
 def _has_actionable_text(text: str) -> bool:
     return len(_ACTIONABLE_CHARS.findall(text)) >= 3
+
+
+def _negated_defaults(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _NEGATED_DEFAULTS_PATTERNS):
+        return True
+    return any(token in text for token in _NEGATED_DEFAULTS_CJK)
+
+
+def _pending_blockers(snapshot: dict[str, Any] | None) -> bool:
+    if not snapshot:
+        return False
+    spec: GoalSpec | None = snapshot.get("spec")
+    return bool(_blocking_ambiguity_ids(spec) or _blocking_critique_ids(spec))
+
+
+def _default_blocker_answers(
+    snapshot: dict[str, Any] | None, message: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fill every pending blocker deterministically for a "use your defaults" reply."""
+    spec: GoalSpec | None = snapshot.get("spec") if snapshot else None
+    if spec is None:
+        return {}, {}
+    fallback = message.strip()
+    answers: dict[str, str] = {}
+    for amb in spec.open_ambiguities:
+        if not amb.blocking or amb.answer:
+            continue
+        choice = (amb.default_assumption or "").strip()
+        if not choice and amb.options:
+            choice = next((item.strip() for item in amb.options if item.strip()), "")
+        if not choice:
+            choice = fallback
+        if choice:
+            answers[amb.id] = choice
+    resolutions: dict[str, str] = {}
+    for note in spec.minority_notes:
+        if note.severity != CritiqueSeverity.BLOCKING or note.resolved:
+            continue
+        if fallback:
+            resolutions[note.id] = fallback
+    return answers, resolutions
+
+
+def _is_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("?", "？")):
+        return True
+    return _QUESTION_PREFIX_RE.search(stripped.casefold()) is not None
+
+
+def _is_default_delegation(text: str) -> bool:
+    """True when the text affirmatively delegates decisions to recorded defaults."""
+    lowered = text.casefold()
+    if (
+        _is_question(text)
+        or _CONDITIONAL_DEFAULTS_RE.search(lowered)
+        or _negated_approval(lowered)
+        or _negated_revision(lowered)
+        or _negated_defaults(lowered)
+    ):
+        return False
+    return any(pattern.search(lowered) for pattern in _DEFAULT_ACCEPTANCE_PATTERNS) or any(
+        token in lowered for token in _DEFAULT_ACCEPTANCE_CJK
+    )
+
+
+def _default_acceptance(
+    text: str,
+    *,
+    snapshot: dict[str, Any] | None,
+    message: str,
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    """Return deterministic default answers when the human delegates to defaults."""
+    if not _pending_blockers(snapshot):
+        return None
+    if not _is_default_delegation(text):
+        return None
+    return _default_blocker_answers(snapshot, message)
 
 
 def _negated_approval(text: str) -> bool:
@@ -235,13 +389,30 @@ def _extract_explicit_clarifications(
 
 
 def _keyword_fallback(
-    message: str, *, snapshot: dict[str, Any] | None = None
+    message: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    pause_kind: PauseKind | None = None,
 ) -> ReplyIntent:
     """Conservative fallback used only when the structured parse fails."""
     text = message.casefold().strip()
     if not text:
         return ReplyIntent(action="unknown", message="Empty reply")
     answers, resolutions = _extract_explicit_clarifications(message, snapshot)
+    defaults = _default_acceptance(text, snapshot=snapshot, message=message)
+    if defaults is not None:
+        default_answers, default_resolutions = defaults
+        default_answers.update(
+            {key: value for key, value in answers.items() if not _is_default_delegation(value)}
+        )
+        default_resolutions.update(
+            {
+                key: value
+                for key, value in resolutions.items()
+                if not _is_default_delegation(value)
+            }
+        )
+        answers, resolutions = default_answers, default_resolutions
     if answers or resolutions:
         return ReplyIntent(
             action="clarify",
@@ -249,7 +420,11 @@ def _keyword_fallback(
             resolutions=resolutions,
             message="Keyword fallback: explicit blocker answers",
         )
-    revise = any(token in text for token in _REVISE_TOKENS) and not _negated_revision(text)
+    revise = (
+        any(token in text for token in _REVISE_TOKENS)
+        and not _negated_revision(text)
+        and not _CONDITIONAL_DEFAULTS_RE.search(text)
+    )
     if _negated_approval(text):
         # A negated approval is never an approval: treat an explicit revision ask
         # as a revision and everything else as ambiguous, so no gate is confirmed.
@@ -267,6 +442,16 @@ def _keyword_fallback(
         return ReplyIntent(
             action="revise", feedback=message.strip(), message="Keyword fallback: revision"
         )
+    if pause_kind == PauseKind.BLOCKED and _has_actionable_text(message) and not (
+        _negated_revision(text) or _negated_defaults(text)
+    ):
+        # Any concrete hint (path, symbol, diagnosis, redirect) is actionable recovery
+        # context while blocked; never deadlock on an unmappable reply.
+        return ReplyIntent(
+            action="revise",
+            feedback=message.strip(),
+            message="Keyword fallback: blocked recovery hint",
+        )
     if any(token in text for token in _APPROVE_TOKENS):
         return ReplyIntent(action="approve", message="Keyword fallback: approval")
     return ReplyIntent(action="unknown", message="Could not parse the reply safely")
@@ -277,6 +462,7 @@ def _sanitize(
     *,
     snapshot: dict[str, Any],
     message: str,
+    pause_kind: PauseKind | None = None,
 ) -> ReplyIntent:
     spec: GoalSpec | None = snapshot.get("spec")
     valid_answers = _blocking_ambiguity_ids(spec)
@@ -291,26 +477,71 @@ def _sanitize(
         for key, value in raw.resolutions.items()
         if key.strip() in valid_resolutions and value.strip()
     }
-    if not answers and not resolutions:
-        explicit_answers, explicit_resolutions = _extract_explicit_clarifications(
-            message, snapshot
-        )
+    explicit_answers, explicit_resolutions = _extract_explicit_clarifications(message, snapshot)
+    lowered = message.casefold()
+    asks_about_defaults = _is_question(message) and any(
+        token in lowered for token in ("default", "assumption", "recommend", "默认", "推荐")
+    )
+    if (
+        _negated_defaults(lowered)
+        or _negated_revision(lowered)
+        or _CONDITIONAL_DEFAULTS_RE.search(lowered)
+        or asks_about_defaults
+    ):
+        # Never accept LLM-guessed answers when the user rejected defaults, asked a
+        # question about defaults, or posed a conditional warning; keep only explicit IDs.
+        answers = dict(explicit_answers)
+        resolutions = dict(explicit_resolutions)
+    else:
         answers.update(explicit_answers)
         resolutions.update(explicit_resolutions)
+    defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
+    if defaults is not None:
+        # A human delegation to defaults resolves every remaining blocker
+        # deterministically; explicit per-ID text in the message still wins.
+        default_answers, default_resolutions = defaults
+        default_answers.update(
+            {
+                key: value
+                for key, value in explicit_answers.items()
+                if not _is_default_delegation(value)
+            }
+        )
+        default_resolutions.update(
+            {
+                key: value
+                for key, value in explicit_resolutions.items()
+                if not _is_default_delegation(value)
+            }
+        )
+        answers, resolutions = default_answers, default_resolutions
     action = raw.action
     feedback = raw.feedback.strip()
-    lowered = message.casefold()
     if answers or resolutions:
         # Human answers always win: never approve/revise while silently dropping them.
         action = "clarify"
     elif action == "clarify":
         action = "unknown"
-    if action == "approve" and _negated_approval(lowered):
+    if action == "approve" and (
+        _negated_approval(lowered) or _negated_defaults(lowered)
+    ):
         revise = any(token in lowered for token in _REVISE_TOKENS) and not _negated_revision(
             lowered
         )
         action = "revise" if revise else "unknown"
         feedback = message.strip() if revise else ""
+    elif (
+        action == "approve"
+        and _negated_revision(lowered)
+        and not any(token in lowered for token in _APPROVE_TOKENS)
+    ):
+        # A pure "do not change anything" reply is never an approval.
+        action = "unknown"
+        feedback = ""
+    if action == "reopen" and (_negated_approval(lowered) or _negated_defaults(lowered)):
+        # A refusal must never reopen a completed run, even if the router guessed so.
+        action = "unknown"
+        feedback = ""
     if action in ("reopen", "revise") and (
         _negated_revision(lowered) or not _has_actionable_text(message)
     ):
@@ -320,6 +551,18 @@ def _sanitize(
         feedback = message.strip()
         if not feedback:
             action = "unknown"
+    if (
+        action in ("unknown", "approve", "reopen")
+        and pause_kind == PauseKind.BLOCKED
+        and _has_actionable_text(message)
+        and not _negated_revision(lowered)
+        and not _negated_approval(lowered)
+        and not _negated_defaults(lowered)
+    ):
+        # While blocked, any concrete hint is recovery context: route it to revision
+        # instead of approving a gate the deterministic validator already rejected.
+        action = "revise"
+        feedback = message.strip()
     return ReplyIntent(
         action=action,
         answers=answers,
@@ -355,10 +598,10 @@ def parse_reply(
     try:
         parsed = _RawIntent.model_validate_json(_extract_json(response.content))
     except Exception:  # noqa: BLE001 -- malformed router JSON falls back to keyword guard
-        return _keyword_fallback(message, snapshot=snapshot)
-    intent = _sanitize(parsed, snapshot=snapshot, message=message)
+        return _keyword_fallback(message, snapshot=snapshot, pause_kind=pause_kind)
+    intent = _sanitize(parsed, snapshot=snapshot, message=message, pause_kind=pause_kind)
     if intent.action == "unknown":
-        return _keyword_fallback(message, snapshot=snapshot)
+        return _keyword_fallback(message, snapshot=snapshot, pause_kind=pause_kind)
     return intent
 
 

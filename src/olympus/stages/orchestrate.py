@@ -39,7 +39,7 @@ from olympus.core.dag import (
     scopes_overlap,
     validate_plan,
 )
-from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.harness.activity import LiveActivity, milestone_fields
 from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
 from olympus.harness.diff_gate import run_diff_gate
@@ -51,9 +51,11 @@ from olympus.harness.driver import (
     DriverTurnRequest,
     ExecutionDriversConfig,
     default_driver_factories,
+    resolve_driver_spec,
 )
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
+from olympus.harness.structured import run_structured_turn
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
@@ -71,7 +73,11 @@ from olympus.harness.worktree import (
 )
 from olympus.providers.base import LLMProvider
 from olympus.providers.factory import build_provider
-from olympus.stages.common import format_workspace_inventory
+from olympus.stages.common import (
+    default_artifacts_root,
+    format_workspace_inventory,
+    resolve_stage_driver,
+)
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
 if TYPE_CHECKING:
@@ -101,7 +107,14 @@ Rules:
 8. Exploration limit: inspect at most 3 existing files from Observed workspace files; if design
    paths do not exist yet (greenfield), emit TaskPlan JSON directly without running glob/grep.
 9. Output ONLY a single raw JSON object starting with '{' matching TaskPlan (NEVER call an
-   invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys)."""
+   invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys).
+10. Ground checks in observed reality: acceptance_checks commands MUST only use paths named by
+    the Observed workspace files, the task's own write_scope, and tools/packages actually
+    available in the environment. NEVER invent uninstalled third-party packages, never
+    reference a test directory that neither exists nor is created inside the task's write_scope,
+    and never assume a module/runner exists without observing it. When a task creates its own
+    test file, target that exact path; otherwise prefer inline 'python -c' assertions that
+    import only artifacts the task itself delivers."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
@@ -516,7 +529,7 @@ class OrchestrateStage:
         self.artifacts_root = (
             artifacts_root
             if artifacts_root is not None
-            else self.workspace_root / ".olympus" / "runs"
+            else default_artifacts_root(store, self.workspace_root)
         )
         self.sandbox_root = Path(sandbox_root).resolve() if sandbox_root is not None else None
 
@@ -570,13 +583,27 @@ class OrchestrateStage:
             )
         return design
 
+    def _latest_human_guidance(self, run_id: str) -> str:
+        """Return the most recent human recovery/revision hint recorded on the run."""
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return ""
+        for event in reversed(events):
+            if event.event_type != "session.continued":
+                continue
+            feedback = event.payload.get("feedback")
+            if isinstance(feedback, str) and feedback.strip():
+                return feedback.strip()
+        return ""
+
     def propose_plan(
         self,
         *,
         run_id: str,
         auto_approve: bool = False,
         approver: str = "zeus",
-        max_steps: int = 10,
+        max_steps: int = 16,
         topology: str = "minimal_patch",
         use_design: bool = True,
     ) -> TaskPlan:
@@ -612,6 +639,13 @@ class OrchestrateStage:
         else:
             guidance_block = ""
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
         loop = AgentLoop(
             provider=self.provider,
             toolkit=toolkit,
@@ -657,9 +691,17 @@ class OrchestrateStage:
                 else ""
             )
 
+        guidance = self._latest_human_guidance(run_id)
+        human_guidance_block = (
+            "Latest human recovery guidance (honor it and ground checks in it):\n"
+            f"{guidance}\n\n"
+            if guidance
+            else ""
+        )
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
             f"{inventory}\n"
+            f"{human_guidance_block}"
             f"Note: acceptance_checks[*].command will run in an isolated sandbox worktree "
             f"(cwd = sandbox root). NEVER reference '{self.workspace_root}' inside commands.\n"
             f"Remember: acceptance_checks[*].kind MUST be one of "
@@ -690,16 +732,26 @@ class OrchestrateStage:
         def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
             raise PlanValidationError(violations)
 
-        plan = loop.run_structured(
+        plan = run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="orchestrate:planner",
             system_prompt=_PLANNER_SYSTEM_PROMPT + guidance_block,
             user_prompt=base_prompt,
             model_cls=TaskPlan,
+            trace_path=self._run_dir(run_id) / "traces" / "planner.jsonl",
+            max_steps=max_steps,
             max_validation_retries=2,
             validation_header="[PLAN VALIDATION FAILED]",
             validation_instruction="Fix all violations and return valid TaskPlan JSON.",
             transform=stamp_binding,
             validator=plan_gate,
             on_validation_exhausted=raise_exhausted,
+            on_event=self.on_driver_event,
         )
 
         self.store.save_plan(run_id, plan, actor="orchestrate")
@@ -864,7 +916,7 @@ class OrchestrateStage:
             task_id=task.task_id,
             lease_generation=task.lease_generation,
             read_only=True,
-            max_steps=8,
+            max_steps=12,
             trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
             model=model,
         )
@@ -1520,14 +1572,16 @@ class OrchestrateStage:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
         registry = self.driver_registry.with_factories(
-            default_driver_factories(store=self.store, run_id=run_id)
+            default_driver_factories(
+                store=self.store, run_id=run_id, provider=self.provider
+            )
         )
         worker = registry.resolve(
-            self.execution_drivers.worker_driver,
+            resolve_driver_spec(self.execution_drivers.worker_driver, provider=self.provider),
             native_factory=lambda model: self._native_driver(run_id, model),
         )
         reviewer = registry.resolve(
-            self.execution_drivers.reviewer_driver,
+            resolve_driver_spec(self.execution_drivers.reviewer_driver, provider=self.provider),
             native_factory=lambda model: self._native_driver(run_id, model, review=True),
         )
         monitor_factory = self._monitor_factory()

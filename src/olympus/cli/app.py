@@ -303,6 +303,13 @@ def cmd_run(
     provider: ProviderOpt = "auto",
     model: ModelOpt = None,
     base_url: BaseUrlOpt = None,
+    stage_driver: Annotated[
+        str | None,
+        typer.Option(
+            help="Planning driver for Align/Design/Plan: auto|native|pi "
+            "(optionally driver@model)."
+        ),
+    ] = None,
     worker_driver: Annotated[
         str | None,
         typer.Option(help="Stage 2 worker driver: native|pi (optionally driver@model)."),
@@ -322,6 +329,7 @@ def cmd_run(
         provider=llm,
         workspace_root=ws,
         execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver=stage_driver,
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,

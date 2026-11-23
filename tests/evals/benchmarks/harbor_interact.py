@@ -29,6 +29,18 @@ except Exception:  # pragma: no cover - the fallback branch runs in core pytest
     _HarborCapabilities = None
     _HarborExecResult = None
 
+try:  # pragma: no cover - connection specs ship with newer Harbor releases
+    from harbor.agents import agent_auth_resolution as _harbor_auth
+    from harbor.models import model_api_format as _harbor_api_format
+
+    _HarborModelConnectionSpec = _harbor_auth.ModelConnectionSpec
+    _HarborProviderAccess = _harbor_auth.ProviderAccess
+    _HarborModelApiFormat = _harbor_api_format.ModelApiFormat
+except Exception:  # pragma: no cover - old Harbor releases resolve natively
+    _HarborModelConnectionSpec = None
+    _HarborProviderAccess = None
+    _HarborModelApiFormat = None
+
 try:
     from .interact_bridge import DEFAULT_INITIAL_QUESTION, redact_text
 except ImportError:  # Imported as a top-level module by standalone tooling.
@@ -37,6 +49,7 @@ except ImportError:  # Imported as a top-level module by standalone tooling.
 VERSION = "0.1.0"
 BRIDGE_DIR = "/tmp/olympus-bridge"
 PI_PREFIX = "/tmp/pi-cli"
+GATEWAY_ENV_PREFIXES = ("OPENAI_", "ANTHROPIC_")
 _PLAN_ONLY_ROLE = "plan"
 _EXECUTE_ROLE = "execute"
 _HANDOFF_ROLE = "handoff"
@@ -126,6 +139,12 @@ def _as_optional_bool(value: Any) -> bool | None:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _driver_uses_pi(value: str | None) -> bool:
+    """Return True when a driver setting resolves to Pi after ``auto`` probing."""
+    name = (value or "").split("@", 1)[0].strip().lower()
+    return name in {"auto", "pi"}
+
+
 @dataclass(frozen=True)
 class InteractOptions:
     """Everything Harbor may pass through ``-ak key=value`` to the session CLI."""
@@ -135,8 +154,9 @@ class InteractOptions:
     provider: str | None = None
     model: str | None = None
     base_url: str | None = None
-    worker_driver: str | None = None
-    reviewer_driver: str | None = None
+    stage_driver: str | None = "auto"
+    worker_driver: str | None = "auto"
+    reviewer_driver: str | None = "auto"
     monitor_model: str | None = None
     max_turns_per_step: int = 8
     workspace_path: str = "/app"
@@ -151,6 +171,7 @@ class InteractOptions:
     pi_package: str = "@earendil-works/pi-coding-agent"
     install_pi: bool | None = None
     pi_bin: str | None = None
+    pi_bundle: str | None = None
     step_roles: str | None = None
     plan_path: str = "/tmp/plan.md"
     initial_question: str = DEFAULT_INITIAL_QUESTION
@@ -247,6 +268,19 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         if _HarborCapabilities is not None
         else _FallbackCapabilities()
     )
+    if _HarborModelConnectionSpec is not None:
+        MODEL_CONNECTION = _HarborModelConnectionSpec(
+            base_url_destination_names={"default": None},
+            supported_api_formats=[
+                _HarborModelApiFormat.OPENAI_CHAT_COMPLETIONS,
+                _HarborModelApiFormat.OPENAI_RESPONSES,
+                _HarborModelApiFormat.ANTHROPIC_MESSAGES,
+            ],
+            agent_provider_access=_HarborProviderAccess(
+                api_key_candidate_names=["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+                base_url_candidate_names=["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"],
+            ),
+        )
     DEFAULT_SETUP_TIMEOUT_SEC: ClassVar[float] = 900.0
 
     def __init__(
@@ -398,8 +432,39 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         options = self._interact
         if options.install_pi is not None:
             return options.install_pi
-        driver = (options.worker_driver or "").strip().lower()
-        return driver == "pi" or driver.startswith("pi@")
+        drivers = (options.stage_driver, options.worker_driver, options.reviewer_driver)
+        return any(_driver_uses_pi(driver) for driver in drivers)
+
+    def _gateway_env(self) -> dict[str, str] | None:
+        """Gateway credentials forwarded to the in-container Pi agent, never logged."""
+        env = {
+            key: value
+            for key, value in self.extra_env.items()
+            if key.startswith(GATEWAY_ENV_PREFIXES)
+        }
+        provider_key = (self._interact.provider or "").casefold()
+        env_groups: tuple[tuple[str, str], ...] = (
+            (("OPENAI_API_KEY", "OPENAI_BASE_URL"),)
+            if provider_key == "openai"
+            else (
+                (("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),)
+                if provider_key == "anthropic"
+                else (
+                    ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+                    ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+                )
+            )
+        )
+        for api_key_var, base_url_var in env_groups:
+            if api_key_var not in env:
+                host_key = os.environ.get(api_key_var, "").strip()
+                if host_key:
+                    env[api_key_var] = host_key
+            if base_url_var not in env:
+                host_base = (self._interact.base_url or os.environ.get(base_url_var, "")).strip()
+                if host_base:
+                    env[base_url_var] = host_base
+        return env or None
 
     async def _install_olympus(self, environment: Any) -> None:
         options = self._interact
@@ -503,17 +568,24 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                 '      UV_BOOT="$UV_BOOT_TRY"',
                 "    fi",
                 "  fi",
+                "  export UV_HTTP_TIMEOUT=120",
+                "  _uv_venv() {",
+                '    for _i in 1 2 3; do "$@" venv --quiet --python 3.13 "$VENV_DIR" '
+                "&& return 0; sleep 2; done",
+                "    return 1",
+                "  }",
                 '  if [ -n "$UV_BIN" ]; then',
-                '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
+                '    _uv_venv "$UV_BIN"',
                 f'    "$UV_BIN" pip install --quiet --python "$VENV_DIR/bin/python" {target}',
                 '  elif [ -n "$UV_BOOT" ]; then',
                 '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
-                '"$PY" -m uv venv --quiet --python 3.13 "$VENV_DIR"',
+                '_uv_venv "$PY" -m uv',
                 '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
                 f'"$PY" -m uv pip install --quiet --python "$VENV_DIR/bin/python" {target}',
                 "  elif command -v curl >/dev/null 2>&1; then",
-                "    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1",
-                '    "$HOME/.local/bin/uv" venv --quiet --python 3.13 "$VENV_DIR"',
+                "    curl -LsSf --retry 4 --retry-delay 2 https://astral.sh/uv/install.sh "
+                "| sh >/dev/null 2>&1",
+                '    _uv_venv "$HOME/.local/bin/uv"',
                 '    "$HOME/.local/bin/uv" pip install --quiet '
                 f'--python "$VENV_DIR/bin/python" {target}',
                 "  else",
@@ -544,20 +616,97 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
 
     async def _install_pi(self, environment: Any) -> None:
         options = self._interact
-        prefix = shlex.quote(PI_PREFIX)
-        command = (
-            "set -e; "
-            "if ! command -v npm >/dev/null 2>&1; then "
-            "  if command -v apt-get >/dev/null 2>&1; then "
-            "    apt-get update -qq && apt-get install -y -qq nodejs npm; "
-            "  else echo 'npm is required to install the pi CLI' >&2; exit 1; fi; "
-            "fi; "
-            f"npm install -g --ignore-scripts --prefix {prefix} "
-            f"{shlex.quote(options.pi_package)} && "
-            f"{shlex.quote(PI_PREFIX + '/bin/pi')} --version"
+        if options.pi_bundle:
+            bundle = Path(options.pi_bundle).expanduser().resolve()
+            if not bundle.is_file():
+                raise FileNotFoundError(f"Pi bundle not found: {bundle}")
+            await environment.upload_file(bundle, "/tmp/olympus-pi-bundle.tar.gz")
+            command = "\n".join(
+                [
+                    "set -eu",
+                    f"PI_DIR={shlex.quote(PI_PREFIX)}",
+                    'if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                    'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                    'tar -xzf /tmp/olympus-pi-bundle.tar.gz -C "$PI_DIR"',
+                    'rm -f /tmp/olympus-pi-bundle.tar.gz',
+                    'PI_BIN="$PI_DIR/bin/pi"',
+                    'chmod 755 "$PI_BIN"',
+                    'if [ -w /usr/local/bin ] && [ "$PI_BIN" != "/usr/local/bin/pi" ]; then '
+                    'ln -sf "$PI_BIN" /usr/local/bin/pi; fi',
+                    '"$PI_BIN" --version >/dev/null',
+                    'echo "$PI_BIN"',
+                ]
+            )
+            result = await self._exec(environment, command, timeout_sec=300)
+            candidates = [
+                line.strip()
+                for line in (result.stdout or "").splitlines()
+                if line.strip().startswith("/")
+            ]
+            self._installed_pi_bin = candidates[-1] if candidates else f"{PI_PREFIX}/bin/pi"
+            return
+        pkg = shlex.quote(options.pi_package)
+        command = "\n".join(
+            [
+                "set -eu",
+                'PI_BIN=""',
+                'if command -v pi >/dev/null 2>&1 && pi --version >/dev/null 2>&1; then',
+                "  PI_BIN=$(command -v pi)",
+                'elif [ -x "$HOME/.local/bin/pi" ] && '
+                '"$HOME/.local/bin/pi" --version >/dev/null 2>&1; then',
+                '  PI_BIN="$HOME/.local/bin/pi"',
+                f'elif [ -x {shlex.quote(PI_PREFIX + "/bin/pi")} ] && '
+                f'{shlex.quote(PI_PREFIX + "/bin/pi")} --version >/dev/null 2>&1; then',
+                f"  PI_BIN={shlex.quote(PI_PREFIX + '/bin/pi')}",
+                "else",
+                f'  PI_DIR={shlex.quote(PI_PREFIX)}',
+                '  if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                '  NODE_BIN=""',
+                '  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && '
+                'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); '
+                'process.exit(a>22||(a===22&&b>=19)?0:1)" >/dev/null 2>&1; then',
+                '    NODE_BIN=$(dirname "$(command -v node)")',
+                "  elif command -v curl >/dev/null 2>&1; then",
+                '    ARCH=$(uname -m)',
+                '    case "$ARCH" in x86_64|amd64) NARCH=x64;; '
+                'aarch64|arm64) NARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac',
+                '    NODE_DIR="$PI_DIR/node"',
+                '    mkdir -p "$NODE_DIR"',
+                '    curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors '
+                '"https://nodejs.org/dist/v22.21.1/node-v22.21.1-linux-${NARCH}.tar.gz" '
+                '-o /tmp/olympus-node.tar.gz',
+                '    tar -xzf /tmp/olympus-node.tar.gz -C "$NODE_DIR" --strip-components=1',
+                '    rm -f /tmp/olympus-node.tar.gz',
+                '    NODE_BIN="$NODE_DIR/bin"',
+                "  elif command -v npm >/dev/null 2>&1; then",
+                '    NODE_BIN=$(dirname "$(command -v npm)")',
+                "  else",
+                "    echo 'curl or Node.js >= 22.19 with npm is required' >&2; exit 1",
+                "  fi",
+                '  PATH="$NODE_BIN:$PATH" npm install -g --ignore-scripts '
+                f'--prefix "$PI_DIR" {pkg} >/dev/null',
+                '  WRAP="$PI_DIR/bin/pi-olympus"',
+                '  printf \'#!/bin/sh\\nexport PATH="%s:$PATH"\\nexec "%s/bin/pi" "$@"\\n\' '
+                '"$NODE_BIN" "$PI_DIR" > "$WRAP"',
+                '  chmod 755 "$WRAP"',
+                '  PI_BIN="$WRAP"',
+                "fi",
+                'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
+                '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
+                '  ln -sf "$PI_BIN" /usr/local/bin/pi',
+                "fi",
+                '"$PI_BIN" --version >/dev/null',
+                'echo "$PI_BIN"',
+            ]
         )
-        await self._exec(environment, command, timeout_sec=1800)
-        self._installed_pi_bin = f"{PI_PREFIX}/bin/pi"
+        result = await self._exec(environment, command, timeout_sec=1800)
+        candidates = [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip().startswith("/")
+        ]
+        self._installed_pi_bin = candidates[-1] if candidates else f"{PI_PREFIX}/bin/pi"
 
     @staticmethod
     def _project_root() -> Path:
@@ -598,7 +747,9 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             / f"olympus-interact-{step_tag}.jsonl"
         )
         argv = self._bridge_argv(role, remote_instruction, trajectory)
-        result = await environment.exec(shlex.join(argv), timeout_sec=None)
+        result = await environment.exec(
+            shlex.join(argv), timeout_sec=None, env=self._gateway_env()
+        )
         summary = self._parse_bridge_summary(result.stdout)
         if result.return_code != 0 or (summary or {}).get("status") != "ok":
             error = (summary or {}).get("error") or (
@@ -657,6 +808,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             ("--provider", options.provider),
             ("--model", options.model),
             ("--base-url", options.base_url),
+            ("--stage-driver", options.stage_driver),
             ("--worker-driver", options.worker_driver),
             ("--reviewer-driver", options.reviewer_driver),
             ("--monitor-model", options.monitor_model),

@@ -2,7 +2,8 @@
 
 Every test drives the real CLI through Typer's ``CliRunner`` against a real
 temporary git repository, with a scripted ``MockLLMProvider`` and an external
-state directory, so the observable contract is exactly what a Harbor adapter sees.
+state directory, so the observable contract is exactly what an external
+interactive harness sees.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 from olympus.cli.app import app
-from olympus.core.contracts import ApprovalTarget, RunStatus
+from olympus.core.contracts import ApprovalTarget, GoalSpec, RunStatus
 from olympus.core.store import RunStore
 from olympus.graph.loader import WORKFLOW_DIR
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolCall, ToolSpec
@@ -78,6 +79,7 @@ class SessionScript:
         self.router: list[str] = []
         self.workers: list[tuple[str, str]] = []
         self.worker_rounds = 0
+        self.planner_prompts: list[str] = []
 
     def provider(self) -> MockLLMProvider:
         return MockLLMProvider(responder=self._respond)
@@ -98,6 +100,7 @@ class SessionScript:
             assert self.design, "design response queue exhausted"
             return LLMResponse(content=self.design.pop(0))
         if "Task Planner" in system:
+            self.planner_prompts.append(user)
             assert self.plan, "plan response queue exhausted"
             return LLMResponse(content=self.plan.pop(0))
         if "Independent Verifier" in system:
@@ -208,7 +211,8 @@ def _goal_spec(
                 "id": "AMB-1",
                 "question": "What behavior should divide(1, 0) have?",
                 "impact": "Error contract",
-                "options": ["raise ValueError", "return None"],
+                "options": ["raise ValueError('zero')", "return None"],
+                "default_assumption": "raise ValueError('zero')",
                 "blocking": True,
             }
         ]
@@ -219,6 +223,7 @@ def _goal_spec(
                     "question": "Which numeric types must be accepted?",
                     "impact": "Input contract",
                     "options": ["integers only", "int and float"],
+                    "default_assumption": "int and float",
                     "blocking": True,
                 }
             )
@@ -643,6 +648,120 @@ def test_deterministic_validation_failure_pauses_blocked(
     assert "overlapping write_scope" in str(envelope["message"])
     assert envelope["changed_files"] == []
     assert _git_status(repo) == ""
+
+
+def test_invalid_check_syntax_auto_retries_before_pausing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    broken = (
+        "python3 -c \"import calculator; try: assert calculator.divide(6, 2) == 3; "
+        "except Exception: pass\""
+    )
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan(command=broken)))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, envelope = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(envelope, indent=2)
+    assert envelope["status"] == "completed"
+    assert envelope["pause_kind"] is None
+    assert envelope["changed_files"] == ["calculator.py"]
+    assert script.plan == []
+
+    plan = RunStore(state / "olympus.db").get_run(str(envelope["run_id"]))["plan"]
+    assert plan.tasks[0].acceptance_checks[0].command == _DIVIDE_CHECK
+
+
+def test_blocked_pause_hint_restarts_from_plan_and_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    hint = (
+        "The host has no tests directory; verify calculator.py with a "
+        "python3 -c import check instead."
+    )
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.extend(json.dumps(_invalid_overlapping_plan()) for _ in range(3))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append("invalid JSON")
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(blocked, indent=2)
+    assert blocked["pause_kind"] == "blocked"
+    assert "overlapping write_scope" in str(blocked["message"])
+    run_id = str(blocked["run_id"])
+
+    code, recovered = _invoke(["reply", run_id, hint, *_base(repo, state)])
+    assert code == 0, json.dumps(recovered, indent=2)
+    assert recovered["status"] == "completed"
+    assert recovered["changed_files"] == ["calculator.py"]
+    assert (repo / "calculator.py").read_text(encoding="utf-8") == _CALC_CODE
+
+    store = RunStore(state / "olympus.db")
+    continued = [
+        event.payload
+        for event in store.list_events(run_id)
+        if event.event_type == "session.continued"
+    ]
+    assert continued[-1]["recovery_node"] == "plan"
+    assert hint in continued[-1]["raw_input"]
+    assert hint in script.planner_prompts[-1]
+    assert store.get_run(run_id)["status"].value == "completed"
+
+
+def test_blocked_pause_hint_without_design_restarts_from_align(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.extend(
+        [json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))]
+    )
+    script.design.extend(["not a DesignSpec"] * 3)
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append("invalid JSON")
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(blocked, indent=2)
+    assert blocked["pause_kind"] == "blocked"
+
+    code, recovered = _invoke(
+        [
+            "reply",
+            str(blocked["run_id"]),
+            "Keep the design to calculator.py only; do not add new modules.",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0, json.dumps(recovered, indent=2)
+    assert recovered["status"] == "completed"
+    assert (repo / "calculator.py").is_file()
+
+    events = RunStore(state / "olympus.db").list_events(str(blocked["run_id"]))
+    recovery = [
+        event.payload
+        for event in events
+        if event.event_type == "session.continued"
+    ][-1]
+    assert recovery["recovery_node"] == "align"
 
 
 def test_post_completion_reply_reopens_and_applies_follow_up(
@@ -1432,6 +1551,254 @@ def test_explicit_ambiguity_answer_resolves_blocker_when_router_json_fails(
     assert not clarified["unresolved_blockers"]
 
 
+def test_default_assumption_reply_resolves_all_blockers_under_malformed_router_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec(ambiguity=True, two_ambiguities=True)))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append("this is definitely not json {{{")
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0
+    assert started["pause_kind"] == "clarify"
+    assert started["unresolved_blockers"] == ["ambiguity:AMB-1", "ambiguity:AMB-2"]
+    run_id = str(started["run_id"])
+
+    code, resumed = _invoke(
+        ["reply", run_id, "Use your default assumptions and proceed.", *_base(repo, state)]
+    )
+    assert code == 0, json.dumps(resumed, indent=2)
+    assert resumed["status"] == "completed"
+    assert resumed["unresolved_blockers"] == []
+    assert resumed["changed_files"] == ["calculator.py"]
+    assert (repo / "calculator.py").read_text(encoding="utf-8") == _CALC_CODE
+
+    snap = RunStore(state / "olympus.db").get_run(run_id)
+    answers = {amb.id: amb.answer for amb in snap["spec"].open_ambiguities}
+    assert answers == {
+        "AMB-1": "raise ValueError('zero')",
+        "AMB-2": "int and float",
+    }
+
+
+def test_align_repairs_blocking_ambiguity_without_default_assumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    missing_default = _goal_spec(ambiguity=True)
+    del missing_default["open_ambiguities"][0]["default_assumption"]
+    script = SessionScript()
+    script.align.extend([json.dumps(missing_default), json.dumps(_goal_spec(ambiguity=True))])
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append("invalid JSON")
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(started, indent=2)
+    assert started["pause_kind"] == "clarify"
+    assert script.align == []
+
+    snap = RunStore(state / "olympus.db").get_run(str(started["run_id"]))
+    ambiguity = snap["spec"].open_ambiguities[0]
+    assert ambiguity.default_assumption == "raise ValueError('zero')"
+
+    code, resumed = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "Use your default assumptions and proceed.",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0, json.dumps(resumed, indent=2)
+    assert resumed["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Use your default assumptions and proceed.",
+        "proceed with your recommendations",
+        "go with defaults",
+        "按默认方案继续",
+        "按推荐方案继续",
+    ],
+)
+@pytest.mark.parametrize(
+    "router_output",
+    ["invalid JSON", '{"action": "unknown"}', '{"action": "approve"}'],
+)
+def test_default_acceptance_resolves_pending_blockers_for_every_router_outcome(
+    message: str, router_output: str
+) -> None:
+    spec = GoalSpec.model_validate(_goal_spec(ambiguity=True, two_ambiguities=True))
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content=router_output)]),
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None},
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action == "clarify"
+    assert intent.answers == {
+        "AMB-1": "raise ValueError('zero')",
+        "AMB-2": "int and float",
+    }
+
+
+def test_default_acceptance_falls_back_to_first_option_then_user_message() -> None:
+    no_default = _goal_spec(ambiguity=True)
+    del no_default["open_ambiguities"][0]["default_assumption"]
+    spec = GoalSpec.model_validate(no_default)
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="invalid JSON")]),
+        message="Use your default assumptions and proceed.",
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None},
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action == "clarify"
+    assert intent.answers == {"AMB-1": "raise ValueError('zero')"}
+
+    bare = _goal_spec(ambiguity=True)
+    del bare["open_ambiguities"][0]["default_assumption"]
+    bare["open_ambiguities"][0]["options"] = []
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="invalid JSON")]),
+        message="按默认方案继续",
+        snapshot={
+            "status": RunStatus.AWAITING_HUMAN,
+            "spec": GoalSpec.model_validate(bare),
+            "plan": None,
+        },
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action == "clarify"
+    assert intent.answers == {"AMB-1": "按默认方案继续"}
+
+
+def test_explicit_id_pointing_at_defaults_uses_the_recorded_default() -> None:
+    spec = GoalSpec.model_validate(_goal_spec(ambiguity=True, two_ambiguities=True))
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="invalid JSON")]),
+        message="AMB-1: Use your default assumptions and proceed.",
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None},
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action == "clarify"
+    assert intent.answers == {
+        "AMB-1": "raise ValueError('zero')",
+        "AMB-2": "int and float",
+    }
+
+
+def test_default_acceptance_resolves_blocking_critiques() -> None:
+    data = _goal_spec()
+    data["minority_notes"] = [
+        {
+            "id": "CRIT-1",
+            "perspective": "qa",
+            "severity": "blocking",
+            "summary": "The error contract has no regression evidence.",
+        }
+    ]
+    spec = GoalSpec.model_validate(data)
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="invalid JSON")]),
+        message="Use your default assumptions and proceed.",
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None},
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action == "clarify"
+    assert intent.resolutions == {"CRIT-1": "Use your default assumptions and proceed."}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I am not going to approve this.",
+        "Please do not proceed.",
+        "Do not change anything.",
+        "Do not use your default assumptions.",
+    ],
+)
+@pytest.mark.parametrize("router_output", ["invalid JSON", '{"action": "approve"}'])
+def test_negated_or_no_change_replies_never_approve_or_resolve_defaults(
+    message: str, router_output: str
+) -> None:
+    spec = GoalSpec.model_validate(_goal_spec(ambiguity=True))
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content=router_output)]),
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None},
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert intent.action not in ("approve", "clarify", "reopen")
+    assert intent.answers == {}
+    assert intent.resolutions == {}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "C:\\Users\\demo\\.local\\share\\opencode\\opencode.db exists on this computer",
+        "What providers need _build_project_name?",
+        "The failing check should import calculator from the repo root.",
+    ],
+)
+@pytest.mark.parametrize(
+    "router_output",
+    [
+        "invalid JSON",
+        '{"action": "unknown"}',
+        '{"action": "approve"}',
+        '{"action": "reopen", "feedback": "invented"}',
+    ],
+)
+def test_blocked_pause_actionable_hints_route_to_revise(
+    message: str, router_output: str
+) -> None:
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content=router_output)]),
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None},
+        pause_kind=PauseKind.BLOCKED,
+        gate=None,
+    )
+    assert intent.action == "revise"
+    assert intent.feedback == message
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Please do not proceed.", "Do not change anything.", "???", "no"],
+)
+def test_blocked_pause_negated_or_empty_hints_never_route_to_revise(message: str) -> None:
+    intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="invalid JSON")]),
+        message=message,
+        snapshot={"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None},
+        pause_kind=PauseKind.BLOCKED,
+        gate=None,
+    )
+    assert intent.action != "revise"
+
+
 def test_delivery_checks_and_symlinked_sandboxes_never_pollute_target_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1479,3 +1846,293 @@ def test_delivery_checks_and_symlinked_sandboxes_never_pollute_target_repo(
     assert rejected["status"] == "failed"
     assert "inside" in str(rejected["error"])
     assert not (repo2 / ".olympus").exists()
+
+
+def test_session_start_records_stage_driver_option_and_defaults_to_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OLYMPUS_STAGE_DRIVER", raising=False)
+    monkeypatch.delenv("OLYMPUS_WORKER_DRIVER", raising=False)
+    monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            "--stage-driver",
+            "native",
+            *_base(repo, tmp_path / "state-explicit"),
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    explicit = RunStore(tmp_path / "state-explicit" / "olympus.db").get_run(
+        str(start["run_id"])
+    )["execution_drivers"]
+    assert explicit["stage_driver"] == "native"
+    assert explicit["worker_driver"] == "auto"
+    assert explicit["reviewer_driver"] == "auto"
+
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+    code, default_start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            *_base(repo, tmp_path / "state-default"),
+        ]
+    )
+    assert code == 0, json.dumps(default_start, indent=2)
+    recorded = RunStore(tmp_path / "state-default" / "olympus.db").get_run(
+        str(default_start["run_id"])
+    )["execution_drivers"]
+    assert recorded["stage_driver"] == "auto"
+
+
+def test_router_blocks_negated_defaults_questions_and_unchanged_refusals() -> None:
+    from olympus.core.contracts import GoalSpec, RunStatus
+    from olympus.providers.base import MockLLMProvider
+    from olympus.providers.types import LLMResponse
+    from olympus.session.contracts import PauseKind
+    from olympus.session.router import parse_reply
+
+    spec = GoalSpec.model_validate(
+        {
+            **_goal_spec(),
+            "open_ambiguities": [
+                {
+                    "id": "backend",
+                    "question": "Choose backend?",
+                    "impact": "Determines storage isolation",
+                    "blocking": True,
+                    "default_assumption": "Use isolated storage",
+                }
+            ],
+        }
+    )
+    snap = {"status": RunStatus.AWAITING_HUMAN, "spec": spec, "design": None, "plan": None}
+
+    for phrase in ("Do not use your default assumptions.", "Do not change anything."):
+        provider = MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps(
+                        {"action": "clarify", "answers": {"backend": "Use isolated storage"}}
+                    )
+                )
+            ]
+        )
+        intent = parse_reply(
+            provider=provider,
+            message=phrase,
+            snapshot=snap,
+            pause_kind=PauseKind.CLARIFY,
+        )
+        assert intent.action == "unknown", (phrase, intent)
+        assert intent.answers == {}
+
+    malformed = MockLLMProvider(responses=[LLMResponse(content="not json")])
+    q_intent = parse_reply(
+        provider=malformed,
+        message="What are the default assumptions?",
+        snapshot=snap,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert q_intent.action == "unknown"
+
+    malformed2 = MockLLMProvider(responses=[LLMResponse(content="not json")])
+    keep_intent = parse_reply(
+        provider=malformed2,
+        message="Keep everything unchanged.",
+        snapshot=snap,
+        pause_kind=PauseKind.BLOCKED,
+    )
+    assert keep_intent.action == "unknown"
+
+    # Conditional warnings and questions about defaults must never auto-fill blockers.
+    cond_intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="not json")]),
+        message="If we use your default assumptions, we might lose data.",
+        snapshot=snap,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert cond_intent.action == "unknown"
+    assert cond_intent.answers == {}
+
+    # Rejecting defaults while supplying one explicit ID must keep only that explicit ID.
+    spec2 = GoalSpec.model_validate(
+        {
+            **_goal_spec(),
+            "open_ambiguities": [
+                {
+                    "id": "backend",
+                    "question": "Choose backend?",
+                    "impact": "Storage",
+                    "blocking": True,
+                    "default_assumption": "isolation",
+                },
+                {
+                    "id": "limit",
+                    "question": "Choose limit?",
+                    "impact": "Quota",
+                    "blocking": True,
+                    "default_assumption": "20",
+                },
+            ],
+        }
+    )
+    snap2 = {"status": RunStatus.AWAITING_HUMAN, "spec": spec2, "design": None, "plan": None}
+    mixed_intent = parse_reply(
+        provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps(
+                        {"action": "clarify", "answers": {"backend": "guessed", "limit": "20"}}
+                    )
+                )
+            ]
+        ),
+        message="Do not use your default assumptions.\nbackend: exact choice",
+        snapshot=snap2,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert mixed_intent.action == "clarify"
+    assert mixed_intent.answers == {"backend": "exact choice"}
+
+
+def test_session_reply_preserves_builtin_workflow_and_explicit_stage_driver_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.plan.append("not-json-plan")
+    script.plan.append("not-json-plan")
+    script.plan.append("not-json-plan")
+    _patch_provider(monkeypatch, script)
+
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workflow",
+            "repo_fast_patch",
+            "--stage-driver",
+            "native",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    assert start["pause_kind"] == "blocked"
+    run_id = str(start["run_id"])
+
+    # Reply omitting --workflow must reload repo_fast_patch and recover at plan.
+    script2 = SessionScript()
+    script2.router.append(json.dumps({"action": "revise", "feedback": "Use calc.py"}))
+    script2.plan.append(json.dumps(_plan()))
+    _patch_provider(monkeypatch, script2)
+    code2, resumed = _invoke(
+        [
+            "reply",
+            run_id,
+            "Use calc.py",
+            "--step-mode",
+            "plan_only",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code2 == 0, json.dumps(resumed, indent=2)
+    assert resumed["workflow"] == "repo_fast_patch"
+    assert resumed["pause_kind"] == "plan_handoff"
+    events = RunStore(state / "olympus.db").list_events(run_id)
+    continued = [e for e in events if e.event_type == "session.continued"]
+    assert continued[-1].payload["recovery_node"] == "plan"
+
+    # Explicit --stage-driver pi on reply must not be ignored even when snapshot recorded native.
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(tmp_path / "missing-pi"))
+    from olympus.harness.pi import _reset_pi_availability_cache
+
+    _reset_pi_availability_cache()
+    script3 = SessionScript()
+    script3.router.append(json.dumps({"action": "revise", "feedback": "Try with pi"}))
+    _patch_provider(monkeypatch, script3)
+    code3, failed = _invoke(
+        [
+            "reply",
+            run_id,
+            "Try with pi",
+            "--stage-driver",
+            "pi",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code3 == 1
+    assert failed["status"] == "failed"
+    assert "PiDriver requires" in str(failed["error"])
+    _reset_pi_availability_cache()
+
+
+def test_session_reopen_completed_custom_align_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import re
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    custom = tmp_path / "custom.yaml"
+    original = (WORKFLOW_DIR / "product_blueprint.yaml").read_text(encoding="utf-8")
+    renamed = re.sub(r"(?m)(:\s*)align$", r"\1custom_align", original)
+    custom.write_text(
+        renamed.replace("name: product_blueprint", "name: custom_blueprint"),
+        encoding="utf-8",
+    )
+    script = SessionScript()
+    script.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append(json.dumps({"action": "reopen", "feedback": "Add validation rule"}))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workflow",
+            str(custom),
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0 and started["status"] == "completed", started
+    code2, reopened = _invoke(
+        ["reply", str(started["run_id"]), "Add validation rule", *_base(repo, state)]
+    )
+    assert code2 == 0, reopened
+    assert reopened["workflow"] == "custom_blueprint"
+    assert reopened["error"] is None

@@ -126,6 +126,25 @@ def _resolve_user_api_base(
     return None
 
 
+def _register_agent_env_secrets(env: Mapping[str, str]) -> str:
+    ref = f"env-ref:{uuid.uuid4().hex}"
+    _user_api_key_refs()[ref] = json.dumps(dict(env))
+    return ref
+
+
+def _resolve_agent_env_secrets(agent_env_ref: str | None) -> dict[str, str]:
+    if not agent_env_ref:
+        return {}
+    raw = _user_api_key_refs().get(agent_env_ref)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+
+
 _SENSITIVE_URL_QUERY_RE = re.compile(
     r"(?:key|token|secret|auth|pass|pwd|sig|cred)", re.IGNORECASE
 )
@@ -578,6 +597,12 @@ def _split_model_name(name: str | None) -> tuple[str | None, str | None]:
     return None, cleaned or None
 
 
+def _driver_uses_pi(value: str | None) -> bool:
+    """Return True when a driver setting resolves to Pi after ``auto`` probing."""
+    name = (value or "").split("@", 1)[0].strip().lower()
+    return name in {"auto", "pi"}
+
+
 def default_project_root() -> Path:
     """Repository root of this checkout (``pyproject.toml`` + ``src/olympus``)."""
     return Path(__file__).resolve().parents[3]
@@ -647,17 +672,24 @@ def build_install_script(*, install_target: str, olympus_bin: str = "olympus") -
             '      UV_BOOT="$UV_BOOT_TRY"',
             "    fi",
             "  fi",
+            "  export UV_HTTP_TIMEOUT=120",
+            "  _uv_venv() {",
+            '    for _i in 1 2 3; do "$@" venv --quiet --python 3.13 "$VENV_DIR" '
+            "&& return 0; sleep 2; done",
+            "    return 1",
+            "  }",
             '  if [ -n "$UV_BIN" ]; then',
-            '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
+            '    _uv_venv "$UV_BIN"',
             f'    "$UV_BIN" pip install --quiet --python "$VENV_DIR/bin/python" {target}',
             '  elif [ -n "$UV_BOOT" ]; then',
             '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
-            '"$PY" -m uv venv --quiet --python 3.13 "$VENV_DIR"',
+            '_uv_venv "$PY" -m uv',
             '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
             f'"$PY" -m uv pip install --quiet --python "$VENV_DIR/bin/python" {target}',
             "  elif command -v curl >/dev/null 2>&1; then",
-            "    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1",
-            '    "$HOME/.local/bin/uv" venv --quiet --python 3.13 "$VENV_DIR"',
+            "    curl -LsSf --retry 4 --retry-delay 2 https://astral.sh/uv/install.sh "
+            "| sh >/dev/null 2>&1",
+            '    _uv_venv "$HOME/.local/bin/uv"',
             '    "$HOME/.local/bin/uv" pip install --quiet '
             f'--python "$VENV_DIR/bin/python" {target}',
             "  else",
@@ -809,8 +841,9 @@ class UserEnabledOlympusAgent(BaseAgent):
         # Olympus passthrough
         workflow: str = "full_sdlc_tdd",
         gate_policy: str = "interactive_minimal",
-        worker_driver: str | None = None,
-        reviewer_driver: str | None = None,
+        stage_driver: str | None = "auto",
+        worker_driver: str | None = "auto",
+        reviewer_driver: str | None = "auto",
         monitor_model: str | None = None,
         provider: str | None = None,
         model: str | None = None,
@@ -825,8 +858,10 @@ class UserEnabledOlympusAgent(BaseAgent):
         olympus_source: str | None = None,
         olympus_bin: str = "olympus",
         pi_package: str = "@earendil-works/pi-coding-agent",
+        pi_bundle: str | None = None,
         install_pi: bool | None = None,
         extra_env: Mapping[str, str] | None = None,
+        agent_env_ref: str | None = None,
         # Reactive user simulator
         user_model_name: str = "anthropic/claude-opus-4-6",
         user_api_base: str | None = None,
@@ -854,6 +889,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         derived_provider, derived_model = _split_model_name(model_name)
         self._workflow = str(workflow or "full_sdlc_tdd")
         self._gate_policy = str(gate_policy or "interactive_minimal")
+        self._stage_driver = stage_driver.strip() if stage_driver else None
         self._worker_driver = worker_driver.strip() if worker_driver else None
         self._reviewer_driver = reviewer_driver.strip() if reviewer_driver else None
         self._monitor_model = monitor_model.strip() if monitor_model else None
@@ -875,9 +911,45 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._olympus_source = olympus_source
         self._olympus_bin = olympus_bin.strip() or "olympus"
         self._pi_package = pi_package.strip()
-        driver_name = (self._worker_driver or "").split("@", 1)[0].strip().lower()
-        self._needs_pi = bool(install_pi) if install_pi is not None else driver_name == "pi"
-        self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
+        self._pi_bundle = pi_bundle
+        driver_settings = (
+            self._stage_driver,
+            self._worker_driver,
+            self._reviewer_driver,
+        )
+        self._needs_pi = (
+            bool(install_pi)
+            if install_pi is not None
+            else any(_driver_uses_pi(value) for value in driver_settings)
+        )
+        self._extra_env = {
+            **_resolve_agent_env_secrets(agent_env_ref),
+            **{str(key): str(value) for key, value in (extra_env or {}).items()},
+        }
+        # Fallback for Harbor < 0.27 (no MODEL_CONNECTION): forward active provider
+        # credentials in memory at runtime without persisting them in TrialConfig.
+        provider_key = self._provider.casefold()
+        env_groups: tuple[tuple[str, str], ...] = (
+            (("OPENAI_API_KEY", "OPENAI_BASE_URL"),)
+            if provider_key == "openai"
+            else (
+                (("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),)
+                if provider_key == "anthropic"
+                else (
+                    ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+                    ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+                )
+            )
+        )
+        for api_key_var, base_url_var in env_groups:
+            if api_key_var not in self._extra_env:
+                host_key = os.environ.get(api_key_var, "").strip()
+                if host_key:
+                    self._extra_env[api_key_var] = host_key
+            if base_url_var not in self._extra_env:
+                host_base = (self._base_url or os.environ.get(base_url_var, "")).strip()
+                if host_base:
+                    self._extra_env[base_url_var] = host_base
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
         self._user_model_name = user_model_name
@@ -999,17 +1071,86 @@ class UserEnabledOlympusAgent(BaseAgent):
         return await self._exec(environment, script, cwd="/", timeout_sec=900, env={})
 
     async def _install_pi(self, environment: Any) -> None:
-        script = "\n".join(
-            [
-                "set -eu",
-                "if command -v pi >/dev/null 2>&1; then command -v pi; exit 0; fi",
-                "if ! command -v npm >/dev/null 2>&1; then "
-                'echo "npm unavailable; Pi CLI not installed" >&2; exit 0; fi',
-                f"npm install -g --ignore-scripts {shlex.quote(self._pi_package)}",
-                "command -v pi",
-            ]
-        )
+        if self._pi_bundle:
+            bundle = Path(self._pi_bundle).expanduser().resolve()
+            if not bundle.is_file():
+                raise FileNotFoundError(f"Pi bundle not found: {bundle}")
+            await environment.upload_file(
+                source_path=bundle, target_path="/tmp/olympus-pi-bundle.tar.gz"
+            )
+            script = "\n".join(
+                [
+                    "set -eu",
+                    "PI_DIR=/opt/olympus-pi",
+                    'if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                    'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                    'tar -xzf /tmp/olympus-pi-bundle.tar.gz -C "$PI_DIR"',
+                    "rm -f /tmp/olympus-pi-bundle.tar.gz",
+                    'PI_BIN="$PI_DIR/bin/pi"',
+                    'chmod 755 "$PI_BIN"',
+                    'if [ -w /usr/local/bin ] && [ "$PI_BIN" != "/usr/local/bin/pi" ]; then '
+                    'ln -sf "$PI_BIN" /usr/local/bin/pi; fi',
+                    '"$PI_BIN" --version >/dev/null',
+                    'echo "$PI_BIN"',
+                ]
+            )
+        else:
+            pkg = shlex.quote(self._pi_package)
+            script = "\n".join(
+                [
+                    "set -eu",
+                    'PI_BIN=""',
+                    'if command -v pi >/dev/null 2>&1 && pi --version >/dev/null 2>&1; then',
+                    "  PI_BIN=$(command -v pi)",
+                    'elif [ -x "$HOME/.local/bin/pi" ] && '
+                    '"$HOME/.local/bin/pi" --version >/dev/null 2>&1; then',
+                    '  PI_BIN="$HOME/.local/bin/pi"',
+                    "else",
+                    "  PI_DIR=/opt/olympus-pi",
+                    '  if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                    'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                    '  NODE_BIN=""',
+                    '  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && '
+                    'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); '
+                    'process.exit(a>22||(a===22&&b>=19)?0:1)" >/dev/null 2>&1; then',
+                    '    NODE_BIN=$(dirname "$(command -v node)")',
+                    "  elif command -v curl >/dev/null 2>&1; then",
+                    "    ARCH=$(uname -m)",
+                    '    case "$ARCH" in x86_64|amd64) NARCH=x64;; '
+                    'aarch64|arm64) NARCH=arm64;; '
+                    '*) echo "unsupported arch: $ARCH" >&2; exit 1;; esac',
+                    '    NODE_DIR="$PI_DIR/node"',
+                    '    mkdir -p "$NODE_DIR"',
+                    "    curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors "
+                    '"https://nodejs.org/dist/v22.21.1/node-v22.21.1-linux-${NARCH}.tar.gz" '
+                    "-o /tmp/olympus-node.tar.gz",
+                    '    tar -xzf /tmp/olympus-node.tar.gz -C "$NODE_DIR" --strip-components=1',
+                    "    rm -f /tmp/olympus-node.tar.gz",
+                    '    NODE_BIN="$NODE_DIR/bin"',
+                    "  elif command -v npm >/dev/null 2>&1; then",
+                    '    NODE_BIN=$(dirname "$(command -v npm)")',
+                    "  else",
+                    '    echo "curl and npm unavailable; Pi CLI not installed" >&2',
+                    "    exit 0",
+                    "  fi",
+                    '  PATH="$NODE_BIN:$PATH" npm install -g --ignore-scripts '
+                    f'--prefix "$PI_DIR" {pkg} >/dev/null',
+                    '  WRAP="$PI_DIR/bin/pi-olympus"',
+                    '  printf \'#!/bin/sh\\nexport PATH="%s:$PATH"\\nexec "%s/bin/pi" "$@"\\n\' '
+                    '"$NODE_BIN" "$PI_DIR" > "$WRAP"',
+                    '  chmod 755 "$WRAP"',
+                    '  PI_BIN="$WRAP"',
+                    "fi",
+                    'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
+                    '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
+                    '  ln -sf "$PI_BIN" /usr/local/bin/pi',
+                    "fi",
+                    '"$PI_BIN" --version >/dev/null',
+                    'echo "$PI_BIN"',
+                ]
+            )
         result = await self._exec(environment, script, cwd="/", timeout_sec=900, env={})
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / "setup-pi.txt").write_text(
             f"return_code={result.return_code}\n"
             f"stdout:\n{redact_text(result.stdout, self._redaction_secrets)}\n\n"
@@ -1018,12 +1159,18 @@ class UserEnabledOlympusAgent(BaseAgent):
         )
         if result.return_code != 0:
             log.warning(
-                "Pi CLI installation failed (worker_driver=%s): %s",
+                "Pi CLI installation failed (stage=%s worker=%s reviewer=%s): %s",
+                self._stage_driver,
                 self._worker_driver,
+                self._reviewer_driver,
                 redact_text(
                     result.stderr or result.stdout or "", self._redaction_secrets
                 ).strip()[-1000:],
             )
+            return
+        resolved = _resolved_binary(result.stdout)
+        if resolved:
+            self._extra_env.setdefault("OLYMPUS_PI_BIN", resolved)
 
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
@@ -1133,6 +1280,7 @@ class UserEnabledOlympusAgent(BaseAgent):
             ("--provider", self._provider),
             ("--model", self._model),
             ("--base-url", self._base_url),
+            ("--stage-driver", self._stage_driver),
             ("--worker-driver", self._worker_driver),
             ("--reviewer-driver", self._reviewer_driver),
             ("--monitor-model", self._monitor_model),
@@ -1657,6 +1805,16 @@ def build_olympus_trial_config(
     if isinstance(raw_base, str) and raw_base:
         sim_kwargs["user_api_base_ref"] = _register_user_api_base(raw_base)
 
+    safe_agent_env: dict[str, str] = {}
+    secret_agent_env: dict[str, str] = {}
+    for key, value in (agent_env or {}).items():
+        if _SENSITIVE_ENV_RE.search(str(key)):
+            secret_agent_env[str(key)] = str(value)
+        else:
+            safe_agent_env[str(key)] = str(value)
+    if secret_agent_env:
+        sim_kwargs["agent_env_ref"] = _register_agent_env_secrets(secret_agent_env)
+
     (
         AgentConfigClass,
         EnvironmentConfigClass,
@@ -1671,7 +1829,7 @@ def build_olympus_trial_config(
         base_url=base_url,
         override_timeout_sec=agent_timeout,
         kwargs=sim_kwargs,
-        env=dict(agent_env or {}),
+        env=safe_agent_env,
     )
     environment_config = EnvironmentConfigClass(
         type=env_type,

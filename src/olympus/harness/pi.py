@@ -8,15 +8,18 @@ pumped on a dedicated reader thread, tool milestones are normalized onto the
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -26,6 +29,9 @@ from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.harness.driver import ActiveTurnHandle, DriverEvent, DriverTurnRequest, TurnOutcome
 from olympus.harness.receipt import build_turn_receipt
+from olympus.providers.auth import ExternalGatewayBinding
+from olympus.providers.base import LLMProvider
+from olympus.providers.factory import resolve_external_gateway_from_env
 from olympus.tools.aci import build_sandbox_env
 
 _INSTALL_HINT = (
@@ -61,8 +67,85 @@ class PiNotAvailableError(RuntimeError):
     """Raised when the configured Pi CLI is missing or unusable."""
 
 
-_help_cache: dict[str, bool] = {}
+_BinaryCacheKey = tuple[str, int, int]
+_help_cache: dict[_BinaryCacheKey, bool] = {}
 _help_cache_lock = threading.Lock()
+_availability_cache: dict[_BinaryCacheKey, bool] = {}
+_availability_cache_lock = threading.Lock()
+_SECRET_ENV_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|passwd|credential|authorization|auth)"
+)
+
+
+def _binary_cache_key(resolved: str) -> _BinaryCacheKey:
+    """Bind cached binary probes to the concrete file identity on disk."""
+    try:
+        st = os.stat(resolved)
+        return (resolved, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (resolved, -1, -1)
+
+
+def _collect_redaction_secrets(
+    env: Mapping[str, str], extra_secrets: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    values: set[str] = {s for s in extra_secrets if s and len(s) >= 8}
+    for key, val in env.items():
+        if val and len(val) >= 8 and _SECRET_ENV_RE.search(key):
+            values.add(val)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _redact_secrets(text: str, secrets: tuple[str, ...]) -> str:
+    if not text or not secrets:
+        return text
+    redacted = text
+    for secret in secrets:
+        redacted = redacted.replace(secret, "***")
+    return redacted
+
+
+def _redact_value(value: Any, secrets: tuple[str, ...]) -> Any:
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        return _redact_secrets(value, secrets)
+    if isinstance(value, dict):
+        return {k: _redact_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item, secrets) for item in value]
+    return value
+
+
+def pi_available(*, binary: str | None = None) -> bool:
+    """Return True when the Pi CLI resolves and passes its cached ``--help`` probe."""
+    requested = (binary or os.getenv("OLYMPUS_PI_BIN", "") or "pi").strip()
+    try:
+        resolved = _resolve_binary(requested)
+    except PiNotAvailableError:
+        return False
+    cache_key = _binary_cache_key(resolved)
+    with _availability_cache_lock:
+        cached = _availability_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    available = False
+    try:
+        _probe_rpc_support(resolved, dict(os.environ))
+        available = True
+    except PiNotAvailableError:
+        available = False
+    with _availability_cache_lock:
+        _availability_cache[cache_key] = available
+    return available
+
+
+def _reset_pi_availability_cache() -> None:
+    """Drop cached probes (used by tests that swap fake binaries per case)."""
+    with _availability_cache_lock:
+        _availability_cache.clear()
+    with _help_cache_lock:
+        _help_cache.clear()
 
 
 def _resolve_binary(binary: str | None) -> str:
@@ -77,9 +160,10 @@ def _resolve_binary(binary: str | None) -> str:
 
 
 def _probe_rpc_support(binary: str, env: dict[str, str]) -> bool:
-    """Negotiate Pi's output protocol from ``--help`` once per binary path."""
+    """Negotiate Pi's output protocol from ``--help`` once per concrete binary."""
+    cache_key = _binary_cache_key(binary)
     with _help_cache_lock:
-        cached = _help_cache.get(binary)
+        cached = _help_cache.get(cache_key)
     if cached is not None:
         return cached
     proc: subprocess.Popen[str] | None = None
@@ -115,7 +199,7 @@ def _probe_rpc_support(binary: str, env: dict[str, str]) -> bool:
         )
     supports_rpc = "rpc" in mode_help
     with _help_cache_lock:
-        _help_cache[binary] = supports_rpc
+        _help_cache[cache_key] = supports_rpc
     return supports_rpc
 
 
@@ -165,6 +249,86 @@ def _non_negative_int(value: Any) -> int:
         return 0
 
 
+def _read_only_tmp_dir(request: DriverTurnRequest) -> Path | None:
+    """Keep temp dirs outside the repository for read-only turns on the repo root."""
+    if not request.read_only:
+        return None
+    ws = request.workspace_path.resolve()
+    host = request.env_root.resolve()
+    if ws != host and not ws.is_relative_to(host):
+        return None
+    safe_actor = "".join(c if c.isalnum() or c in "-_" else "-" for c in request.actor) or "stage"
+    if request.trace_path is not None:
+        trace_parent = request.trace_path.resolve().parent
+        if not trace_parent.is_relative_to(ws):
+            return trace_parent / ".pi_tmp" / safe_actor
+    digest = hashlib.sha256(str(ws).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "olympus-pi-readonly-tmp" / f"{digest}-{safe_actor}"
+
+
+def _build_pi_env(request: DriverTurnRequest) -> dict[str, str]:
+    return build_sandbox_env(
+        request.workspace_path,
+        host_root=request.env_root,
+        tmp_dir=_read_only_tmp_dir(request),
+    )
+
+
+def _prepare_gateway_config(
+    env: dict[str, str],
+    model: str | None,
+    *,
+    provider: LLMProvider | None = None,
+) -> tuple[str | None, str | None, Path | None, tuple[str, ...]]:
+    """Synthesize an ephemeral ``PI_CODING_AGENT_DIR/models.json`` for custom gateways.
+
+    Active provider gateway metadata wins over ambient environment variables so Pi
+    always targets the exact dialect and base URL selected by the session. Credentials
+    stay as ``$ENV_VAR`` references so no API keys are ever written to disk.
+    """
+    if env.get("PI_CODING_AGENT_DIR"):
+        return None, model, None, ()
+    binding: ExternalGatewayBinding | None = None
+    binder = getattr(provider, "external_gateway_binding", None)
+    if callable(binder):
+        maybe = binder(model)
+        if isinstance(maybe, ExternalGatewayBinding):
+            binding = maybe
+    if binding is None:
+        binding = resolve_external_gateway_from_env(env, model)
+    if binding is None:
+        return None, model, None, ()
+
+    extra_secrets: list[str] = []
+    if binding.api_key_env:
+        api_key_ref = f"${binding.api_key_env}"
+    else:
+        env["OLYMPUS_PI_GATEWAY_KEY"] = binding.api_key or "keyless"
+        api_key_ref = "$OLYMPUS_PI_GATEWAY_KEY"
+        if binding.api_key:
+            extra_secrets.append(binding.api_key)
+
+    cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
+    os.chmod(cfg_dir, 0o700)
+    models_doc = {
+        "providers": {
+            "olympus-gateway": {
+                "baseUrl": binding.base_url,
+                "api": binding.api,
+                "apiKey": api_key_ref,
+                "models": [{"id": binding.model_id}],
+            }
+        }
+    }
+    models_file = cfg_dir / "models.json"
+    models_file.write_text(json.dumps(models_doc, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(models_file, 0o600)
+    env["PI_CODING_AGENT_DIR"] = str(cfg_dir)
+    env.setdefault("PI_OFFLINE", "1")
+    env.setdefault("PI_SKIP_VERSION_CHECK", "1")
+    return "olympus-gateway", binding.model_id, cfg_dir, tuple(extra_secrets)
+
+
 def _safe_argv(command: list[str]) -> list[str]:
     """Redact prompts/API keys so the on-disk trace stays introspectable but compact."""
     safe: list[str] = []
@@ -197,12 +361,18 @@ class _TraceWriter:
         self._path = path
         self._lock = threading.Lock()
         self._handle: Any = None
+        self._secrets: tuple[str, ...] = ()
+
+    def set_secrets(self, secrets: tuple[str, ...]) -> None:
+        with self._lock:
+            self._secrets = secrets
 
     def append(self, entry: dict[str, Any]) -> None:
         if self._path is None:
             return
-        record = {"timestamp": utc_now().isoformat(), **entry}
         with self._lock:
+            safe_entry = _redact_value(entry, self._secrets)
+            record = {"timestamp": utc_now().isoformat(), **safe_entry}
             if self._handle is None:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 self._handle = self._path.open("a", encoding="utf-8")
@@ -230,6 +400,7 @@ class _PiTurn:
         term_grace_seconds: float,
         scope_guard_path: Path,
         emit: DriverEvent | None,
+        provider: LLMProvider | None = None,
     ) -> None:
         self._request = request
         self._binary = binary
@@ -240,6 +411,7 @@ class _PiTurn:
         self._term_grace_seconds = term_grace_seconds
         self._scope_guard_path = scope_guard_path
         self._emit_callback = emit
+        self._provider = provider
         self._trace = _TraceWriter(request.trace_path)
         self._lock = threading.Lock()
         self._stdin_lock = threading.Lock()
@@ -250,6 +422,7 @@ class _PiTurn:
         self._cancel_requested = False
         self._budget_exhausted_reason = ""
         self._max_steps_exceeded = False
+        self._budget_steer_steps: set[int] = set()
         self._stdin_closed = False
         self._steps = 0
         self._tool_started_at: dict[str, float] = {}
@@ -261,7 +434,13 @@ class _PiTurn:
         self._aborted = False
         self._prompt_error = ""
         self._saw_error_message = False
+        self._last_error_message = ""
+        self._last_stderr_line = ""
         self._returncode: int | None = None
+        self._gateway_provider: str | None = None
+        self._gateway_model: str | None = request.model
+        self._gateway_config_dir: Path | None = None
+        self._redaction_secrets: tuple[str, ...] = ()
 
     @property
     def supports_steer(self) -> bool:
@@ -360,9 +539,17 @@ class _PiTurn:
         )
 
     def _spawn(self) -> None:
-        env = build_sandbox_env(self._request.workspace_path, host_root=self._request.env_root)
+        env = _build_pi_env(self._request)
         env["OLYMPUS_PI_WRITE_SCOPE"] = json.dumps(self._request.write_scope)
         env["OLYMPUS_PI_FORBIDDEN_GLOBS"] = json.dumps(self._request.forbidden_globs)
+        provider_name, model_id, cfg_dir, extra_secrets = _prepare_gateway_config(
+            env, self._request.model, provider=self._provider
+        )
+        self._gateway_provider = provider_name
+        self._gateway_model = model_id
+        self._gateway_config_dir = cfg_dir
+        self._redaction_secrets = _collect_redaction_secrets(env, extra_secrets)
+        self._trace.set_secrets(self._redaction_secrets)
         command = self._build_command()
         self._trace.append(
             {
@@ -403,9 +590,13 @@ class _PiTurn:
         ]
         if request.system_prompt.strip():
             command += ["--append-system-prompt", request.system_prompt]
-        if request.model:
-            command += ["--model", request.model]
-        if request.read_only:
+        if self._gateway_provider:
+            command += ["--provider", self._gateway_provider]
+        if self._gateway_model:
+            command += ["--model", self._gateway_model]
+        if request.disable_tools:
+            command += ["--no-tools"]
+        elif request.read_only:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
         else:
             command += ["--tools", _WRITABLE_TOOLS]
@@ -449,25 +640,30 @@ class _PiTurn:
                 break
 
     def _reap(self) -> None:
-        process = self._process
-        if process is None:
-            return
-        with suppress(subprocess.TimeoutExpired):
-            self._returncode = process.wait(timeout=5)
-        if process.poll() is None:
-            self._signal_group(signal.SIGKILL)
+        try:
+            process = self._process
+            if process is None:
+                return
             with suppress(subprocess.TimeoutExpired):
                 self._returncode = process.wait(timeout=5)
-        self._signal_group(signal.SIGKILL)
-        if self._reader is not None:
-            self._reader.join(timeout=5.0)
-        if self._prompt_thread is not None:
-            self._prompt_thread.join(timeout=2.0)
-        self._close_stdin(nonblocking=True)
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                with suppress(Exception):
-                    stream.close()
+            if process.poll() is None:
+                self._signal_group(signal.SIGKILL)
+                with suppress(subprocess.TimeoutExpired):
+                    self._returncode = process.wait(timeout=5)
+            self._signal_group(signal.SIGKILL)
+            if self._reader is not None:
+                self._reader.join(timeout=5.0)
+            if self._prompt_thread is not None:
+                self._prompt_thread.join(timeout=2.0)
+            self._close_stdin(nonblocking=True)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(Exception):
+                        stream.close()
+        finally:
+            if self._gateway_config_dir is not None:
+                shutil.rmtree(self._gateway_config_dir, ignore_errors=True)
+                self._gateway_config_dir = None
 
     def _escalate_cancel(self) -> None:
         if self._closed.wait(self._cancel_grace_seconds):
@@ -542,7 +738,10 @@ class _PiTurn:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if not line:
                     continue
-                self._trace.append({"source": "pi.stderr", "line": line[:2000]})
+                redacted = _redact_secrets(line, self._redaction_secrets)[:2000]
+                with self._lock:
+                    self._last_stderr_line = redacted[:300]
+                self._trace.append({"source": "pi.stderr", "line": redacted})
         except (OSError, ValueError):
             return
 
@@ -557,7 +756,8 @@ class _PiTurn:
                     try:
                         record = json.loads(line)
                     except json.JSONDecodeError:
-                        self._trace.append({"source": "pi.unparsed", "line": line[:2000]})
+                        redacted = _redact_secrets(line, self._redaction_secrets)[:2000]
+                        self._trace.append({"source": "pi.unparsed", "line": redacted})
                         continue
                     if not isinstance(record, dict):
                         continue
@@ -565,7 +765,8 @@ class _PiTurn:
                         self._trace.append({"source": "pi", "record": record})
                     self._handle_record(record)
         except (OSError, ValueError) as exc:
-            self._trace.append({"event": "pi.reader_error", "error": str(exc)[:300]})
+            err_text = _redact_secrets(str(exc), self._redaction_secrets)[:300]
+            self._trace.append({"event": "pi.reader_error", "error": err_text})
         finally:
             self._close_stdin(nonblocking=True)
             self._closed.set()
@@ -698,8 +899,19 @@ class _PiTurn:
             step = self._steps
             self._total_input_tokens += input_tokens
             self._total_output_tokens += output_tokens
-            if message.get("stopReason") == "error":
-                self._saw_error_message = True
+            # Track whether the *latest* assistant message errored so a transient
+            # transport error that Pi retries and recovers from does not fail the turn.
+            is_error_msg = message.get("stopReason") == "error"
+            self._saw_error_message = is_error_msg
+            if is_error_msg:
+                raw_err = str(message.get("errorMessage") or message.get("error") or "").strip()
+                self._last_error_message = (
+                    _redact_secrets(raw_err, self._redaction_secrets)[:300]
+                    if raw_err
+                    else ""
+                )
+            else:
+                self._last_error_message = ""
         text = _assistant_text(message)
         if text:
             self._final_content = text
@@ -738,20 +950,47 @@ class _PiTurn:
                 "cache_write_tokens": cache_write_tokens,
             },
         )
+        stop_reason = str(message.get("stopReason") or "")
         if over_budget:
             with self._lock:
                 self._budget_exhausted_reason = "budget_exhausted: Pi exceeded configured budget"
             self.cancel(reason="budget_exhausted")
-        elif self._request.max_steps is not None and step > self._request.max_steps:
-            with self._lock:
-                self._max_steps_exceeded = True
-            self.cancel(reason="max_steps_exceeded")
+        elif self._request.max_steps is not None:
+            warn_steps = {
+                s for s in (self._request.max_steps - 3, self._request.max_steps - 1) if s >= 1
+            }
+            if step in warn_steps and stop_reason != "stop":
+                with self._lock:
+                    should_steer = step not in self._budget_steer_steps
+                    self._budget_steer_steps.add(step)
+                if should_steer:
+                    threading.Thread(
+                        target=self.steer,
+                        args=(
+                            "Step budget is almost exhausted. Stop calling tools immediately and "
+                            "emit your final response now.",
+                        ),
+                        kwargs={"source": "step_budget"},
+                        daemon=True,
+                    ).start()
+            elif step > self._request.max_steps:
+                allow_final_landing = (
+                    step == self._request.max_steps + 1
+                    and stop_reason == "stop"
+                    and bool(self._final_content.strip())
+                )
+                if not allow_final_landing:
+                    with self._lock:
+                        self._max_steps_exceeded = True
+                    self.cancel(reason="max_steps_exceeded")
 
     def _on_response(self, record: dict[str, Any]) -> None:
         if bool(record.get("success")):
             return
         command = str(record.get("command") or "")
-        error = str(record.get("error") or "unknown error")
+        error = _redact_secrets(
+            str(record.get("error") or "unknown error"), self._redaction_secrets
+        )
         self._trace.append(
             {"event": "pi.command_error", "command": command, "error": error[:500]}
         )
@@ -786,23 +1025,27 @@ class _PiTurn:
             )
             return False
 
+    def _pi_error_reason(self, detail: str = "") -> str:
+        clean = (detail or self._last_error_message or self._last_stderr_line).strip()
+        return f"pi_error: {clean}" if clean else "pi_error"
+
     def _classify_outcome(self) -> tuple[bool, str, str]:
         if self._budget_exhausted_reason:
             return False, self._budget_exhausted_reason, ""
         if self._max_steps_exceeded:
-            return False, "max_steps_exceeded", ""
+            return False, "max_steps_exceeded", self._final_content
         if self._prompt_error:
-            return False, "pi_error", ""
+            return False, self._pi_error_reason(self._prompt_error), ""
         if self._cancel_requested:
             return False, "cancelled", ""
         if self._aborted:
             return False, "pi_aborted", ""
         if self._saw_error_message:
-            return False, "pi_error", ""
+            return False, self._pi_error_reason(self._last_error_message), ""
         if self._returncode not in (0, None):
-            return False, "pi_error", ""
+            return False, self._pi_error_reason(), ""
         if self._steps == 0:
-            return False, "pi_error", ""
+            return False, self._pi_error_reason(), ""
         return True, "final_response", self._final_content
 
     def _persist_receipt(self, receipt: dict[str, Any]) -> None:
@@ -836,6 +1079,7 @@ class PiDriver:
     """Run one Pi turn inside the task sandbox behind the ``AgentDriver`` seam."""
 
     name = "pi"
+    records_usage_internally = True
 
     def __init__(
         self,
@@ -843,6 +1087,7 @@ class PiDriver:
         binary: str | None = None,
         store: RunStore | None = None,
         run_id: str | None = None,
+        provider: LLMProvider | None = None,
         cancel_grace_seconds: float = 3.0,
         term_grace_seconds: float = 2.0,
         scope_guard_path: Path | None = None,
@@ -850,6 +1095,7 @@ class PiDriver:
         self._binary = _resolve_binary(binary)
         self._store = store
         self._run_id = run_id
+        self._provider = provider
         self._cancel_grace_seconds = cancel_grace_seconds
         self._term_grace_seconds = term_grace_seconds
         self._scope_guard_path = scope_guard_path or _SCOPE_GUARD_PATH
@@ -861,7 +1107,7 @@ class PiDriver:
         on_event: DriverEvent | None = None,
         on_handle: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
-        env = build_sandbox_env(request.workspace_path, host_root=request.env_root)
+        env = _build_pi_env(request)
         supports_rpc = _probe_rpc_support(self._binary, env)
         turn = _PiTurn(
             request=request,
@@ -869,6 +1115,7 @@ class PiDriver:
             supports_rpc=supports_rpc,
             store=self._store,
             run_id=self._run_id,
+            provider=self._provider,
             cancel_grace_seconds=self._cancel_grace_seconds,
             term_grace_seconds=self._term_grace_seconds,
             scope_guard_path=self._scope_guard_path,

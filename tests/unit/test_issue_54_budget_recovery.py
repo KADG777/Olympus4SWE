@@ -29,6 +29,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, RunStore
+from olympus.harness.driver import ExecutionDriversConfig
 from olympus.providers.base import (
     ChatMessage,
     LLMProvider,
@@ -860,6 +861,9 @@ def test_upstream_provider_error_mentioning_budget_exhausted_not_misclassified(
         provider=provider,
         workspace_root=tmp_path,
         artifacts_root=tmp_path / "artifacts",
+        execution_drivers=ExecutionDriversConfig(
+            worker_driver="native", reviewer_driver="native"
+        ),
     )
     with pytest.raises(RuntimeError, match="provider_error"):
         orch.run_execution(run_id=run_id)
@@ -883,6 +887,9 @@ def test_run_execution_does_not_overwrite_concurrent_human_pause(
         provider=provider,
         workspace_root=tmp_path,
         artifacts_root=tmp_path / "artifacts",
+        execution_drivers=ExecutionDriversConfig(
+            worker_driver="native", reviewer_driver="native"
+        ),
     )
     snap = orch.run_execution(run_id=run_id)
     assert snap["status"] == RunStatus.PAUSED
@@ -937,6 +944,9 @@ def test_pause_for_budget_preserves_existing_human_hint(tmp_path: Path) -> None:
         provider=_OneCallExhaustProvider(),
         workspace_root=tmp_path,
         artifacts_root=tmp_path / "artifacts",
+        execution_drivers=ExecutionDriversConfig(
+            worker_driver="native", reviewer_driver="native"
+        ),
     )
     snap = orch.run_execution(run_id=run_id)
     by_id = {t.task_id: t for t in snap["plan"].tasks}

@@ -20,9 +20,11 @@ from olympus.core.contracts import (
 from olympus.core.control import RunControl
 from olympus.core.dag import validate_goal_spec
 from olympus.core.store import RunStore
+from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
 from olympus.harness.loop import AgentLoop
+from olympus.harness.structured import run_structured_turn
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory
+from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -80,46 +82,60 @@ Inspect the observed workspace context (and use read-only tools when deeper insp
 to convert the user's raw goal into a crisp, verifiable GoalSpec JSON object.
 
 Rules:
-1. Strict Path Grounding: Cite ONLY file paths listed in Observed workspace files or observed
+1. Code-First Inspection (Grill With Docs): For brownfield goals, inspect the relevant repository
+   modules, entrypoints, and test layout with read-only tools BEFORE asking the human anything.
+   Never ask what the codebase already answers; a blocking ambiguity must survive an honest read
+   of the existing code and observed tests.
+2. Strict Path Grounding: Cite ONLY file paths listed in Observed workspace files or observed
    via tool output. NEVER invent or mention unverified paths (e.g., `src/.../main.py` or
    `tests/...`) inside `constraints`, `assumptions`, `open_ambiguities`, or `minority_notes`.
    When a task is standalone or target layout is unspecified, refer to behavior/deliverables
    conceptually rather than guessing repository paths.
-2. Semantic Audit & Genuine Blockers: Inspect the goal (and existing code via read-only tools)
+3. Semantic Audit & Genuine Blockers: Inspect the goal (and existing code via read-only tools)
    across each distinct behavioral dimension — contradictions with the repo, missing high-level
    scope/success criteria (vague goals MUST stay blocked via `open_ambiguities`), undefined value
    domains, empty/boundary/error/status contracts, operation ordering/tie-breakers/idempotency,
    schema/output format/precision/serialization, optimization targets, and persistence/compatibility
-   defaults — so no correctness-critical choice is silently guessed.
-3. Question Austerity (NO Shotgun Questioning): Treat clarification budget as precious.
+   defaults — so no correctness-critical choice is silently guessed. Only genuine, irreversible
+   behavioral decisions may be `blocking`; repo-answerable details (paths, layout, language
+   version, framework, existing conventions) are never blocking because the code already decides
+   them.
+4. Question Austerity (NO Shotgun Questioning): Treat clarification budget as precious.
    - If requirements are already clear and verifiable, return `"open_ambiguities": []`.
-   - When clarifications are genuinely required, cover every distinct decision blocker
-     (`blocking: true`, typically 1-4 focused items): keep independent behavioral dimensions
-     separate when merging would leave a sub-decision ambiguous, and merge only truly overlapping
-     points.
+   - Restrict `blocking: true` ambiguities to 0-3 genuine irreversible behavioral choices; keep
+     independent behavioral dimensions separate and merge only truly overlapping points.
+   - Every blocking ambiguity MUST carry a concrete, code-grounded `default_assumption` (your
+     recommended answer) and, when meaningful, `options`, so a human can accept your defaults
+     deterministically instead of restating each answer.
    - NEVER pad with generic boilerplate questions about file paths/layout, language version,
      CLI vs function signature, logging, test framework, or validation of inputs already ruled
      out by stated constraints.
-4. Bounded Scope & Falsifiable Criteria: List explicit `out_of_scope` items to prevent scope
+5. Term Collisions & Contradictions: When existing repository behavior contradicts the requested
+   change, or a user term collides with an existing domain concept, surface the mismatch
+   explicitly inside `assumptions` or `constraints` (quoting only observed paths) instead of
+   silently redefining it. Never mutate repository files while aligning.
+6. Bounded Scope & Falsifiable Criteria: List explicit `out_of_scope` items to prevent scope
    creep, and give every requirement concrete, verifiable `acceptance_criteria`.
-5. Exploration Discipline: Limit read-only repo checks to 2-4 focused calls (public API/module
-   layout only) before returning GoalSpec JSON; leave deep implementation reading to Stage 2.
-6. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
+7. Exploration Discipline: Keep read-only inspection focused (typically 2-6 calls on public
+   API/module layout and test layout) before returning GoalSpec JSON; leave deep implementation
+   reading to Stage 2.
+8. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
    `$schema`, or unlisted extra keys.
-7. Greenfield vs. Brownfield: First check whether `Raw user goal` asks to modify the observed
+9. Greenfield vs. Brownfield: First check whether `Raw user goal` asks to modify the observed
    workspace repository or to build a brand-new standalone product unrelated to the existing
    workspace files (e.g., building a consumer app while the workspace holds an unrelated
    framework). If it is a new standalone product unrelated to the workspace files, treat it as
    GREENFIELD immediately: do NOT call tools to inspect unrelated host repo files or treat
    host files as contradictions; synthesize the standalone GoalSpec directly.
-8. Language Mirroring: Write all human-facing prose (`goal`, `description`,
+10. Language Mirroring: Write all human-facing prose (`goal`, `description`,
    `acceptance_criteria`, `out_of_scope`, `constraints`, `question`, `impact`, `options`,
    `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
    `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
-9. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
-   copy the exact text from `assumptions` into `agent_high_impact_assumptions`. Do not mark user
-   decisions or confirmed clarifications as Agent assumptions. Ask about genuine blockers.
-10. Seam-First Test Boundaries: Populate `test_seams` with the fewest, highest-level public
+11. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
+   copy the exact verbatim string from `assumptions` into `agent_high_impact_assumptions` (or leave
+   `agent_high_impact_assumptions` as `[]`). Do not mark user decisions or confirmed clarifications
+   as Agent assumptions. Ask about genuine blockers.
+12. Seam-First Test Boundaries: Populate `test_seams` with the fewest, highest-level public
    boundaries where behavior is verified end to end (HTTP routes, CLI commands, public module
    APIs) — ideal 1-2. Each seam must be exercisable by an external caller in one step; never name
    brittle internal file paths, private helpers, or test-framework internals."""
@@ -129,6 +145,26 @@ Inspect the draft GoalSpec (and repository files if needed) and report ONLY real
 hidden contradictions, feasibility risks, or untestable acceptance criteria.
 Do NOT invent scores or rewrite the spec. If no issues exist, return {{"notes": []}}.
 Output ONLY valid JSON matching {{"notes": [...]}} with no `$comment`, `$schema`, or extra keys."""
+
+_MAX_BLOCKING_AMBIGUITIES = 3
+
+
+def _blocking_discipline_violations(spec: GoalSpec) -> list[str]:
+    """Keep blocking questions few and every one resolvable by a recorded default."""
+    blocking = [amb for amb in spec.open_ambiguities if amb.blocking and not amb.answer]
+    violations: list[str] = []
+    if len(blocking) > _MAX_BLOCKING_AMBIGUITIES:
+        violations.append(
+            f"{len(blocking)} blocking ambiguities exceed the limit of "
+            f"{_MAX_BLOCKING_AMBIGUITIES}; keep only genuine irreversible decisions"
+        )
+    for amb in blocking:
+        if not (amb.default_assumption or "").strip():
+            violations.append(
+                f"Blocking ambiguity {amb.id} lacks a concrete code-grounded "
+                "`default_assumption` (the recommended answer)"
+            )
+    return violations
 
 
 class AlignStage:
@@ -141,11 +177,15 @@ class AlignStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         trace_dir: Path | None = None,
+        execution_drivers: ExecutionDriversConfig | None = None,
+        driver_registry: DriverRegistry | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
         self.workspace_root = Path(workspace_root).resolve()
         self.trace_dir = trace_dir
+        self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
+        self.driver_registry = driver_registry
 
     def _trace_file(self, run_id: str, name: str) -> Path | None:
         if self.trace_dir is None:
@@ -159,7 +199,7 @@ class AlignStage:
         raw_goal: str,
         constraints: list[str] | None = None,
         enable_critique: bool = False,
-        max_steps: int = 10,
+        max_steps: int = 16,
         strict_canonical: bool = False,
         workspace_mode: str | None = None,
         task_type: str | None = None,
@@ -176,6 +216,13 @@ class AlignStage:
         ``brownfield`` run binds its scoped paths and git ref into the prompt.
         """
         self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -227,14 +274,16 @@ class AlignStage:
 
         def validation_gate(candidate: GoalSpec) -> list[str]:
             # Blocking ambiguities are a human decision, not something the model repairs:
-            # only the initial draft may skip the single repair pass. A repaired draft is
+            # only the initial draft may skip the canonical repair pass. A repaired draft is
             # always re-validated so a repair that introduces a blocker is still surfaced.
+            # The blocking-discipline contract (count + required default) is always checked.
             gate_calls["count"] += 1
+            discipline = _blocking_discipline_violations(candidate)
             if gate_calls["count"] == 1 and candidate.unresolved_blockers():
-                return []
+                return discipline
             if not strict_canonical:
-                return []
-            return validate_goal_spec(candidate)
+                return discipline
+            return [*discipline, *validate_goal_spec(candidate)]
 
         exhausted_violations: list[str] = []
 
@@ -243,10 +292,19 @@ class AlignStage:
             exhausted_violations.extend(violations)
             return candidate
 
-        draft = loop.run_structured(
+        draft = run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="align:proposer",
             system_prompt=_ALIGN_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model_cls=GoalSpec,
+            trace_path=self._trace_file(run_id, "align-proposer"),
+            max_steps=max_steps,
             max_validation_retries=1,
             validation_header="[GOALSPEC VALIDATION FAILED]",
             validation_instruction=(
@@ -314,6 +372,13 @@ class AlignStage:
         critique_schema = json.dumps(CritiqueOutput.model_json_schema(), ensure_ascii=False)
 
         def run_one(perspective: CritiquePerspective) -> list[CritiqueNote]:
+            driver, driver_model = resolve_stage_driver(
+                settings=self.execution_drivers,
+                registry=self.driver_registry,
+                provider=self.provider,
+                store=self.store,
+                run_id=run_id,
+            )
             toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
             loop = AgentLoop(
                 provider=self.provider,
@@ -321,7 +386,7 @@ class AlignStage:
                 store=self.store,
                 run_id=run_id,
                 actor=f"align:critic-{perspective.value}",
-                max_steps=6,
+                max_steps=10,
                 trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
             )
             inventory = format_workspace_inventory(toolkit)
@@ -334,10 +399,19 @@ class AlignStage:
                 f"Set perspective='{perspective.value}' on every note.\n"
                 f"Return JSON matching schema:\n{critique_schema}"
             )
-            out = loop.run_structured(
+            out = run_structured_turn(
+                loop=loop,
+                driver=driver,
+                driver_model=driver_model,
+                store=self.store,
+                run_id=run_id,
+                workspace_root=self.workspace_root,
+                actor=f"align:critic-{perspective.value}",
                 system_prompt=sys_prompt,
                 user_prompt=user_prompt,
                 model_cls=CritiqueOutput,
+                trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
+                max_steps=10,
             )
             return out.notes
 
