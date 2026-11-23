@@ -7,6 +7,7 @@ import { HitlBanner } from "./components/HitlBanner";
 import { InspectorDock } from "./components/InspectorDock";
 import { ClarifyPanel, IntentCard } from "./components/IntentClarify";
 import { OracleBoard } from "./components/OracleBoard";
+import { PantheonDock } from "./components/PantheonDock";
 import { StageHeader } from "./components/StageHeader";
 import { ThreadRail } from "./components/ThreadRail";
 import { TopologyView } from "./components/TopologyView";
@@ -94,7 +95,11 @@ export function App({ workbench }: { workbench: Workbench }) {
       <div className="cockpit" ref={cockpit}>
         <ThreadRail workbench={workbench} state={state} />
         {state.activeSurface === "board" ? (
-          <OracleBoard workbench={workbench} state={state} />
+          <OracleBoard
+            workbench={workbench}
+            state={state}
+            footerSlot={<PantheonDock workbench={workbench} state={state} />}
+          />
         ) : (
           <main id="stage" className="scroller">
             <StageHeader workbench={workbench} state={state} />

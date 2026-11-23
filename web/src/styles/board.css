@@ -227,8 +227,20 @@
   opacity: 0.36;
 }
 
+.oracle-card[data-highlight="true"],
 .oracle-card[data-highlighted="true"] {
   border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.oracle-card[data-ball="agent"][data-highlight="true"],
+.oracle-card[data-ball="agent"][data-highlighted="true"] {
+  border-color: var(--live);
+}
+
+.oracle-card[data-ball="done"][data-highlight="true"],
+.oracle-card[data-ball="done"][data-highlighted="true"] {
+  border-color: var(--ok);
 }
 
 .oracle-card-trigger {

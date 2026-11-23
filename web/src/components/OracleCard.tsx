@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import type { RunSummary } from "../api/types";
+import type { RunSummary, SeatState } from "../api/types";
 import {
   boardBadgeVariant,
   GOD_META,
@@ -10,6 +10,7 @@ import {
   TASK_TYPE_LABELS,
   WORKSPACE_MODE_LABELS,
 } from "../lib/labels";
+import { GodAvatar } from "./GodAvatar";
 
 export interface OracleCardProps {
   run: RunSummary;
@@ -47,6 +48,12 @@ export function OracleCard({
         : `${god.name} · ${god.role}`;
 
   const quickLabel = run.pending_action ? PENDING_ACTION_CTA[run.pending_action] : "Review";
+  const cardAvatarState: SeatState =
+    run.ball_holder === "human"
+      ? "waiting_on_human"
+      : run.ball_holder === "agent"
+        ? "working"
+        : "idle";
 
   return (
     <article
@@ -56,6 +63,7 @@ export function OracleCard({
       data-god={run.active_god}
       data-mode={run.workspace_mode}
       data-dimmed={dimmed ? "true" : undefined}
+      data-highlight={highlighted ? "true" : undefined}
       data-highlighted={highlighted ? "true" : undefined}
     >
       <button
@@ -84,9 +92,7 @@ export function OracleCard({
 
       <div className="oracle-card-foot">
         <span className="oracle-card-god">
-          <span className="oracle-god-monogram" data-god={run.active_god} aria-hidden="true">
-            {god.monogram}
-          </span>
+          <GodAvatar god={run.active_god} state={cardAvatarState} size="sm" />
           <span className="oracle-card-handoff">{handoffText}</span>
         </span>
 

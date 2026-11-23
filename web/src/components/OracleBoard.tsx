@@ -68,6 +68,7 @@ export function OracleBoard({
   const activeCount = activeRuns.filter((run) => run.ball_holder !== "done").length;
   const connection = workbench.connectionText();
   const activeGodMeta = state.selectedGodFilter ? GOD_META[state.selectedGodFilter] : null;
+  const effectiveGodFilter = state.hoveredGod ?? state.selectedGodFilter;
 
   const grouped: Record<BallHolder, RunSummary[]> = {
     human: activeRuns.filter((run) => run.ball_holder === "human"),
@@ -126,7 +127,7 @@ export function OracleBoard({
         </div>
       </header>
 
-      {activeGodMeta ? (
+      {activeGodMeta && !footerSlot ? (
         <div className="board-filter-bar" role="status">
           <span>
             Highlighting Pantheon seat: <strong>{activeGodMeta.name}</strong> ({activeGodMeta.role})
@@ -134,7 +135,7 @@ export function OracleBoard({
           <button
             type="button"
             className="btn btn-quiet"
-            onClick={() => workbench.setSelectedGodFilter(null)}
+            onClick={() => workbench.setGodFilter(null)}
           >
             Clear filter
           </button>
@@ -162,9 +163,9 @@ export function OracleBoard({
             <div className="board-archive-grid" data-column="archive">
               {archivedRuns.map((run) => {
                 const dimmed =
-                  state.selectedGodFilter !== null && run.active_god !== state.selectedGodFilter;
+                  effectiveGodFilter !== null && run.active_god !== effectiveGodFilter;
                 const highlighted =
-                  state.selectedGodFilter !== null && run.active_god === state.selectedGodFilter;
+                  effectiveGodFilter !== null && run.active_god === effectiveGodFilter;
                 return (
                   <OracleCard
                     key={run.run_id}
@@ -203,11 +204,11 @@ export function OracleBoard({
                     {items.length ? (
                       items.map((run) => {
                         const dimmed =
-                          state.selectedGodFilter !== null &&
-                          run.active_god !== state.selectedGodFilter;
+                          effectiveGodFilter !== null &&
+                          run.active_god !== effectiveGodFilter;
                         const highlighted =
-                          state.selectedGodFilter !== null &&
-                          run.active_god === state.selectedGodFilter;
+                          effectiveGodFilter !== null &&
+                          run.active_god === effectiveGodFilter;
                         return (
                           <OracleCard
                             key={run.run_id}

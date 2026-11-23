@@ -147,6 +147,7 @@ export interface WorkbenchState {
   selectedWorkspaceId: string | null;
   boardModeFilter: BoardModeFilter;
   selectedGodFilter: PantheonGod | null;
+  hoveredGod: PantheonGod | null;
   showArchived: boolean;
   openTabs: string[];
   quickDrawerRunId: string | null;
@@ -230,6 +231,7 @@ export class Workbench {
       selectedWorkspaceId: null,
       boardModeFilter: "all",
       selectedGodFilter: null,
+      hoveredGod: null,
       showArchived: false,
       openTabs: initialTabs,
       quickDrawerRunId: null,
@@ -433,6 +435,7 @@ export class Workbench {
     const archivedChanged = s.showArchived !== nextArchived;
     s.activeSurface = "board";
     s.showArchived = nextArchived;
+    s.hoveredGod = null;
     s.dockOpen = false;
     this.syncUrl();
     if (archivedChanged || s.selectedWorkspaceId) {
@@ -471,6 +474,7 @@ export class Workbench {
       this.persistTabs([...s.openTabs, runId]);
     }
     s.activeSurface = "oracle";
+    s.hoveredGod = null;
     s.quickDrawerRunId = null;
     if (s.runId !== runId || !s.projection || s.projection.run_id !== runId) {
       s.selectedTaskId = null;
@@ -536,7 +540,21 @@ export class Workbench {
   }
 
   setSelectedGodFilter(god: PantheonGod | null): void {
-    this.state.selectedGodFilter = god && this.state.selectedGodFilter === god ? null : god;
+    const next = god && this.state.selectedGodFilter === god ? null : god;
+    this.state.selectedGodFilter = next;
+    if (next === null) {
+      this.state.hoveredGod = null;
+    }
+    this.commit();
+  }
+
+  setGodFilter(god: PantheonGod | null): void {
+    this.setSelectedGodFilter(god);
+  }
+
+  setHoveredGod(god: PantheonGod | null): void {
+    if (this.state.hoveredGod === god) return;
+    this.state.hoveredGod = god;
     this.commit();
   }
 
