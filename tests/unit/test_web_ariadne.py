@@ -42,7 +42,7 @@ from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
 from olympus.web.demos import seed_demo_runs
 from olympus.web.projection import build_run_projection
-from olympus.web.server import AriadneApp, create_fastapi_app
+from olympus.web.server import AriadneApp, create_fastapi_app, normalize_clone_url
 from olympus.web.supervisor import RunSupervisor
 
 
@@ -1960,6 +1960,441 @@ def test_workspace_registry_http_lifecycle_and_disk_is_untouched(tmp_path: Path)
         app.supervisor.shutdown()
 
 
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=tests@example.com", "-c", "user.name=Olympus Test", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _seed_bare_repo(root: Path) -> Path:
+    source = root / "source"
+    source.mkdir(parents=True)
+    _git(source, "init", "-b", "main")
+    (source / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-m", "init")
+    bare = root / "bare.git"
+    _git(root, "clone", "--bare", str(source), str(bare))
+    return bare
+
+
+def _browse_fixture(tmp_path: Path) -> tuple[AriadneApp, Path, Path]:
+    base = tmp_path / "tree"
+    base.mkdir()
+    host = base / "host"
+    host.mkdir()
+    app = AriadneApp(store=RunStore(host / ".olympus" / "olympus.db"), workspace_root=host)
+    return app, base, host
+
+
+def test_filesystem_browse_lists_only_child_directories_with_git_metadata(
+    tmp_path: Path,
+) -> None:
+    app, base, host = _browse_fixture(tmp_path)
+    try:
+        (base / "alpha").mkdir()
+        (base / "beta").mkdir()
+        (base / "note.txt").write_text("not a directory\n", encoding="utf-8")
+        (base / ".hidden-dir").mkdir()
+        repo = base / "zeta-repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        with TestClient(create_fastapi_app(app)) as client:
+            response = client.get("/api/filesystem/browse")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["current_path"] == str(base.resolve())
+        assert payload["parent_path"] == str(base.resolve().parent)
+        assert payload["prefix"] == ""
+        assert payload["path_missing"] is False
+        entries = payload["entries"]
+        assert [entry["name"] for entry in entries] == ["zeta-repo", "alpha", "beta", "host"]
+        assert entries[0]["is_git_repo"] is True
+        assert entries[0]["default_branch"] == "main"
+        by_name = {entry["name"]: entry for entry in entries}
+        assert by_name["host"]["already_registered"] is True
+        assert by_name["alpha"]["already_registered"] is False
+        assert by_name["alpha"]["is_git_repo"] is False
+        assert all(entry["path"].startswith(str(base.resolve())) for entry in entries)
+        quick_roots = {root["label"]: root["path"] for root in payload["quick_roots"]}
+        assert quick_roots["Projects"] == str(base.resolve())
+        assert quick_roots["Home"] == str(Path.home().resolve())
+        assert quick_roots["Workspace"] == str(host.resolve())
+        assert len(quick_roots) == len(payload["quick_roots"])
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_filesystem_browse_expands_tilde_and_ranks_prefix_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "tree"
+    base.mkdir()
+    host = base / "host"
+    host.mkdir()
+    (base / "app-store").mkdir()
+    (base / "happening").mkdir()
+    (base / "alpha").mkdir()
+    monkeypatch.setenv("HOME", str(base))
+    app = AriadneApp(store=RunStore(host / ".olympus" / "olympus.db"), workspace_root=host)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            home_view = client.get(
+                "/api/filesystem/browse", params={"partial_path": "~"}
+            ).json()
+            assert home_view["current_path"] == str(base.resolve())
+            assert home_view["prefix"] == ""
+
+            trailing = client.get(
+                "/api/filesystem/browse", params={"partial_path": "~/app-store/"}
+            ).json()
+            assert trailing["current_path"] == str((base / "app-store").resolve())
+            assert trailing["prefix"] == ""
+            assert trailing["entries"] == []
+
+            filtered = client.get(
+                "/api/filesystem/browse", params={"partial_path": str(base / "app")}
+            ).json()
+            assert filtered["current_path"] == str(base.resolve())
+            assert filtered["prefix"] == "app"
+            assert [entry["name"] for entry in filtered["entries"]] == ["app-store", "happening"]
+
+            existing = client.get(
+                "/api/filesystem/browse", params={"partial_path": str(base / "alpha")}
+            ).json()
+            assert existing["current_path"] == str((base / "alpha").resolve())
+            assert existing["entries"] == []
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_filesystem_browse_hides_dot_directories_until_requested(tmp_path: Path) -> None:
+    app, base, _host = _browse_fixture(tmp_path)
+    try:
+        (base / ".cache").mkdir()
+        (base / "visible").mkdir()
+        with TestClient(create_fastapi_app(app)) as client:
+            default_names = [
+                entry["name"] for entry in client.get("/api/filesystem/browse").json()["entries"]
+            ]
+            assert "visible" in default_names
+            assert ".cache" not in default_names
+
+            shown_names = [
+                entry["name"]
+                for entry in client.get(
+                    "/api/filesystem/browse", params={"show_hidden": "true"}
+                ).json()["entries"]
+            ]
+            assert ".cache" in shown_names
+
+            dotted = client.get(
+                "/api/filesystem/browse", params={"partial_path": str(base / ".ca")}
+            ).json()
+            assert dotted["prefix"] == ".ca"
+            assert [entry["name"] for entry in dotted["entries"]] == [".cache"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_filesystem_browse_reports_missing_paths_and_rejects_unsafe_input(
+    tmp_path: Path,
+) -> None:
+    app, base, _host = _browse_fixture(tmp_path)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            ghost = base / "ghost"
+            missing = client.get(
+                "/api/filesystem/browse", params={"partial_path": f"{ghost}/"}
+            ).json()
+            assert missing["path_missing"] is True
+            assert missing["entries"] == []
+            assert missing["current_path"] == str(ghost.resolve())
+            assert missing["parent_path"] == str(base.resolve())
+
+            nested = client.get(
+                "/api/filesystem/browse", params={"partial_path": str(ghost / "deeper")}
+            ).json()
+            assert nested["path_missing"] is True
+            assert nested["current_path"] == str(ghost.resolve())
+            assert nested["prefix"] == "deeper"
+            assert nested["entries"] == []
+
+            nul = client.get("/api/filesystem/browse?partial_path=bad%00path")
+            assert nul.status_code == 400
+            assert nul.json() == {"ok": False, "error": "partial_path must not contain NUL bytes"}
+
+            oversized = client.get(
+                "/api/filesystem/browse", params={"partial_path": "a" * 600}
+            )
+            assert oversized.status_code == 400
+            assert "512" in oversized.json()["error"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_normalize_clone_url_accepts_supported_remote_forms() -> None:
+    assert normalize_clone_url("https://github.com/Owner/Repo.git") == (
+        "https://github.com/Owner/Repo.git",
+        "Repo",
+    )
+    assert normalize_clone_url("ssh://git@github.com/owner/repo.git") == (
+        "ssh://git@github.com/owner/repo.git",
+        "repo",
+    )
+    assert normalize_clone_url("git@github.com:owner/repo.git") == (
+        "git@github.com:owner/repo.git",
+        "repo",
+    )
+    assert normalize_clone_url("owner/repo") == ("https://github.com/owner/repo.git", "repo")
+    assert normalize_clone_url("owner/repo.git") == ("https://github.com/owner/repo.git", "repo")
+    assert normalize_clone_url("  https://github.com/owner/repo  ") == (
+        "https://github.com/owner/repo",
+        "repo",
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "-upload-pack=evil",
+        "file:///tmp/repo",
+        "/home/someone/repo",
+        "../repo",
+        "C:\\repos\\demo",
+        "https://github.com/owner",
+        "https://github.com/owner/../repo",
+        "git@github.com:",
+        "owner",
+        "two words",
+    ],
+)
+def test_normalize_clone_url_rejects_unsafe_remotes(raw: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_clone_url(raw)
+
+
+def test_clone_workspace_clones_bare_repo_and_registers_workspace(tmp_path: Path) -> None:
+    bare = _seed_bare_repo(tmp_path / "fixture")
+    host = tmp_path / "host"
+    host.mkdir()
+    clones = tmp_path / "clones"
+    clones.mkdir()
+    app = AriadneApp(store=RunStore(host / ".olympus" / "olympus.db"), workspace_root=host)
+    invoked: list[tuple[str, Path]] = []
+
+    def _clone(remote_url: str, destination: Path) -> None:
+        invoked.append((remote_url, destination))
+        subprocess.run(
+            ["git", "clone", "--", str(bare), str(destination)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    app._run_git_clone = _clone
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            created = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://example.invalid/acme/demo-repo.git",
+                    "parent_dir": str(clones),
+                    "name": "Demo",
+                },
+            )
+            assert created.status_code == 200, created.text
+            workspace = created.json()["workspace"]
+            destination = (clones / "demo-repo").resolve()
+            assert Path(workspace["root_path"]) == destination
+            assert workspace["name"] == "Demo"
+            assert workspace["is_git_repo"] is True
+            assert workspace["default_branch"] == "main"
+            assert (destination / "README.md").read_text(encoding="utf-8") == "hello\n"
+            assert invoked == [("https://example.invalid/acme/demo-repo.git", destination)]
+            assert app.store.get_workspace_by_root(destination) is not None
+
+            renamed = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "git@github.com:acme/second.git",
+                    "parent_dir": str(clones),
+                    "folder_name": "custom-folder",
+                },
+            )
+            assert renamed.status_code == 200, renamed.text
+            assert Path(renamed.json()["workspace"]["root_path"]) == (
+                clones / "custom-folder"
+            ).resolve()
+            assert renamed.json()["workspace"]["name"] == "custom-folder"
+            assert invoked[1][0] == "git@github.com:acme/second.git"
+
+            duplicate = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "owner/other",
+                    "parent_dir": str(clones),
+                    "folder_name": "demo-repo",
+                },
+            )
+            assert duplicate.status_code == 400
+            assert "not empty" in duplicate.json()["error"]
+            assert len(invoked) == 2
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_clone_workspace_cleans_up_only_directories_it_created(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    clones = tmp_path / "clones"
+    clones.mkdir()
+    app = AriadneApp(store=RunStore(host / ".olympus" / "olympus.db"), workspace_root=host)
+
+    def _failing_clone(remote_url: str, destination: Path) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "partial").write_text("half\n", encoding="utf-8")
+        raise ValueError("git clone failed: simulated network error")
+
+    app._run_git_clone = _failing_clone
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            failed = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://example.invalid/acme/broken.git",
+                    "parent_dir": str(clones),
+                },
+            )
+            assert failed.status_code == 400
+            assert "git clone failed" in failed.json()["error"]
+            assert not (clones / "broken").exists()
+
+            preexisting = clones / "preexisting"
+            preexisting.mkdir()
+            preserved = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://example.invalid/acme/preexisting.git",
+                    "parent_dir": str(clones),
+                },
+            )
+            assert preserved.status_code == 400
+            assert preexisting.is_dir()
+
+            assert app.store.get_workspace_by_root(clones / "broken") is None
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_clone_workspace_rejects_unsafe_requests_before_git(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    clones = tmp_path / "clones"
+    clones.mkdir()
+    app = AriadneApp(store=RunStore(host / ".olympus" / "olympus.db"), workspace_root=host)
+    invoked: list[Path] = []
+
+    def _forbidden_clone(remote_url: str, destination: Path) -> None:
+        invoked.append(destination)
+        raise AssertionError("git clone must not run for rejected requests")
+
+    app._run_git_clone = _forbidden_clone
+    cases = [
+        (
+            {"remote_url": "file:///tmp/repo", "parent_dir": str(clones)},
+            "scheme",
+        ),
+        (
+            {"remote_url": "-upload-pack=evil", "parent_dir": str(clones)},
+            "must not start with",
+        ),
+        (
+            {
+                "remote_url": "https://github.com/acme/repo.git",
+                "parent_dir": str(clones),
+                "folder_name": "../escape",
+            },
+            "path separators",
+        ),
+        (
+            {
+                "remote_url": "https://github.com/acme/repo.git",
+                "parent_dir": str(clones),
+                "folder_name": "con",
+            },
+            "reserved",
+        ),
+        (
+            {
+                "remote_url": "https://github.com/acme/repo.git",
+                "parent_dir": str(tmp_path / "missing-parent"),
+            },
+            "does not exist",
+        ),
+    ]
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            for body, expected in cases:
+                rejected = client.post("/api/workspaces/clone", json=body)
+                assert rejected.status_code == 400, rejected.text
+                assert rejected.json()["ok"] is False
+                assert expected in rejected.json()["error"]
+
+            file_target = clones / "already-a-file"
+            file_target.write_text("x\n", encoding="utf-8")
+            not_a_directory = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://github.com/acme/repo.git",
+                    "parent_dir": str(clones),
+                    "folder_name": "already-a-file",
+                },
+            )
+            assert not_a_directory.status_code == 400
+            assert "not a directory" in not_a_directory.json()["error"]
+
+            populated = clones / "populated"
+            populated.mkdir()
+            (populated / "keep.txt").write_text("keep\n", encoding="utf-8")
+            occupied = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://github.com/acme/repo.git",
+                    "parent_dir": str(clones),
+                    "folder_name": "populated",
+                },
+            )
+            assert occupied.status_code == 400
+            assert "not empty" in occupied.json()["error"]
+            assert (populated / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+
+            registered_dir = clones / "registered-empty"
+            registered_dir.mkdir()
+            app.store.register_workspace(
+                name="Registered", root_path=registered_dir, is_git_repo=False
+            )
+            registered = client.post(
+                "/api/workspaces/clone",
+                json={
+                    "remote_url": "https://github.com/acme/repo.git",
+                    "parent_dir": str(clones),
+                    "folder_name": "registered-empty",
+                },
+            )
+            assert registered.status_code == 400
+            assert "already registered" in registered.json()["error"]
+    finally:
+        assert invoked == []
+        app.supervisor.shutdown()
+
+
 def test_brownfield_run_validates_scope_before_any_llm_call(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
@@ -3079,3 +3514,116 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             )
     finally:
         sup.shutdown()
+
+
+def test_workspace_picker_and_clone_review_hardening(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from olympus.web.server import normalize_clone_url
+
+    assert normalize_clone_url("ssh://git@example.invalid:2222/repo.git") == (
+        "ssh://git@example.invalid:2222/repo.git",
+        "repo",
+    )
+    assert normalize_clone_url("git@example.invalid:repo.git") == (
+        "git@example.invalid:repo.git",
+        "repo",
+    )
+    for bad_scheme in ("http://example.invalid/o/r.git", "git://example.invalid/o/r.git"):
+        with pytest.raises(ValueError, match="Unsupported clone URL scheme"):
+            normalize_clone_url(bad_scheme)
+
+    root = tmp_path / "host"
+    root.mkdir()
+    bogus = root / "plain-dot-git"
+    bogus.mkdir()
+    (bogus / ".git").write_text("not a gitdir pointer\n", encoding="utf-8")
+
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    symlink_dest = root / "to-sibling"
+    symlink_dest.symlink_to(sibling)
+
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(bare), str(seed)], check=True, capture_output=True)
+    for args in (
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(args, cwd=seed, check=True, capture_output=True)
+    (seed / "README.md").write_text("hi\n", encoding="utf-8")
+    for args in (
+        ["git", "add", "README.md"],
+        ["git", "commit", "-m", "init"],
+        ["git", "push", "origin", "HEAD"],
+    ):
+        subprocess.run(args, cwd=seed, check=True, capture_output=True)
+
+    store = RunStore(tmp_path / "runs.db")
+    app = AriadneApp(store=store, workspace_root=root)
+
+    def _local_clone(_remote_url: str, destination: Path) -> None:
+        proc = subprocess.run(
+            ["git", "clone", str(bare), str(destination)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise ValueError(f"git clone failed: {proc.stderr.strip()}")
+
+    app._run_git_clone = _local_clone  # type: ignore[method-assign] -- local bare-repo seam
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            assert (
+                client.get("/api/filesystem/browse", params={"wrong": "1"}).status_code == 400
+            )
+            entries = {
+                e["name"]: e
+                for e in client.get(
+                    "/api/filesystem/browse", params={"partial_path": f"{root}/"}
+                ).json()["entries"]
+            }
+            assert entries["plain-dot-git"]["is_git_repo"] is False
+
+            assert (
+                client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "owner/repo",
+                        "parent_dir": str(root),
+                        "folder_name": "to-sibling",
+                    },
+                ).status_code
+                == 400
+            )
+            assert (
+                client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "owner/repo",
+                        "parent_dir": "~olympus_missing_109_user",
+                    },
+                ).status_code
+                == 400
+            )
+
+            def _attempt(_idx: int) -> int:
+                return client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "https://example.invalid/org/raced.git",
+                        "parent_dir": str(root),
+                        "folder_name": "raced",
+                    },
+                ).status_code
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                codes = sorted(pool.map(_attempt, range(2)))
+            assert codes == [200, 400]
+            assert (root / "raced" / "README.md").is_file()
+            assert store.get_workspace_by_root(root / "raced") is not None
+    finally:
+        app.supervisor.shutdown()

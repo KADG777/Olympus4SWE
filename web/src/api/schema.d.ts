@@ -38,6 +38,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/filesystem/browse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Browse Filesystem */
+        get: operations["browse_filesystem_api_filesystem_browse_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/providers": {
         parameters: {
             query?: never;
@@ -221,6 +238,23 @@ export interface paths {
         put?: never;
         /** Create Workspace */
         post: operations["create_workspace_api_workspaces_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/clone": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Clone Workspace */
+        post: operations["clone_workspace_api_workspaces_clone_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -543,6 +577,17 @@ export interface components {
             sync: boolean;
             /** Target Hash */
             target_hash?: string | null;
+        };
+        /** CloneWorkspaceRequest */
+        CloneWorkspaceRequest: {
+            /** Folder Name */
+            folder_name?: string | null;
+            /** Name */
+            name?: string | null;
+            /** Parent Dir */
+            parent_dir: string;
+            /** Remote Url */
+            remote_url: string;
         };
         /** CommandResponse */
         CommandResponse: {
@@ -1050,6 +1095,49 @@ export interface components {
          * @enum {string}
          */
         ExecutionStrategy: "serial_handoff" | "contract_first_parallel";
+        /** FilesystemBrowseEntry */
+        FilesystemBrowseEntry: {
+            /**
+             * Already Registered
+             * @default false
+             */
+            already_registered: boolean;
+            /** Default Branch */
+            default_branch?: string | null;
+            /** Is Git Repo */
+            is_git_repo: boolean;
+            /** Name */
+            name: string;
+            /** Path */
+            path: string;
+        };
+        /** FilesystemBrowseResponse */
+        FilesystemBrowseResponse: {
+            /** Current Path */
+            current_path: string;
+            /** Entries */
+            entries: components["schemas"]["FilesystemBrowseEntry"][];
+            /**
+             * Ok
+             * @default true
+             * @constant
+             */
+            ok: true;
+            /** Parent Path */
+            parent_path?: string | null;
+            /**
+             * Path Missing
+             * @default false
+             */
+            path_missing: boolean;
+            /**
+             * Prefix
+             * @default
+             */
+            prefix: string;
+            /** Quick Roots */
+            quick_roots: components["schemas"]["QuickRoot"][];
+        };
         /**
          * GlobalInvariant
          * @description Cross-cutting rule locked before parallel or sequential module implementation.
@@ -1391,6 +1479,13 @@ export interface components {
             ok: true;
             /** Providers */
             providers: components["schemas"]["ProviderStatus"][];
+        };
+        /** QuickRoot */
+        QuickRoot: {
+            /** Label */
+            label: string;
+            /** Path */
+            path: string;
         };
         /** ReassignHumanCommand */
         ReassignHumanCommand: {
@@ -2417,6 +2512,38 @@ export interface operations {
             };
         };
     };
+    browse_filesystem_api_filesystem_browse_get: {
+        parameters: {
+            query?: {
+                partial_path?: string | null;
+                show_hidden?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FilesystemBrowseResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     list_providers_api_providers_get: {
         parameters: {
             query?: never;
@@ -2910,6 +3037,39 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["CreateWorkspaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    clone_workspace_api_workspaces_clone_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloneWorkspaceRequest"];
             };
         };
         responses: {

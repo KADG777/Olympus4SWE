@@ -7,7 +7,9 @@ import {
   WORKFLOW_SUMMARY,
   WORKSPACE_MODE_LABELS,
 } from "../lib/labels";
+import { isValidSingleFolderSegment, joinDirPath, splitDirPath } from "../lib/paths";
 import type { NewRunForm, Workbench, WorkbenchState } from "../state/workbench";
+import { DirectoryPicker } from "./DirectoryPicker";
 
 const FILE_NOTE = "支持 .md / .txt / .json / .yaml / .yml";
 const CUSTOM_PATH_VALUE = "__custom__";
@@ -87,6 +89,7 @@ const EMPTY_FORM: NewRunForm = {
   workspaceId: "",
   customWorkspaceRoot: "",
   greenfieldPath: "",
+  initGit: false,
   contextWorkspaceId: "",
   baseRef: "",
   scopePaths: "",
@@ -104,6 +107,9 @@ const EMPTY_FORM: NewRunForm = {
 
 export function NewRunDialog({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
   const [form, setForm] = useState<NewRunForm>(EMPTY_FORM);
+  const [greenfieldParent, setGreenfieldParent] = useState("");
+  const [greenfieldParentTouched, setGreenfieldParentTouched] = useState(false);
+  const [greenfieldName, setGreenfieldName] = useState("");
   const [fileNote, setFileNote] = useState(FILE_NOTE);
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -214,6 +220,15 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
+    if (
+      form.workspaceMode === "greenfield" &&
+      !demo &&
+      greenfieldName.trim() &&
+      !isValidSingleFolderSegment(greenfieldName)
+    ) {
+      setError("短目录名必须是单个合法目录段，不能包含 '/'、'\\' 或 '..'");
+      return;
+    }
     const result = await workbench.submitNewRun(form);
     if (!result.ok) {
       setError(`创建请求失败：${result.error}`);
@@ -227,9 +242,52 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
       taskType: current.taskType,
       provider: current.provider,
     }));
+    setGreenfieldName("");
     setFileNote(FILE_NOTE);
     setError(null);
     closeDialog();
+  };
+
+  const handleGreenfieldParentChange = (nextParent: string) => {
+    setGreenfieldParentTouched(true);
+    setGreenfieldParent(nextParent);
+    if (greenfieldName.trim()) {
+      set({ greenfieldPath: joinDirPath(nextParent, greenfieldName) });
+    }
+  };
+
+  const handleGreenfieldDefaultRoot = (defaultRoot: string) => {
+    if (greenfieldParentTouched) return;
+    setGreenfieldParent(defaultRoot);
+    if (greenfieldName.trim()) {
+      set({ greenfieldPath: joinDirPath(defaultRoot, greenfieldName) });
+    }
+  };
+
+  const handleGreenfieldNameChange = (nextName: string) => {
+    setGreenfieldName(nextName);
+    const trimmed = nextName.trim();
+    if (!trimmed) {
+      set({ greenfieldPath: "" });
+      return;
+    }
+    if (!isValidSingleFolderSegment(trimmed)) {
+      setError("短目录名必须是单个合法目录段，不能包含 '/'、'\\' 或 '..'");
+      return;
+    }
+    if (greenfieldParent.trim()) {
+      set({ greenfieldPath: joinDirPath(greenfieldParent, trimmed) });
+    }
+  };
+
+  const handleGreenfieldPathChange = (nextPath: string) => {
+    set({ greenfieldPath: nextPath });
+    const { parent, name } = splitDirPath(nextPath);
+    if (parent) {
+      setGreenfieldParentTouched(true);
+      setGreenfieldParent(parent);
+    }
+    setGreenfieldName(name);
   };
 
   const onFile = () => {
@@ -338,7 +396,7 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
                       {`${ws.name} — ${ws.root_path}`}
                     </option>
                   ))}
-                  <option value={CUSTOM_PATH_VALUE}>Custom local path…</option>
+                  <option value={CUSTOM_PATH_VALUE}>Browse / Custom Local Path…</option>
                 </select>
               </div>
               {form.workspaceId === CUSTOM_PATH_VALUE ? (
@@ -346,13 +404,15 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
                   <label className="dialog-label" htmlFor="new-run-workspace-root">
                     Existing Directory Path
                   </label>
-                  <input
-                    id="new-run-workspace-root"
-                    className="field"
-                    type="text"
-                    placeholder="/path/to/existing/repository"
+                  <DirectoryPicker
+                    idPrefix="new-run-custom"
+                    inputId="new-run-workspace-root"
                     value={form.customWorkspaceRoot}
-                    onChange={(event) => set({ customWorkspaceRoot: event.target.value })}
+                    onChange={(next) => set({ customWorkspaceRoot: next })}
+                    placeholder="/path/to/existing/repository"
+                    disabled={state.submitting}
+                    mode="select_folder"
+                    refreshKey={state.newRunOpenSeq}
                   />
                 </div>
               ) : null}
@@ -388,18 +448,63 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
           ) : null}
 
           {form.workspaceMode === "greenfield" && !demo ? (
-            <div className="form-field">
-              <label className="dialog-label" htmlFor="new-run-greenfield-path">
-                New Target Directory Path
+            <div className="greenfield-scope-box">
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="new-run-greenfield-parent-input">
+                  Parent Directory
+                </label>
+                <DirectoryPicker
+                  idPrefix="new-run-greenfield-parent"
+                  inputId="new-run-greenfield-parent-input"
+                  value={greenfieldParent}
+                  onChange={handleGreenfieldParentChange}
+                  onDefaultRoot={handleGreenfieldDefaultRoot}
+                  placeholder="/path/to/projects"
+                  disabled={state.submitting}
+                  mode="select_parent"
+                  refreshKey={state.newRunOpenSeq}
+                />
+              </div>
+              <div className="form-grid">
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-greenfield-name">
+                    Short Folder Name
+                  </label>
+                  <input
+                    id="new-run-greenfield-name"
+                    className="field mono"
+                    type="text"
+                    placeholder="e.g. voice-cli-new"
+                    value={greenfieldName}
+                    disabled={state.submitting}
+                    onChange={(event) => handleGreenfieldNameChange(event.target.value)}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="new-run-greenfield-path">
+                    Target Directory Path
+                  </label>
+                  <input
+                    id="new-run-greenfield-path"
+                    className="field mono"
+                    type="text"
+                    placeholder="/path/to/new-project"
+                    value={form.greenfieldPath}
+                    disabled={state.submitting}
+                    onChange={(event) => handleGreenfieldPathChange(event.target.value)}
+                  />
+                </div>
+              </div>
+              <label className="dialog-check">
+                <input
+                  id="new-run-greenfield-init-git"
+                  type="checkbox"
+                  checked={form.initGit}
+                  disabled={state.submitting}
+                  onChange={(event) => set({ initGit: event.target.checked })}
+                />
+                <span>Initialize Git repo (git init)</span>
               </label>
-              <input
-                id="new-run-greenfield-path"
-                className="field"
-                type="text"
-                placeholder="/path/to/new-project"
-                value={form.greenfieldPath}
-                onChange={(event) => set({ greenfieldPath: event.target.value })}
-              />
             </div>
           ) : null}
 

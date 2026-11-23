@@ -102,7 +102,69 @@ def test_openapi_covers_every_ariadne_route() -> None:
         "/api/workflows",
         "/api/demos",
         "/api/seed-demo",
+        "/api/filesystem/browse",
+        "/api/workspaces/clone",
     } <= paths
+
+
+def test_openapi_covers_filesystem_browse_and_workspace_clone_contracts() -> None:
+    schema = build_openapi_schema()
+    components = schema["components"]["schemas"]
+
+    browse = schema["paths"]["/api/filesystem/browse"]["get"]
+    assert {parameter["name"] for parameter in browse["parameters"]} == {
+        "partial_path",
+        "show_hidden",
+    }
+    assert set(browse["responses"]) >= {"200", "400"}
+    assert browse["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("FilesystemBrowseResponse")
+    assert browse["responses"]["400"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("ErrorResponse")
+
+    browse_response = components["FilesystemBrowseResponse"]
+    assert browse_response["additionalProperties"] is False
+    assert {
+        "current_path",
+        "parent_path",
+        "prefix",
+        "path_missing",
+        "quick_roots",
+        "entries",
+    } <= set(browse_response["properties"])
+    assert browse_response["properties"]["entries"]["items"]["$ref"].endswith(
+        "FilesystemBrowseEntry"
+    )
+    assert browse_response["properties"]["quick_roots"]["items"]["$ref"].endswith("QuickRoot")
+
+    entry = components["FilesystemBrowseEntry"]
+    assert entry["additionalProperties"] is False
+    assert {
+        "name",
+        "path",
+        "is_git_repo",
+        "default_branch",
+        "already_registered",
+    } <= set(entry["properties"])
+    assert set(components["QuickRoot"]["properties"]) == {"label", "path"}
+
+    clone = schema["paths"]["/api/workspaces/clone"]["post"]
+    body = clone["requestBody"]["content"]["application/json"]["schema"]
+    assert body["$ref"].endswith("CloneWorkspaceRequest")
+    assert set(clone["responses"]) >= {"200", "400"}
+    assert clone["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("WorkspaceResponse")
+    assert clone["responses"]["400"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("ErrorResponse")
+
+    clone_request = components["CloneWorkspaceRequest"]
+    assert clone_request["additionalProperties"] is False
+    assert set(clone_request["required"]) == {"remote_url", "parent_dir"}
+    assert {"folder_name", "name"} <= set(clone_request["properties"])
 
 
 def test_openapi_board_projection_contract_is_concrete() -> None:
