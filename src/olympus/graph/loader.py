@@ -94,7 +94,7 @@ class WorkflowRuntime:
     auto_approve: bool = False
     approver: str = "zeus"
     enable_critique: bool = False
-    max_steps: int = 10
+    max_steps: int = 16
     worker_max_steps: int | None = None
     apply_to_workspace: bool = False
     topology: str = "modular_product"

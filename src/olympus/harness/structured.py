@@ -29,7 +29,18 @@ def _validation_prompt(
     header: str,
     violations: Sequence[str],
     instruction: str,
+    *,
+    previous_output: str | None = None,
 ) -> str:
+    draft = (previous_output or "").strip()
+    if draft:
+        snippet = draft if len(draft) <= 16000 else draft[:16000] + "\n...[truncated]"
+        return (
+            f"{user_prompt}\n\n"
+            f"Previous draft output (preserve grounded facts; fix ONLY the errors below "
+            f"without re-exploring the repository):\n{snippet}\n\n"
+            f"{header}\nViolations: {'; '.join(violations)}\n{instruction}"
+        )
     return f"{user_prompt}\n\n{header}\nViolations: {'; '.join(violations)}\n{instruction}"
 
 
@@ -97,6 +108,7 @@ def run_structured_turn[T: BaseModel](
         )
 
     prompt = user_prompt
+    turn_max_steps = max_steps
     parse_retries = 0
     validation_retries = 0
     attempt = 0
@@ -110,7 +122,7 @@ def run_structured_turn[T: BaseModel](
                 user_prompt=prompt,
                 actor=actor,
                 read_only=True,
-                max_steps=max_steps,
+                max_steps=turn_max_steps,
                 trace_path=trace_path,
                 model=driver_model,
             ),
@@ -136,8 +148,14 @@ def run_structured_turn[T: BaseModel](
             if parse_retries < max_parse_retries:
                 parse_retries += 1
                 prompt = _validation_prompt(
-                    user_prompt, validation_header, violations, validation_instruction
+                    user_prompt,
+                    validation_header,
+                    violations,
+                    "Do NOT call any tools. Fix ONLY the JSON/schema errors in the previous "
+                    "draft and output a single raw JSON object.",
+                    previous_output=outcome.final_content,
                 )
+                turn_max_steps = min(max_steps, 2) if max_steps is not None else 2
                 continue
             raise ValueError(
                 f"Failed to parse {model_cls.__name__} JSON from {driver.name}: {exc}"
@@ -150,8 +168,13 @@ def run_structured_turn[T: BaseModel](
         if validation_retries < max_validation_retries:
             validation_retries += 1
             prompt = _validation_prompt(
-                user_prompt, validation_header, violations, validation_instruction
+                user_prompt,
+                validation_header,
+                violations,
+                validation_instruction,
+                previous_output=candidate.model_dump_json(indent=2),
             )
+            turn_max_steps = min(max_steps, 4) if max_steps is not None else 4
             continue
         if on_validation_exhausted is not None:
             return on_validation_exhausted(candidate, violations)
