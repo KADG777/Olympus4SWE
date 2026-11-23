@@ -36,6 +36,7 @@ import tarfile
 import time
 import tomllib
 import types
+import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
@@ -107,6 +108,40 @@ def _resolve_user_api_key(
     if user_api_key_ref:
         return _user_api_key_refs().get(user_api_key_ref)
     return None
+
+
+def _register_user_api_base(value: str) -> str:
+    ref = f"base-ref:{uuid.uuid4().hex}"
+    _user_api_key_refs()[ref] = value
+    return ref
+
+
+def _resolve_user_api_base(
+    *, user_api_base: str | None, user_api_base_ref: str | None
+) -> str | None:
+    if user_api_base:
+        return user_api_base
+    if user_api_base_ref:
+        return _user_api_key_refs().get(user_api_base_ref)
+    return None
+
+
+def _extract_url_secrets(url: str | None) -> tuple[str, ...]:
+    """Return credentials or query-token values embedded in a gateway URL."""
+    if not url:
+        return ()
+    parts = urllib.parse.urlsplit(url)
+    found: list[str] = []
+    if parts.password:
+        found.append(parts.password)
+    if parts.username and parts.password:
+        found.append(f"{parts.username}:{parts.password}")
+    if parts.query:
+        found.append(parts.query)
+        for _key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=False):
+            if len(value) >= 6:
+                found.append(value)
+    return tuple(dict.fromkeys(found))
 
 _SESSION_STATUSES = frozenset({"needs_input", "completed", "failed"})
 _STOP_WORDS = frozenset({"stop", "done", "finish", "finished", "terminate", "exit"})
@@ -598,12 +633,14 @@ def build_install_script(*, install_target: str, olympus_bin: str = "olympus") -
             '  if command -v uv >/dev/null 2>&1; then UV_BIN=$(command -v uv);',
             '  elif [ -x "$HOME/.local/bin/uv" ]; then UV_BIN="$HOME/.local/bin/uv";',
             '  elif [ -n "$PY" ]; then',
-            "    UV_BOOT=/tmp/olympus-uv",
-            '    mkdir -p "$UV_BOOT"',
-            '    "$PY" -m pip install --quiet --disable-pip-version-check '
-            '--target "$UV_BOOT" uv >/dev/null 2>&1 || '
+            "    UV_BOOT_TRY=/tmp/olympus-uv",
+            '    mkdir -p "$UV_BOOT_TRY"',
+            '    if "$PY" -m pip install --quiet --disable-pip-version-check '
+            '--target "$UV_BOOT_TRY" uv >/dev/null 2>&1 || '
             '"$PY" -m pip install --quiet --disable-pip-version-check '
-            '--break-system-packages --target "$UV_BOOT" uv >/dev/null 2>&1',
+            '--break-system-packages --target "$UV_BOOT_TRY" uv >/dev/null 2>&1; then',
+            '      UV_BOOT="$UV_BOOT_TRY"',
+            "    fi",
             "  fi",
             '  if [ -n "$UV_BIN" ]; then',
             '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
@@ -788,6 +825,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         # Reactive user simulator
         user_model_name: str = "anthropic/claude-opus-4-6",
         user_api_base: str | None = None,
+        user_api_base_ref: str | None = None,
         user_api_key: str | None = None,
         user_api_key_ref: str | None = None,
         user_temperature: float = 0.5,
@@ -838,14 +876,22 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
         self._user_model_name = user_model_name
-        self._user_api_base = user_api_base
+        self._user_api_base = _resolve_user_api_base(
+            user_api_base=user_api_base, user_api_base_ref=user_api_base_ref
+        )
         self._user_api_key = _resolve_user_api_key(
             user_api_key=user_api_key, user_api_key_ref=user_api_key_ref
         )
         redaction_env = dict(self._extra_env)
         if self._user_api_key:
             redaction_env["USER_SIM_API_KEY"] = self._user_api_key
-        self._redaction_secrets = collect_redaction_secrets(redaction_env)
+        extra_url_secrets = (
+            *_extract_url_secrets(self._user_api_base),
+            *_extract_url_secrets(self._base_url),
+        )
+        self._redaction_secrets = tuple(
+            dict.fromkeys((*collect_redaction_secrets(redaction_env), *extra_url_secrets))
+        )
         self._user_temperature = user_temperature
         self._user_context_chars = max(500, int(user_context_chars))
         self._original_user_messages = list(original_user_messages or [])
@@ -893,7 +939,9 @@ class UserEnabledOlympusAgent(BaseAgent):
             encoding="utf-8",
         )
         if install.return_code != 0:
-            tail = (install.stderr or install.stdout or "").strip()[-2000:]
+            tail = redact_text(
+                install.stderr or install.stdout or "", self._redaction_secrets
+            ).strip()[-2000:]
             raise RuntimeError(
                 f"failed to install olympus in the task container "
                 f"(exit {install.return_code}): {tail}"
@@ -967,7 +1015,9 @@ class UserEnabledOlympusAgent(BaseAgent):
             log.warning(
                 "Pi CLI installation failed (worker_driver=%s): %s",
                 self._worker_driver,
-                (result.stderr or result.stdout).strip()[-1000:],
+                redact_text(
+                    result.stderr or result.stdout or "", self._redaction_secrets
+                ).strip()[-1000:],
             )
 
 
@@ -1019,6 +1069,7 @@ class UserEnabledOlympusAgent(BaseAgent):
                     consecutive_noops = 0
                     with suppress(Exception):
                         self._sim_user.advance_original_index(1)
+                    message_kind = "simulated_user"
                 else:
                     consecutive_noops += 1
                     if consecutive_noops >= self._max_consecutive_noops:
@@ -1044,8 +1095,9 @@ class UserEnabledOlympusAgent(BaseAgent):
                             break
                     else:
                         message = "continue"
+                    message_kind = "adapter_default"
                 self._record_message(
-                    role="user", content=message, turn=turn, kind="simulated_user"
+                    role="user", content=message, turn=turn, kind=message_kind
                 )
                 self._turn_start_time = time.monotonic()
                 envelope = await self._execute_turn(
@@ -1577,13 +1629,14 @@ def build_olympus_trial_config(
     original_messages = _load_task_user_messages(task)
     sim_kwargs: dict[str, Any] = {
         "user_model_name": user_model or model,
-        "user_api_base": user_api_base,
         "original_user_messages": original_messages,
         "session_analysis": _load_task_session_analysis(task, len(original_messages)),
         "max_messages": None,
         "user_context_chars": user_context_chars,
         "call_user_on_completion": call_user_on_completion,
     }
+    if user_api_base:
+        sim_kwargs["user_api_base_ref"] = _register_user_api_base(user_api_base)
     if user_api_key:
         sim_kwargs["user_api_key_ref"] = _register_user_api_key(user_api_key)
     if user_temperature != 0.5:
@@ -1592,6 +1645,12 @@ def build_olympus_trial_config(
         sim_kwargs["base_url"] = base_url
     sim_kwargs.update(_task_agent_kwargs(task))
     sim_kwargs.update(dict(agent_kwargs or {}))
+    raw_key = sim_kwargs.pop("user_api_key", None)
+    if isinstance(raw_key, str) and raw_key:
+        sim_kwargs["user_api_key_ref"] = _register_user_api_key(raw_key)
+    raw_base = sim_kwargs.pop("user_api_base", None)
+    if isinstance(raw_base, str) and raw_base:
+        sim_kwargs["user_api_base_ref"] = _register_user_api_base(raw_base)
 
     (
         AgentConfigClass,

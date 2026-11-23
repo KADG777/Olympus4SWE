@@ -150,7 +150,8 @@ def _reply_context(
 _NEGATED_APPROVAL_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
-        r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never)\b[^.!?\n]{0,40}\b(?:proceed|approve|approved|go\s+ahead|continue|ship|merge)\b",
+        r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never)\b[^.!?\n]{0,40}\b(?:proceed|approve|approved|approving|go\s+ahead|continue|ship|merge)\b",
+        r"\bnot\b[^.!?,;\n]{0,40}\b(?:proceed|approve|approved|approving|go\s+ahead|continue|ship|merge)\b",
         r"\bnot\s+(?:ready|approv(?:e|ed|al)|good\s+to\s+go|ok(?:ay)?|yet)\b",
         r"\b(?:not|never)\s+approv(?:e|ed|al)\b",
         r"\bhold\s+off\b",
@@ -163,6 +164,28 @@ _NEGATED_APPROVAL_PATTERNS = tuple(
 _NEGATED_APPROVAL_CJK = ("不要", "不批准", "不同意", "拒绝", "取消", "暂不", "先不")
 # ``别`` negates an instruction, but is also a morpheme in 特别/分别/区别/个别 ….
 _NEGATED_APPROVAL_CJK_BIE = re.compile(r"(?<![特分区个性差级告])别")
+_NEGATED_REVISION_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never|no\s+need\s+to|stop)\b[^.!?,;\n]{0,40}\b(?:change|modify|edit|revise|rework|redo|touch|reopen|alter|update)\b",
+        r"\bno\s+(?:changes?|modifications?|edits?|revisions?|further\s+work)\b",
+        r"\bleave\s+(?:it|everything|this|that)\s+as\s+is\b",
+        r"\bnothing\s+(?:else\s+)?to\s+(?:change|fix|do|modify|update)\b",
+    )
+)
+_NEGATED_REVISION_CJK = (
+    "不要改",
+    "别改",
+    "不用改",
+    "不要修改",
+    "不用修改",
+    "无需修改",
+    "保持原样",
+    "不要动",
+)
+_EXPLICIT_ANSWER_LINE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:(?:ambiguity|critique)\s*:\s*)?([A-Za-z][A-Za-z0-9_-]*)\s*[:=]\s*(.+?)\s*$"
+)
 _ACTIONABLE_CHARS = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
 
 
@@ -178,12 +201,55 @@ def _negated_approval(text: str) -> bool:
     return _NEGATED_APPROVAL_CJK_BIE.search(text) is not None
 
 
-def _keyword_fallback(message: str) -> ReplyIntent:
+def _negated_revision(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _NEGATED_REVISION_PATTERNS):
+        return True
+    return any(token in text for token in _NEGATED_REVISION_CJK)
+
+
+def _extract_explicit_clarifications(
+    message: str, snapshot: dict[str, Any] | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    if not snapshot:
+        return {}, {}
+    spec: GoalSpec | None = snapshot.get("spec")
+    valid_answers = {item.casefold(): item for item in _blocking_ambiguity_ids(spec)}
+    valid_resolutions = {item.casefold(): item for item in _blocking_critique_ids(spec)}
+    if not valid_answers and not valid_resolutions:
+        return {}, {}
+    answers: dict[str, str] = {}
+    resolutions: dict[str, str] = {}
+    for line in message.splitlines():
+        match = _EXPLICIT_ANSWER_LINE.match(line)
+        if not match:
+            continue
+        raw_id, value = match.group(1).strip(), match.group(2).strip()
+        if not value:
+            continue
+        key = raw_id.casefold()
+        if key in valid_answers:
+            answers[valid_answers[key]] = value
+        elif key in valid_resolutions:
+            resolutions[valid_resolutions[key]] = value
+    return answers, resolutions
+
+
+def _keyword_fallback(
+    message: str, *, snapshot: dict[str, Any] | None = None
+) -> ReplyIntent:
     """Conservative fallback used only when the structured parse fails."""
     text = message.casefold().strip()
     if not text:
         return ReplyIntent(action="unknown", message="Empty reply")
-    revise = any(token in text for token in _REVISE_TOKENS)
+    answers, resolutions = _extract_explicit_clarifications(message, snapshot)
+    if answers or resolutions:
+        return ReplyIntent(
+            action="clarify",
+            answers=answers,
+            resolutions=resolutions,
+            message="Keyword fallback: explicit blocker answers",
+        )
+    revise = any(token in text for token in _REVISE_TOKENS) and not _negated_revision(text)
     if _negated_approval(text):
         # A negated approval is never an approval: treat an explicit revision ask
         # as a revision and everything else as ambiguous, so no gate is confirmed.
@@ -225,18 +291,29 @@ def _sanitize(
         for key, value in raw.resolutions.items()
         if key.strip() in valid_resolutions and value.strip()
     }
+    if not answers and not resolutions:
+        explicit_answers, explicit_resolutions = _extract_explicit_clarifications(
+            message, snapshot
+        )
+        answers.update(explicit_answers)
+        resolutions.update(explicit_resolutions)
     action = raw.action
     feedback = raw.feedback.strip()
+    lowered = message.casefold()
     if answers or resolutions:
         # Human answers always win: never approve/revise while silently dropping them.
         action = "clarify"
     elif action == "clarify":
         action = "unknown"
-    if action == "approve" and _negated_approval(message.casefold()):
-        revise = any(token in message.casefold() for token in _REVISE_TOKENS)
+    if action == "approve" and _negated_approval(lowered):
+        revise = any(token in lowered for token in _REVISE_TOKENS) and not _negated_revision(
+            lowered
+        )
         action = "revise" if revise else "unknown"
         feedback = message.strip() if revise else ""
-    if action in ("reopen", "revise") and not _has_actionable_text(message):
+    if action in ("reopen", "revise") and (
+        _negated_revision(lowered) or not _has_actionable_text(message)
+    ):
         action = "unknown"
         feedback = ""
     if action == "revise" and not feedback:
@@ -278,10 +355,10 @@ def parse_reply(
     try:
         parsed = _RawIntent.model_validate_json(_extract_json(response.content))
     except Exception:  # noqa: BLE001 -- malformed router JSON falls back to keyword guard
-        return _keyword_fallback(message)
+        return _keyword_fallback(message, snapshot=snapshot)
     intent = _sanitize(parsed, snapshot=snapshot, message=message)
     if intent.action == "unknown":
-        return _keyword_fallback(message)
+        return _keyword_fallback(message, snapshot=snapshot)
     return intent
 
 

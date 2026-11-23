@@ -494,12 +494,14 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                 '  if command -v uv >/dev/null 2>&1; then UV_BIN=$(command -v uv);',
                 '  elif [ -x "$HOME/.local/bin/uv" ]; then UV_BIN="$HOME/.local/bin/uv";',
                 '  elif [ -n "$PY" ]; then',
-                "    UV_BOOT=/tmp/olympus-uv",
-                '    mkdir -p "$UV_BOOT"',
-                '    "$PY" -m pip install --quiet --disable-pip-version-check '
-                '--target "$UV_BOOT" uv >/dev/null 2>&1 || '
+                "    UV_BOOT_TRY=/tmp/olympus-uv",
+                '    mkdir -p "$UV_BOOT_TRY"',
+                '    if "$PY" -m pip install --quiet --disable-pip-version-check '
+                '--target "$UV_BOOT_TRY" uv >/dev/null 2>&1 || '
                 '"$PY" -m pip install --quiet --disable-pip-version-check '
-                '--break-system-packages --target "$UV_BOOT" uv >/dev/null 2>&1',
+                '--break-system-packages --target "$UV_BOOT_TRY" uv >/dev/null 2>&1; then',
+                '      UV_BOOT="$UV_BOOT_TRY"',
+                "    fi",
                 "  fi",
                 '  if [ -n "$UV_BIN" ]; then',
                 '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',

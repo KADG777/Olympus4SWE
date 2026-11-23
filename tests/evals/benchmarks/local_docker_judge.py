@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import importlib
 import json
 import logging
@@ -907,6 +908,10 @@ async def run_judge_task(
 
 _UPSTREAM_MODEL_STACK: list[str | None] = []
 _UPSTREAM_MODEL_ORIGINAL: list[str | None] = []
+_ACTIVE_GATEWAY_JUDGE_MODEL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_olympus_active_gateway_judge_model", default=None
+)
+_JUDGE_MODEL_PATCHES: dict[int, tuple[Any, int]] = {}
 
 
 async def _run_upstream_judge(
@@ -920,7 +925,8 @@ async def _run_upstream_judge(
     model: str | None,
 ) -> JudgeRunResult:
     pushed_model = False
-    original_judge_model: Any = None
+    gateway_token: contextvars.Token[str | None] | None = None
+    patched_llm_cfg_id: int | None = None
     llm_cfg = getattr(backend.module, "llm_config", None)
     custom_anthropic_gateway = bool(
         model
@@ -937,14 +943,34 @@ async def _run_upstream_judge(
             os.environ["SWT_JUDGE_MODEL"] = model
             pushed_model = True
             if custom_anthropic_gateway and llm_cfg is not None and hasattr(llm_cfg, "judge_model"):
-                original_judge_model = llm_cfg.judge_model
                 resolved_cls = getattr(llm_cfg, "ResolvedModel", None)
                 if resolved_cls is not None:
-                    llm_cfg.judge_model = lambda *_a, **_kw: resolved_cls(
-                        seat="judge",
-                        backend="native",
-                        model=f"anthropic/{model}",
-                    )
+                    gateway_token = _ACTIVE_GATEWAY_JUDGE_MODEL.set(model)
+                    cfg_id = id(llm_cfg)
+                    existing = _JUDGE_MODEL_PATCHES.get(cfg_id)
+                    if existing is None:
+                        orig_fn = llm_cfg.judge_model
+
+                        def _dispatch_judge_model(
+                            *args: Any,
+                            _orig: Any = orig_fn,
+                            _resolved: Any = resolved_cls,
+                            **kwargs: Any,
+                        ) -> Any:
+                            active = _ACTIVE_GATEWAY_JUDGE_MODEL.get()
+                            if active:
+                                return _resolved(
+                                    seat="judge",
+                                    backend="native",
+                                    model=f"anthropic/{active}",
+                                )
+                            return _orig(*args, **kwargs)
+
+                        _JUDGE_MODEL_PATCHES[cfg_id] = (orig_fn, 1)
+                        llm_cfg.judge_model = _dispatch_judge_model
+                    else:
+                        _JUDGE_MODEL_PATCHES[cfg_id] = (existing[0], existing[1] + 1)
+                    patched_llm_cfg_id = cfg_id
     try:
         result = await backend.module.run_judge(
             task_name,
@@ -957,10 +983,22 @@ async def _run_upstream_judge(
         )
     finally:
         backend.restore()
+        if gateway_token is not None:
+            _ACTIVE_GATEWAY_JUDGE_MODEL.reset(gateway_token)
         if pushed_model:
             with _UPSTREAM_JUDGE_ENV_LOCK:
-                if original_judge_model is not None and llm_cfg is not None:
-                    llm_cfg.judge_model = original_judge_model
+                if patched_llm_cfg_id is not None and llm_cfg is not None:
+                    entry = _JUDGE_MODEL_PATCHES.get(patched_llm_cfg_id)
+                    if entry is not None:
+                        orig_fn, refcount = entry
+                        if refcount <= 1:
+                            _JUDGE_MODEL_PATCHES.pop(patched_llm_cfg_id, None)
+                            llm_cfg.judge_model = orig_fn
+                        else:
+                            _JUDGE_MODEL_PATCHES[patched_llm_cfg_id] = (
+                                orig_fn,
+                                refcount - 1,
+                            )
                 if model in _UPSTREAM_MODEL_STACK:
                     _UPSTREAM_MODEL_STACK.remove(model)
                 if _UPSTREAM_MODEL_STACK:

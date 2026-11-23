@@ -1693,3 +1693,25 @@ def test_interact_agent_declares_mcp_servers_and_uses_isolated_py313_venv(
     assert agent._installed_olympus_bin == "/tmp/olympus-venv/bin/olympus"
     argv = agent._bridge_argv("plan", "/tmp/instr.md", "/logs/agent/step.jsonl")
     assert argv[argv.index("--olympus-bin") + 1] == "/tmp/olympus-venv/bin/olympus"
+
+
+def test_interact_install_script_falls_back_to_curl_when_pip_fails(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "curl-called"
+    python_bin = bin_dir / "python3"
+    python_bin.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    curl_bin = bin_dir / "curl"
+    curl_bin.write_text('#!/bin/sh\nprintf called > "$CALLS"\nexit 1\n', encoding="utf-8")
+    python_bin.chmod(0o755)
+    curl_bin.chmod(0o755)
+    (bin_dir / "mkdir").symlink_to("/bin/mkdir")
+    (bin_dir / "sh").symlink_to("/bin/sh")
+    script = (
+        OlympusInteractAgent._pip_install_command("olympus4swe")
+        .replace("/opt/olympus", f"{tmp_path}/opt/olympus")
+        .replace("/tmp/olympus", f"{tmp_path}/tmp/olympus")
+    )
+    env = {**os.environ, "PATH": str(bin_dir), "HOME": str(tmp_path), "CALLS": str(calls)}
+    subprocess.run(["/bin/bash", "-c", script], capture_output=True, env=env, check=False)
+    assert calls.exists()

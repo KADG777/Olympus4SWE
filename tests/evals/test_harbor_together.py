@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -1610,3 +1611,135 @@ def test_silent_user_on_clarify_proceeds_with_defaults_then_accepts_correction(
     assert "AMB-1: Use your default assumptions and proceed." in replies[0]
     assert "AMB-2: Use your default assumptions and proceed." in replies[0]
     assert "_build_project_name" in replies[1]
+    records = [
+        json.loads(line)
+        for line in (agent.logs_dir / "conversation.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    user_turns = [rec for rec in records if rec.get("role") == "user" and rec.get("turn", 0) > 0]
+    assert [rec.get("kind") for rec in user_turns] == ["adapter_default", "simulated_user"]
+
+
+def test_together_hides_user_api_base_token_in_trial_config_and_redacts_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    token = "synthetic-gateway-token-987654"
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix bug")
+    gateway = f"https://gateway.example/v1?token={token}"
+    cfg = build_olympus_trial_config(
+        task,
+        model="openai/gpt-4o",
+        user_api_base=gateway,
+        swe_together_root=root,
+    )
+    serialized = (
+        cfg.model_dump_json() if hasattr(cfg, "model_dump_json") else json.dumps(cfg.agent.kwargs)
+    )
+    assert token not in serialized
+    rebuilt = UserEnabledOlympusAgent(logs_dir=tmp_path / "rebuilt", **cfg.agent.kwargs)
+    assert rebuilt._user_api_base == gateway
+
+    monkeypatch.setattr(
+        rebuilt,
+        "_install_olympus",
+        AsyncMock(return_value=ExecOutcome("", f"install failed for {token}", 1)),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(rebuilt.setup(None))
+    assert token not in str(excinfo.value)
+    assert token not in (tmp_path / "rebuilt" / "setup-install.txt").read_text(encoding="utf-8")
+
+
+def test_together_install_script_falls_back_to_curl_when_pip_fails(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "curl-called"
+    python_bin = bin_dir / "python3"
+    python_bin.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    curl_bin = bin_dir / "curl"
+    curl_bin.write_text('#!/bin/sh\nprintf called > "$CALLS"\nexit 1\n', encoding="utf-8")
+    python_bin.chmod(0o755)
+    curl_bin.chmod(0o755)
+    (bin_dir / "mkdir").symlink_to("/bin/mkdir")
+    (bin_dir / "sh").symlink_to("/bin/sh")
+    script = (
+        build_install_script(install_target="olympus4swe")
+        .replace("/opt/olympus", f"{tmp_path}/opt/olympus")
+        .replace("/tmp/olympus", f"{tmp_path}/tmp/olympus")
+    )
+    env = {**os.environ, "PATH": str(bin_dir), "HOME": str(tmp_path), "CALLS": str(calls)}
+    subprocess.run(["/bin/bash", "-c", script], capture_output=True, env=env, check=False)
+    assert calls.exists()
+
+
+def test_overlapping_upstream_judge_calls_isolate_and_restore_gateway_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.evals.benchmarks.local_docker_judge import (
+        DockerJudgeBackend,
+        JudgeInputs,
+        _run_upstream_judge,
+    )
+
+    def baseline() -> Any:
+        return SimpleNamespace(model="baseline")
+
+    llm_cfg = SimpleNamespace(
+        ResolvedModel=lambda **kw: SimpleNamespace(**kw),
+        judge_model=baseline,
+    )
+
+    async def _run_overlap() -> dict[str, str]:
+        first_started, second_started = asyncio.Event(), asyncio.Event()
+        finish_first, finish_second = asyncio.Event(), asyncio.Event()
+        seen: dict[str, str] = {}
+
+        async def _fake_run_judge(_task: str, trial_id: str, *_a: Any, **_kw: Any) -> Any:
+            seen[trial_id] = llm_cfg.judge_model().model
+            (first_started if trial_id == "A" else second_started).set()
+            await (finish_first if trial_id == "A" else finish_second).wait()
+            return SimpleNamespace(
+                verdict={},
+                stdout="",
+                stderr="",
+                exit_code=0,
+                sandbox_id=trial_id,
+                judge_model=seen[trial_id],
+                judge_backend="native",
+            )
+
+        mod = SimpleNamespace(
+            llm_config=llm_cfg,
+            run_judge=_fake_run_judge,
+            open_judge_sandbox=lambda **_kw: None,
+        )
+
+        async def _call(trial_id: str) -> Any:
+            backend = DockerJudgeBackend(mod, image_resolver=lambda _t: "img:1")
+            return await _run_upstream_judge(
+                backend,
+                task_name="demo",
+                trial_id=trial_id,
+                inputs=JudgeInputs(),
+                timeout_sec=10,
+                max_turns=3,
+                model=f"gateway-{trial_id}",
+            )
+
+        first = asyncio.create_task(_call("A"))
+        await first_started.wait()
+        second = asyncio.create_task(_call("B"))
+        await second_started.wait()
+        finish_first.set()
+        await first
+        finish_second.set()
+        await second
+        return seen
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example/v1")
+    observed = asyncio.run(_run_overlap())
+    assert observed == {"A": "anthropic/gateway-A", "B": "anthropic/gateway-B"}
+    assert llm_cfg.judge_model is baseline

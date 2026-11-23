@@ -1340,3 +1340,92 @@ def test_reply_rejects_same_name_tampered_yaml_workflow(
     assert code == 1
     assert rejected["status"] == "failed"
     assert "does not match the workflow that started this run" in str(rejected["error"])
+
+
+def test_negated_approval_and_no_change_replies_never_mutate_or_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.router.append("invalid JSON")
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        ["start", "Build a calculator library", "--gate-policy", "default", *_base(repo, state)]
+    )
+    assert code == 0
+    run_id = str(started["run_id"])
+    store = RunStore(state / "olympus.db")
+    snap = store.get_run(run_id)
+
+    code, refused = _invoke(
+        ["reply", run_id, "I am not going to approve this.", *_base(repo, state)]
+    )
+    assert code == 0
+    assert refused["pause_kind"] == "approval"
+    assert not store.is_approved(
+        run_id=run_id,
+        target=ApprovalTarget.GOAL_SPEC,
+        target_id=snap["spec"].spec_id,
+        target_hash=snap["spec"].content_hash,
+    )
+
+    repo2 = tmp_path / "repo2"
+    _init_git_repo(repo2)
+    state2 = tmp_path / "state2"
+    script2 = SessionScript()
+    script2.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
+    script2.design.extend([json.dumps(_design())] * 2)
+    script2.plan.extend([json.dumps(_plan())] * 2)
+    script2.workers.extend([("calculator.py", _CALC_CODE)] * 2)
+    script2.router.extend(["invalid JSON", json.dumps({"action": "reopen", "feedback": "edit"})])
+    _patch_provider(monkeypatch, script2)
+
+    code, done = _invoke(["start", "Build a calculator library", *_base(repo2, state2)])
+    assert code == 0
+    assert done["status"] == "completed"
+    done_id = str(done["run_id"])
+
+    for _ in range(2):
+        code, stayed = _invoke(
+            ["reply", done_id, "Do not change anything.", *_base(repo2, state2)]
+        )
+        assert code == 0
+        assert stayed["status"] == "needs_input"
+
+    store2 = RunStore(state2 / "olympus.db")
+    assert store2.get_run(done_id)["status"] == RunStatus.COMPLETED
+    assert not any(ev.event_type == "run.reopened" for ev in store2.list_events(done_id))
+
+
+def test_explicit_ambiguity_answer_resolves_blocker_when_router_json_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec(ambiguity=True)))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append("invalid JSON")
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0
+    assert started["pause_kind"] == "clarify"
+    assert started["unresolved_blockers"]
+
+    code, clarified = _invoke(
+        [
+            "reply",
+            str(started["run_id"]),
+            "AMB-1: Use your default assumptions and proceed.",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0, json.dumps(clarified, indent=2)
+    assert not clarified["unresolved_blockers"]
