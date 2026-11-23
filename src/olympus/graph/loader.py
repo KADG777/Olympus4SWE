@@ -132,6 +132,8 @@ def _align_stage(runtime: WorkflowRuntime) -> AlignStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         trace_dir=runtime.artifacts_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
     )
 
 
@@ -141,6 +143,8 @@ def _design_stage(runtime: WorkflowRuntime) -> DesignStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         artifacts_root=runtime.artifacts_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
     )
 
 

@@ -67,6 +67,13 @@ BaseUrlOpt = Annotated[
     str | None,
     typer.Option("--base-url", help="Override OpenAI-compatible/Anthropic base URL."),
 ]
+StageDriverOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--stage-driver",
+        help="Planning driver for Align/Design/Plan: auto|native|pi (optionally driver@model).",
+    ),
+]
 WorkerDriverOpt = Annotated[
     str | None,
     typer.Option(
@@ -117,6 +124,7 @@ def _build_runner(
     provider: str | None,
     model: str | None,
     base_url: str | None,
+    stage_driver: str | None,
     worker_driver: str | None,
     reviewer_driver: str | None,
     monitor_model: str | None,
@@ -137,6 +145,7 @@ def _build_runner(
         provider=provider or "auto",
         model=model,
         base_url=base_url,
+        stage_driver=stage_driver,
         worker_driver=worker_driver,
         reviewer_driver=reviewer_driver,
         monitor_model=monitor_model,
@@ -163,6 +172,7 @@ def cmd_start(
     provider: ProviderOpt = "auto",
     model: ModelOpt = None,
     base_url: BaseUrlOpt = None,
+    stage_driver: StageDriverOpt = None,
     worker_driver: WorkerDriverOpt = None,
     reviewer_driver: ReviewerDriverOpt = None,
     monitor_model: MonitorModelOpt = None,
@@ -179,6 +189,7 @@ def cmd_start(
             provider=provider,
             model=model,
             base_url=base_url,
+            stage_driver=stage_driver,
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
@@ -214,6 +225,7 @@ def cmd_reply(
     provider: ProviderOpt = "auto",
     model: ModelOpt = None,
     base_url: BaseUrlOpt = None,
+    stage_driver: StageDriverOpt = None,
     worker_driver: WorkerDriverOpt = None,
     reviewer_driver: ReviewerDriverOpt = None,
     monitor_model: MonitorModelOpt = None,
@@ -230,6 +242,7 @@ def cmd_reply(
             provider=provider,
             model=model,
             base_url=base_url,
+            stage_driver=stage_driver,
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,

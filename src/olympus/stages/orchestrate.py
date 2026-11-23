@@ -51,9 +51,11 @@ from olympus.harness.driver import (
     DriverTurnRequest,
     ExecutionDriversConfig,
     default_driver_factories,
+    resolve_driver_spec,
 )
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
+from olympus.harness.structured import run_structured_turn
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
@@ -71,7 +73,7 @@ from olympus.harness.worktree import (
 )
 from olympus.providers.base import LLMProvider
 from olympus.providers.factory import build_provider
-from olympus.stages.common import format_workspace_inventory
+from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
 if TYPE_CHECKING:
@@ -612,6 +614,13 @@ class OrchestrateStage:
         else:
             guidance_block = ""
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
         loop = AgentLoop(
             provider=self.provider,
             toolkit=toolkit,
@@ -690,16 +699,26 @@ class OrchestrateStage:
         def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
             raise PlanValidationError(violations)
 
-        plan = loop.run_structured(
+        plan = run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="orchestrate:planner",
             system_prompt=_PLANNER_SYSTEM_PROMPT + guidance_block,
             user_prompt=base_prompt,
             model_cls=TaskPlan,
+            trace_path=self._run_dir(run_id) / "traces" / "planner.jsonl",
+            max_steps=max_steps,
             max_validation_retries=2,
             validation_header="[PLAN VALIDATION FAILED]",
             validation_instruction="Fix all violations and return valid TaskPlan JSON.",
             transform=stamp_binding,
             validator=plan_gate,
             on_validation_exhausted=raise_exhausted,
+            on_event=self.on_driver_event,
         )
 
         self.store.save_plan(run_id, plan, actor="orchestrate")
@@ -1523,11 +1542,11 @@ class OrchestrateStage:
             default_driver_factories(store=self.store, run_id=run_id)
         )
         worker = registry.resolve(
-            self.execution_drivers.worker_driver,
+            resolve_driver_spec(self.execution_drivers.worker_driver, provider=self.provider),
             native_factory=lambda model: self._native_driver(run_id, model),
         )
         reviewer = registry.resolve(
-            self.execution_drivers.reviewer_driver,
+            resolve_driver_spec(self.execution_drivers.reviewer_driver, provider=self.provider),
             native_factory=lambda model: self._native_driver(run_id, model, review=True),
         )
         monitor_factory = self._monitor_factory()

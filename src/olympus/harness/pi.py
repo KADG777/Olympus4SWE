@@ -63,6 +63,33 @@ class PiNotAvailableError(RuntimeError):
 
 _help_cache: dict[str, bool] = {}
 _help_cache_lock = threading.Lock()
+_availability_cache: dict[str, bool] = {}
+_availability_cache_lock = threading.Lock()
+
+
+def pi_available(*, binary: str | None = None) -> bool:
+    """Return True when the Pi CLI resolves and passes its cached ``--help`` probe."""
+    requested = (binary or os.getenv("OLYMPUS_PI_BIN", "") or "pi").strip()
+    with _availability_cache_lock:
+        cached = _availability_cache.get(requested)
+    if cached is not None:
+        return cached
+    available = False
+    try:
+        resolved = _resolve_binary(requested)
+        _probe_rpc_support(resolved, dict(os.environ))
+        available = True
+    except PiNotAvailableError:
+        available = False
+    with _availability_cache_lock:
+        _availability_cache[requested] = available
+    return available
+
+
+def _reset_pi_availability_cache() -> None:
+    """Drop cached probes (used by tests that swap fake binaries per case)."""
+    with _availability_cache_lock:
+        _availability_cache.clear()
 
 
 def _resolve_binary(binary: str | None) -> str:
@@ -836,6 +863,7 @@ class PiDriver:
     """Run one Pi turn inside the task sandbox behind the ``AgentDriver`` seam."""
 
     name = "pi"
+    records_usage_internally = True
 
     def __init__(
         self,

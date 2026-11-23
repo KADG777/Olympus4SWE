@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import pytest
@@ -27,6 +27,7 @@ from olympus.core.contracts import (
     GoalSpec,
     RunMode,
     RunStatus,
+    SpecStatus,
     TaskPlan,
     TaskStatus,
 )
@@ -34,13 +35,21 @@ from olympus.core.store import RunStore
 from olympus.harness.activity import milestone_fields
 from olympus.harness.driver import (
     ActiveTurnHandle,
+    DriverRegistry,
     DriverTurnRequest,
     ExecutionDriversConfig,
     TurnOutcome,
+    resolve_driver_spec,
 )
-from olympus.harness.pi import PiDriver, PiNotAvailableError, _safe_argv
+from olympus.harness.pi import (
+    PiDriver,
+    PiNotAvailableError,
+    _reset_pi_availability_cache,
+    _safe_argv,
+)
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.stages.align import AlignStage
+from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
 
 _FAKE_PI_SOURCE = '''
@@ -225,6 +234,14 @@ def _prepare_hang():
     return True
 
 
+def _final_text():
+    payload_path = os.environ.get("FAKE_PI_PAYLOAD_FILE")
+    if payload_path:
+        with open(payload_path, encoding="utf-8") as handle:
+            return handle.read()
+    return "Documented change."
+
+
 def rpc_main():
     hang = _prepare_hang()
     await_steer = os.environ.get("FAKE_PI_AWAIT_STEER") == "1"
@@ -240,7 +257,7 @@ def rpc_main():
             if hang:
                 break
             if not await_steer:
-                _finish("Documented change.")
+                _finish(_final_text())
                 return 0
         elif kind == "steer":
             _respond(command.get("id"), "steer", {"disposition": "queued"})
@@ -274,7 +291,7 @@ def json_main():
         }
     )
     _emit_work()
-    _finish("Documented change.")
+    _finish(_final_text())
     return 0
 
 
@@ -1148,3 +1165,473 @@ def test_pi_driver_trace_omits_message_start_turn_end_and_success_responses(
     )
     assert "message_end" in types
 
+
+
+# ------------------------------------------------------- stage driver auto-default seam
+
+
+class _StageProvider:
+    """Non-mock provider whose call count proves whether a stage used the native loop."""
+
+    provider_name = "openai"
+
+    def __init__(self, model_name: str = "stage-model") -> None:
+        self.model_name = model_name
+        self.calls = 0
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+        temperature: float = 0.0,
+    ) -> LLMResponse:
+        del messages, tools, temperature
+        self.calls += 1
+        raise AssertionError("the native loop must not run when auto resolves to Pi")
+
+
+class _ScriptedStageDriver:
+    """External driver returning pre-scripted structured payloads and token usage."""
+
+    name = "scripted"
+
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = list(contents)
+        self.requests: list[DriverTurnRequest] = []
+        self._lock = Lock()
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        on_handle: Callable[[ActiveTurnHandle], None] | None = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        with self._lock:
+            self.requests.append(request)
+            content = self.contents.pop(0)
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content=content,
+            steps_taken=1,
+            total_input_tokens=10,
+            total_output_tokens=5,
+            driver_name=self.name,
+        )
+
+
+def _stage_goal_payload() -> dict[str, Any]:
+    return {
+        "spec_id": "spec-stage-pi",
+        "goal": "Expose a calculator module with an explicit zero-division error",
+        "deliverable_kind": "library",
+        "observable_surfaces": ["calculator module"],
+        "actors": ["developer"],
+        "test_seams": ["calculator.divide(a, b)"],
+        "requirements": [
+            {
+                "id": "R1",
+                "description": "divide returns a / b and rejects a zero divisor",
+                "actor": "developer",
+                "ears_criteria": [
+                    {
+                        "id": "R1-C1",
+                        "pattern": "ubiquitous",
+                        "outcome": "return a / b for a non-zero divisor",
+                    },
+                    {
+                        "id": "R1-C2",
+                        "pattern": "unwanted_behavior",
+                        "condition": "b equals zero",
+                        "outcome": "raise ValueError('zero')",
+                    },
+                ],
+            }
+        ],
+        "out_of_scope": ["graphical interface"],
+        "constraints": [],
+    }
+
+
+def _stage_design_payload() -> dict[str, Any]:
+    return {
+        "architecture_summary": "A single calculator module with an explicit zero error",
+        "shared_invariants": [
+            {
+                "id": "INV-ERR",
+                "category": "error_envelope",
+                "rule": "Raise ValueError('zero') when the divisor is zero",
+                "applies_to": ["M1"],
+            }
+        ],
+        "shared_contract_paths": [],
+        "modules": [
+            {
+                "id": "M1",
+                "name": "Calculator",
+                "responsibility": "Provide arithmetic helpers with explicit errors",
+                "requirement_refs": ["R1"],
+                "target_paths": ["calculator.py"],
+            }
+        ],
+        "data_models": [],
+        "interfaces": [],
+        "execution_strategy": "serial_handoff",
+        "strategy_rationale": "One cohesive module keeps the change atomic and verifiable.",
+    }
+
+
+def _stage_plan_payload(spec: GoalSpec) -> dict[str, Any]:
+    return {
+        "plan_id": "plan-stage-pi",
+        "spec_id": spec.spec_id,
+        "spec_hash": spec.content_hash,
+        "tasks": [
+            {
+                "task_id": "T1",
+                "title": "Implement calculator.divide",
+                "objective": "Implement calculator.divide with a zero guard in calculator.py",
+                "requirement_refs": ["R1"],
+                "write_scope": ["calculator.py"],
+                "acceptance_checks": [
+                    {
+                        "id": "C1",
+                        "kind": "command",
+                        "description": "Import the calculator module",
+                        "command": "python3 -c 'import calculator'",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _workspace_files(root: Path) -> set[str]:
+    ignored = {".git", ".olympus"}
+    return {
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file() and not ignored.intersection(path.relative_to(root).parts)
+    }
+
+
+def _git_status_clean(root: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip() == ""
+
+
+def test_execution_drivers_config_defaults_to_auto_and_accepts_legacy_snapshots() -> None:
+    default = ExecutionDriversConfig()
+    assert default.stage_driver == "auto"
+    assert default.worker_driver == "auto"
+    assert default.reviewer_driver == "auto"
+
+    legacy = ExecutionDriversConfig.model_validate(
+        {"worker_driver": "pi", "reviewer_driver": "native", "monitor_model": "monitor-x"}
+    )
+    assert legacy.stage_driver == "auto"
+    assert legacy.worker_driver == "pi"
+    assert legacy.reviewer_driver == "native"
+    assert legacy.monitor_model == "monitor-x"
+
+
+def test_execution_drivers_config_resolve_prefers_explicit_over_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OLYMPUS_STAGE_DRIVER", "pi@env-stage")
+    monkeypatch.delenv("OLYMPUS_WORKER_DRIVER", raising=False)
+    monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
+
+    resolved = ExecutionDriversConfig.resolve()
+    assert resolved.stage_driver == "pi@env-stage"
+    assert resolved.worker_driver == "auto"
+
+    explicit = ExecutionDriversConfig.resolve(stage_driver="native")
+    assert explicit.stage_driver == "native"
+
+
+def test_resolve_driver_spec_auto_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _StageProvider()
+    mock = MockLLMProvider()
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(fake))
+    _reset_pi_availability_cache()
+    try:
+        assert resolve_driver_spec("auto", provider=mock) == "native"
+        assert resolve_driver_spec("auto", provider=provider) == "pi@stage-model"
+        assert resolve_driver_spec("auto@review-model", provider=provider) == "pi@review-model"
+        assert resolve_driver_spec("pi", provider=provider) == "pi"
+        assert resolve_driver_spec("pi@explicit", provider=provider) == "pi@explicit"
+        assert resolve_driver_spec("native@local", provider=provider) == "native@local"
+
+        monkeypatch.setenv("OLYMPUS_PI_BIN", str(tmp_path / "missing-pi"))
+        _reset_pi_availability_cache()
+        assert resolve_driver_spec("auto", provider=provider) == "native"
+    finally:
+        _reset_pi_availability_cache()
+
+
+def test_align_stage_auto_runs_pi_read_only_and_leaves_workspace_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Auto align")
+    fake = _write_fake_pi(state, rpc=True)
+    payload_file = state / "align-payload.json"
+    argv_file = state / "argv.json"
+    payload_file.write_text(json.dumps(_stage_goal_payload()), encoding="utf-8")
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(fake))
+    monkeypatch.setenv("FAKE_PI_PAYLOAD_FILE", str(payload_file))
+    monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("FAKE_PI_WRITE_FILE", str(state / "fake-write.txt"))
+    _reset_pi_availability_cache()
+
+    provider = _StageProvider()
+    before = _workspace_files(workspace)
+    stage = AlignStage(
+        store=store,
+        provider=provider,
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="auto"),
+    )
+    spec = stage.propose_spec(
+        run_id=run_id,
+        raw_goal="Expose a calculator module for developers",
+        max_steps=6,
+        strict_canonical=True,
+    )
+    _reset_pi_availability_cache()
+
+    assert spec.status == SpecStatus.AWAITING_HUMAN
+    assert spec.goal.startswith("Expose a calculator module")
+    assert provider.calls == 0
+    argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert argv[argv.index("--tools") + 1] == "read,grep,find,ls"
+    assert argv[argv.index("--exclude-tools") + 1] == "bash,write,edit,powershell"
+    assert argv[argv.index("--model") + 1] == "stage-model"
+    assert _workspace_files(workspace) == before
+    assert _git_status_clean(workspace)
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
+    saved = store.get_run(run_id)["spec"]
+    assert saved is not None and saved.content_hash == spec.content_hash
+
+
+def test_design_and_plan_stages_auto_run_pi_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Auto design and plan")
+    spec = GoalSpec.model_validate(_stage_goal_payload())
+    store.save_spec(run_id, spec)
+    AlignStage(
+        store=store, provider=MockLLMProvider(), workspace_root=workspace
+    ).confirm_spec(run_id=run_id, approver="zeus")
+
+    fake = _write_fake_pi(state, rpc=True)
+    payload_file = state / "stage-payload.json"
+    argv_file = state / "argv.json"
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(fake))
+    monkeypatch.setenv("FAKE_PI_PAYLOAD_FILE", str(payload_file))
+    monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("FAKE_PI_WRITE_FILE", str(state / "fake-write.txt"))
+    _reset_pi_availability_cache()
+
+    provider = _StageProvider()
+    drivers = ExecutionDriversConfig(stage_driver="auto")
+    before = _workspace_files(workspace)
+
+    payload_file.write_text(json.dumps(_stage_design_payload()), encoding="utf-8")
+    design_stage = DesignStage(
+        store=store,
+        provider=provider,
+        workspace_root=workspace,
+        artifacts_root=state / "artifacts",
+        execution_drivers=drivers,
+    )
+    design = design_stage.propose_design(run_id, max_steps=6)
+    assert design.spec_hash == spec.content_hash
+    assert design.architecture_summary.startswith("A single calculator module")
+    design_stage.approve_design(run_id, approver="zeus")
+
+    payload_file.write_text(json.dumps(_stage_plan_payload(spec)), encoding="utf-8")
+    plan = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=workspace,
+        artifacts_root=state / "artifacts",
+        execution_drivers=drivers,
+    ).propose_plan(run_id=run_id, use_design=False, max_steps=6)
+    _reset_pi_availability_cache()
+
+    assert plan.spec_id == spec.spec_id
+    assert plan.spec_hash == spec.content_hash
+    assert [task.task_id for task in plan.tasks] == ["T1"]
+    assert provider.calls == 0
+    argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert argv[argv.index("--tools") + 1] == "read,grep,find,ls"
+    assert argv[argv.index("--exclude-tools") + 1] == "bash,write,edit,powershell"
+    assert _workspace_files(workspace) == before
+    assert _git_status_clean(workspace)
+    snap = store.get_run(run_id)
+    assert snap["design"] is not None and snap["plan"] is not None
+
+
+def test_stage_driver_retries_gate_violations_with_feedback_and_settles_usage(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Scripted stage retry")
+    invalid = _stage_goal_payload()
+    for key in ("deliverable_kind", "actors", "out_of_scope"):
+        invalid.pop(key)
+    driver = _ScriptedStageDriver([json.dumps(invalid), json.dumps(_stage_goal_payload())])
+    provider = MockLLMProvider()
+    stage = AlignStage(
+        store=store,
+        provider=provider,
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": driver}),
+    )
+
+    spec = stage.propose_spec(
+        run_id=run_id,
+        raw_goal="Expose a calculator module for developers",
+        strict_canonical=True,
+    )
+
+    assert len(driver.requests) == 2
+    assert all(request.read_only for request in driver.requests)
+    retry_prompt = driver.requests[1].user_prompt
+    assert "[GOALSPEC VALIDATION FAILED]" in retry_prompt
+    assert "deliverable_kind" in retry_prompt
+    assert provider.recorded_requests == []
+    assert spec.deliverable_kind is not None
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert (ledger.input_tokens, ledger.output_tokens) == (20, 10)
+    assert ledger.llm_calls_used == 2
+
+
+def test_stage_driver_exhaustion_records_validation_event(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Scripted stage exhaustion")
+    invalid = _stage_goal_payload()
+    for key in ("deliverable_kind", "actors", "out_of_scope"):
+        invalid.pop(key)
+    driver = _ScriptedStageDriver([json.dumps(invalid), json.dumps(invalid)])
+    stage = AlignStage(
+        store=store,
+        provider=MockLLMProvider(),
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": driver}),
+    )
+
+    spec = stage.propose_spec(
+        run_id=run_id,
+        raw_goal="Expose a calculator module for developers",
+        strict_canonical=True,
+    )
+
+    assert len(driver.requests) == 2
+    assert spec.deliverable_kind is None
+    events = [e for e in store.list_events(run_id) if e.event_type == "spec.validation_failed"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert any("deliverable_kind" in violation for violation in payload["violations"])
+    assert payload["spec_hash"] == spec.content_hash
+
+
+def test_align_critics_run_through_stage_driver_read_only(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Scripted critique")
+    critique = json.dumps(
+        {
+            "notes": [
+                {
+                    "id": "N1",
+                    "perspective": "qa",
+                    "severity": "warning",
+                    "summary": "Zero-division coverage must be verified end to end",
+                }
+            ]
+        }
+    )
+    driver = _ScriptedStageDriver([json.dumps(_stage_goal_payload())] + [critique] * 3)
+    stage = AlignStage(
+        store=store,
+        provider=MockLLMProvider(),
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": driver}),
+    )
+
+    spec = stage.propose_spec(
+        run_id=run_id,
+        raw_goal="Expose a calculator module for developers",
+        enable_critique=True,
+    )
+
+    assert len(driver.requests) == 4
+    assert all(request.read_only for request in driver.requests)
+    assert len(spec.minority_notes) == 3
+    assert all(note.id == "N1" for note in spec.minority_notes)
+
+
+def test_explicit_pi_stage_driver_fails_loudly_when_binary_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Explicit pi missing")
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(tmp_path / "missing-pi"))
+    _reset_pi_availability_cache()
+    stage = AlignStage(
+        store=store,
+        provider=_StageProvider(),
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="pi"),
+    )
+
+    with pytest.raises(PiNotAvailableError) as excinfo:
+        stage.propose_spec(run_id=run_id, raw_goal="Expose a calculator module")
+
+    assert "not found" in str(excinfo.value)
+    _reset_pi_availability_cache()

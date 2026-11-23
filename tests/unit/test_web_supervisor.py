@@ -913,6 +913,7 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
     app, supervisor, make_client = supervisor_app
     monkeypatch.setenv("OLYMPUS_WORKER_DRIVER", "environment-worker")
     monkeypatch.setenv("OLYMPUS_MONITOR_MODEL", "environment-monitor")
+    monkeypatch.delenv("OLYMPUS_STAGE_DRIVER", raising=False)
     monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
     with make_client() as client:
         _assert_spa_control_ids(
@@ -932,8 +933,9 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
         assert response.status_code == 200, response.text
         snap = app.store.get_run(response.json()["run_id"])
         assert snap["execution_drivers"] == {
+            "stage_driver": "auto",
             "worker_driver": "native@custom-worker",
-            "reviewer_driver": "native",
+            "reviewer_driver": "auto",
             "monitor_model": "environment-monitor",
         }
         invalid = client.post("/api/runs", json={"raw_input": "Goal", "reviewer_driver": 42})
@@ -947,6 +949,7 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
         sync=True,
     )
     assert app.store.get_run(started["run_id"])["execution_drivers"] == {
+        "stage_driver": "auto",
         "worker_driver": "environment-worker",
         "reviewer_driver": "native@custom-reviewer",
         "monitor_model": "custom-monitor",

@@ -75,6 +75,7 @@ class SessionConfig:
     provider: str = "auto"
     model: str | None = None
     base_url: str | None = None
+    stage_driver: str | None = None
     worker_driver: str | None = None
     reviewer_driver: str | None = None
     monitor_model: str | None = None
@@ -440,6 +441,7 @@ class SessionRunner:
 
     def _drivers_config(self) -> ExecutionDriversConfig:
         return ExecutionDriversConfig.resolve(
+            stage_driver=self.config.stage_driver,
             worker_driver=self.config.worker_driver,
             reviewer_driver=self.config.reviewer_driver,
             monitor_model=self.config.monitor_model,
