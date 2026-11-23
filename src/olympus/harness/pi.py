@@ -377,7 +377,7 @@ class _PiTurn:
         self._cancel_requested = False
         self._budget_exhausted_reason = ""
         self._max_steps_exceeded = False
-        self._budget_steer_sent = False
+        self._budget_steer_steps: set[int] = set()
         self._stdin_closed = False
         self._steps = 0
         self._tool_started_at: dict[str, float] = {}
@@ -542,7 +542,9 @@ class _PiTurn:
             command += ["--provider", self._gateway_provider]
         if self._gateway_model:
             command += ["--model", self._gateway_model]
-        if request.read_only:
+        if request.disable_tools:
+            command += ["--no-tools"]
+        elif request.read_only:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
         else:
             command += ["--tools", _WRITABLE_TOOLS]
@@ -884,20 +886,19 @@ class _PiTurn:
                 self._budget_exhausted_reason = "budget_exhausted: Pi exceeded configured budget"
             self.cancel(reason="budget_exhausted")
         elif self._request.max_steps is not None:
-            if (
-                self._request.max_steps >= 3
-                and step == self._request.max_steps - 2
-                and stop_reason == "toolUse"
-            ):
+            warn_steps = {
+                s for s in (self._request.max_steps - 3, self._request.max_steps - 1) if s >= 1
+            }
+            if step in warn_steps and stop_reason != "stop":
                 with self._lock:
-                    should_steer = not self._budget_steer_sent
-                    self._budget_steer_sent = True
+                    should_steer = step not in self._budget_steer_steps
+                    self._budget_steer_steps.add(step)
                 if should_steer:
                     threading.Thread(
                         target=self.steer,
                         args=(
-                            "Step budget is almost exhausted. Stop calling tools and emit your "
-                            "final response now.",
+                            "Step budget is almost exhausted. Stop calling tools immediately and "
+                            "emit your final response now.",
                         ),
                         kwargs={"source": "step_budget"},
                         daemon=True,

@@ -109,6 +109,8 @@ def run_structured_turn[T: BaseModel](
 
     prompt = user_prompt
     turn_max_steps = max_steps
+    turn_disable_tools = False
+    synthesized_after_cap = False
     parse_retries = 0
     validation_retries = 0
     attempt = 0
@@ -122,6 +124,7 @@ def run_structured_turn[T: BaseModel](
                 user_prompt=prompt,
                 actor=actor,
                 read_only=True,
+                disable_tools=turn_disable_tools,
                 max_steps=turn_max_steps,
                 trace_path=trace_path,
                 model=driver_model,
@@ -137,6 +140,19 @@ def run_structured_turn[T: BaseModel](
             attempt=attempt,
         )
         if not outcome.completed:
+            if outcome.stop_reason == "max_steps_exceeded" and not synthesized_after_cap:
+                synthesized_after_cap = True
+                prompt = _validation_prompt(
+                    user_prompt,
+                    "[STEP LIMIT REACHED]",
+                    ["exploration reached the step budget before returning JSON"],
+                    "Tools are disabled. Synthesize and return ONLY a single raw JSON object "
+                    f"conforming to {model_cls.__name__} from the observed workspace context.",
+                    previous_output=outcome.final_content,
+                )
+                turn_disable_tools = True
+                turn_max_steps = 2
+                continue
             raise StructuredTurnError(
                 f"{driver.name} driver stopped before returning {model_cls.__name__}: "
                 f"{outcome.stop_reason}"
@@ -155,7 +171,8 @@ def run_structured_turn[T: BaseModel](
                     "draft and output a single raw JSON object.",
                     previous_output=outcome.final_content,
                 )
-                turn_max_steps = min(max_steps, 2) if max_steps is not None else 2
+                turn_disable_tools = True
+                turn_max_steps = 2
                 continue
             raise ValueError(
                 f"Failed to parse {model_cls.__name__} JSON from {driver.name}: {exc}"
@@ -174,7 +191,8 @@ def run_structured_turn[T: BaseModel](
                 validation_instruction,
                 previous_output=candidate.model_dump_json(indent=2),
             )
-            turn_max_steps = min(max_steps, 4) if max_steps is not None else 4
+            turn_disable_tools = True
+            turn_max_steps = 2
             continue
         if on_validation_exhausted is not None:
             return on_validation_exhausted(candidate, violations)

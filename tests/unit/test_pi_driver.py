@@ -1736,4 +1736,6 @@ def test_stage_driver_honors_parse_retries_when_validation_retries_zero(tmp_path
         strict_canonical=False,
     )
     assert len(driver.requests) == 2
+    assert driver.requests[0].disable_tools is False
+    assert driver.requests[1].disable_tools is True
     assert spec.goal.startswith("Expose a calculator module")
