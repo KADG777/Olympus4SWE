@@ -424,6 +424,16 @@ export interface components {
         };
         /** BudgetSummary */
         BudgetSummary: {
+            /**
+             * Cache Read Tokens
+             * @default 0
+             */
+            cache_read_tokens: number;
+            /**
+             * Cache Write Tokens
+             * @default 0
+             */
+            cache_write_tokens: number;
             /** Calls Reserved */
             calls_reserved: number;
             /** Calls Used */
@@ -997,6 +1007,11 @@ export interface components {
             spec_id?: string;
             /** @default draft */
             status: components["schemas"]["SpecStatus"];
+            /**
+             * Test Seams
+             * @description Fewest, highest-level public seams (HTTP routes, CLI commands, public APIs) where behavior is verified.
+             */
+            test_seams?: string[];
             /**
              * Version
              * @default 1

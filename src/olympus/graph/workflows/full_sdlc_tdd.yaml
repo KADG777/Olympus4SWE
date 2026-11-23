@@ -1,8 +1,9 @@
 name: full_sdlc_tdd
 description: >-
-  Full SDLC with TDD-first decomposition: every human gate stays enabled, the planner
-  emits contract/test/implement waves before integration, and execution continues to the
-  end of the task DAG.
+  Full SDLC with TDD-first vertical tracer-bullet slicing: every human gate stays enabled, the
+  planner emits a thin runnable end-to-end skeleton slice followed by cohesive vertical
+  user-story slices, each carrying its own executable seam check, and execution continues to
+  the end of the task DAG.
 stop_after: execute
 topology: tdd_first
 nodes:

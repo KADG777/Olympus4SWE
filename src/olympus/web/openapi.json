@@ -545,6 +545,16 @@
       "BudgetSummary": {
         "additionalProperties": false,
         "properties": {
+          "cache_read_tokens": {
+            "default": 0,
+            "title": "Cache Read Tokens",
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "default": 0,
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
           "calls_reserved": {
             "title": "Calls Reserved",
             "type": "integer"
@@ -2146,6 +2156,14 @@
           "status": {
             "$ref": "#/components/schemas/SpecStatus",
             "default": "draft"
+          },
+          "test_seams": {
+            "description": "Fewest, highest-level public seams (HTTP routes, CLI commands, public APIs) where behavior is verified.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Test Seams",
+            "type": "array"
           },
           "version": {
             "default": 1,

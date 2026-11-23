@@ -173,12 +173,19 @@ class GoalSpec(FingerprintedModel):
     deliverable_kind: DeliverableKind | None = None
     observable_surfaces: list[str] = Field(default_factory=list)
     actors: list[str] = Field(default_factory=list)
+    test_seams: list[str] = Field(
+        default_factory=list,
+        description="Fewest, highest-level public seams (HTTP routes, CLI commands, public "
+        "APIs) where behavior is verified.",
+    )
 
     def _hash_payload(self) -> dict[str, Any]:
-        """Keep existing approvals valid when provenance is absent."""
+        """Drop empty optional fields so legacy approvals keep identical hashes."""
         payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
         if not self.agent_high_impact_assumptions:
             del payload["agent_high_impact_assumptions"]
+        if not self.test_seams:
+            del payload["test_seams"]
         return payload
 
     @model_validator(mode="after")
@@ -201,9 +208,12 @@ class GoalSpec(FingerprintedModel):
             "",
             self.goal,
             "",
-            "## Requirements",
-            "",
         ]
+        if self.test_seams:
+            lines.extend(["## Test seams", ""])
+            lines.extend(f"- {seam}" for seam in self.test_seams)
+            lines.append("")
+        lines.extend(["## Requirements", ""])
         for req in self.requirements:
             actor = f" [{req.actor}]" if req.actor else ""
             lines.append(f"### {req.id}{actor}")
@@ -650,11 +660,18 @@ class BudgetLedger(StrictModel):
     llm_calls_reserved: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
     unknown_outcome_calls: int = Field(default=0, ge=0)
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
 
     def can_reserve(self, policy: BudgetPolicy) -> bool:
         calls_ok = (
@@ -675,6 +692,8 @@ class BudgetLedger(StrictModel):
         self,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
         *,
         unknown: bool = False,
     ) -> BudgetLedger:
@@ -686,6 +705,8 @@ class BudgetLedger(StrictModel):
                 "llm_calls_used": self.llm_calls_used + 1,
                 "input_tokens": self.input_tokens + max(0, input_tokens),
                 "output_tokens": self.output_tokens + max(0, output_tokens),
+                "cache_read_tokens": self.cache_read_tokens + max(0, cache_read_tokens),
+                "cache_write_tokens": self.cache_write_tokens + max(0, cache_write_tokens),
                 "unknown_outcome_calls": self.unknown_outcome_calls + (1 if unknown else 0),
             }
         )

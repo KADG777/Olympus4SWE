@@ -23,6 +23,7 @@ from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
+    BudgetPolicy,
     GoalSpec,
     RunMode,
     RunStatus,
@@ -30,13 +31,14 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.harness.activity import milestone_fields
 from olympus.harness.driver import (
     ActiveTurnHandle,
     DriverTurnRequest,
     ExecutionDriversConfig,
     TurnOutcome,
 )
-from olympus.harness.pi import PiDriver, PiNotAvailableError
+from olympus.harness.pi import PiDriver, PiNotAvailableError, _safe_argv
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
@@ -68,12 +70,14 @@ def _emit(record):
 
 
 def _usage(tin, tout):
+    cache_read = int(os.environ.get("FAKE_PI_CACHE_READ", "0"))
+    cache_write = int(os.environ.get("FAKE_PI_CACHE_WRITE", "0"))
     return {
         "input": tin,
         "output": tout,
-        "cacheRead": 0,
-        "cacheWrite": 0,
-        "totalTokens": tin + tout,
+        "cacheRead": cache_read,
+        "cacheWrite": cache_write,
+        "totalTokens": tin + tout + cache_read + cache_write,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
     }
 
@@ -168,6 +172,14 @@ def _emit_work():
                 "result": {"content": [{"type": "text", "text": "Repeated error"}]},
                 "isError": True,
             })
+    if os.environ.get("FAKE_PI_COMPACT") == "1":
+        _emit({"type": "compaction_start", "reason": "threshold"})
+        _emit({
+            "type": "compaction_end",
+            "reason": "threshold",
+            "result": {"summary": "SECRET COMPACTION PROSE"},
+            "aborted": False,
+        })
     _emit({"type": "turn_end", "message": first, "toolResults": []})
     _emit({"type": "agent_end", "messages": [first], "willRetry": False})
 
@@ -432,13 +444,13 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
         entry["event"] == "agent.steered" and entry["source"] == "human"
         for entry in normalized
     )
-    raw_updates = [
-        entry["record"]
-        for entry in entries
-        if entry.get("record", {}).get("type") == "message_update"
-    ]
+    assert not any(
+        entry.get("record", {}).get("type") == "message_update" for entry in entries
+    )
+    text_deltas = [payload for kind, payload in events if kind == "text_delta"]
+    assert any(payload["text"] == "Working on it " for payload in text_deltas)
     assert any(
-        update["assistantMessageEvent"]["delta"] == "Working on it " for update in raw_updates
+        entry["event"] == "llm" and entry["input_tokens"] == 11 for entry in normalized
     )
 
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
@@ -453,6 +465,91 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
     assert json.loads(env["write_scope"]) == ["feature.py"]
     assert json.loads(env["forbidden_globs"]) == ["shared/*.py"]
     assert env["cwd"] == str(tmp_path)
+
+
+def test_pi_driver_settles_cache_tokens_and_enforces_true_total_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_PI_CACHE_READ", "50")
+    monkeypatch.setenv("FAKE_PI_CACHE_WRITE", "10")
+    store = RunStore(tmp_path / "run.db")
+    run_id = store.create_run(
+        title="cache-token-cap",
+        mode=RunMode.SIMULATION,
+        budget_policy=BudgetPolicy(max_total_tokens=50),
+    )
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    outcome = PiDriver(binary=str(fake), store=store, run_id=run_id).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert not outcome.completed
+    assert outcome.stop_reason.startswith("budget_exhausted")
+    assert outcome.steps_taken == ledger.llm_calls_used == 2
+    assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
+    assert (ledger.cache_read_tokens, ledger.cache_write_tokens) == (100, 20)
+    # The same run stays under the cap without cache tokens; cached reads/writes trip it.
+    assert ledger.total_tokens == 146 > 50
+
+    llm_events = [payload for kind, payload in events if kind == "llm"]
+    assert all(
+        (payload["cache_read_tokens"], payload["cache_write_tokens"]) == (50, 10)
+        for payload in llm_events
+    )
+    llm_trace = [entry for entry in _read_jsonl(trace_path) if entry.get("event") == "llm"]
+    assert llm_trace and all(
+        (entry["cache_read_tokens"], entry["cache_write_tokens"]) == (50, 10)
+        for entry in llm_trace
+    )
+
+
+def test_pi_driver_bridges_compaction_milestones_without_raw_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_PI_COMPACT", "1")
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    outcome = PiDriver(binary=str(fake)).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert outcome.completed
+    compactions = [payload for kind, payload in events if kind == "agent.compaction"]
+    assert [payload["phase"] for payload in compactions] == ["start", "end"]
+    assert "SECRET COMPACTION PROSE" not in json.dumps(compactions)
+
+    trace_compactions = [
+        entry for entry in _read_jsonl(trace_path) if entry.get("event") == "agent.compaction"
+    ]
+    assert [entry["phase"] for entry in trace_compactions] == ["start", "end"]
+
+
+def test_compaction_milestone_fields_drop_raw_prose() -> None:
+    payload = {"phase": "end", "result": {"summary": "SECRET COMPACTION PROSE"}}
+    assert milestone_fields("agent.compaction", payload) == {"phase": "end"}
+    assert milestone_fields("agent.compaction", {"phase": "middle"}) is None
 
 
 def test_pi_driver_cancel_reclaims_process_group_with_grandchild(
@@ -531,6 +628,55 @@ def test_pi_driver_missing_binary_fails_fast(tmp_path: Path) -> None:
         driver.run_turn(_request(tmp_path))
 
 
+def test_pi_driver_writable_turn_appends_prompt_and_enables_native_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
+
+    outcome = PiDriver(binary=str(fake)).run_turn(_request(tmp_path))
+
+    assert outcome.completed
+    argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert "--append-system-prompt" in argv
+    assert "--system-prompt" not in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == "You are the fake worker."
+    assert argv[argv.index("--tools") + 1] == "read,bash,edit,write,grep,find,ls"
+    assert "--exclude-tools" not in argv
+    assert argv[argv.index("--extension") + 1].endswith("pi_scope_guard.ts")
+
+    spawn = next(
+        entry
+        for entry in _read_jsonl(tmp_path / "worker.jsonl")
+        if entry.get("event") == "pi.spawn"
+    )
+    assert f"<{len('You are the fake worker.')} chars>" in spawn["argv"]
+    assert "You are the fake worker." not in json.dumps(spawn)
+
+
+def test_safe_argv_redacts_prompt_flags_and_trailing_prompt() -> None:
+    argv = _safe_argv(
+        [
+            "pi",
+            "--append-system-prompt",
+            "system rules",
+            "--model",
+            "fake-model",
+            "--",
+            "user prompt",
+        ]
+    )
+    assert argv == [
+        "--append-system-prompt",
+        f"<{len('system rules')} chars>",
+        "--model",
+        "fake-model",
+        "--",
+        f"<prompt: {len('user prompt')} chars>",
+    ]
+
+
 def test_pi_driver_read_only_turn_restricts_pi_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -541,8 +687,10 @@ def test_pi_driver_read_only_turn_restricts_pi_tools(
 
     assert outcome.completed
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
+    assert "--append-system-prompt" in argv and "--system-prompt" not in argv
     assert argv[argv.index("--tools") + 1] == "read,grep,find,ls"
     assert argv[argv.index("--exclude-tools") + 1] == "bash,write,edit,powershell"
+    assert "read,bash,edit,write,grep,find,ls" not in argv
     assert "--no-extensions" in argv
     assert "--extension" not in argv
 
@@ -704,7 +852,8 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
 
     ledger = store.get_run(run_id)["budget_ledger"]
     assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
-    assert ledger.llm_calls_used == 3  # two Pi steps + one native Argus call
+    watchdog_calls = 1 if watchdog_enabled else 0
+    assert ledger.llm_calls_used == 3 + watchdog_calls
 
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
     assert "--mode" in argv and argv[argv.index("--mode") + 1] == "rpc"
@@ -933,8 +1082,6 @@ def test_pi_driver_help_probe_reaps_helper_child_process(tmp_path: Path) -> None
 
 
 def test_pi_driver_enforces_budget_and_max_steps_with_honest_ledger(tmp_path: Path) -> None:
-    from olympus.core.contracts import BudgetPolicy, RunMode
-
     store = RunStore(tmp_path / "run.db")
     run_id = store.create_run(
         title="budget-cap",
@@ -963,3 +1110,41 @@ def test_pi_driver_enforces_budget_and_max_steps_with_honest_ledger(tmp_path: Pa
     assert not any(
         "usage.settle_error" in line for line in trace_path.read_text(encoding="utf-8").splitlines()
     )
+
+
+def test_pi_driver_trace_omits_message_start_turn_end_and_success_responses(
+    tmp_path: Path,
+) -> None:
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "compact.jsonl"
+    deltas: list[str] = []
+    outcome = PiDriver(binary=str(fake)).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: (
+            deltas.append(str(payload.get("text", ""))) if kind == "text_delta" else None
+        ),
+    )
+    assert outcome.completed
+    assert deltas
+    raw_records = [
+        entry["record"]
+        for entry in _read_jsonl(trace_path)
+        if entry.get("source") == "pi" and isinstance(entry.get("record"), dict)
+    ]
+    types = {record.get("type") for record in raw_records}
+    assert "message_update" not in types
+    assert "message_start" not in types
+    assert "turn_end" not in types
+    assert not any(
+        record.get("type") == "response" and record.get("success") is True
+        for record in raw_records
+    )
+    assert "message_end" in types
+

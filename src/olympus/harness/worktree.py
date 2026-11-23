@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from olympus.tools.aci import IGNORED_DIR_NAMES
+from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, sandbox_tmp_path
 from olympus.tools.aci import build_sandbox_env as build_sandbox_env
 
 
@@ -20,6 +22,26 @@ class SandboxHandle:
     workspace_path: Path
     base_commit: str | None
     is_git_worktree: bool
+    reused: bool = False
+
+    @property
+    def tmp_dir(self) -> Path:
+        return sandbox_tmp_path(self.workspace_path, self.repo_root)
+
+    @property
+    def baseline_path(self) -> Path:
+        if not self.workspace_path.resolve().is_relative_to(self.repo_root.resolve()):
+            return (
+                self.workspace_path.resolve().parent
+                / ".sandbox_baselines"
+                / f"{self.workspace_path.name}.json"
+            )
+        return (
+            self.repo_root
+            / ".olympus"
+            / "sandbox_baselines"
+            / f"{self.workspace_path.name}.json"
+        )
 
 
 @dataclass(frozen=True)
@@ -28,6 +50,7 @@ class SandboxBaseline:
 
     is_git: bool
     entries: tuple[tuple[str, str | None], ...]
+    base_commit: str | None = None
 
     def mapping(self) -> dict[str, str | None]:
         return dict(self.entries)
@@ -48,25 +71,55 @@ def is_git_repo(path: Path) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
+def _safe_label(label: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in label)
+
+
+def _open_retained_sandbox(root: Path, sandbox_dir: Path) -> SandboxHandle | None:
+    if is_git_repo(root):
+        if not is_git_repo(sandbox_dir):
+            return None
+        probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
+        saved = load_sandbox_baseline(probe)
+        if saved is not None and saved.base_commit is not None:
+            base_commit = saved.base_commit
+        else:
+            head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
+            if head_proc.returncode != 0:
+                return None
+            base_commit = head_proc.stdout.strip()
+        return SandboxHandle(
+            root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
+        )
+    return SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
+
+
 def create_sandbox(
     repo_root: Path | str,
     *,
     label: str,
+    reuse: bool = False,
     sandbox_root: Path | str | None = None,
 ) -> SandboxHandle:
     """Create an isolated git worktree when inside a git repo, else copy workspace.
 
-    ``sandbox_root`` keeps sandbox worktrees outside the target repository (the headless
-    session CLI externalizes all mutable state this way).
+    With ``reuse=True`` a healthy retained sandbox is reopened as-is so a retried
+    attempt keeps every uncommitted file from its previous turn. ``sandbox_root``
+    keeps sandbox worktrees (and their baselines/tmp dirs) outside the target
+    repository so headless sessions never pollute the repo with ``.olympus``.
     """
     root = Path(repo_root).resolve()
-    safe_label = "".join(c if c.isalnum() or c in "-_" else "-" for c in label)
+    safe_label = _safe_label(label)
     sandbox_dir = (
         Path(sandbox_root).resolve() / safe_label
         if sandbox_root is not None
         else root / ".olympus" / "sandboxes" / safe_label
     )
     if sandbox_dir.exists():
+        if reuse:
+            retained = _open_retained_sandbox(root, sandbox_dir)
+            if retained is not None:
+                return retained
         remove_sandbox(SandboxHandle(root, sandbox_dir, None, is_git_repo(root)))
 
     if is_git_repo(root):
@@ -105,11 +158,60 @@ def create_sandbox(
     )
 
 
-def capture_sandbox_diff(handle: SandboxHandle) -> str:
-    """Return tracked diff plus untracked file list/contents for cold-start review."""
+def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> None:
+    """Persist the task's Attempt-1 baseline next to its retained sandbox."""
+    path = handle.baseline_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "is_git": baseline.is_git,
+                "base_commit": baseline.base_commit,
+                "entries": [list(e) for e in baseline.entries],
+            },
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_sandbox_baseline(handle: SandboxHandle) -> SandboxBaseline | None:
+    """Load the persisted Attempt-1 baseline; ``None`` when absent or unreadable."""
+    try:
+        payload = json.loads(handle.baseline_path.read_text(encoding="utf-8"))
+        entries = tuple(
+            (str(rel), None if fingerprint is None else str(fingerprint))
+            for rel, fingerprint in payload["entries"]
+        )
+        raw_commit = payload.get("base_commit")
+        base_commit = str(raw_commit) if isinstance(raw_commit, str) and raw_commit else None
+        return SandboxBaseline(
+            is_git=bool(payload["is_git"]),
+            entries=entries,
+            base_commit=base_commit,
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def capture_sandbox_diff(
+    handle: SandboxHandle, baseline: SandboxBaseline | None = None
+) -> str:
+    """Return tracked diff plus untracked file contents for cold-start review.
+
+    Supplying the task's pre-worker ``baseline`` restricts the output to paths
+    mutated since that snapshot, so unchanged upstream ``accepted_overlay``
+    files never leak into a downstream task's diff. Without a baseline the
+    legacy ``HEAD`` + untracked behavior is preserved for direct callers.
+    """
+    if baseline is not None:
+        return _baseline_scoped_diff(handle, baseline)
     ws = handle.workspace_path
     if not is_git_repo(ws):
         return "(non-git sandbox; inspect modified files directly)"
+    return _head_scoped_diff(ws)
+
+
+def _head_scoped_diff(ws: Path) -> str:
     tracked = _run_git(ws, "diff", "HEAD").stdout
     untracked_proc = _run_git(ws, "ls-files", "--others", "--exclude-standard")
     parts: list[str] = []
@@ -119,12 +221,152 @@ def capture_sandbox_diff(handle: SandboxHandle) -> str:
     for rel in untracked:
         fpath = ws / rel
         if fpath.is_file():
-            try:
-                content = fpath.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = "<binary file>"
-            parts.append(f"--- /dev/null\n+++ b/{rel}\n{content}")
+            parts.append(f"--- /dev/null\n+++ b/{rel}\n{_read_text(fpath)}")
     return "\n\n".join(parts) if parts else "(no changes)"
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "<binary file>"
+
+
+def _prefixed_content(path: Path) -> tuple[str, int]:
+    text = _read_text(path)
+    lines = text.splitlines()
+    if not lines:
+        return "", 0
+    return "\n".join(f"+{line}" for line in lines) + "\n", len(lines)
+
+
+def _is_tracked_at_base(ws: Path, base_commit: str | None, rel: str) -> bool:
+    if base_commit is None or not is_git_repo(ws):
+        return False
+    return _run_git(ws, "cat-file", "-e", f"{base_commit}:{rel}").returncode == 0
+
+
+def _no_index_new_file_diff(ws: Path, rel: str) -> str:
+    proc = _run_git(
+        ws,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-index",
+        "--",
+        "/dev/null",
+        rel,
+    )
+    if proc.returncode in (0, 1) and proc.stdout.strip():
+        lines = proc.stdout.rstrip().splitlines()
+        if lines and lines[0].startswith("diff --git "):
+            lines[0] = f"diff --git a/{rel} b/{rel}"
+        return "\n".join(lines)
+    body, count = _prefixed_content(ws / rel)
+    hunk = f"@@ -0,0 +1,{count} @@\n{body}" if count else ""
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        "new file mode 100644\n"
+        f"--- /dev/null\n+++ b/{rel}\n"
+        f"{hunk}"
+    ).rstrip()
+
+
+def _new_file_block(ws: Path, rel: str) -> str:
+    return _no_index_new_file_diff(ws, rel)
+
+
+def _deleted_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
+    if base_commit is not None and is_git_repo(ws):
+        tracked = _run_git(
+            ws, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", rel
+        ).stdout.rstrip()
+        if tracked:
+            return tracked
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        "deleted file mode 100644\n"
+        f"--- a/{rel}\n+++ /dev/null"
+    )
+
+
+def _overlay_file_block(ws: Path, rel: str) -> str:
+    body, count = _prefixed_content(ws / rel)
+    hunk = f"@@ -0,0 +1,{count} @@\n{body}" if count else ""
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"--- a/{rel}\n+++ b/{rel}\n"
+        f"{hunk}"
+    ).rstrip()
+
+
+def _modified_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
+    if _is_tracked_at_base(ws, base_commit, rel):
+        assert base_commit is not None
+        diff_out = _run_git(
+            ws, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", rel
+        ).stdout.rstrip()
+        if diff_out:
+            return diff_out
+    return _overlay_file_block(ws, rel)
+
+
+def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> str:
+    ws = handle.workspace_path
+    before = baseline.mapping()
+    base_commit = baseline.base_commit or handle.base_commit
+    changed = collect_sandbox_changes(handle, baseline)
+    if not changed:
+        return "(no changes)"
+
+    def present(rel: str) -> bool:
+        candidate = ws / rel
+        return candidate.is_file() or candidate.is_symlink()
+
+    added = {
+        rel
+        for rel in changed
+        if rel not in before and not _is_tracked_at_base(ws, base_commit, rel) and present(rel)
+    }
+    deleted = {
+        rel
+        for rel in changed
+        if (rel in before or _is_tracked_at_base(ws, base_commit, rel)) and not present(rel)
+    }
+    modified = set(changed) - added - deleted
+
+    renames: dict[str, str] = {}
+    for old in sorted(deleted):
+        fingerprint = before.get(old)
+        if fingerprint is None:
+            continue
+        match = next(
+            (new for new in sorted(added) if _file_fingerprint(ws / new) == fingerprint),
+            None,
+        )
+        if match is not None:
+            renames[old] = match
+            added.discard(match)
+
+    blocks: list[str] = []
+    for rel in sorted(changed):
+        if rel in renames:
+            new = renames[rel]
+            blocks.append(
+                f"diff --git a/{rel} b/{new}\n"
+                "similarity index 100%\n"
+                f"rename from {rel}\nrename to {new}"
+            )
+        elif rel in renames.values():
+            continue
+        elif rel in added:
+            blocks.append(_new_file_block(ws, rel))
+        elif rel in deleted:
+            blocks.append(_deleted_file_block(ws, rel, base_commit))
+        elif rel in modified:
+            blocks.append(_modified_file_block(ws, rel, base_commit))
+    return "\n\n".join(blocks) if blocks else "(no changes)"
 
 
 def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
@@ -132,7 +374,7 @@ def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
     patch = attempt_dir / "diff.patch"
     if handle.base_commit is None:
         patch.write_text("Non-git workspace preserved in sandbox/\n", encoding="utf-8")
-        shutil.move(handle.workspace_path, attempt_dir / "sandbox")
+        shutil.copytree(handle.workspace_path, attempt_dir / "sandbox", dirs_exist_ok=True)
         return
 
     ws = handle.workspace_path
@@ -241,24 +483,38 @@ def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
         except RuntimeError:
             entries = _workspace_fingerprints(ws)
             return SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
-        return SandboxBaseline(is_git=True, entries=tuple(sorted(entries.items())))
+        return SandboxBaseline(
+            is_git=True,
+            entries=tuple(sorted(entries.items())),
+            base_commit=handle.base_commit,
+        )
     return SandboxBaseline(
         is_git=False, entries=tuple(sorted(_workspace_fingerprints(ws).items()))
     )
 
 
-def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
-    """Return repo-relative paths mutated since ``baseline`` (adds, edits, deletes, renames)."""
+def _current_fingerprints(
+    handle: SandboxHandle, baseline: SandboxBaseline | None = None
+) -> dict[str, str | None]:
     ws = handle.workspace_path
-    if baseline.is_git and handle.base_commit is not None and is_git_repo(ws):
+    use_git = baseline.is_git if baseline is not None else handle.is_git_worktree
+    base_commit = (
+        baseline.base_commit
+        if baseline is not None and baseline.base_commit is not None
+        else handle.base_commit
+    )
+    if use_git and base_commit is not None and is_git_repo(ws):
         try:
-            current = _git_changed_fingerprints(ws, handle.base_commit)
+            return _git_changed_fingerprints(ws, base_commit)
         except RuntimeError:
             # A tampered sandbox (e.g. deleted .git) fails closed: every file looks changed.
-            current = _workspace_fingerprints(ws)
-    else:
-        current = _workspace_fingerprints(ws)
+            return _workspace_fingerprints(ws)
+    return _workspace_fingerprints(ws)
 
+
+def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
+    """Return repo-relative paths mutated since ``baseline`` (adds, edits, deletes, renames)."""
+    current = _current_fingerprints(handle, baseline)
     before = baseline.mapping()
     changed = {
         rel
@@ -269,9 +525,125 @@ def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) ->
     return sorted(changed)
 
 
+def sync_upstream_files(
+    handle: SandboxHandle,
+    overlay_dir: Path,
+    baseline: SandboxBaseline,
+    *,
+    write_scope: Sequence[str],
+) -> SandboxBaseline:
+    """Refresh newly accepted upstream files without clobbering the task's in-progress work.
+
+    Only paths the worker left exactly at their baseline content are synced. Worker
+    mutations outside ``write_scope`` stay untouched so the Diff Gate still audits them,
+    and the returned baseline records fingerprints for the synced upstream paths only.
+    """
+    if not overlay_dir.is_dir():
+        return baseline
+    policy = WorkspacePolicy(allowed_write_scope=list(write_scope))
+    merged = baseline.mapping()
+    current_map = _current_fingerprints(handle, baseline)
+    base_commit = baseline.base_commit or handle.base_commit
+    ws = handle.workspace_path
+    synced_rels: list[str] = []
+    for src in sorted(overlay_dir.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(overlay_dir).as_posix()
+        if any(
+            part in IGNORED_DIR_NAMES or part == ".olympus"
+            for part in PurePosixPath(rel).parts
+        ):
+            continue
+        if policy.allows_relative_path(rel):
+            continue
+        if rel in current_map and current_map[rel] != merged.get(rel):
+            continue
+        if rel in merged and rel not in current_map:
+            continue
+        current = _file_fingerprint(ws / rel)
+        if rel in merged:
+            if current != merged[rel]:
+                continue
+        elif (current is not None) != _is_tracked_at_base(ws, base_commit, rel):
+            continue
+        dst = ws / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        synced_rels.append(rel)
+    if synced_rels:
+        updated_map = _current_fingerprints(handle, baseline)
+        for rel in synced_rels:
+            if rel in updated_map:
+                merged[rel] = updated_map[rel]
+            else:
+                merged.pop(rel, None)
+    return SandboxBaseline(
+        is_git=baseline.is_git,
+        entries=tuple(sorted(merged.items())),
+        base_commit=baseline.base_commit,
+    )
+
+
+def absorb_verification_artifacts(
+    handle: SandboxHandle,
+    baseline: SandboxBaseline,
+    *,
+    write_scope: Sequence[str],
+) -> SandboxBaseline:
+    """Fold newly created untracked out-of-scope check-command side effects into the baseline.
+
+    Tracked or pre-existing baseline files modified or deleted by a check command are never
+    absorbed so tampered inputs remain visible to the Diff Gate on retry.
+    """
+    policy = WorkspacePolicy(allowed_write_scope=list(write_scope))
+    current = _current_fingerprints(handle, baseline)
+    merged = baseline.mapping()
+    base_commit = baseline.base_commit or handle.base_commit
+    ws = handle.workspace_path
+    for rel, fingerprint in current.items():
+        if policy.allows_relative_path(rel):
+            continue
+        if rel in merged or _is_tracked_at_base(ws, base_commit, rel):
+            continue
+        if fingerprint is not None:
+            merged[rel] = fingerprint
+    return SandboxBaseline(
+        is_git=baseline.is_git,
+        entries=tuple(sorted(merged.items())),
+        base_commit=baseline.base_commit,
+    )
+
+
 def remove_sandbox(handle: SandboxHandle) -> None:
-    """Clean up a worktree or copied sandbox directory."""
+    """Clean up a worktree or copied sandbox directory plus its temp dir and baseline."""
     if handle.is_git_worktree and is_git_repo(handle.repo_root):
         _run_git(handle.repo_root, "worktree", "remove", "--force", str(handle.workspace_path))
     if handle.workspace_path.exists():
         shutil.rmtree(handle.workspace_path, ignore_errors=True)
+    shutil.rmtree(handle.tmp_dir, ignore_errors=True)
+    handle.baseline_path.unlink(missing_ok=True)
+
+
+def remove_run_sandboxes(repo_root: Path | str, run_id: str) -> None:
+    """Reclaim every retained sandbox, baseline, and temp dir belonging to ``run_id``."""
+    root = Path(repo_root).resolve()
+    prefix = f"{_safe_label(run_id)}-"
+    git_host = is_git_repo(root)
+    sandboxes = root / ".olympus" / "sandboxes"
+    if sandboxes.is_dir():
+        for entry in sorted(sandboxes.iterdir()):
+            if entry.is_dir() and entry.name.startswith(prefix):
+                if git_host:
+                    _run_git(root, "worktree", "remove", "--force", str(entry))
+                shutil.rmtree(entry, ignore_errors=True)
+    baselines = root / ".olympus" / "sandbox_baselines"
+    if baselines.is_dir():
+        for entry in sorted(baselines.iterdir()):
+            if entry.name.startswith(prefix):
+                entry.unlink(missing_ok=True)
+    tmp_root = root / ".olympus" / "sandbox_tmp"
+    if tmp_root.is_dir():
+        for entry in sorted(tmp_root.iterdir()):
+            if entry.is_dir() and entry.name.startswith(prefix):
+                shutil.rmtree(entry, ignore_errors=True)

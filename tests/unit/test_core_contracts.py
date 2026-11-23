@@ -41,6 +41,24 @@ def _sample_spec(**overrides: object) -> GoalSpec:
     return GoalSpec(**data)
 
 
+_LEGACY_GOAL_SPEC_JSON = """{
+  "spec_id": "spec-legacy",
+  "version": 1,
+  "goal": "Build auth service",
+  "requirements": [
+    {
+      "id": "R1",
+      "description": "Support login token issue",
+      "acceptance_criteria": ["POST /login returns JWT"]
+    }
+  ],
+  "out_of_scope": ["OAuth social login"],
+  "constraints": ["Python 3.13"]
+}"""
+
+_LEGACY_GOAL_SPEC_HASH = "sha256:2640ccd1bb0c4b8b5312297df31a2ce01ea922df5c85358f5e41760498eee678"
+
+
 def test_goal_spec_hash_ignores_status_and_detects_content_changes() -> None:
     draft = _sample_spec(status=SpecStatus.DRAFT)
     confirmed = _sample_spec(status=SpecStatus.CONFIRMED)
@@ -49,6 +67,24 @@ def test_goal_spec_hash_ignores_status_and_detects_content_changes() -> None:
 
     edited = _sample_spec(out_of_scope=["OAuth social login", "SMS OTP"])
     assert edited.content_hash != draft.content_hash
+
+
+def test_legacy_goal_spec_json_without_test_seams_keeps_its_content_hash() -> None:
+    spec = GoalSpec.model_validate_json(_LEGACY_GOAL_SPEC_JSON)
+    assert spec.test_seams == []
+    assert spec.content_hash == _LEGACY_GOAL_SPEC_HASH
+
+
+def test_goal_spec_test_seams_fingerprint_content_and_render_markdown() -> None:
+    legacy = GoalSpec.model_validate_json(_LEGACY_GOAL_SPEC_JSON)
+    seamed = legacy.model_copy(update={"test_seams": ["POST /login", "GET /health"]})
+
+    assert seamed.content_hash != legacy.content_hash
+    assert "## Test seams" not in legacy.to_markdown()
+    markdown = seamed.to_markdown()
+    assert "## Test seams" in markdown
+    assert "- POST /login" in markdown
+    assert "- GET /health" in markdown
 
 
 def test_review_verdict_blocks_passing_with_important_finding() -> None:
@@ -121,3 +157,21 @@ def test_budget_ledger_is_monotonic_and_enforces_limit() -> None:
     assert not ledger.can_reserve(policy)
     with pytest.raises(ValueError):
         ledger.reserve(policy)
+
+
+def test_budget_ledger_accounts_cache_tokens_and_reads_legacy_json() -> None:
+    legacy = BudgetLedger.model_validate_json('{"input_tokens": 300, "output_tokens": 200}')
+    assert (legacy.cache_read_tokens, legacy.cache_write_tokens) == (0, 0)
+    assert legacy.total_tokens == 500
+
+    settled = legacy.reserve(BudgetPolicy(max_total_tokens=2000)).settle(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=250,
+        cache_write_tokens=150,
+    )
+    assert settled.total_tokens == 1050
+    assert (settled.cache_read_tokens, settled.cache_write_tokens) == (250, 150)
+    # Cached tokens count against the true total even when input/output stay small.
+    assert settled.can_reserve(BudgetPolicy(max_total_tokens=1050)) is False
+    assert settled.can_reserve(BudgetPolicy(max_total_tokens=1051)) is True

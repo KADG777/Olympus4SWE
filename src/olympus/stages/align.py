@@ -72,7 +72,11 @@ Rules:
    `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
 9. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
    copy the exact text from `assumptions` into `agent_high_impact_assumptions`. Do not mark user
-   decisions or confirmed clarifications as Agent assumptions. Ask about genuine blockers."""
+   decisions or confirmed clarifications as Agent assumptions. Ask about genuine blockers.
+10. Seam-First Test Boundaries: Populate `test_seams` with the fewest, highest-level public
+   boundaries where behavior is verified end to end (HTTP routes, CLI commands, public module
+   APIs) — ideal 1-2. Each seam must be exercisable by an external caller in one step; never name
+   brittle internal file paths, private helpers, or test-framework internals."""
 
 _CRITIQUE_SYSTEM_TEMPLATE = """You are a cold-start read-only {perspective} reviewer.
 Inspect the draft GoalSpec (and repository files if needed) and report ONLY real omissions,
@@ -136,6 +140,8 @@ class AlignStage:
             "- deliverable_kind: one of web_app/rest_api/cli/library/desktop/multi_surface\n"
             "- observable_surfaces: the externally visible surfaces that can be exercised\n"
             "- actors: every human/system actor that triggers behavior\n"
+            "- test_seams: 1-2 highest-level public seams (HTTP routes, CLI commands, public\n"
+            "  APIs) where behavior is verified end to end; never internal file paths or helpers\n"
             "- every requirement sets actor plus ears_criteria with pattern="
             "ubiquitous|event_driven|state_driven|unwanted_behavior|optional_feature\n"
             "- acceptance_criteria stay plain strings and must carry measurable thresholds\n"
@@ -165,14 +171,11 @@ class AlignStage:
                 return []
             return validate_goal_spec(candidate)
 
+        exhausted_violations: list[str] = []
+
         def record_validation_failure(candidate: GoalSpec, violations: list[str]) -> GoalSpec:
-            self.store.append_event(
-                run_id=run_id,
-                stage="align",
-                event_type="spec.validation_failed",
-                actor="align",
-                payload={"violations": violations},
-            )
+            exhausted_violations.clear()
+            exhausted_violations.extend(violations)
             return candidate
 
         draft = loop.run_structured(
@@ -199,6 +202,17 @@ class AlignStage:
             }
         )
         self.store.save_spec(run_id, spec, actor="align")
+        if exhausted_violations:
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="spec.validation_failed",
+                actor="align",
+                payload={
+                    "violations": list(exhausted_violations),
+                    "spec_hash": spec.content_hash,
+                },
+            )
         self.store.set_run_status(
             run_id,
             RunStatus.AWAITING_HUMAN,

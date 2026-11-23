@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 from olympus.core.contracts import ApprovalTarget, RunEvent, RunStatus, TaskPlan, TaskStatus
 from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
+from olympus.core.dag import validate_plan_topology
 from olympus.core.store import RunStore
 
 if TYPE_CHECKING:
@@ -87,6 +88,14 @@ def resolve_resume_node(
         and is_artifact_approved(store, run_id, "plan", snap)
         and is_plan_bound_to_upstream(store, run_id, snap)
     ):
+        plan_design = snap.get("design") if snap["plan"].design_id is not None else None
+        if "validate_plan" in names and validate_plan_topology(
+            snap["plan"],
+            snap.get("spec"),
+            design=plan_design,
+            topology=definition.topology,
+        ):
+            return "validate_plan"
         if definition.stop_after == "execute" and "execute" in names:
             return "execute"
         # Re-enter the terminal gate so the graph records its final routed/END events.

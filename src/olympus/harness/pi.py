@@ -33,9 +33,28 @@ _INSTALL_HINT = (
     "or point OLYMPUS_PI_BIN at the pi executable."
 )
 _READ_ONLY_TOOLS = "read,grep,find,ls"
+_WRITABLE_TOOLS = "read,bash,edit,write,grep,find,ls"
 _FORBIDDEN_WRITE_TOOLS = "bash,write,edit,powershell"
 _HELP_PROBE_TIMEOUT_SECONDS = 10.0
 _SCOPE_GUARD_PATH = Path(__file__).with_name("pi_scope_guard.ts")
+_TRACE_MILESTONE_TYPES = frozenset(
+    {
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_end",
+        "compaction_start",
+        "compaction_end",
+        "agent_settled",
+        "extension_error",
+    }
+)
+
+
+def _is_trace_milestone(record: dict[str, Any]) -> bool:
+    record_type = record.get("type")
+    if record_type in _TRACE_MILESTONE_TYPES:
+        return True
+    return record_type == "response" and not bool(record.get("success"))
 
 
 class PiNotAvailableError(RuntimeError):
@@ -383,17 +402,19 @@ class _PiTurn:
             "--no-skills",
         ]
         if request.system_prompt.strip():
-            command += ["--system-prompt", request.system_prompt]
+            command += ["--append-system-prompt", request.system_prompt]
         if request.model:
             command += ["--model", request.model]
         if request.read_only:
             command += ["--tools", _READ_ONLY_TOOLS, "--exclude-tools", _FORBIDDEN_WRITE_TOOLS]
-        elif self._scope_guard_path.is_file():
-            command += ["--extension", str(self._scope_guard_path)]
         else:
-            self._trace.append(
-                {"event": "pi.scope_guard_missing", "path": str(self._scope_guard_path)}
-            )
+            command += ["--tools", _WRITABLE_TOOLS]
+            if self._scope_guard_path.is_file():
+                command += ["--extension", str(self._scope_guard_path)]
+            else:
+                self._trace.append(
+                    {"event": "pi.scope_guard_missing", "path": str(self._scope_guard_path)}
+                )
         if not self._supports_rpc:
             command += ["--", request.user_prompt]
         return command
@@ -540,7 +561,8 @@ class _PiTurn:
                         continue
                     if not isinstance(record, dict):
                         continue
-                    self._trace.append({"source": "pi", "record": record})
+                    if _is_trace_milestone(record):
+                        self._trace.append({"source": "pi", "record": record})
                     self._handle_record(record)
         except (OSError, ValueError) as exc:
             self._trace.append({"event": "pi.reader_error", "error": str(exc)[:300]})
@@ -564,6 +586,8 @@ class _PiTurn:
             message = record.get("message")
             if isinstance(message, dict) and message.get("role") == "assistant":
                 self._on_assistant_message(message)
+        elif record_type in ("compaction_start", "compaction_end"):
+            self._on_compaction(record_type)
         elif record_type == "agent_settled":
             with self._lock:
                 self._aborted = bool(record.get("aborted"))
@@ -650,11 +674,25 @@ class _PiTurn:
             },
         )
 
+    def _on_compaction(self, record_type: str) -> None:
+        phase = "start" if record_type == "compaction_start" else "end"
+        self._trace.append({"event": "agent.compaction", "phase": phase})
+        self._emit(
+            "agent.compaction",
+            {
+                "actor": self._request.actor,
+                "task_id": self._request.task_id,
+                "phase": phase,
+            },
+        )
+
     def _on_assistant_message(self, message: dict[str, Any]) -> None:
         usage = message.get("usage")
         usage = usage if isinstance(usage, dict) else {}
         input_tokens = _non_negative_int(usage.get("input"))
         output_tokens = _non_negative_int(usage.get("output"))
+        cache_read_tokens = _non_negative_int(usage.get("cacheRead"))
+        cache_write_tokens = _non_negative_int(usage.get("cacheWrite"))
         with self._lock:
             self._steps += 1
             step = self._steps
@@ -671,6 +709,8 @@ class _PiTurn:
                 "step": step,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
             }
         )
         self._receipt_events.append(
@@ -683,7 +723,9 @@ class _PiTurn:
                 "output_tokens": output_tokens,
             }
         )
-        over_budget = self._settle_usage(step, input_tokens, output_tokens)
+        over_budget = self._settle_usage(
+            step, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        )
         self._emit(
             "llm",
             {
@@ -692,6 +734,8 @@ class _PiTurn:
                 "step": step,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
             },
         )
         if over_budget:
@@ -716,7 +760,14 @@ class _PiTurn:
                 self._prompt_error = error[:500]
             self._close_stdin(nonblocking=True)
 
-    def _settle_usage(self, step: int, input_tokens: int, output_tokens: int) -> bool:
+    def _settle_usage(
+        self,
+        step: int,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+    ) -> bool:
         if self._store is None or self._run_id is None:
             return False
         try:
@@ -726,6 +777,8 @@ class _PiTurn:
                 purpose=f"pi_step_{step}",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - usage accounting must not kill the turn
             self._trace.append(

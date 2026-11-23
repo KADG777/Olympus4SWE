@@ -1,0 +1,594 @@
+{
+  "content_hash": "sha256:d8246c28dcefcc864b364d906bc1a08a96331c83f2a4455fa6e89ee15001419b",
+  "plan_id": "blacknote-task-plan-v1",
+  "spec_id": "blacknote-goal-spec-v1",
+  "spec_hash": "sha256:5890b579369df437c141ade9375e079606b99f404057af3411b5155d72d2e1e9",
+  "design_id": "blacknote-design-v2",
+  "design_hash": "sha256:d780a1aac9a8d63defda539b4b43680d94d6294658e4700ee2aa7d38b8adb61a",
+  "version": 1,
+  "tasks": [
+    {
+      "task_id": "T0-contracts",
+      "title": "Wave 0: 冻结共享契约层 src/blacknote/contracts/",
+      "objective": "实现只读共享契约：错误信封与业务错误码常量 (errors.py)、UUIDv4 ID 生成/校验 (ids.py)、UTC ISO-8601 时间工具 (timeutil.py)、唯一可见性谓词 is_visible_to 及状态枚举 (visibility.py)、require_auth/AUTH_REQUIRED 守卫 (auth_guard.py)、Role 枚举与 require_admin 守卫 (roles.py)、LIMITS 常量与 check_fields 校验器 (validation.py)、Settings 配置 dataclass (config.py)，以及各模块接口的数据类型/签名声明 (interfaces.py: NoteInput/FeedQuery/PageQuery/Counters/ProfilePatch 等)。附带契约自测 tests/test_contracts.py。",
+      "requirement_refs": [
+        "R1-account",
+        "R2-note-crud",
+        "R3-feed-discovery",
+        "R4-interactions",
+        "R5-moderation"
+      ],
+      "depends_on": [],
+      "write_scope": [
+        "src/blacknote/contracts/",
+        "src/blacknote/__init__.py",
+        "tests/test_contracts.py",
+        "tests/__init__.py",
+        "conftest.py"
+      ],
+      "read_scope": [
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T0-C1",
+          "kind": "command",
+          "description": "契约层自带测试全部通过（错误信封结构、is_visible_to 谓词对 deleted/moderated/draft/blocked 的过滤、超时常量、ID/时间格式）",
+          "command": "python -m pytest tests/test_contracts.py -v",
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        },
+        {
+          "id": "T0-C2",
+          "kind": "independent_review",
+          "description": "审查 contracts/ 是否完整覆盖设计不变量：INV-error-envelope、INV-id-format、INV-time-encoding、INV-visibility-predicate、INV-auth-session、INV-role-check、INV-field-validation、INV-config-db，且 interfaces.py 中数据结构与 IF-* 接口签名一致；契约层不得 import 任何业务模块。",
+          "command": null,
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        }
+      ],
+      "max_cycles": 3,
+      "status": "accepted",
+      "attempt": 2,
+      "review_cycle": 1,
+      "lease_generation": 4,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "IF-account-auth",
+        "IF-account-profile",
+        "IF-note-crud",
+        "IF-note-feed",
+        "IF-note-exists-for-interaction",
+        "IF-interaction-actions",
+        "IF-moderation-actions"
+      ],
+      "role": "architect",
+      "kind": "contract",
+      "deliverables": [
+        "src/blacknote/contracts/errors.py",
+        "src/blacknote/contracts/ids.py",
+        "src/blacknote/contracts/timeutil.py",
+        "src/blacknote/contracts/visibility.py",
+        "src/blacknote/contracts/auth_guard.py",
+        "src/blacknote/contracts/roles.py",
+        "src/blacknote/contracts/validation.py",
+        "src/blacknote/contracts/config.py",
+        "src/blacknote/contracts/interfaces.py"
+      ]
+    },
+    {
+      "task_id": "T1-account",
+      "title": "Wave 1: 实现账号与身份层 mod-account",
+      "objective": "实现 src/blacknote/account/：注册（邮箱合法且唯一、密码≥8位、加盐哈希存储、成功即建会话）、登录、登出（会话失效）、current_user 会话解析、个人资料 get_profile/update_profile（username/bio/specialty/affiliation/expertise_tags），实现 INV-auth-session 与 INV-role-check 守卫，预置 admin seed 账号路径。所有错误走契约错误信封（EMAIL_TAKEN/INVALID_CREDENTIALS/AUTH_REQUIRED/PERMISSION_DENIED/VALIDATION_ERROR）。数据持久化到服务端数据库（SQLite via config 连接串），重启不丢失。测试 tests/test_account.py。",
+      "requirement_refs": [
+        "R1-account"
+      ],
+      "depends_on": [
+        "T0-contracts"
+      ],
+      "write_scope": [
+        "src/blacknote/account/",
+        "tests/test_account.py"
+      ],
+      "read_scope": [
+        "src/blacknote/contracts/",
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T1-C1",
+          "kind": "command",
+          "description": "账号层服务级测试通过：有效注册→登录→进入首页所需会话可用；重复邮箱注册返回 EMAIL_TAKEN；密码<8位返回 VALIDATION_ERROR；登出后 current_user 返回 AUTH_REQUIRED；update_profile 后 get_profile 立即反映新内容",
+          "command": "python -m pytest tests/test_account.py -v",
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        },
+        {
+          "id": "T1-C2",
+          "kind": "independent_review",
+          "description": "审查密码为加盐哈希存储（无明文）、会话令牌为不透明串、角色枚举限定 {user,admin}、admin 由 seed 预置，且仅使用 contracts 层的错误码/校验/ID/时间工具。",
+          "command": null,
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        }
+      ],
+      "max_cycles": 3,
+      "status": "accepted",
+      "attempt": 1,
+      "review_cycle": 0,
+      "lease_generation": 3,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-account",
+        "IF-account-auth",
+        "IF-account-profile"
+      ],
+      "role": "engineer",
+      "kind": "implement",
+      "deliverables": [
+        "src/blacknote/account/"
+      ]
+    },
+    {
+      "task_id": "T1-note",
+      "title": "Wave 1: 实现笔记内容层 mod-note",
+      "objective": "实现 src/blacknote/note/：create_note/update_note/delete_note/get_note（标题≤100、正文 Markdown≤10000、图片≤9 张单图≤5MB、话题标签≥1、topic∈{ai_news,ai_tools,ai_products}、status∈{draft,published}），软删除 status=deleted，所有权校验（非作者编辑/删除返回 PERMISSION_DENIED），list_feed/search_notes（created_at UTC 倒序分页 page_size≥10、cursor、topic/tag/author_id/following_only 过滤、关键词命中 title/body、空结果 total=0），is_publicly_interactable/get_note_author_id 供互动层调用。所有读取经 contracts.visibility.is_visible_to 过滤（含他人草稿、被下架、已删除）。测试 tests/test_note.py（用桩/最小 account 依赖注入或契约守卫 mock，不 import 兄弟模块实现细节之外的并发任务代码——可依赖 T0 契约与自身 fake repository）。",
+      "requirement_refs": [
+        "R2-note-crud",
+        "R3-feed-discovery"
+      ],
+      "depends_on": [
+        "T0-contracts"
+      ],
+      "write_scope": [
+        "src/blacknote/note/",
+        "tests/test_note.py"
+      ],
+      "read_scope": [
+        "src/blacknote/contracts/",
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T1-C1",
+          "kind": "command",
+          "description": "笔记层服务级测试通过：发布合法笔记出现在 feed 与作者列表；缺标题/空字段返回 VALIDATION_ERROR 并列出缺失字段；草稿仅作者可见不入公共流；编辑后 get_note/list_feed 反映最新；删除后 get_note 返回 NOTE_NOT_FOUND 且不在 feed/search；非作者 update/delete 返回 PERMISSION_DENIED；feed 按 created_at 倒序分页且 topic/tag 过滤 100% 准确；搜索无匹配返回 total=0",
+          "command": "python -m pytest tests/test_note.py -v",
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        },
+        {
+          "id": "T1-C2",
+          "kind": "independent_review",
+          "description": "审查可见性过滤全部经由 contracts.visibility.is_visible_to（无本地复制逻辑）、计数缓存列初始化为 0 且本层不直接修改互动计数、时间戳以 UTC ISO-8601 Z 结尾序列化。",
+          "command": null,
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        }
+      ],
+      "max_cycles": 3,
+      "status": "accepted",
+      "attempt": 1,
+      "review_cycle": 0,
+      "lease_generation": 3,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-note",
+        "IF-note-crud",
+        "IF-note-feed",
+        "IF-note-exists-for-interaction"
+      ],
+      "role": "engineer",
+      "kind": "implement",
+      "deliverables": [
+        "src/blacknote/note/"
+      ]
+    },
+    {
+      "task_id": "T1-interaction",
+      "title": "Wave 1: 实现互动讨论层 mod-interaction",
+      "objective": "实现 src/blacknote/interaction/：like/unlike/favorite/unfavorite（(user_id,note_id) 唯一约束幂等，取消减一且不为负）、comment（body 1..2000 非空否则 VALIDATION_ERROR，parent_comment_id 多层线程关联）、list_comments（时间正序、过滤 blocked 及其子树）、list_favorites。点赞/收藏/评论写入与 Note 计数缓存列在同一事务内原子更新（INV-concurrency-counters）；未登录操作返回 AUTH_REQUIRED 且不写入任何数据（R4-AC3）；通过 note 层 is_publicly_interactable/get_note_author_id 单向查询笔记存在性与可见性。测试 tests/test_interaction.py 使用自有 fake note repository（模拟 IF-note-exists-for-interaction），不 import 并发 sibling 的真实实现。",
+      "requirement_refs": [
+        "R4-interactions"
+      ],
+      "depends_on": [
+        "T0-contracts"
+      ],
+      "write_scope": [
+        "src/blacknote/interaction/",
+        "tests/test_interaction.py"
+      ],
+      "read_scope": [
+        "src/blacknote/contracts/",
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T1-C1",
+          "kind": "command",
+          "description": "互动层服务级测试通过：重复点赞计数不叠加、取消后减一；评论提交即时返回并出现在 list_comments，回复正确挂到父评论形成线程；收藏后 list_favorites 数量与操作记录一致；blocked 评论及其子回复被过滤；空评论/超 2000 字返回 VALIDATION_ERROR；匿名 token 触发 AUTH_REQUIRED 且无任何写入",
+          "command": "python -m pytest tests/test_interaction.py -v",
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        },
+        {
+          "id": "T1-C2",
+          "kind": "independent_review",
+          "description": "审查计数更新与关系表写入处于同一事务边界（同 commit），依赖方向仅为 interaction→note 查询接口，无反向回调；幂等靠唯一约束而非应用层先查后写。",
+          "command": null,
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        }
+      ],
+      "max_cycles": 3,
+      "status": "accepted",
+      "attempt": 2,
+      "review_cycle": 1,
+      "lease_generation": 7,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-interaction",
+        "IF-interaction-actions",
+        "IF-note-exists-for-interaction"
+      ],
+      "role": "engineer",
+      "kind": "implement",
+      "deliverables": [
+        "src/blacknote/interaction/"
+      ]
+    },
+    {
+      "task_id": "T1-moderation",
+      "title": "Wave 1: 实现内容治理层 mod-moderation",
+      "objective": "实现 src/blacknote/moderation/：unlist_note（写 Note.moderated=true）、block_comment（写 Comment.blocked=true，子回复可见性由共享谓词依据祖先链处理）、越权访问记录 ModerationAuditLog(action=privilege_denied)。所有入口先用 contracts.roles.require_admin 校验 role=admin，非管理员返回 PERMISSION_DENIED 且成功率 0%；管理动作要求已登录（AUTH_REQUIRED）。本层只写状态标志，不实现读取过滤。测试 tests/test_moderation.py 使用自有 fake repositories 验证标志写入与审计日志。",
+      "requirement_refs": [
+        "R5-moderation"
+      ],
+      "depends_on": [
+        "T0-contracts"
+      ],
+      "write_scope": [
+        "src/blacknote/moderation/",
+        "tests/test_moderation.py"
+      ],
+      "read_scope": [
+        "src/blacknote/contracts/",
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T1-C1",
+          "kind": "command",
+          "description": "治理层服务级测试通过：admin token 下架笔记后 Note.moderated=true；屏蔽评论后 Comment.blocked=true；非 admin 用户调用 unlist_note/block_comment 返回 PERMISSION_DENIED 且目标状态未被修改，并写入一条 privilege_denied 审计记录；未登录返回 AUTH_REQUIRED",
+          "command": "python -m pytest tests/test_moderation.py -v",
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        },
+        {
+          "id": "T1-C2",
+          "kind": "independent_review",
+          "description": "审查治理层未自建可见性判断逻辑（仅复用 contracts），审计日志字段与 ModerationAuditLog 数据模型一致，目标不存在返回 NOTE_NOT_FOUND/COMMENT_NOT_FOUND。",
+          "command": null,
+          "passed": true,
+          "evidence_ref": "<sanitized-path>"
+        }
+      ],
+      "max_cycles": 3,
+      "status": "accepted",
+      "attempt": 1,
+      "review_cycle": 0,
+      "lease_generation": 1,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-moderation",
+        "IF-moderation-actions"
+      ],
+      "role": "engineer",
+      "kind": "implement",
+      "deliverables": [
+        "src/blacknote/moderation/"
+      ]
+    },
+    {
+      "task_id": "T2-web",
+      "title": "Wave 2: 实现 Web 应用与路由层 mod-web",
+      "objective": "实现 src/blacknote/web/ + templates/ + src/blacknote/static/：组装浏览器可访问的完整 Web 应用——注册/登录/登出页与会话 cookie、需登录页面未会话重定向至登录页、信息流首页（发布时间倒序、每页≥10、滚动加载下一页）、话题分类(AI新闻/工具/产品)与标签检索、关键词搜索（含空结果态）、笔记详情页（Markdown 白名单净化渲染）、发布/编辑编辑器（含图片上传≤9张单图≤5MB，本地磁盘存储+静态资源路由）、个人主页（用户名/简介/专业背景/已发布笔记列表）、收藏夹、评论与多层回复、点赞/收藏按钮、管理后台入口（下架/屏蔽）。写操作仅限登录用户，错误统一渲染契约错误信封，性能满足 ≤1万条 P95≤2s（分页+索引）。测试 tests/test_web_routes.py 用 HTTP client 端到端验证路由行为。",
+      "requirement_refs": [
+        "R1-account",
+        "R2-note-crud",
+        "R3-feed-discovery",
+        "R4-interactions",
+        "R5-moderation"
+      ],
+      "depends_on": [
+        "T0-contracts",
+        "T1-account",
+        "T1-note",
+        "T1-interaction",
+        "T1-moderation"
+      ],
+      "write_scope": [
+        "src/blacknote/web/",
+        "src/blacknote/static/",
+        "templates/",
+        "tests/test_web_routes.py"
+      ],
+      "read_scope": [
+        "src/blacknote/contracts/",
+        "src/blacknote/account/",
+        "src/blacknote/note/",
+        "src/blacknote/interaction/",
+        "src/blacknote/moderation/",
+        "pyproject.toml"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T2-C1",
+          "kind": "command",
+          "description": "Web 路由测试通过：注册成功后跳转信息流首页；登出后访问 /feed 等受保护页 302 重定向登录页；发布笔记后出现在 feed 与主页；未登录 POST 点赞/评论返回 AUTH_REQUIRED 等价响应且无数据写入；访客访问被下架笔记详情返回 404",
+          "command": "python -m pytest tests/test_web_routes.py -v",
+          "passed": false,
+          "evidence_ref": null
+        },
+        {
+          "id": "T2-C2",
+          "kind": "independent_review",
+          "description": "审查页面 HTML 可被浏览器观测（类小红书图文卡片信息流）、Markdown 渲染经过 XSS 白名单净化、图片上传限制单图≤5MB 且静态资源路由可用、错误响应符合契约 JSON 信封或等价页面提示。",
+          "command": null,
+          "passed": false,
+          "evidence_ref": null
+        }
+      ],
+      "max_cycles": 3,
+      "status": "running",
+      "attempt": 2,
+      "review_cycle": 1,
+      "lease_generation": 2,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": "Diff Gate rejected the attempt: 3 changed path(s) violate the task sandbox scope.\nAllowed write_scope: [\"src/blacknote/web/\", \"src/blacknote/static/\", \"templates/\", \"tests/test_web_routes.py\"]\nForbidden globs: [\"src/blacknote/contracts/\"]\nViolating paths:\n- file:<home>/.t3/userdata/antigravity-tmp/ac0a3dfd6ddd/run-WbFWnt/tmp54q202c3/blacknote_moderation_audit.db (outside authorized write_scope)\n- file:<home>/.t3/userdata/antigravity-tmp/ac0a3dfd6ddd/run-WbFWnt/tmpnzl2qpcr/blacknote_moderation_audit.db (outside authorized write_scope)\n- file:<home>/.t3/userdata/antigravity-tmp/ac0a3dfd6ddd/run-WbFWnt/tmpp4uwtlzo/blacknote_moderation_audit.db (outside authorized write_scope)\nNo changes were reverted. Move these paths back inside the authorized scope or request a scope change, then retry.",
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-web",
+        "IF-account-auth",
+        "IF-account-profile",
+        "IF-note-crud",
+        "IF-note-feed",
+        "IF-interaction-actions",
+        "IF-moderation-actions"
+      ],
+      "role": "engineer",
+      "kind": "implement",
+      "deliverables": [
+        "src/blacknote/web/",
+        "templates/"
+      ]
+    },
+    {
+      "task_id": "T2-integration",
+      "title": "Wave 2: 跨模块集成验证",
+      "objective": "编写并运行跨层集成测试 tests/test_integration.py：验证五层组合后的端到端语义——注册→发布→信息流可见→点赞/收藏/评论计数在两个用户视图中一致（误差 0）→作者编辑/删除后 feed/搜索/主页同步→管理员下架后普通用户与访客在所有列表和直链均不可见、屏蔽评论后其子回复不再展示→非管理员调用管理入口 0% 成功→服务重启（重开 DB 连接）后内容与互动数据不丢失→profile 更新刷新即见。发现集成缺陷时以最小修复定位报告（不改契约）。",
+      "requirement_refs": [
+        "R1-account",
+        "R2-note-crud",
+        "R3-feed-discovery",
+        "R4-interactions",
+        "R5-moderation"
+      ],
+      "depends_on": [
+        "T0-contracts",
+        "T1-account",
+        "T1-note",
+        "T1-interaction",
+        "T1-moderation",
+        "T2-web"
+      ],
+      "write_scope": [
+        "tests/test_integration.py"
+      ],
+      "read_scope": [
+        "src/blacknote/"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T2-C1",
+          "kind": "command",
+          "description": "全仓测试套件（契约+四层+web+集成）通过，跨模块计数一致性、可见性传播、权限守卫、持久化重启恢复全部验证",
+          "command": "python -m pytest tests/ -v",
+          "passed": false,
+          "evidence_ref": null
+        },
+        {
+          "id": "T2-C2",
+          "kind": "command",
+          "description": "集成测试专项：两用户视角 like/favorite/comment 计数完全一致；管理员下架后 feed/search/detail 均 404 或不可见；被屏蔽评论的子回复不出现在 list_comments",
+          "command": "python -m pytest tests/test_integration.py -v",
+          "passed": false,
+          "evidence_ref": null
+        }
+      ],
+      "max_cycles": 3,
+      "status": "waiting",
+      "attempt": 0,
+      "review_cycle": 0,
+      "lease_generation": 0,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-account",
+        "mod-note",
+        "mod-interaction",
+        "mod-moderation",
+        "mod-web"
+      ],
+      "role": "qa",
+      "kind": "test",
+      "deliverables": [
+        "tests/test_integration.py"
+      ]
+    },
+    {
+      "task_id": "T2-e2e-human",
+      "title": "Wave 2: 浏览器端人类可视验收",
+      "objective": "启动 BlackNote Web 应用，人工以浏览器完成关键用户旅程验收：注册登录→浏览信息流与话题分类→发布图文笔记→点赞/收藏/评论讨论→编辑个人资料→管理员下架验证。确认交付形态为可通过浏览器访问的类小红书 Web 应用（A1 决议）。",
+      "requirement_refs": [
+        "R1-account",
+        "R2-note-crud",
+        "R3-feed-discovery",
+        "R4-interactions",
+        "R5-moderation"
+      ],
+      "depends_on": [
+        "T2-integration"
+      ],
+      "write_scope": [
+        "docs/e2e-report.md"
+      ],
+      "read_scope": [
+        "src/blacknote/",
+        "templates/"
+      ],
+      "acceptance_checks": [
+        {
+          "id": "T2-C1",
+          "kind": "human",
+          "description": "人工在浏览器中走完注册→发布→信息流→互动→主页→管理下架全流程，界面体验符合类小红书图文信息流预期，并将结论记录于 docs/e2e-report.md",
+          "command": null,
+          "passed": false,
+          "evidence_ref": null
+        }
+      ],
+      "max_cycles": 2,
+      "status": "waiting",
+      "attempt": 0,
+      "review_cycle": 0,
+      "lease_generation": 0,
+      "worktree_path": null,
+      "commit_sha": null,
+      "last_error": null,
+      "accepted_risk_reason": null,
+      "design_refs": [
+        "mod-web"
+      ],
+      "role": "qa",
+      "kind": "test",
+      "deliverables": [
+        "docs/e2e-report.md"
+      ]
+    }
+  ],
+  "delivery_checks": [
+    {
+      "requirement_id": "R1-account",
+      "criterion_index": 1,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nr = c.post('/register', data={'email': 'e2e_r1@example.com', 'password': 'passw0rd123', 'username': 'r1user'})\nassert r.status_code in (200, 302), r.status_code\nr2 = c.get('/feed')\nassert r2.status_code == 200, r2.status_code\nc2 = app.test_client()\nr3 = c2.post('/login', data={'email': 'e2e_r1@example.com', 'password': 'passw0rd123'})\nassert r3.status_code in (200, 302), r3.status_code\nr4 = c2.get('/feed')\nassert r4.status_code == 200\nprint('OK R1-AC1 register+login reaches feed')\nEOF"
+    },
+    {
+      "requirement_id": "R1-account",
+      "criterion_index": 2,
+      "command": "python - <<'EOF'\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nr = c.post('/register', data={'email': 'e2e_r1@example.com', 'password': 'passw0rd123', 'username': 'dup'})\nassert r.status_code >= 400, r.status_code\nassert b'EMAIL_TAKEN' in r.data or '已被占用' in r.get_data(as_text=True) or 'taken' in r.get_data(as_text=True).lower()\nprint('OK R1-AC2 duplicate email rejected with clear message')\nEOF"
+    },
+    {
+      "requirement_id": "R1-account",
+      "criterion_index": 3,
+      "command": "python - <<'EOF'\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r1c3@example.com', 'password': 'passw0rd123', 'username': 'c3user'})\nc.get('/feed')\nc.post('/logout')\nr = c.get('/feed', follow_redirects=False)\nassert r.status_code in (302, 303), r.status_code\nloc = r.headers.get('Location', '')\nassert 'login' in loc.lower(), loc\nprint('OK R1-AC3 logout then protected page redirects to login')\nEOF"
+    },
+    {
+      "requirement_id": "R1-account",
+      "criterion_index": 4,
+      "command": "python - <<'EOF'\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r1c4@example.com', 'password': 'passw0rd123', 'username': 'c4user'})\nr = c.post('/create', data={'title': 'R1C4 我的第一篇笔记', 'body': 'hello blacknote', 'topic': 'ai_tools', 'tags': 'agents', 'status': 'published'})\nassert r.status_code in (200, 302), r.status_code\nr = c.post('/profile', data={'bio': 'LLM inference specialist', 'specialty': 'infra', 'affiliation': 'OpenAI-lab', 'expertise_tags': 'rag,eval'})\nassert r.status_code in (200, 302), r.status_code\nme = c.get('/me').get_data(as_text=True)\nassert 'c4user' in me and 'LLM inference specialist' in me and 'R1C4' in me\nprint('OK R1-AC4 profile shows name/bio/published notes after update refresh')\nEOF"
+    },
+    {
+      "requirement_id": "R2-note-crud",
+      "criterion_index": 1,
+      "command": "python - <<'EOF'\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r2c1@example.com', 'password': 'passw0rd123', 'username': 'r2c1'})\nr = c.post('/create', data={'title': 'R2C1 发布可见性测试', 'body': 'content here', 'topic': 'ai_news', 'tags': 'llm-news', 'status': 'published'})\nassert r.status_code in (200, 302), r.status_code\nfeed = c.get('/feed').get_data(as_text=True)\nassert 'R2C1' in feed\nme = c.get('/me').get_data(as_text=True)\nassert 'R2C1' in me\nprint('OK R2-AC1 published note appears in feed and author profile')\nEOF"
+    },
+    {
+      "requirement_id": "R2-note-crud",
+      "criterion_index": 2,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r2c2@example.com', 'password': 'passw0rd123', 'username': 'r2c2'})\nr = c.post('/create', data={'title': 'R2C2 原始标题', 'body': 'v1', 'topic': 'ai_products', 'tags': 'x', 'status': 'published'})\nh = r.headers.get('Location', '') or r.get_data(as_text=True)\nm = re.search(r'[?/](?:note[s]?/)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', h)\nassert m, h\nnid = m.group(1)\nc.post(f'/note/{nid}/edit', data={'title': 'R2C2 编辑后标题', 'body': 'v2 updated', 'topic': 'ai_products', 'tags': 'x', 'status': 'published'})\ndetail = c.get(f'/note/{nid}').get_data(as_text=True)\nassert '编辑后标题' in detail\nfeed = c.get('/feed').get_data(as_text=True)\nassert '编辑后标题' in feed\nprint('OK R2-AC2 edit reflected in detail and feed on next load')\nEOF"
+    },
+    {
+      "requirement_id": "R2-note-crud",
+      "criterion_index": 3,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r2c3@example.com', 'password': 'passw0rd123', 'username': 'r2c3'})\nr = c.post('/create', data={'title': 'R2C3 将被删除', 'body': 'bye', 'topic': 'ai_tools', 'tags': 'del', 'status': 'published'})\nh = r.headers.get('Location', '') or r.get_data(as_text=True)\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', h).group(0)\nc.post(f'/note/{nid}/delete')\ndel_resp = c.get(f'/note/{nid}')\nassert del_resp.status_code == 404, del_resp.status_code\nassert '将被删除' not in c.get('/feed').get_data(as_text=True)\nassert '将被删除' not in c.get('/search?q=将被删除').get_data(as_text=True)\nprint('OK R2-AC3 deleted note gone from feed/search and detail 404')\nEOF"
+    },
+    {
+      "requirement_id": "R2-note-crud",
+      "criterion_index": 4,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\na = app.test_client()\na.post('/register', data={'email': 'e2e_r2c4a@example.com', 'password': 'passw0rd123', 'username': 'owner'})\nr = a.post('/create', data={'title': 'R2C4 他人笔记', 'body': 'mine', 'topic': 'ai_news', 'tags': 'own', 'status': 'published'})\nh = r.headers.get('Location', '') or r.get_data(as_text=True)\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', h).group(0)\nb = app.test_client()\nb.post('/register', data={'email': 'e2e_r2c4b@example.com', 'password': 'passw0rd123', 'username': 'other'})\ne = b.post(f'/note/{nid}/edit', data={'title': 'hijack', 'body': 'x', 'topic': 'ai_news', 'tags': 'own', 'status': 'published'})\nd = b.post(f'/note/{nid}/delete')\nassert e.status_code in (401, 403), e.status_code\nassert d.status_code in (401, 403), d.status_code\nassert '他人笔记' in a.get(f'/note/{nid}').get_data(as_text=True)\nprint('OK R2-AC4 non-author edit/delete rejected 0% success')\nEOF"
+    },
+    {
+      "requirement_id": "R3-feed-discovery",
+      "criterion_index": 1,
+      "command": "python - <<'EOF'\nimport json, re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r3c1@example.com', 'password': 'passw0rd123', 'username': 'feeder'})\nfor i in range(12):\n    c.post('/create', data={'title': f'R3C1 feed item {i:02d}', 'body': 'x', 'topic': 'ai_tools', 'tags': 'paging', 'status': 'published'})\npage1 = c.get('/feed').get_data(as_text=True)\nassert 'item 11' in page1\nitems = re.findall(r'item (\\d{2})', page1)\nassert len(items) >= 10, len(items)\nnums = [int(n) for n in items]\nassert nums == sorted(nums, reverse=True), nums\nm = re.search(r'(/feed\\?[^\"\\' ]*cursor=[^\"\\' ]+)', page1)\nassert m, 'no next-page cursor link found'\npage2 = c.get(m.group(1)).get_data(as_text=True)\nassert 'item' in page2\nprint('OK R3-AC1 desc order paging >=10 per page with next cursor')\nEOF"
+    },
+    {
+      "requirement_id": "R3-feed-discovery",
+      "criterion_index": 2,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r3c2@example.com', 'password': 'passw0rd123', 'username': 'mixer'})\nc.post('/create', data={'title': 'R3C2 news-only post', 'body': 'n', 'topic': 'ai_news', 'tags': 't', 'status': 'published'})\nc.post('/create', data={'title': 'R3C2 tools-only post', 'body': 't', 'topic': 'ai_tools', 'tags': 't', 'status': 'published'})\nhtml = c.get('/topic/ai_news').get_data(as_text=True)\nassert 'news-only post' in html\nassert 'tools-only post' not in html\nprint('OK R3-AC2 topic listing contains only matching notes')\nEOF"
+    },
+    {
+      "requirement_id": "R3-feed-discovery",
+      "criterion_index": 3,
+      "command": "python - <<'EOF'\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r3c3@example.com', 'password': 'passw0rd123', 'username': 'seeker'})\nc.post('/create', data={'title': 'ZephyrTransformer 深度评测', 'body': '关于 zephyrx 模型的正文', 'topic': 'ai_products', 'tags': 'rev', 'status': 'published'})\nhit = c.get('/search?q=ZephyrTransformer').get_data(as_text=True)\nassert 'ZephyrTransformer' in hit\nmiss = c.get('/search?q=nothingmatchesxyz123').get_data(as_text=True)\nassert ('ZephyrTransformer' not in miss) and ('没有' in miss or 'no result' in miss.lower() or 'empty' in miss.lower() or '0' in miss)\nprint('OK R3-AC3 keyword search hits title/body and clear empty state')\nEOF"
+    },
+    {
+      "requirement_id": "R3-feed-discovery",
+      "criterion_index": 4,
+      "command": "python - <<'EOF'\nimport time\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r3c4@example.com', 'password': 'passw0rd123', 'username': 'perf'})\nfor i in range(50):\n    c.post('/create', data={'title': f'R3C4 perf note {i}', 'body': 'b' * 200, 'topic': 'ai_tools', 'tags': 'perf', 'status': 'published'})\nelapsed = []\nfor _ in range(10):\n    t0 = time.perf_counter()\n    r = c.get('/feed')\n    elapsed.append(time.perf_counter() - t0)\n    assert r.status_code == 200\nelapsed.sort()\np95 = elapsed[int(0.95 * len(elapsed)) - 1]\nassert p95 <= 2.0, f'P95={p95:.3f}s'\nprint(f'OK R3-AC4 feed P95={p95*1000:.1f}ms <= 2s')\nEOF"
+    },
+    {
+      "requirement_id": "R4-interactions",
+      "criterion_index": 1,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r4c1@example.com', 'password': 'passw0rd123', 'username': 'liker'})\nr = c.post('/create', data={'title': 'R4C1 点赞幂等', 'body': 'x', 'topic': 'ai_tools', 'tags': 'lk', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nc.post(f'/note/{nid}/like')\nc.post(f'/note/{nid}/like')\ntxt = c.get(f'/note/{nid}').get_data(as_text=True)\nn = re.search(r'likes?[\":= ]+(\\d+)', txt, re.I)\nassert n and int(n.group(1)) == 1, txt[:400]\nc.post(f'/note/{nid}/unlike')\ntxt2 = c.get(f'/note/{nid}').get_data(as_text=True)\nn2 = re.search(r'likes?[\":= ]+(\\d+)', txt2, re.I)\nassert n2 and int(n2.group(1)) == 0\nprint('OK R4-AC1 idempotent like then unlike decrements to 0')\nEOF"
+    },
+    {
+      "requirement_id": "R4-interactions",
+      "criterion_index": 2,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r4c2@example.com', 'password': 'passw0rd123', 'username': 'talker'})\nr = c.post('/create', data={'title': 'R4C2 评论区', 'body': 'x', 'topic': 'ai_news', 'tags': 'cm', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nrc = c.post(f'/note/{nid}/comment', data={'body': '顶层评论一号'})\nassert rc.status_code in (200, 302), rc.status_code\ndetail = c.get(f'/note/{nid}').get_data(as_text=True)\nassert '顶层评论一号' in detail\nrid = c.post(f'/note/{nid}/comment', data={'body': '对一号的回复', 'parent_comment_id': ''})\nassert rid.status_code in (200, 302)\ndetail2 = c.get(f'/note/{nid}').get_data(as_text=True)\nassert '对一号的回复' in detail2\nprint('OK R4-AC2 comment appears immediately and reply threads work')\nEOF"
+    },
+    {
+      "requirement_id": "R4-interactions",
+      "criterion_index": 3,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nc = app.test_client()\nc.post('/register', data={'email': 'e2e_r4c3@example.com', 'password': 'passw0rd123', 'username': 'collector'})\nids = []\nfor i in range(3):\n    r = c.post('/create', data={'title': f'R4C3 fav target {i}', 'body': 'x', 'topic': 'ai_tools', 'tags': 'fv', 'status': 'published'})\n    ids.append(re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0))\nfor nid in ids:\n    c.post(f'/note/{nid}/favorite')\nfavs = c.get('/favorites').get_data(as_text=True)\nfor nid in ids:\n    assert f'/note/{nid}' in favs, nid\nassert favs.count('R4C3 fav target') == 3\nprint('OK R4-AC3 favorites page lists exactly the 3 favorited notes')\nEOF"
+    },
+    {
+      "requirement_id": "R4-interactions",
+      "criterion_index": 4,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nowner = app.test_client()\nowner.post('/register', data={'email': 'e2e_r4c4o@example.com', 'password': 'passw0rd123', 'username': 'o4'})\nr = owner.post('/create', data={'title': 'R4C4 计数一致', 'body': 'x', 'topic': 'ai_products', 'tags': 'cc', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nu1 = app.test_client(); u1.post('/register', data={'email': 'e2e_r4c4a@example.com', 'password': 'passw0rd123', 'username': 'v1'})\nu2 = app.test_client(); u2.post('/register', data={'email': 'e2e_r4c4b@example.com', 'password': 'passw0rd123', 'username': 'v2'})\nu1.post(f'/note/{nid}/like'); u2.post(f'/note/{nid}/like')\nu1.post(f'/note/{nid}/comment', data={'body': 'view1 comment'})\ndef likes_of(cli):\n    t = cli.get(f'/note/{nid}').get_data(as_text=True)\n    return re.search(r'likes?[\":= ]+(\\d+)', t, re.I).group(1)\ndef comments_of(cli):\n    t = cli.get(f'/note/{nid}').get_data(as_text=True)\n    return re.search(r'comments?[\":= ]+(\\d+)', t, re.I).group(1)\nassert likes_of(u1) == likes_of(u2) == '2', (likes_of(u1), likes_of(u2))\nassert comments_of(u1) == comments_of(u2) == '1'\nprint('OK R4-AC4 counters identical across two user views (diff 0)')\nEOF"
+    },
+    {
+      "requirement_id": "R5-moderation",
+      "criterion_index": 1,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\nfrom blacknote.contracts.config import Settings\ns = Settings.from_env()\napp = create_app()\nauthor = app.test_client()\nauthor.post('/register', data={'email': s.admin_email, 'password': s.admin_password, 'username': 'admin'})\nr = author.post('/create', data={'title': 'R5C1 违规内容', 'body': 'bad', 'topic': 'ai_news', 'tags': 'viol', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nra = author.post(f'/admin/note/{nid}/unlist')\nassert ra.status_code in (200, 302), ra.status_code\nanon = app.test_client()\nassert anon.get(f'/note/{nid}').status_code == 404\nassert '违规内容' not in anon.get('/feed').get_data(as_text=True)\nassert '违规内容' not in anon.get('/search?q=违规内容').get_data(as_text=True)\nprint('OK R5-AC1 unlisted note invisible to users/visitors everywhere')\nEOF"
+    },
+    {
+      "requirement_id": "R5-moderation",
+      "criterion_index": 2,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\nfrom blacknote.contracts.config import Settings\ns = Settings.from_env()\napp = create_app()\nad = app.test_client()\nad.post('/register', data={'email': s.admin_email, 'password': s.admin_password, 'username': 'admin2'})\nr = ad.post('/create', data={'title': 'R5C2 评论宿主', 'body': 'x', 'topic': 'ai_tools', 'tags': 'cb', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nrc = ad.post(f'/note/{nid}/comment', data={'body': '要被屏蔽的评论'})\ntxt = ad.get(f'/note/{nid}').get_data(as_text=True)\ncid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12]', rc.headers.get('Location', '') or rc.get_data(as_text=True) or txt)\nassert cid\nres = ad.post(f'/admin/comment/{cid.group(0)}/block')\nassert res.status_code in (200, 302), res.status_code\nafter = ad.get(f'/note/{nid}').get_data(as_text=True)\nassert '要被屏蔽的评论' not in after\nprint('OK R5-AC2 blocked comment and its replies no longer shown')\nEOF"
+    },
+    {
+      "requirement_id": "R5-moderation",
+      "criterion_index": 3,
+      "command": "python - <<'EOF'\nimport re\nfrom blacknote.web.app import create_app\napp = create_app()\nn = app.test_client()\nn.post('/register', data={'email': 'e2e_r5c3@example.com', 'password': 'passw0rd123', 'username': 'norm'})\nr = n.post('/create', data={'title': 'R5C3 目标', 'body': 'x', 'topic': 'ai_news', 'tags': 'z', 'status': 'published'})\nnid = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', r.headers.get('Location', '') or r.get_data(as_text=True)).group(0)\nu1 = n.post(f'/admin/note/{nid}/unlist')\nu2 = n.post('/admin/comments/x/block')\nu3 = n.get('/admin')\nassert u1.status_code in (401, 403), u1.status_code\nassert u2.status_code in (401, 403), u2.status_code\nassert u3.status_code in (401, 403, 404), u3.status_code\nassert 'R5C3 目标' in n.get(f'/note/{nid}').get_data(as_text=True)\nprint('OK R5-AC3 non-admin admin-entry access rejected 0% success')\nEOF"
+    }
+  ]
+}

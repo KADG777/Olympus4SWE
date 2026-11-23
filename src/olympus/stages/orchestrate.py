@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
@@ -32,8 +33,10 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import RunControl, is_plan_bound_to_upstream
 from olympus.core.dag import (
+    VERTICAL_SLICE_TOPOLOGIES,
     PlanValidationError,
     compute_dispatchable_tasks,
+    scopes_overlap,
     validate_plan,
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
@@ -54,12 +57,17 @@ from olympus.harness.native import NativeDriver
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
+    absorb_verification_artifacts,
     archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
     create_sandbox,
+    load_sandbox_baseline,
+    remove_run_sandboxes,
     remove_sandbox,
+    save_sandbox_baseline,
     snapshot_sandbox_state,
+    sync_upstream_files,
 )
 from olympus.providers.base import LLMProvider
 from olympus.providers.factory import build_provider
@@ -72,7 +80,8 @@ if TYPE_CHECKING:
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
 Rules:
-1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable.
+1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable
+   (unless vertical tracer-bullet slicing applies).
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
 4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
@@ -97,10 +106,18 @@ Rules:
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
 Rules:
-1. Read relevant files first using absolute paths under the sandbox root.
-2. Only write or edit files inside your assigned write_scope.
-3. Run tests/checks with run_bash and observe actual outputs before finishing.
-4. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
+1. Work seam-first and vertically: write one failing seam test at the highest observable boundary
+   (public API, CLI, or route) for the first acceptance criterion, add the minimal clean
+   implementation that makes it pass, then repeat for the next criterion.
+2. Keep the implementation deep and minimal: add no speculative abstractions, wrappers, or
+   configuration layers for hypothetical callers, and write no implementation-coupled or
+   tautological tests that merely restate the code under test.
+3. Prefer native file read/search/edit tools, batching independent reads, searches, and edits in
+   one turn, instead of serial shell `cat`/`sed`/`grep`/`find` probes; reserve shell execution for
+   running tests, linters, and builds.
+4. Read relevant files first using absolute paths under the sandbox root, and only write or edit
+   files inside your assigned write_scope.
+5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding."""
 
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
@@ -164,7 +181,7 @@ def _copy_matching_scope(
 
 
 def _format_spec_context(spec: GoalSpec) -> str:
-    """Format constraints, assumptions, and resolved Stage 1 clarifications for Stage 2 roles."""
+    """Format constraints, assumptions, test seams, and clarifications for Stage 2 roles."""
     clarifications = [
         {"id": amb.id, "question": amb.question, "answer": amb.answer}
         for amb in spec.open_ambiguities
@@ -178,6 +195,8 @@ def _format_spec_context(spec: GoalSpec) -> str:
     lines = [
         f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
         f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+        "Test seams (verify behavior at these public boundaries): "
+        f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
         f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
     ]
     if unresolved:
@@ -207,6 +226,82 @@ def _diff_stats(diff_text: str) -> tuple[int, int]:
             elif line.startswith("-") and not line.startswith("---"):
                 removed += 1
     return added, removed
+
+
+_INLINE_DIFF_BUDGET = 48_000
+
+
+def _diff_file_blocks(diff_text: str) -> list[str]:
+    if diff_text.startswith("diff --git "):
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in diff_text.splitlines():
+            if line.startswith("diff --git ") and current:
+                blocks.append("\n".join(current))
+                current = []
+            current.append(line)
+        if current:
+            blocks.append("\n".join(current))
+        return blocks
+    return [block for block in diff_text.split("\n\n") if block.strip()]
+
+
+def _diff_block_label(block: str) -> str | None:
+    rename_from = re.search(r"^rename from (.+)$", block, re.MULTILINE)
+    rename_to = re.search(r"^rename to (.+)$", block, re.MULTILINE)
+    if rename_from is not None and rename_to is not None:
+        return f"renamed: {rename_to.group(1).strip()} (from {rename_from.group(1).strip()})"
+    header = re.search(r"^diff --git a/(.+?) b/(.+)$", block, re.MULTILINE)
+    if header is not None:
+        path = header.group(2).strip()
+    else:
+        target = re.search(r"^\+\+\+ b/(.+)$", block, re.MULTILINE)
+        path = target.group(1).strip() if target is not None else None
+    if path is None:
+        return None
+    if "new file mode" in block or block.startswith("--- /dev/null") or "\n--- /dev/null" in block:
+        return f"new: {path}"
+    if "deleted file mode" in block or "\n+++ /dev/null" in block:
+        return f"deleted: {path}"
+    return f"modified: {path}"
+
+
+def _diff_summary_lines(diff_text: str) -> list[str]:
+    lines: list[str] = []
+    for block in _diff_file_blocks(diff_text):
+        label = _diff_block_label(block)
+        if label is None:
+            continue
+        added, removed = _diff_stats(block)
+        lines.append(f"- {label} (+{added}/-{removed})")
+    return lines
+
+
+def _bounded_inline_diff(
+    diff_text: str, *, budget: int = _INLINE_DIFF_BUDGET
+) -> tuple[str, bool]:
+    if len(diff_text) <= budget:
+        return diff_text, False
+    cut = diff_text.rfind("\n", 0, budget)
+    if cut <= 0:
+        cut = budget
+    return diff_text[:cut].rstrip(), True
+
+
+def _reopen_or_recreate_sandbox(
+    workspace_root: Path,
+    *,
+    label: str,
+    reuse: bool,
+    sandbox_root: Path | str | None = None,
+) -> SandboxHandle:
+    sandbox = create_sandbox(
+        workspace_root, label=label, reuse=reuse, sandbox_root=sandbox_root
+    )
+    if sandbox.reused and load_sandbox_baseline(sandbox) is None:
+        remove_sandbox(sandbox)
+        return create_sandbox(workspace_root, label=label, sandbox_root=sandbox_root)
+    return sandbox
 
 
 def _write_manifest_md(
@@ -359,6 +454,26 @@ Modular product decomposition (topology={topology}):
 """
 
 
+_VERTICAL_PLANNER_GUIDANCE = """
+Vertical tracer-bullet decomposition (topology={topology}):
+- If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
+  `kind='contract'` task owning those paths before Slice 1.
+- Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
+  the smallest vertical path that wires core storage/logic to one observable user-facing seam
+  named by GoalSpec.test_seams or observable_surfaces, with at least one executable
+  kind='command' seam check proving the path runs.
+- Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
+  each delivers exactly one observable capability end to end (its storage/logic plus seam
+  wiring) and carries its own executable kind='command' seam test.
+- NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
+  routes/templates/static wave, and no bulk test-only wave after unverified code waves.
+- NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,
+  4+ top-level scopes, or 4+ requirements across 4+ write scopes; split into vertical slices.
+- Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
+  have strictly disjoint write_scope.
+"""
+
+
 class _ReviewOutputError(ValueError):
     pass
 
@@ -468,8 +583,9 @@ class OrchestrateStage:
         """Generate and deterministically validate a TaskPlan.
 
         Accepts an approved DesignSpec (with or without a GoalSpec) or, for backward
-        compatibility, an approved GoalSpec alone. ``modular_product``/``tdd_first``
-        topologies decompose the design's modules into Wave 0/1/2 tasks.
+        compatibility, an approved GoalSpec alone. ``modular_product`` decomposes the design's
+        modules into Wave 0/1/2 tasks, while ``tdd_first``/``vertical_slices`` slice the design
+        into vertical tracer-bullet user stories.
         """
         snap = self.store.get_run(run_id)
         design: DesignSpec | None = snap["design"] if use_design else None
@@ -487,7 +603,14 @@ class OrchestrateStage:
         else:
             spec = self._require_confirmed_spec(run_id)
 
-        modular = topology in ("modular_product", "tdd_first") and design is not None
+        vertical = topology in VERTICAL_SLICE_TOPOLOGIES
+        modular = design is not None and (topology == "modular_product" or vertical)
+        if vertical:
+            guidance_block = _VERTICAL_PLANNER_GUIDANCE.format(topology=topology)
+        elif modular:
+            guidance_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+        else:
+            guidance_block = ""
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -517,7 +640,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
-            modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
             design_paths = [
                 p for mod in design.modules for p in mod.target_paths
             ] + list(design.shared_contract_paths)
@@ -534,7 +656,6 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             )
-            modular_block = ""
 
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
@@ -549,7 +670,7 @@ class OrchestrateStage:
             "Run these commands against the composed delivery after task execution. "
             "Omit conditions without a reliable executable check. Task checks are separate.\n"
             f"{context_block}"
-            f"{modular_block}"
+            f"{guidance_block}"
             f"{chr(10).join(binding_lines)}\n"
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
         )
@@ -563,13 +684,14 @@ class OrchestrateStage:
                 spec=spec,
                 design=design if modular else None,
                 workspace_root=self.workspace_root,
+                topology=topology,
             )
 
         def raise_exhausted(candidate: TaskPlan, violations: list[str]) -> TaskPlan:
             raise PlanValidationError(violations)
 
         plan = loop.run_structured(
-            system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
+            system_prompt=_PLANNER_SYSTEM_PROMPT + guidance_block,
             user_prompt=base_prompt,
             model_cls=TaskPlan,
             max_validation_retries=2,
@@ -678,6 +800,7 @@ class OrchestrateStage:
         task: TaskNode,
         sandbox: SandboxHandle,
         diff_text: str,
+        diff_path: Path,
         check_summary: str,
         art_dir: Path,
         reviewer: tuple[AgentDriver, str | None],
@@ -700,6 +823,20 @@ class OrchestrateStage:
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
         spec_ctx = _format_spec_context(spec)
         design_ctx = _format_design_context(design, task=task)
+        diff_summary = "\n".join(_diff_summary_lines(diff_text)) or "- (none detected)"
+        inline_diff, diff_truncated = _bounded_inline_diff(diff_text)
+        diff_ctx = (
+            f"Changed files (per-file summary):\n{diff_summary}\n\n"
+            f"Diff (inline{' truncated' if diff_truncated else ''}):\n{inline_diff}\n"
+        )
+        if diff_truncated:
+            diff_ctx += (
+                f"\nThe inline diff above was truncated at {_INLINE_DIFF_BUDGET} characters. "
+                f"The complete diff is saved at: {diff_path}\n"
+                "Inspect only the specific files you need with your read-only tools "
+                "(read_file, grep_files, glob_files) before deciding; do not assume the "
+                "inline diff is complete.\n"
+            )
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
             f"TaskNode: {task_summary}\n"
@@ -712,7 +849,7 @@ class OrchestrateStage:
             f"Incremental review cycle={task.review_cycle + 1} (incremental_only={incremental})\n"
             f"{prior_ctx}\n"
             f"Command check outputs:\n{check_summary}\n\n"
-            f"Git diff / changes:\n{diff_text}\n\n"
+            f"{diff_ctx}\n"
             f"Set task_id='{task.task_id}', attempt={task.attempt}, "
             f"incremental_only={str(incremental).lower()}.\n"
             f"Return ReviewVerdict JSON matching schema:\n{schema_json}"
@@ -876,24 +1013,50 @@ class OrchestrateStage:
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
         art_dir.mkdir(parents=True, exist_ok=True)
         overlay_dir = self._run_dir(run_id) / "accepted_overlay"
-        sandbox = create_sandbox(
+        label = f"{run_id}-{leased.task_id}"
+        sandbox = _reopen_or_recreate_sandbox(
             self.workspace_root,
-            label=f"{run_id}-{leased.task_id}-a{leased.attempt}",
+            label=label,
+            reuse=leased.attempt > 1,
             sandbox_root=self.sandbox_root,
         )
-        _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
 
-        archive_failed = False
+        retain_sandbox = False
+
+        def retain(node: TaskNode) -> TaskNode:
+            nonlocal retain_sandbox
+            retain_sandbox = True
+            return node
+
         try:
-            worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
                 else ()
             )
+            if sandbox.reused:
+                task_baseline = load_sandbox_baseline(sandbox)
+                assert task_baseline is not None
+                task_baseline = sync_upstream_files(
+                    sandbox, overlay_dir, task_baseline, write_scope=leased.write_scope
+                )
+            else:
+                _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
+                task_baseline = snapshot_sandbox_state(sandbox)
+            save_sandbox_baseline(sandbox, task_baseline)
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"
                 if leased.last_error
+                else ""
+            )
+            repair_ctx = (
+                "\n\n[IN-PLACE REPAIR]\n"
+                "This sandbox was retained from your previous attempt: the files you already "
+                "changed are still present on disk. Inspect their current contents and apply "
+                "targeted edits that resolve the reported rejection instead of rewriting "
+                "unrelated files from scratch. Remove or relocate any paths the rejection "
+                "reports as outside write_scope; nothing was reverted for you.\n"
+                if sandbox.reused
                 else ""
             )
             checks_json = json.dumps(
@@ -924,6 +1087,7 @@ class OrchestrateStage:
                 f"{handoff_block}"
                 f"Out of scope: {json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
                 f"Acceptance checks: {checks_json}"
+                f"{repair_ctx}"
                 f"{rework_ctx}"
             )
             driver, model = worker
@@ -961,6 +1125,10 @@ class OrchestrateStage:
                     objective=leased.objective,
                     write_scope=leased.write_scope,
                     emit=emit_watchdog,
+                    store=self.store,
+                    run_id=run_id,
+                    baseline=task_baseline,
+                    forbidden_globs=list(forbidden_contracts),
                 )
             worker_error = None
             try:
@@ -979,7 +1147,6 @@ class OrchestrateStage:
                 worker_error = type(exc).__name__
 
             if watchdog is not None and watchdog.pause_diagnosis is not None:
-                archive_failed = True
                 diagnosis = dict(watchdog.pause_diagnosis)
                 if worker_error is not None:
                     diagnosis["worker_error"] = worker_error
@@ -991,18 +1158,22 @@ class OrchestrateStage:
                     archive_sandbox_recovery(sandbox, art_dir)
                 except (OSError, subprocess.SubprocessError) as exc:
                     diagnosis["archive_error"] = type(exc).__name__
-                else:
-                    archive_failed = False
+                retained = (
+                    str(sandbox.workspace_path) if sandbox.workspace_path.exists() else None
+                )
+                retain_sandbox = retained is not None
                 paused_task = RunControl(self.store).pause_for_watchdog(
                     run_id, task=leased, diagnosis=diagnosis,
-                    retained_sandbox=str(sandbox.workspace_path) if archive_failed else None,
+                    retained_sandbox=retained,
                 )
                 if on_run_paused is not None:
                     on_run_paused()
                 return paused_task
 
-            if self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            run_status = self.store.get_run(run_id)["status"]
+            if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 interrupted.set()
+                retain_sandbox = run_status == RunStatus.PAUSED
                 return self._return_interrupted_task(run_id, leased)
 
             # Transition lease to VERIFYING before running checks/review
@@ -1020,7 +1191,7 @@ class OrchestrateStage:
                 event_type="task.verifying",
             )
 
-            diff_text = capture_sandbox_diff(sandbox)
+            diff_text = capture_sandbox_diff(sandbox, task_baseline)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
 
@@ -1038,16 +1209,18 @@ class OrchestrateStage:
                 )
                 if loop_res.stop_reason == "cancelled":
                     interrupted.set()
-                    return self._return_interrupted_task(run_id, verifying)
-                return self._pause_for_budget(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    return retain(self._return_interrupted_task(run_id, verifying))
+                return retain(
+                    self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    )
                 )
 
             gate = run_diff_gate(
                 sandbox,
-                worker_baseline,
+                task_baseline,
                 allowed_write_scope=verifying.write_scope,
                 forbidden_globs=forbidden_contracts,
             )
@@ -1082,11 +1255,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=gate.rejection_message(),
-                    checks=verifying.acceptance_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=gate.rejection_message(),
+                        checks=verifying.acceptance_checks,
+                    )
                 )
 
             if not loop_res.completed and not (
@@ -1100,11 +1275,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Worker did not complete cleanly: {loop_res.stop_reason}",
-                    checks=verifying.acceptance_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Worker did not complete cleanly: {loop_res.stop_reason}",
+                        checks=verifying.acceptance_checks,
+                    )
                 )
 
             updated_checks, cmd_failures = self._run_command_checks(
@@ -1113,6 +1290,10 @@ class OrchestrateStage:
                 sandbox=sandbox,
                 art_dir=art_dir,
             )
+            task_baseline = absorb_verification_artifacts(
+                sandbox, task_baseline, write_scope=verifying.write_scope
+            )
+            save_sandbox_baseline(sandbox, task_baseline)
             if cmd_failures:
                 _write_manifest_md(
                     art_dir=art_dir,
@@ -1122,11 +1303,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason="\n".join(cmd_failures),
-                    checks=updated_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason="\n".join(cmd_failures),
+                        checks=updated_checks,
+                    )
                 )
 
             # Run cold-start independent review if check or default policy requires it
@@ -1140,16 +1323,19 @@ class OrchestrateStage:
                     task=verifying,
                     sandbox=sandbox,
                     diff_text=diff_text,
+                    diff_path=diff_file,
                     check_summary=check_summary,
                     art_dir=art_dir,
                     reviewer=reviewer,
                     design=design,
                 )
             except BudgetExhaustedError as exc:
-                return self._pause_for_budget(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Paused due to budget limit: {exc}",
+                return retain(
+                    self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {exc}",
+                    )
                 )
             except (_ReviewCancelled, _ReviewOutputError) as exc:
                 _write_manifest_md(
@@ -1162,9 +1348,11 @@ class OrchestrateStage:
                 )
                 if isinstance(exc, _ReviewCancelled):
                     interrupted.set()
-                    return self._return_interrupted_task(run_id, verifying)
-                return self._fail_or_requeue(
-                    run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
+                    return retain(self._return_interrupted_task(run_id, verifying))
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
+                    )
                 )
             if not verdict.passed:
                 important_lines = [
@@ -1181,11 +1369,13 @@ class OrchestrateStage:
                     verdict=verdict,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=err_msg,
-                    checks=updated_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=err_msg,
+                        checks=updated_checks,
+                    )
                 )
 
             verdict_path = str(art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json")
@@ -1213,11 +1403,10 @@ class OrchestrateStage:
                     reject_if_run_inactive=True,
                 )
             except ConcurrencyConflictError:
-                if self.store.get_run(run_id)["status"] in (
-                    RunStatus.PAUSED,
-                    RunStatus.CANCELLED,
-                ):
+                run_status = self.store.get_run(run_id)["status"]
+                if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
                     interrupted.set()
+                    retain_sandbox = run_status == RunStatus.PAUSED
                     return self._return_interrupted_task(run_id, verifying)
                 raise
 
@@ -1236,7 +1425,7 @@ class OrchestrateStage:
             )
             return accepted
         finally:
-            if not archive_failed:
+            if not retain_sandbox:
                 remove_sandbox(sandbox)
 
     def _fail_or_requeue(
@@ -1346,6 +1535,8 @@ class OrchestrateStage:
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                if snap["status"] == RunStatus.CANCELLED:
+                    remove_run_sandboxes(self.workspace_root, run_id)
                 return snap
             design: DesignSpec | None = snap.get("design")
             plan: TaskPlan | None = snap["plan"]
@@ -1387,173 +1578,213 @@ class OrchestrateStage:
 
         wave_lock = Lock()
         wave_handles: set[ActiveTurnHandle] = set()
+        wave_paused = False
 
         def register_wave_handle(handle: ActiveTurnHandle) -> None:
             with wave_lock:
-                wave_handles.add(handle)
+                already_paused = wave_paused
+                if not already_paused:
+                    wave_handles.add(handle)
+            if already_paused:
+                handle.cancel(reason="run_paused")
 
         def unregister_wave_handle(handle: ActiveTurnHandle) -> None:
             with wave_lock:
                 wave_handles.discard(handle)
 
         def cancel_wave_peers() -> None:
+            nonlocal wave_paused
             with wave_lock:
+                wave_paused = True
                 peers = list(wave_handles)
             for peer in peers:
                 peer.cancel(reason="run_paused")
 
-        while True:
-            snap = self.store.get_run(run_id)
-            if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
-                return snap
-            if interrupted.is_set():
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        RunStatus.AWAITING_HUMAN,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={"reason": "turn_cancelled"},
-                    )
-                except ConcurrencyConflictError:
-                    continue
-                return self.store.get_run(run_id)
-            design = snap.get("design")
-            plan = snap["plan"]
-            assert plan is not None
-            policy = snap["budget_policy"]
+        limit = (
+            1
+            if effective_serial
+            else self.store.get_run(run_id)["budget_policy"].max_concurrent_tasks
+        )
+        in_flight: dict[Future[TaskNode], TaskNode] = {}
 
-            ready = compute_dispatchable_tasks(
-                plan,
-                max_concurrent=1 if effective_serial else policy.max_concurrent_tasks,
-            )
-            if not ready:
-                all_done = all(
-                    t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for t in plan.tasks
-                )
-                if (
-                    all_done
-                    and plan.delivery_checks
-                    and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
-                    and snap["spec"] is not None
-                    and snap["spec"].content_hash == spec.content_hash
-                    and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
-                    and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
-                    and self.store.is_approved(
-                        run_id=run_id,
-                        target=ApprovalTarget.GOAL_SPEC,
-                        target_id=spec.spec_id,
-                        target_hash=spec.content_hash,
-                    )
-                    and self.store.is_approved(
-                        run_id=run_id,
-                        target=ApprovalTarget.TASK_PLAN,
-                        target_id=plan.plan_id,
-                        target_hash=plan.content_hash,
-                    )
-                ):
-                    run_dir = self._run_dir(run_id)
-                    receipt = run_delivery_checks(
-                        plan,
-                        workspace_root=self.workspace_root,
-                        overlay_dir=run_dir / "accepted_overlay",
-                        run_dir=run_dir,
-                    )
+        def pick_dispatchable(ready: Sequence[TaskNode], capacity: int) -> list[TaskNode]:
+            occupied = list(in_flight.values())
+            occupied_ids = {task.task_id for task in occupied}
+            occupied_scopes = [scope for task in occupied for scope in task.write_scope]
+            picked: list[TaskNode] = []
+            for task in ready:
+                if task.task_id in occupied_ids:
+                    continue
+                if any(dep in occupied_ids for dep in task.depends_on):
+                    continue
+                if scopes_overlap(task.write_scope, occupied_scopes):
+                    continue
+                picked.append(task)
+                occupied_scopes.extend(task.write_scope)
+                if len(picked) == capacity:
+                    break
+            return picked
+
+        def drain_in_flight() -> None:
+            for future in list(in_flight):
+                in_flight.pop(future)
+                future.result()
+
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            while True:
+                snap = self.store.get_run(run_id)
+                if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                    if in_flight:
+                        drain_in_flight()
+                        continue
+                    if snap["status"] == RunStatus.CANCELLED:
+                        remove_run_sandboxes(self.workspace_root, run_id)
+                    return snap
+                if interrupted.is_set():
+                    if in_flight:
+                        drain_in_flight()
+                        continue
                     try:
-                        self.store.append_event(
-                            run_id=run_id,
-                            stage="verify",
-                            event_type=DELIVERY_EVENT,
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.AWAITING_HUMAN,
+                            expected_revision=int(snap["state_revision"]),
                             actor="chronos",
-                            payload=receipt,
-                            expected_state_revision=snap["state_revision"],
+                            stage="orchestrate",
+                            detail={"reason": "turn_cancelled"},
                         )
                     except ConcurrencyConflictError:
                         continue
-                target_status = RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        target_status,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={
-                            "accepted": sum(
-                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                            ),
-                            "total": len(plan.tasks),
-                        },
-                    )
-                except ConcurrencyConflictError:
-                    continue
-                return self.store.get_run(run_id)
+                    return self.store.get_run(run_id)
+                design = snap.get("design")
+                plan = snap["plan"]
+                assert plan is not None
+                policy = snap["budget_policy"]
 
-            if not snap["budget_ledger"].can_reserve(policy):
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        RunStatus.AWAITING_HUMAN,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={
-                            "reason": "budget_exhausted",
-                            "accepted": sum(
-                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                            ),
-                            "total": len(plan.tasks),
-                        },
-                    )
-                except ConcurrencyConflictError:
+                ready: list[TaskNode] = []
+                capacity = limit - len(in_flight)
+                if capacity > 0:
+                    ready = compute_dispatchable_tasks(plan, max_concurrent=limit)
+                    candidates = pick_dispatchable(ready, capacity)
+                    if candidates and snap["budget_ledger"].can_reserve(policy):
+                        for task in candidates:
+                            handoff = (
+                                _format_handoff_context(plan, current_task_id=task.task_id)
+                                if effective_serial
+                                else ""
+                            )
+                            future = pool.submit(
+                                self._execute_single_task,
+                                run_id=run_id,
+                                spec=spec,
+                                task_id=task.task_id,
+                                mode=snap["mode"],
+                                apply_to_workspace=apply_to_workspace,
+                                worker_max_steps=worker_max_steps,
+                                worker=worker,
+                                monitor_factory=monitor_factory,
+                                reviewer=reviewer,
+                                interrupted=interrupted,
+                                design=design,
+                                handoff_context=handoff,
+                                on_handle_registered=register_wave_handle,
+                                on_handle_finished=unregister_wave_handle,
+                                on_run_paused=cancel_wave_peers,
+                            )
+                            in_flight[future] = task
+                if in_flight:
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        in_flight.pop(future)
+                        future.result()
                     continue
-                return self.store.get_run(run_id)
 
-            if len(ready) == 1:
-                handoff = (
-                    _format_handoff_context(plan, current_task_id=ready[0].task_id)
-                    if effective_serial
-                    else ""
-                )
-                self._execute_single_task(
-                    run_id=run_id,
-                    spec=spec,
-                    task_id=ready[0].task_id,
-                    mode=snap["mode"],
-                    apply_to_workspace=apply_to_workspace,
-                    worker_max_steps=worker_max_steps,
-                    worker=worker,
-                    monitor_factory=monitor_factory,
-                    reviewer=reviewer,
-                    interrupted=interrupted,
-                    design=design,
-                    handoff_context=handoff,
-                )
-            else:
-                with ThreadPoolExecutor(max_workers=len(ready)) as pool:
-                    futures = [
-                        pool.submit(
-                            self._execute_single_task,
+                if not ready:
+                    all_done = all(
+                        t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED)
+                        for t in plan.tasks
+                    )
+                    if (
+                        all_done
+                        and plan.delivery_checks
+                        and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
+                        and snap["spec"] is not None
+                        and snap["spec"].content_hash == spec.content_hash
+                        and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
+                        and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
+                        and self.store.is_approved(
                             run_id=run_id,
-                            spec=spec,
-                            task_id=t.task_id,
-                            mode=snap["mode"],
-                            apply_to_workspace=apply_to_workspace,
-                            worker_max_steps=worker_max_steps,
-                            worker=worker,
-                            monitor_factory=monitor_factory,
-                            reviewer=reviewer,
-                            interrupted=interrupted,
-                            design=design,
-                            on_handle_registered=register_wave_handle,
-                            on_handle_finished=unregister_wave_handle,
-                            on_run_paused=cancel_wave_peers,
+                            target=ApprovalTarget.GOAL_SPEC,
+                            target_id=spec.spec_id,
+                            target_hash=spec.content_hash,
                         )
-                        for t in ready
-                    ]
-                    for fut in futures:
-                        fut.result()
+                        and self.store.is_approved(
+                            run_id=run_id,
+                            target=ApprovalTarget.TASK_PLAN,
+                            target_id=plan.plan_id,
+                            target_hash=plan.content_hash,
+                        )
+                    ):
+                        run_dir = self._run_dir(run_id)
+                        receipt = run_delivery_checks(
+                            plan,
+                            workspace_root=self.workspace_root,
+                            overlay_dir=run_dir / "accepted_overlay",
+                            run_dir=run_dir,
+                        )
+                        try:
+                            self.store.append_event(
+                                run_id=run_id,
+                                stage="verify",
+                                event_type=DELIVERY_EVENT,
+                                actor="chronos",
+                                payload=receipt,
+                                expected_state_revision=snap["state_revision"],
+                            )
+                        except ConcurrencyConflictError:
+                            continue
+                    target_status = (
+                        RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
+                    )
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            target_status,
+                            expected_revision=int(snap["state_revision"]),
+                            actor="chronos",
+                            stage="orchestrate",
+                            detail={
+                                "accepted": sum(
+                                    1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                                ),
+                                "total": len(plan.tasks),
+                            },
+                        )
+                    except ConcurrencyConflictError:
+                        continue
+                    if target_status == RunStatus.COMPLETED:
+                        remove_run_sandboxes(self.workspace_root, run_id)
+                    return self.store.get_run(run_id)
+
+                if not snap["budget_ledger"].can_reserve(policy):
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.AWAITING_HUMAN,
+                            expected_revision=int(snap["state_revision"]),
+                            actor="chronos",
+                            stage="orchestrate",
+                            detail={
+                                "reason": "budget_exhausted",
+                                "accepted": sum(
+                                    1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                                ),
+                                "total": len(plan.tasks),
+                            },
+                        )
+                    except ConcurrencyConflictError:
+                        continue
+                    return self.store.get_run(run_id)
 
     def retry_blocked_task(
         self,

@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import SimpleQueue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from threading import enumerate as enumerate_threads
 from typing import Any
 
@@ -21,6 +21,7 @@ from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
+    BudgetPolicy,
     CheckKind,
     DesignSpec,
     ExecutionStrategy,
@@ -32,6 +33,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.dag import PlanValidationError, validate_plan
 from olympus.core.store import RunStore
 from olympus.harness.driver import (
     ActiveTurnHandle,
@@ -49,7 +51,8 @@ from olympus.providers.base import (
     ToolSpec,
 )
 from olympus.stages.align import AlignStage
-from olympus.stages.orchestrate import OrchestrateStage
+from olympus.stages.orchestrate import _WORKER_SYSTEM_PROMPT, OrchestrateStage
+from olympus.tools.aci import build_sandbox_env
 from olympus.web.projection import build_run_projection
 from olympus.web.server import AriadneApp, create_fastapi_app
 
@@ -67,10 +70,15 @@ def _init_repo(root: Path) -> None:
 
 
 def _confirmed_run(
-    tmp_path: Path, *, criteria: list[str] | None = None
+    tmp_path: Path,
+    *,
+    criteria: list[str] | None = None,
+    budget_policy: BudgetPolicy | None = None,
 ) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
-    run_id = store.create_run(title="Manifest run", mode=RunMode.SIMULATION)
+    run_id = store.create_run(
+        title="Manifest run", mode=RunMode.SIMULATION, budget_policy=budget_policy
+    )
     spec = GoalSpec(
         spec_id="spec-manifest",
         goal="Add a feature flag module",
@@ -626,6 +634,171 @@ def test_propose_plan_repairs_broken_inline_python_check_via_validation_loop(
     assert plan.tasks[0].acceptance_checks[0].command == "python -m pytest -q"
 
 
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_propose_plan_injects_vertical_tracer_bullet_guidance(
+    tmp_path: Path, topology: str
+) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        prompts.append(messages[0].content)
+        return LLMResponse(
+            content=json.dumps(
+                _plan_payload(
+                    spec_id=spec.spec_id,
+                    spec_hash=spec.content_hash,
+                    file_name="feature.py",
+                    checks=[
+                        {
+                            "id": "CHK-SEAM",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Exercise the seam",
+                            "command": "python -m pytest -q",
+                        }
+                    ],
+                )
+            )
+        )
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    plan = orch.propose_plan(run_id=run_id, topology=topology)
+    assert len(prompts) == 1
+    assert "Vertical tracer-bullet decomposition" in prompts[0]
+    assert "tracer bullet" in prompts[0].lower()
+    assert "depends_on" in prompts[0]
+    assert "kind='command'" in prompts[0]
+    assert plan.tasks[0].kind == TaskKind.IMPLEMENT
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_propose_plan_vertical_topologies_reject_slices_without_command(
+    tmp_path: Path, topology: str
+) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    review_only = {
+        "id": "CHK-REV",
+        "kind": CheckKind.INDEPENDENT_REVIEW.value,
+        "description": "Cold review only",
+    }
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        return LLMResponse(
+            content=json.dumps(
+                _plan_payload(
+                    spec_id=spec.spec_id,
+                    spec_hash=spec.content_hash,
+                    file_name="feature.py",
+                    checks=[review_only],
+                )
+            )
+        )
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    with pytest.raises(PlanValidationError, match="command"):
+        orch.propose_plan(run_id=run_id, topology=topology)
+
+    legacy = orch.propose_plan(run_id=run_id)
+    assert legacy.tasks[0].acceptance_checks[0].kind == CheckKind.INDEPENDENT_REVIEW
+
+
+def test_propose_plan_legacy_topologies_keep_their_guidance(tmp_path: Path) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    spec_only_prompts: list[str] = []
+    modular_prompts: list[str] = []
+
+    def _plan_for(*, with_design: bool) -> dict[str, Any]:
+        task: dict[str, Any] = {
+            "task_id": "T1",
+            "title": "Implement the flag module",
+            "objective": "Create feature.py",
+            "requirement_refs": ["R1"],
+            "write_scope": ["src/feature.py"],
+            "acceptance_checks": [
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Smoke",
+                    "command": "python -m pytest -q",
+                }
+            ],
+        }
+        payload: dict[str, Any] = {
+            "plan_id": "plan-guidance",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [task],
+        }
+        if with_design:
+            task["design_refs"] = ["M1"]
+        return payload
+
+    def spec_only_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        spec_only_prompts.append(messages[0].content)
+        return LLMResponse(content=json.dumps(_plan_for(with_design=False)))
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=spec_only_responder),
+        workspace_root=tmp_path,
+    )
+    orch.propose_plan(run_id=run_id, topology="minimal_patch")
+    assert len(spec_only_prompts) == 1
+    assert "Vertical tracer-bullet decomposition" not in spec_only_prompts[0]
+
+    design = _contract_design(spec, shared_paths=[])
+    store.save_design(run_id, design, actor="design")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+    def modular_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        modular_prompts.append(messages[0].content)
+        return LLMResponse(content=json.dumps(_plan_for(with_design=True)))
+
+    modular_orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=modular_responder),
+        workspace_root=tmp_path,
+    )
+    modular_orch.propose_plan(run_id=run_id, topology="modular_product")
+    assert len(modular_prompts) == 1
+    assert "Modular product decomposition" in modular_prompts[0]
+    assert "Vertical tracer-bullet decomposition" not in modular_prompts[0]
+
+
 def test_timeout_retry_is_visible_while_an_independent_task_completes(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     store, run_id = _confirmed_run(tmp_path)
@@ -958,6 +1131,66 @@ def _gate_rejections(store: RunStore, run_id: str) -> list[Any]:
     return [e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"]
 
 
+class _DirectWriteWorker:
+    """Deterministic worker driver: writes prepared files per task and completes."""
+
+    name = "direct"
+    supports_steer = False
+
+    def __init__(self, files: dict[str, dict[str, str]]) -> None:
+        self._files = files
+
+    def steer(self, guidance: str, *, source: str) -> bool:
+        del guidance, source
+        return False
+
+    def cancel(self, *, reason: str) -> None:
+        del reason
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        for rel, content in self._files[request.task_id].items():
+            target = request.workspace_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content="done",
+            steps_taken=1,
+            driver_name="direct",
+        )
+
+
+def _capturing_reviewer(prompts: dict[str, str]) -> MockLLMProvider:
+    class CapturingReviewer(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args
+            user_prompt = kwargs["messages"][1].content
+            task_id = re.search(r'"task_id":"(T\d+)"', user_prompt)
+            assert task_id is not None
+            prompts[task_id.group(1)] = user_prompt
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": task_id.group(1),
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "ok",
+                        "findings": [],
+                    }
+                )
+            )
+
+    return CapturingReviewer()
+
+
 def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     notes = tmp_path / "docs" / "notes.md"
@@ -986,7 +1219,8 @@ def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_pa
     responder, state = _scope_gate_responder(
         [
             _bash_action("printf 'tampered\\n' >> docs/notes.md"),
-            _write_action("feature.py", "FLAG = True\n"),
+            # The sandbox is retained, so the retry repairs the stray edit in place.
+            _bash_action("git checkout -- docs/notes.md && printf 'FLAG = True\\n' > feature.py"),
         ]
     )
     orch = OrchestrateStage(
@@ -1217,7 +1451,8 @@ def test_diff_gate_validates_non_git_sandbox_without_crashing(tmp_path: Path) ->
     responder, state = _scope_gate_responder(
         [
             _bash_action("printf 'x\\n' > stray.py"),
-            _write_action("feature.py", "FLAG = True\n"),
+            # The retained sandbox keeps stray.py on disk, so the retry removes it in place.
+            _bash_action("rm stray.py && printf 'FLAG = True\\n' > feature.py"),
         ]
     )
     orch = OrchestrateStage(
@@ -1288,6 +1523,354 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
     assert (docs / "notes.md").is_file()
     assert (docs / "legacy.txt").is_file()
     assert not (docs / "notes-renamed.md").exists()
+
+
+AttemptAction = Callable[[int, Path, str], None]
+
+
+class _AttemptWorker:
+    """Deterministic driver replaying one scripted action per leased attempt."""
+
+    name = "attempt-scripted"
+    supports_steer = False
+
+    def __init__(self, script: Sequence[AttemptAction]) -> None:
+        self._script = list(script)
+        self.sandboxes: list[Path] = []
+        self.prompts: list[str] = []
+
+    def steer(self, guidance: str, *, source: str) -> bool:
+        del guidance, source
+        return False
+
+    def cancel(self, *, reason: str) -> None:
+        del reason
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        self.sandboxes.append(request.workspace_path)
+        self.prompts.append(request.user_prompt)
+        action = self._script[min(len(self.sandboxes) - 1, len(self._script) - 1)]
+        action(len(self.sandboxes), request.workspace_path, request.user_prompt)
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content="done",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _retained_stage(
+    store: RunStore,
+    tmp_path: Path,
+    worker: _AttemptWorker,
+    *,
+    provider: MockLLMProvider | None = None,
+) -> OrchestrateStage:
+    return OrchestrateStage(
+        store=store,
+        provider=provider or _capturing_reviewer({}),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver=worker.name),
+        driver_registry=DriverRegistry({worker.name: worker}),
+    )
+
+
+def _empty_dir(path: Path) -> bool:
+    return not path.exists() or not any(path.iterdir())
+
+
+def test_retained_sandbox_enables_in_place_repair_on_diff_gate_retry(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Feature module exposes the new flag",
+                    "command": "python3 -c 'import feature; assert feature.FLAG == 2'",
+                }
+            ],
+        ),
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        assert (ws / "scratch.db").is_file()
+        assert "IN-PLACE REPAIR" in prompt
+        (ws / "scratch.db").unlink()
+        (ws / "feature.py").write_text("FLAG = 2\n", encoding="utf-8")
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 2
+    assert len(worker.sandboxes) == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    rejections = _gate_rejections(store, run_id)
+    assert [(e.payload["attempt"], e.payload["violating_paths"]) for e in rejections] == [
+        (1, ["scratch.db"])
+    ]
+    assert _empty_dir(tmp_path / ".olympus" / "sandboxes")
+    assert _empty_dir(tmp_path / ".olympus" / "sandbox_tmp")
+
+
+def test_retained_sandbox_never_rebaselines_out_of_scope_violations(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+
+    def leave_stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        assert (ws / "scratch.db").is_file()
+
+    worker = _AttemptWorker([stray, leave_stray])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    assert [(e.payload["attempt"], e.payload["violating_paths"])
+            for e in _gate_rejections(store, run_id)] == [
+        (1, ["scratch.db"]),
+        (2, ["scratch.db"]),
+    ]
+    assert worker.sandboxes[0].is_dir()
+
+
+def test_command_check_failure_reuses_retained_sandbox_for_repair(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Feature flag must be 2",
+                    "command": "python3 -c 'import feature; assert feature.FLAG == 2'",
+                }
+            ],
+        ),
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        (ws / "feature.py").write_text("FLAG = 2  # repaired\n", encoding="utf-8")
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    check_events = [
+        e for e in store.list_events(run_id) if e.event_type == "check.command_completed"
+    ]
+    assert [e.payload["passed"] for e in check_events] == [False, True]
+
+
+def test_argus_rejection_reuses_retained_sandbox_for_targeted_repair(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    review_passes = [False, True]
+
+    def responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        assert "Independent Verifier" in messages[0].content
+        passed = review_passes.pop(0)
+        findings = [] if passed else [{
+            "id": "F1",
+            "severity": "important",
+            "file_path": "feature.py",
+            "line": 1,
+            "message": "Missing audit flag",
+        }]
+        return LLMResponse(content=json.dumps({
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": passed,
+            "summary": "ok" if passed else "Missing audit flag",
+            "findings": findings,
+        }))
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        (ws / "feature.py").write_text(
+            "FLAG = True\nAUDIT = True\n", encoding="utf-8"
+        )
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(
+        store, tmp_path, worker, provider=MockLLMProvider(responder=responder)
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    reviews = [e for e in store.list_events(run_id) if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["attempt"] for e in reviews] == [1, 2]
+
+
+def test_resume_after_pause_reuses_retained_sandbox(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def pause_then_repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            store.set_run_status(run_id, RunStatus.PAUSED, actor="zeus")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        (ws / "feature.py").write_text("FLAG = 2\n", encoding="utf-8")
+
+    worker = _AttemptWorker([pause_then_repair])
+    stage = _retained_stage(store, tmp_path, worker)
+    paused = stage.run_execution(run_id=run_id)
+
+    assert paused["status"] == RunStatus.PAUSED
+    sandbox = worker.sandboxes[0]
+    assert sandbox.is_dir()
+    assert (sandbox / "feature.py").is_file()
+
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="zeus")
+    resumed = stage.run_execution(run_id=run_id)
+
+    assert resumed["status"] == RunStatus.COMPLETED
+    assert resumed["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert resumed["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    assert _empty_dir(tmp_path / ".olympus" / "sandboxes")
+
+
+def test_run_cancellation_reclaims_retained_sandbox_and_temp_dir(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        build_sandbox_env(ws, host_root=tmp_path)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+
+    worker = _AttemptWorker([stray])
+    stage = _retained_stage(store, tmp_path, worker)
+    snap = stage.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    sandbox = worker.sandboxes[0]
+    tmp_dir = tmp_path / ".olympus" / "sandbox_tmp" / sandbox.name
+    assert sandbox.is_dir()
+    assert tmp_dir.is_dir()
+
+    store.set_run_status(run_id, RunStatus.CANCELLED, actor="zeus")
+    cancelled = stage.run_execution(run_id=run_id)
+
+    assert cancelled["status"] == RunStatus.CANCELLED
+    assert not sandbox.exists()
+    assert not tmp_dir.exists()
 
 
 def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Path) -> None:
@@ -1735,16 +2318,17 @@ def test_watchdog_pause_preserves_work_and_skips_review(
     assert json.loads((attempt / "watchdog.json").read_text())["summary"] == task.last_error
     events = store.list_events(run_id)
     paused, = [event for event in events if event.event_type == "watchdog.paused"]
+    # A paused attempt keeps its sandbox on disk so retry_task can resume in place.
+    assert task.worktree_path == paused.payload["retained_sandbox"]
+    retained = Path(task.worktree_path)
+    assert retained.is_dir()
+    assert (retained / "feature.py").read_bytes() == b"\x00unfinished\n"
     if archive_fails:
         assert paused.payload["archive_error"] == "PermissionError"
-        assert task.worktree_path == paused.payload["retained_sandbox"]
-        assert (Path(task.worktree_path) / "feature.py").read_bytes() == b"\x00unfinished\n"
     else:
-        assert not task.worktree_path
         patch = attempt / "diff.patch"
         assert "GIT binary patch" in patch.read_text(encoding="utf-8")
         subprocess.run(["git", "apply", "--check", str(patch)], cwd=tmp_path, check=True)
-        assert not list((tmp_path / ".olympus" / "sandboxes").iterdir())
     assert any(e.event_type == "run.paused" for e in events)
     progress = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
         "projection"
@@ -1896,7 +2480,11 @@ def test_watchdog_timers_fail_open_through_stage(
             stage.run_execution(run_id=run_id)
     else:
         assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
-    watchdog_events = [e for e in store.list_events(run_id) if e.actor == "watchdog"]
+    watchdog_events = [
+        e
+        for e in store.list_events(run_id)
+        if e.actor == "watchdog" and e.event_type.startswith("watchdog.")
+    ]
     assert len(monitor.recorded_requests) == len(expected_triggers)
     assert [event.event_type for event in watchdog_events] == [event_type] * len(expected_triggers)
     assert [event.payload["trigger"] for event in watchdog_events] == expected_triggers
@@ -2323,6 +2911,139 @@ def test_argus_prompt_enforces_hard_write_scope_boundary(tmp_path: Path) -> None
     assert expected_scope_line in user_prompt
 
 
+def test_multiwave_diff_and_argus_prompt_exclude_unchanged_upstream_overlay(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-scoped-diff",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T0",
+                    "title": "Publish the upstream module",
+                    "objective": "Create the upstream module",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["upstream.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "REV-0",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Review the upstream module",
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T1",
+                    "title": "Publish the downstream module",
+                    "objective": "Create the downstream module",
+                    "requirement_refs": ["R1"],
+                    "depends_on": ["T0"],
+                    "write_scope": ["child.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "REV-1",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Review the downstream module",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    _approve_plan(store, run_id, plan)
+    upstream_body = "".join(f"UPSTREAM_{i} = {i}\n" for i in range(300))
+    prompts: dict[str, str] = {}
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry(
+            {
+                "direct": _DirectWriteWorker(
+                    {
+                        "T0": {"upstream.py": upstream_body},
+                        "T1": {"child.py": "CHILD = True\n"},
+                    }
+                )
+            }
+        ),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert set(prompts) == {"T0", "T1"}
+    assert "UPSTREAM_299" in prompts["T0"]
+
+    downstream_prompt = prompts["T1"]
+    assert "child.py" in downstream_prompt
+    assert "CHILD = True" in downstream_prompt
+    assert "UPSTREAM_" not in downstream_prompt
+    assert "upstream.py" not in downstream_prompt
+
+    diff_path = (
+        tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1" / "diff.patch"
+    )
+    downstream_diff = diff_path.read_text(encoding="utf-8")
+    assert "child.py" in downstream_diff and "CHILD = True" in downstream_diff
+    assert "UPSTREAM_" not in downstream_diff
+    assert "upstream.py" not in downstream_diff
+
+
+def test_oversized_task_diff_is_bounded_in_argus_prompt_with_patch_pointer(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["big_feature.py"],
+        checks=[
+            {
+                "id": "REV-1",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Review the oversized module",
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    body = "".join(f"ROW_{i} = {i}\n" for i in range(4000)) + "TAIL_MARKER = True\n"
+    prompts: dict[str, str] = {}
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry(
+            {"direct": _DirectWriteWorker({"T1": {"big_feature.py": body}})}
+        ),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    prompt = prompts["T1"]
+    assert "new: big_feature.py" in prompt
+    assert "+4001" in prompt
+    assert "diff.patch" in prompt
+    assert "truncated" in prompt.lower()
+    assert "TAIL_MARKER" not in prompt
+    assert "ROW_3999" not in prompt
+    assert len(prompt) < 60_000
+
+    diff_path = (
+        tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1" / "diff.patch"
+    )
+    full_diff = diff_path.read_text(encoding="utf-8")
+    assert "TAIL_MARKER" in full_diff
+    assert "ROW_3999" in full_diff
+
+
 def test_default_worker_max_steps_is_unlimited() -> None:
     import inspect
 
@@ -2409,6 +3130,693 @@ def test_agent_loop_supports_unlimited_max_steps() -> None:
     assert res.stop_reason == "final_response"
     assert res.steps_taken == 26
     assert res.final_content == "finished after 26 steps"
+
+
+class _GatedDriver:
+    """Hold each worker turn until released, recording lifecycle ordering per task."""
+
+    name = "gated"
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self._files = files
+        self._lock = Lock()
+        self.started = {task_id: Event() for task_id in files}
+        self.finished = {task_id: Event() for task_id in files}
+        self.release = {task_id: Event() for task_id in files}
+        self.start_times: dict[str, float] = {}
+        self.end_times: dict[str, float] = {}
+        self.prompts: dict[str, str] = {}
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        task_id = request.task_id
+        assert task_id is not None and task_id in self._files
+        with self._lock:
+            self.start_times[task_id] = time.monotonic()
+            self.prompts[task_id] = request.user_prompt
+        self.started[task_id].set()
+        assert self.release[task_id].wait(10), f"{task_id} was never released"
+        target = request.workspace_path / self._files[task_id]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{task_id}\n", encoding="utf-8")
+        with self._lock:
+            self.end_times[task_id] = time.monotonic()
+        self.finished[task_id].set()
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content=f"{task_id} done",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _parallel_plan(spec: GoalSpec, *, scopes: dict[str, list[str]]) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-continuous",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": task_id,
+                    "title": f"Run {task_id}",
+                    "objective": f"Execute {task_id} independently",
+                    "requirement_refs": ["R1"],
+                    "write_scope": write_scope,
+                    "acceptance_checks": [
+                        {
+                            "id": f"{task_id}-REV",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Cold review",
+                        }
+                    ],
+                }
+                for task_id, write_scope in scopes.items()
+            ],
+        }
+    )
+
+
+def _passing_reviewer(
+    messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+) -> LLMResponse:
+    del messages, tools
+    return LLMResponse(
+        content=json.dumps(
+            {"task_id": "T1", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+        )
+    )
+
+
+def _start_stage(
+    stage: OrchestrateStage, run_id: str, **kwargs: Any
+) -> tuple[Thread, list[dict[str, Any]], list[Exception]]:
+    results: list[dict[str, Any]] = []
+    errors: list[Exception] = []
+
+    def execute() -> None:
+        try:
+            results.append(stage.run_execution(run_id=run_id, **kwargs))
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = Thread(target=execute, daemon=True)
+    thread.start()
+    return thread, results, errors
+
+
+def test_continuous_dispatch_refills_slots_without_barrier_sync(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={task_id: [f"{task_id.lower()}.txt"] for task_id in ("T1", "T2", "T3", "T4")},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver(
+        {task_id: f"{task_id.lower()}.txt" for task_id in ("T1", "T2", "T3", "T4")}
+    )
+    driver.release["T1"].set()
+    driver.release["T3"].set()
+    driver.release["T4"].set()
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id)
+    try:
+        assert driver.started["T2"].wait(5), "blocked task never started"
+        assert driver.started["T3"].wait(5), "Task C did not start while Task B was blocked"
+        assert driver.finished["T3"].wait(5), "Task C did not finish while Task B was blocked"
+        assert driver.finished["T4"].wait(5), "Task D did not finish while Task B was blocked"
+        assert not driver.release["T2"].is_set()
+    finally:
+        driver.release["T2"].set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T3"] < driver.end_times["T2"]
+
+
+def test_continuous_dispatch_serializes_overlapping_write_scopes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={"T1": ["shared/"], "T2": ["shared/"]},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver({"T1": "shared/t1.txt", "T2": "shared/t2.txt"})
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id)
+    assert driver.started["T1"].wait(5)
+    assert not driver.started["T2"].wait(0.3), "overlapping write_scope ran concurrently"
+    driver.release["T1"].set()
+    assert driver.finished["T1"].wait(5)
+    assert driver.started["T2"].wait(5)
+    driver.release["T2"].set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T1"] < driver.start_times["T2"]
+
+
+def test_serial_execution_stays_sequential_and_keeps_handoff_context(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={"T1": ["t1.txt"], "T2": ["t2.txt"]},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver({"T1": "t1.txt", "T2": "t2.txt"})
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id, serial_execution=True)
+    assert driver.started["T1"].wait(5)
+    assert not driver.started["T2"].wait(0.3), "serial execution ran two tasks together"
+    driver.release["T1"].set()
+    assert driver.finished["T1"].wait(5)
+    assert driver.started["T2"].wait(5)
+    driver.release["T2"].set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T1"] < driver.start_times["T2"]
+    assert "Prior Accepted Handoff Summary (serial_handoff)" in driver.prompts["T2"]
+    assert "T1" in driver.prompts["T2"]
+    status_events = [
+        event
+        for event in store.list_events(run_id)
+        if event.event_type == "run.status_changed"
+    ]
+    assert any(event.payload.get("serial_execution") is True for event in status_events)
+
+
+def test_retained_sandbox_diff_gate_blocks_worker_committed_out_of_scope_file(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def worker(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            (ws / "out-of-scope.txt").write_text("leaked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "out-of-scope.txt"], cwd=ws, check=True)
+            subprocess.run(["git", "commit", "-m", "commit leak"], cwd=ws, check=True)
+        else:
+            assert (ws / "out-of-scope.txt").is_file()
+
+    snap = _retained_stage(store, tmp_path, _AttemptWorker([worker])).run_execution(run_id=run_id)
+    rejections = [
+        (event.payload["attempt"], event.payload["violating_paths"])
+        for event in _gate_rejections(store, run_id)
+    ]
+    assert rejections == [(1, ["out-of-scope.txt"]), (2, ["out-of-scope.txt"])]
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+
+
+def test_continuous_dispatch_waits_for_upstream_overlay_publish_before_starting_dependent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import olympus.stages.orchestrate as orch_module
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    files = {"T1": "t1.txt", "T2": "t2.txt", "T3": "t3.txt"}
+    plan = _parallel_plan(store.get_run(run_id)["spec"], scopes={k: [v] for k, v in files.items()})
+    plan = plan.model_copy(
+        update={
+            "tasks": [
+                *plan.tasks[:2],
+                plan.tasks[2].model_copy(update={"depends_on": ["T1"]}),
+            ]
+        }
+    )
+    _approve_plan(store, run_id, plan)
+    observations: list[bool] = []
+
+    class _ObserveDriver(_GatedDriver):
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            if request.task_id == "T3":
+                observations.append((request.workspace_path / "t1.txt").exists())
+            return super().run_turn(request, on_event=on_event, on_handle=on_handle)
+
+    driver = _ObserveDriver(files)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+    original_copy = orch_module._copy_matching_scope
+    before_publish, allow_publish = Event(), Event()
+
+    def gated_copy(src: Path, dst: Path, write_scope: list[str] | None) -> None:
+        if write_scope == ["t1.txt"] and dst.name == "accepted_overlay":
+            before_publish.set()
+            assert allow_publish.wait(10)
+        original_copy(src, dst, write_scope=write_scope)
+
+    monkeypatch.setattr(orch_module, "_copy_matching_scope", gated_copy)
+    thread, results, errors = _start_stage(stage, run_id)
+    try:
+        assert driver.started["T1"].wait(5) and driver.started["T2"].wait(5)
+        driver.release["T1"].set()
+        assert before_publish.wait(5)
+        driver.release["T2"].set()
+        driver.release["T3"].set()
+        assert not driver.started["T3"].wait(0.3), "T3 started before T1 overlay publish finished"
+        allow_publish.set()
+        assert driver.started["T3"].wait(5)
+    finally:
+        allow_publish.set()
+        for event in driver.release.values():
+            event.set()
+        thread.join(10)
+
+    assert not thread.is_alive() and not errors
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert observations == [True]
+
+
+def test_watchdog_pause_cancels_late_registering_peer_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"], scopes={"T1": ["one.txt"], "T2": ["two.txt"]}
+    )
+    _approve_plan(store, run_id, plan)
+    peer_entered, pause_processed = Event(), Event()
+    peer_cancelled, source_cancelled = Event(), Event()
+
+    class _Handle:
+        supports_steer = False
+
+        def __init__(self, event: Event) -> None:
+            self._event = event
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            self._event.set()
+
+    class _PeerDriver:
+        name = "late-peer"
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            if request.task_id == "T1":
+                on_handle(_Handle(source_cancelled))
+                assert peer_entered.wait(5)
+                for step in range(3):
+                    on_event(
+                        "agent.tool_finished",
+                        {"step": step, "tool": "write", "status": "error", "error_signature": "r"},
+                    )
+                assert source_cancelled.wait(5)
+                return TurnOutcome(False, "cancelled", "", 1)
+            peer_entered.set()
+            assert pause_processed.wait(5)
+            on_handle(_Handle(peer_cancelled))
+            assert peer_cancelled.wait(2)
+            return TurnOutcome(False, "cancelled", "", 1)
+
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Blocked."})
+                )
+            ]
+        ),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="late-peer"),
+        driver_registry=DriverRegistry({"late-peer": _PeerDriver()}),
+    )
+    orig_exec = stage._execute_single_task
+
+    def coordinated_exec(**kwargs: Any) -> Any:
+        result = orig_exec(**kwargs)
+        if kwargs["task_id"] == "T1":
+            pause_processed.set()
+        return result
+
+    monkeypatch.setattr(stage, "_execute_single_task", coordinated_exec)
+    snap = stage.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.PAUSED
+    assert peer_cancelled.is_set()
+
+
+def test_nongit_watchdog_pause_preserves_retained_sandbox_for_retry(tmp_path: Path) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+    cancelled = Event()
+    seen_prior: list[bool] = []
+
+    class _NonGitDriver:
+        name = "nongit"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            cancelled.set()
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            ws = request.workspace_path
+            on_handle(self)
+            seen_prior.append((ws / "feature.py").exists())
+            if len(seen_prior) == 1:
+                (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+                for step in range(3):
+                    on_event(
+                        "agent.tool_finished",
+                        {"step": step, "tool": "write", "status": "error", "error_signature": "e"},
+                    )
+                assert cancelled.wait(3)
+                return TurnOutcome(False, "cancelled", "", 1)
+            return TurnOutcome(True, "final_response", "done", 1)
+
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Blocked."})
+                )
+            ]
+        ),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="nongit"),
+        driver_registry=DriverRegistry({"nongit": _NonGitDriver()}),
+    )
+    paused = stage.run_execution(run_id=run_id)
+    assert paused["status"] == RunStatus.PAUSED
+    stage.retry_blocked_task(
+        operation_id="retry-nongit",
+        run_id=run_id,
+        task_id="T1",
+        expected_state_revision=paused["state_revision"],
+    )
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="zeus")
+    finished = stage.run_execution(run_id=run_id)
+    assert finished["status"] == RunStatus.COMPLETED
+    assert seen_prior == [False, True]
+
+
+def test_worker_system_prompt_is_harness_agnostic_seam_first_and_anti_bloat() -> None:
+    prompt = _WORKER_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    assert "run_bash" not in prompt
+    assert "failing seam test" in lowered
+    assert "minimal clean" in lowered and "next criterion" in lowered
+    assert "speculative" in lowered and "tautological" in lowered
+    assert "batch" in lowered and "native" in lowered
+    assert "shell execution" in lowered
+    for probe in ("`cat`", "`sed`", "`grep`", "`find`"):
+        assert probe in prompt
+
+
+class _SliceDriver:
+    """Write each vertical slice's files into its sandbox without LLM turns."""
+
+    name = "slices"
+
+    def __init__(self, files: dict[str, dict[str, str]]) -> None:
+        self._files = files
+        self.turns: list[str] = []
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        task_id = request.task_id
+        assert task_id is not None and task_id in self._files
+        self.turns.append(task_id)
+        for rel_path, content in self._files[task_id].items():
+            target = request.workspace_path / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content=f"{task_id} implemented",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _vertical_slice_fixture() -> tuple[GoalSpec, DesignSpec, TaskPlan]:
+    spec = GoalSpec(
+        spec_id="spec-vertical",
+        goal="Grow an inventory through vertical slices",
+        requirements=[
+            {
+                "id": requirement_id,
+                "description": f"Deliver capability {requirement_id}",
+                "acceptance_criteria": ["Works end to end"],
+            }
+            for requirement_id in ("R1", "R2", "R3", "R4")
+        ],
+    )
+    design = DesignSpec.model_validate(
+        {
+            "design_id": "design-vertical",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "One storage core with two feature modules.",
+            "modules": [
+                {
+                    "id": "M1",
+                    "name": "Core",
+                    "responsibility": "Storage and entrypoint",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["store.py", "app.py"],
+                },
+                {
+                    "id": "M2",
+                    "name": "Items",
+                    "responsibility": "Item capability",
+                    "requirement_refs": ["R2", "R3"],
+                    "target_paths": ["feature_items.py"],
+                },
+                {
+                    "id": "M3",
+                    "name": "Count",
+                    "responsibility": "Count capability",
+                    "requirement_refs": ["R4"],
+                    "target_paths": ["feature_count.py"],
+                },
+            ],
+        }
+    )
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-vertical",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "design_id": design.design_id,
+            "design_hash": design.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1-skeleton",
+                    "title": "Runnable skeleton",
+                    "objective": "Wire storage into one observable seam",
+                    "requirement_refs": ["R1"],
+                    "design_refs": ["M1"],
+                    "write_scope": ["store.py", "app.py", "test_app.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Seam returns a missing item",
+                            "command": (
+                                "python3 -c 'import app; assert app.get_item(\"missing\") is None'"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T2-items",
+                    "title": "Items slice",
+                    "objective": "Deliver the item capability end to end",
+                    "requirement_refs": ["R2", "R3"],
+                    "design_refs": ["M2"],
+                    "depends_on": ["T1-skeleton"],
+                    "write_scope": ["feature_items.py", "test_feature_items.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T2-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Item round trips through storage",
+                            "command": (
+                                "python3 -c 'import feature_items; "
+                                "assert feature_items.add_item(\"a\", 1) == 1'"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T3-count",
+                    "title": "Count slice",
+                    "objective": "Deliver the count capability end to end",
+                    "requirement_refs": ["R4"],
+                    "design_refs": ["M3"],
+                    "depends_on": ["T1-skeleton"],
+                    "write_scope": ["feature_count.py", "test_feature_count.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T3-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Count reads the storage core",
+                            "command": (
+                                "python3 -c 'import feature_count; "
+                                "assert feature_count.count() == 0'"
+                            ),
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    return spec, design, plan
+
+
+def test_vertical_three_slice_tracer_bullet_dag_completes_end_to_end(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Vertical tracer bullet", mode=RunMode.EXECUTION)
+    spec, design, plan = _vertical_slice_fixture()
+    store.save_spec(run_id, spec)
+    align = AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path)
+    align.confirm_spec(run_id=run_id, approver="zeus")
+    assert validate_plan(plan, spec=spec, design=design, topology="vertical_slices") == []
+    _approve_plan(store, run_id, plan, design=design)
+
+    driver = _SliceDriver(
+        {
+            "T1-skeleton": {
+                "store.py": "ITEMS: dict[str, int] = {}\n",
+                "app.py": "from store import ITEMS\n\n\ndef get_item(key: str) -> int | None:\n"
+                "    return ITEMS.get(key)\n",
+                "test_app.py": "def test_skeleton() -> None:\n    assert True\n",
+            },
+            "T2-items": {
+                "feature_items.py": "from store import ITEMS\n\n\ndef add_item("
+                "key: str, value: int) -> int:\n    ITEMS[key] = value\n"
+                "    return ITEMS[key]\n",
+                "test_feature_items.py": "def test_items() -> None:\n    assert True\n",
+            },
+            "T3-count": {
+                "feature_count.py": "from store import ITEMS\n\n\ndef count() -> int:\n"
+                "    return len(ITEMS)\n",
+                "test_feature_count.py": "def test_count() -> None:\n    assert True\n",
+            },
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="slices"),
+        driver_registry=DriverRegistry({"slices": driver}),
+    )
+    final = stage.run_execution(run_id=run_id)
+    assert final["status"] == RunStatus.COMPLETED
+    assert {task.status for task in final["plan"].tasks} == {TaskStatus.ACCEPTED}
+    assert set(driver.turns) == {"T1-skeleton", "T2-items", "T3-count"}
+    assert driver.turns[0] == "T1-skeleton"
+
 
 
 
