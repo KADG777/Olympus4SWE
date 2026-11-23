@@ -168,7 +168,8 @@ def run_structured_turn[T: BaseModel](
                     validation_header,
                     violations,
                     "Do NOT call any tools. Fix ONLY the JSON/schema errors in the previous "
-                    "draft and output a single raw JSON object.",
+                    "draft (ensure any provenance or reference list copies exact strings from "
+                    "its source list, or is empty) and output a single raw JSON object.",
                     previous_output=outcome.final_content,
                 )
                 turn_disable_tools = True

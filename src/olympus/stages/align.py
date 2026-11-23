@@ -132,8 +132,9 @@ Rules:
    `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
    `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
 11. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
-   copy the exact text from `assumptions` into `agent_high_impact_assumptions`. Do not mark user
-   decisions or confirmed clarifications as Agent assumptions. Ask about genuine blockers.
+   copy the exact verbatim string from `assumptions` into `agent_high_impact_assumptions` (or leave
+   `agent_high_impact_assumptions` as `[]`). Do not mark user decisions or confirmed clarifications
+   as Agent assumptions. Ask about genuine blockers.
 12. Seam-First Test Boundaries: Populate `test_seams` with the fewest, highest-level public
    boundaries where behavior is verified end to end (HTTP routes, CLI commands, public module
    APIs) — ideal 1-2. Each seam must be exercisable by an external caller in one step; never name
