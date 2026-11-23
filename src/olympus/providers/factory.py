@@ -20,10 +20,20 @@ from olympus.providers.dialects import (
     OpenAIChatCompat,
     OpenAIChatDialect,
 )
-from olympus.providers.registry import EndpointSpec, ProviderRegistry, ProviderSpec
+from olympus.providers.registry import (
+    BUILTIN_PROVIDERS,
+    EndpointSpec,
+    ProviderRegistry,
+    ProviderSpec,
+)
 from olympus.providers.types import LLMProvider, ProviderError
 
 _DEFAULT_USER_PROVIDERS_PATH = Path("~/.olympus/providers.json")
+_BUILTIN_DEFAULT_BASE_URLS: dict[str, str] = {
+    spec.id: spec.base_url.strip().rstrip("/")
+    for spec in BUILTIN_PROVIDERS
+    if spec.base_url and spec.base_url.strip()
+}
 
 
 def build_provider(
@@ -135,8 +145,21 @@ def _resolve_endpoints(
     elif shorthand_base:
         own_keys = _shorthand_keys(spec, env)
         keys = list(seed_keys) if seed_keys else own_keys
+        builtin_default_url = _BUILTIN_DEFAULT_BASE_URLS.get(spec.id)
+        is_builtin_default = (
+            builtin_default_url is not None
+            and base_override is None
+            and _env_value(env, spec.base_url_env) is None
+            and shorthand_base.strip().rstrip("/") == builtin_default_url
+        )
         targets.extend(
-            _targets_for(shorthand_base, keys, dict(spec.headers), allow_keyless=allow_keyless)
+            _targets_for(
+                shorthand_base,
+                keys,
+                dict(spec.headers),
+                allow_keyless=allow_keyless,
+                is_custom_endpoint=not is_builtin_default,
+            )
         )
 
     return _dedupe_targets(targets)
@@ -170,16 +193,30 @@ def _targets_for(
     headers: Mapping[str, str],
     *,
     allow_keyless: bool,
+    is_custom_endpoint: bool = True,
 ) -> list[EndpointTarget]:
     url = base_url.strip().rstrip("/")
     if not url:
         return []
     if keys:
         return [
-            EndpointTarget(api_key=key, base_url=url, headers=dict(headers)) for key in keys
+            EndpointTarget(
+                api_key=key,
+                base_url=url,
+                headers=dict(headers),
+                is_custom_endpoint=is_custom_endpoint,
+            )
+            for key in keys
         ]
     if allow_keyless:
-        return [EndpointTarget(api_key="", base_url=url, headers=dict(headers))]
+        return [
+            EndpointTarget(
+                api_key="",
+                base_url=url,
+                headers=dict(headers),
+                is_custom_endpoint=is_custom_endpoint,
+            )
+        ]
     return []
 
 

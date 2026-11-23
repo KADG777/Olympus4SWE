@@ -2109,6 +2109,271 @@ def test_session_start_records_stage_driver_option_and_defaults_to_auto(
     assert recorded["stage_driver"] == "auto"
 
 
+def test_session_start_records_pi_options_and_rejects_invalid_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OLYMPUS_PI_PROVIDER", raising=False)
+    monkeypatch.delenv("OLYMPUS_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("OLYMPUS_CONTEXT_WINDOW", raising=False)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            "--pi-provider",
+            "gateway-x",
+            "--thinking",
+            "HIGH",
+            "--context-window",
+            "262144",
+            *_base(repo, tmp_path / "state-ok"),
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    recorded = RunStore(tmp_path / "state-ok" / "olympus.db").get_run(
+        str(start["run_id"])
+    )["execution_drivers"]
+    assert recorded["pi_provider"] == "gateway-x"
+    assert recorded["thinking_level"] == "high"
+    assert recorded["context_window"] == 262144
+
+    code, failed = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--thinking",
+            "extreme",
+            *_base(repo, tmp_path / "state-bad-thinking"),
+        ]
+    )
+    assert code == 1
+    assert failed["status"] == "failed"
+    assert "thinking_level" in failed["error"]
+
+    invalid_window = RUNNER.invoke(
+        app,
+        [
+            "session",
+            "start",
+            "Build a calculator library",
+            "--context-window",
+            "512",
+            *_base(repo, tmp_path / "state-bad-window"),
+        ],
+    )
+    # Typer rejects the below-minimum window before the command runs.
+    assert invalid_window.exit_code == 2
+    assert "1024" in invalid_window.stdout or "1024" in invalid_window.stderr
+
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+    code, env_start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            *_base(repo, tmp_path / "state-env"),
+        ]
+    )
+    assert code == 0, json.dumps(env_start, indent=2)
+    recorded = RunStore(tmp_path / "state-env" / "olympus.db").get_run(
+        str(env_start["run_id"])
+    )["execution_drivers"]
+    assert recorded["pi_provider"] is None
+    assert recorded["thinking_level"] is None
+    assert recorded["context_window"] is None
+
+
+def test_session_reply_applies_explicit_pi_overrides_onto_recorded_drivers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.harness.driver import (
+        ExecutionDriversConfig,
+    )
+    from olympus.harness.driver import (
+        default_driver_factories as real_factories,
+    )
+
+    captured: list[ExecutionDriversConfig] = []
+
+    def spy(*, store, run_id, provider, execution_drivers=None):
+        captured.append(execution_drivers)
+        return real_factories(
+            store=store, run_id=run_id, provider=provider, execution_drivers=execution_drivers
+        )
+
+    monkeypatch.setattr("olympus.session.runner.default_driver_factories", spy)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec(ambiguity=True)))
+    _patch_provider(monkeypatch, script)
+
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--pi-provider",
+            "gateway-one",
+            "--thinking",
+            "high",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    assert start["pause_kind"] == "clarify"
+    assert captured[-1].pi_provider == "gateway-one"
+    assert captured[-1].thinking_level == "high"
+
+    script.router.append(
+        json.dumps({"action": "clarify", "answers": {"AMB-1": "raise ValueError('zero')"}})
+    )
+    code, reply = _invoke(
+        [
+            "reply",
+            str(start["run_id"]),
+            "Make divide(1, 0) raise ValueError('zero').",
+            "--pi-provider",
+            "gateway-two",
+            "--thinking",
+            "low",
+            "--context-window",
+            "200000",
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0, json.dumps(reply, indent=2)
+    # The recorded snapshot keeps the start-time values; the live runtime honors
+    # the explicit reply overrides on top of them.
+    recorded = RunStore(state / "olympus.db").get_run(str(start["run_id"]))[
+        "execution_drivers"
+    ]
+    assert recorded["pi_provider"] == "gateway-one"
+    assert captured[-1].pi_provider == "gateway-two"
+    assert captured[-1].thinking_level == "low"
+    assert captured[-1].context_window == 200000
+    assert captured[-1].stage_driver == "auto"
+
+
+def test_session_runner_token_usage_aggregates_ledger_and_actors(tmp_path: Path) -> None:
+    from olympus.core.contracts import BudgetPolicy, RunMode
+    from olympus.session.contracts import TokenUsageSummary
+    from olympus.session.runner import SessionConfig, SessionRunner
+
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    runner = SessionRunner(SessionConfig(workspace_root=repo, state_dir=state))
+    run_id = runner.store.create_run(
+        title="usage", mode=RunMode.SIMULATION, budget_policy=BudgetPolicy(max_llm_calls=100)
+    )
+    runner.store.record_external_llm_usage(
+        run_id,
+        actor="align:proposer",
+        purpose="align",
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=300,
+        cache_write_tokens=25,
+        reasoning_tokens=10,
+    )
+    runner.store.record_external_llm_usage(
+        run_id,
+        actor="hephaestus:T1",
+        purpose="pi_step_1",
+        input_tokens=20,
+        output_tokens=10,
+        reasoning_tokens=4,
+    )
+
+    usage = runner._token_usage(run_id)
+    assert isinstance(usage, TokenUsageSummary)
+    assert usage.llm_calls == 2
+    assert usage.input_tokens == 120
+    assert usage.output_tokens == 60
+    assert usage.reasoning_tokens == 14
+    assert usage.cache_read_tokens == 300
+    assert usage.cache_write_tokens == 25
+    # Reasoning is a subset of output tokens: never added into the total.
+    assert usage.total_tokens == 120 + 60 + 300 + 25
+    assert usage.cache_hit_rate == round(300 / (120 + 300), 4)
+
+    align = usage.by_actor["align:proposer"]
+    assert align.llm_calls == 1
+    assert (align.input_tokens, align.output_tokens) == (100, 50)
+    assert (align.cache_read_tokens, align.cache_write_tokens) == (300, 25)
+    assert align.reasoning_tokens == 10
+    assert align.total_tokens == 100 + 50 + 300 + 25
+    worker = usage.by_actor["hephaestus:T1"]
+    assert (worker.input_tokens, worker.output_tokens, worker.reasoning_tokens) == (20, 10, 4)
+    assert worker.total_tokens == 30
+
+    missing = runner._token_usage("run-does-not-exist")
+    assert missing == TokenUsageSummary()
+
+
+def test_session_envelope_reports_token_usage_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec(ambiguity=True)))
+    _patch_provider(monkeypatch, script)
+
+    code, start = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(start, indent=2)
+    usage = start["token_usage"]
+    assert set(usage) == {
+        "llm_calls",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "cache_hit_rate",
+        "by_actor",
+    }
+    assert usage["llm_calls"] >= 1
+    assert usage["cache_hit_rate"] == 0.0
+    assert usage["reasoning_tokens"] == 0
+    assert usage["total_tokens"] == (
+        usage["input_tokens"]
+        + usage["output_tokens"]
+        + usage["cache_read_tokens"]
+        + usage["cache_write_tokens"]
+    )
+    assert "align:proposer" in usage["by_actor"]
+    actor = usage["by_actor"]["align:proposer"]
+    assert set(actor) == {
+        "llm_calls",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+    }
+
+    # Failure envelopes without a stored run still carry an empty summary.
+    code, failed = _invoke(["start", "   ", *_base(repo, state)])
+    assert code == 1
+    assert failed["token_usage"]["llm_calls"] == 0
+    assert failed["token_usage"]["by_actor"] == {}
+
+
 def test_router_blocks_negated_defaults_questions_and_unchanged_refusals() -> None:
     from olympus.core.contracts import GoalSpec, RunStatus
     from olympus.providers.base import MockLLMProvider

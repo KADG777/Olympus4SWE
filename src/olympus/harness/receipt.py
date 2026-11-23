@@ -48,6 +48,9 @@ def build_turn_receipt(
     calls = 0
     input_tokens = 0
     output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    reasoning_tokens = 0
     tools: list[dict[str, Any]] = []
     for event in events:
         kind = event.get("kind")
@@ -55,6 +58,9 @@ def build_turn_receipt(
             calls += int(event.get("calls", 1))
             input_tokens += int(event.get("input_tokens", 0))
             output_tokens += int(event.get("output_tokens", 0))
+            cache_read_tokens += int(event.get("cache_read_tokens", 0))
+            cache_write_tokens += int(event.get("cache_write_tokens", 0))
+            reasoning_tokens += int(event.get("reasoning_tokens", 0))
         elif kind == "tool_end":
             tools.append(
                 {
@@ -76,6 +82,10 @@ def build_turn_receipt(
         f"{actor} · {calls} calls · "
         f"{_format_k(input_tokens)} in / {_format_k(output_tokens)} out"
     )
+    if cache_read_tokens > 0 or cache_write_tokens > 0:
+        one_line += (
+            f" · cache {_format_k(cache_read_tokens)}r / {_format_k(cache_write_tokens)}w"
+        )
     if tools:
         one_line += f" | {_collapse_tool_names(tools)}"
     if any(diff_lines):
@@ -89,6 +99,13 @@ def build_turn_receipt(
             "calls": calls,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "total_tokens": input_tokens
+            + output_tokens
+            + cache_read_tokens
+            + cache_write_tokens,
         },
         "tools": tools,
         "artifacts": {

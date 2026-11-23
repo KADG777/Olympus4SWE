@@ -83,11 +83,13 @@ def _emit(record):
 def _usage(tin, tout):
     cache_read = int(os.environ.get("FAKE_PI_CACHE_READ", "0"))
     cache_write = int(os.environ.get("FAKE_PI_CACHE_WRITE", "0"))
+    reasoning = int(os.environ.get("FAKE_PI_REASONING", "0"))
     return {
         "input": tin,
         "output": tout,
         "cacheRead": cache_read,
         "cacheWrite": cache_write,
+        "reasoning": reasoning,
         "totalTokens": tin + tout + cache_read + cache_write,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
     }
@@ -430,7 +432,15 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
     assert outcome.final_content == "steered:Prefer smaller edits"
     assert outcome.steps_taken == 2
     assert (outcome.total_input_tokens, outcome.total_output_tokens) == (18, 8)
-    assert outcome.receipt["llm"] == {"calls": 2, "input_tokens": 18, "output_tokens": 8}
+    assert outcome.receipt["llm"] == {
+        "calls": 2,
+        "input_tokens": 18,
+        "output_tokens": 8,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 26,
+    }
     assert outcome.receipt["tools"] == [{"tool": "write", "status": "ok", "duration_ms": 12}]
     assert "2 calls" in outcome.receipt["one_line"]
     assert "Prefer smaller edits" not in json.dumps(outcome.receipt)
@@ -624,7 +634,15 @@ def test_pi_driver_falls_back_to_json_mode_without_rpc_support(
     )
 
     assert outcome.completed and outcome.final_content == "Documented change."
-    assert outcome.receipt["llm"] == {"calls": 2, "input_tokens": 18, "output_tokens": 8}
+    assert outcome.receipt["llm"] == {
+        "calls": 2,
+        "input_tokens": 18,
+        "output_tokens": 8,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 26,
+    }
     assert "agent.tool_started" in events and "agent.tool_finished" in events
     assert not handles[0].supports_steer
     assert handles[0].steer("too late", source="human") is False
@@ -2017,6 +2035,399 @@ def test_pi_driver_cleans_up_gateway_dir_on_spawn_failure(
     _reset_pi_availability_cache()
 
 
+_GATEWAY_PROBE_SOURCE = '''
+"""Fake Pi CLI capturing gateway config, argv, and file modes for Olympus tests."""
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+CAPTURE_FILE = os.environ["FAKE_PI_CAPTURE_FILE"]
+
+
+def _main():
+    argv = sys.argv[1:]
+    if "--help" in argv:
+        print("  --mode <mode>  Output mode: text, json, or rpc")
+        return 0
+    cfg_dir = os.environ.get("PI_CODING_AGENT_DIR", "")
+    models_path = Path(cfg_dir) / "models.json" if cfg_dir else None
+    payload = {
+        "argv": argv,
+        "cfg_dir": cfg_dir,
+        "models_json": models_path.read_text(encoding="utf-8") if models_path else None,
+        "cfg_dir_mode": stat.S_IMODE(Path(cfg_dir).stat().st_mode) if cfg_dir else None,
+        "models_mode": (
+            stat.S_IMODE(models_path.stat().st_mode) if models_path is not None else None
+        ),
+        "pi_offline": os.environ.get("PI_OFFLINE", ""),
+        "pi_skip_version_check": os.environ.get("PI_SKIP_VERSION_CHECK", ""),
+    }
+    Path(CAPTURE_FILE).write_text(json.dumps(payload), encoding="utf-8")
+    for line in sys.stdin:
+        if '"prompt"' in line:
+            reasoning = int(os.environ.get("FAKE_PI_REASONING", "0"))
+            print(json.dumps({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input": 5, "output": 2, "reasoning": reasoning},
+                },
+            }), flush=True)
+            print(json.dumps({"type": "agent_settled", "aborted": False}), flush=True)
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
+'''
+
+
+def _write_gateway_probe(root: Path) -> Path:
+    path = root / "gateway_probe.py"
+    path.write_text(f"#!{sys.executable}\n" + _GATEWAY_PROBE_SOURCE, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_pi_driver_native_provider_passthrough_with_thinking_and_no_models_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "pi-capture.json"
+    fake = _write_gateway_probe(tmp_path)
+    monkeypatch.setenv("FAKE_PI_CAPTURE_FILE", str(capture_file))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(binary=str(fake), pi_provider="gateway-x", thinking_level="HIGH")
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="Return ok.",
+                user_prompt="ping",
+                actor="align:proposer",
+                read_only=True,
+                model="gateway-x/gateway-model",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "gateway-x"
+    assert argv[argv.index("--model") + 1] == "gateway-model"
+    assert argv[argv.index("--thinking") + 1] == "high"
+    # Pure passthrough: Pi's own provider catalog supplies the wiring, no models.json.
+    assert captured["cfg_dir"] == ""
+    assert captured["models_json"] is None
+    assert not (workspace / ".olympus").exists()
+
+
+def test_pi_driver_provider_override_models_json_with_base_url_and_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "pi-capture.json"
+    fake = _write_gateway_probe(tmp_path)
+    secret = "sk-passthrough-gateway-secret-424242"
+    monkeypatch.setenv("FAKE_PI_CAPTURE_FILE", str(capture_file))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(binary=str(fake), pi_provider="openai", context_window=262144)
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="Return ok.",
+                user_prompt="ping",
+                actor="align:proposer",
+                read_only=True,
+                model="openai/gpt-4o",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "openai"
+    assert argv[argv.index("--model") + 1] == "gpt-4o"
+    raw = captured["models_json"]
+    assert raw is not None and secret not in raw
+    doc = json.loads(raw)
+    override = doc["providers"]["openai"]
+    # Provider-override shape: no "models" array, modelOverrides carries the window.
+    assert "models" not in override
+    assert override == {
+        "baseUrl": "https://gateway.example/v1",
+        "apiKey": "$OPENAI_API_KEY",
+        "modelOverrides": {"gpt-4o": {"contextWindow": 262144}},
+    }
+    assert captured["cfg_dir_mode"] == 0o700
+    assert captured["models_mode"] == 0o600
+    assert captured["pi_offline"] == "1"
+    assert captured["pi_skip_version_check"] == "1"
+    # The ephemeral config dir is removed once the turn reaps.
+    assert not Path(captured["cfg_dir"]).exists()
+
+
+def test_pi_driver_respects_caller_pi_coding_agent_dir_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    caller_dir = tmp_path / "caller-pi-cfg"
+    caller_dir.mkdir()
+    sentinel = '{"providers": {"caller-owned": {"baseUrl": "https://caller.invalid"}}}'
+    (caller_dir / "models.json").write_text(sentinel, encoding="utf-8")
+    capture_file = tmp_path / "pi-capture.json"
+    fake = _write_gateway_probe(tmp_path)
+    monkeypatch.setenv("FAKE_PI_CAPTURE_FILE", str(capture_file))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(caller_dir))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(binary=str(fake), pi_provider="gateway-x", context_window=200000)
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="Return ok.",
+                user_prompt="ping",
+                actor="align:proposer",
+                read_only=True,
+                model="gateway-x/gateway-model",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "gateway-x"
+    # Caller-owned config dir wins: the model passes through unstripped, nothing overwritten.
+    assert argv[argv.index("--model") + 1] == "gateway-x/gateway-model"
+    assert captured["cfg_dir"] == str(caller_dir)
+    assert captured["models_json"] == sentinel
+    assert (caller_dir / "models.json").read_text(encoding="utf-8") == sentinel
+
+
+def test_pi_driver_legacy_gateway_models_json_carries_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "pi-capture.json"
+    fake = _write_gateway_probe(tmp_path)
+    secret = "sk-legacy-gateway-secret-313131"
+    monkeypatch.setenv("FAKE_PI_CAPTURE_FILE", str(capture_file))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(binary=str(fake), context_window=131072)
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="Return ok.",
+                user_prompt="ping",
+                actor="align:proposer",
+                read_only=True,
+                model="openai/custom-model-v1",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "olympus-gateway"
+    assert argv[argv.index("--model") + 1] == "custom-model-v1"
+    raw = captured["models_json"]
+    assert raw is not None and secret not in raw
+    doc = json.loads(raw)
+    gateway = doc["providers"]["olympus-gateway"]
+    assert gateway["api"] == "openai-completions"
+    assert gateway["baseUrl"] == "https://gateway.example/v1"
+    assert gateway["apiKey"] == "$OPENAI_API_KEY"
+    assert gateway["models"] == [{"id": "custom-model-v1", "contextWindow": 131072}]
+    assert not Path(captured["cfg_dir"]).exists()
+
+
+def test_execution_drivers_config_validates_thinking_and_context_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OLYMPUS_PI_PROVIDER", raising=False)
+    monkeypatch.delenv("OLYMPUS_THINKING_LEVEL", raising=False)
+    monkeypatch.delenv("OLYMPUS_CONTEXT_WINDOW", raising=False)
+
+    resolved = ExecutionDriversConfig.resolve(
+        pi_provider="gateway-nine", thinking_level="XHIGH", context_window=262144
+    )
+    assert resolved.pi_provider == "gateway-nine"
+    assert resolved.thinking_level == "xhigh"
+    assert resolved.context_window == 262144
+
+    monkeypatch.setenv("OLYMPUS_PI_PROVIDER", "env-gateway")
+    monkeypatch.setenv("OLYMPUS_THINKING_LEVEL", "Medium")
+    monkeypatch.setenv("OLYMPUS_CONTEXT_WINDOW", "200000")
+    from_env = ExecutionDriversConfig.resolve()
+    assert from_env.pi_provider == "env-gateway"
+    assert from_env.thinking_level == "medium"
+    assert from_env.context_window == 200000
+    # Explicit args still win over the environment.
+    explicit = ExecutionDriversConfig.resolve(
+        pi_provider="cli-gateway", thinking_level="low", context_window=120000
+    )
+    assert (explicit.pi_provider, explicit.thinking_level, explicit.context_window) == (
+        "cli-gateway",
+        "low",
+        120000,
+    )
+
+    with pytest.raises(ValueError):
+        ExecutionDriversConfig.resolve(thinking_level="extreme")
+    from olympus.harness.pi import _normalize_thinking_level
+
+    with pytest.raises(ValueError):
+        _normalize_thinking_level("ultra")
+    with pytest.raises(ValueError):
+        monkeypatch.setenv("OLYMPUS_CONTEXT_WINDOW", "not-a-number")
+        ExecutionDriversConfig.resolve()
+    monkeypatch.setenv("OLYMPUS_CONTEXT_WINDOW", "512")
+    with pytest.raises(ValueError):
+        ExecutionDriversConfig.resolve()
+
+
+def test_pi_driver_propagates_reasoning_and_cache_totals_to_receipt_and_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.harness.receipt import build_turn_receipt
+
+    monkeypatch.setenv("FAKE_PI_CACHE_READ", "40")
+    monkeypatch.setenv("FAKE_PI_CACHE_WRITE", "5")
+    monkeypatch.setenv("FAKE_PI_REASONING", "7")
+    store = RunStore(tmp_path / "run.db")
+    run_id = store.create_run(
+        title="reasoning-accounting",
+        mode=RunMode.SIMULATION,
+        budget_policy=BudgetPolicy(max_total_tokens=10_000),
+    )
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    outcome = PiDriver(binary=str(fake), store=store, run_id=run_id).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert outcome.completed is True
+    assert outcome.steps_taken == 2
+    # Two assistant messages: (11,5) toolUse + (7,3) final, cache/reasoning each.
+    assert (outcome.total_input_tokens, outcome.total_output_tokens) == (18, 8)
+    assert (outcome.total_cache_read_tokens, outcome.total_cache_write_tokens) == (80, 10)
+    assert outcome.total_reasoning_tokens == 14
+
+    llm_events = [payload for kind, payload in events if kind == "llm"]
+    assert len(llm_events) == 2
+    assert all(payload["reasoning_tokens"] == 7 for payload in llm_events)
+    assert all(payload["cache_read_tokens"] == 40 for payload in llm_events)
+
+    llm = outcome.receipt["llm"]
+    assert llm == {
+        "calls": 2,
+        "input_tokens": 18,
+        "output_tokens": 8,
+        "cache_read_tokens": 80,
+        "cache_write_tokens": 10,
+        "reasoning_tokens": 14,
+        "total_tokens": 116,
+    }
+    # Reasoning is a non-additive subset of output tokens: never double-counted.
+    assert llm["total_tokens"] == 18 + 8 + 80 + 10
+    assert outcome.receipt == build_turn_receipt(
+        turn_id=outcome.receipt["turn_id"],
+        actor="worker",
+        events=[
+            {
+                "kind": "llm",
+                "input_tokens": 11,
+                "output_tokens": 5,
+                "cache_read_tokens": 40,
+                "cache_write_tokens": 5,
+                "reasoning_tokens": 7,
+            },
+            {
+                "kind": "llm",
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "cache_read_tokens": 40,
+                "cache_write_tokens": 5,
+                "reasoning_tokens": 7,
+            },
+            {
+                "kind": "tool_end",
+                "tool": "write",
+                "is_error": False,
+                "duration_ms": 12,
+            },
+        ],
+    )
+
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
+    assert (ledger.cache_read_tokens, ledger.cache_write_tokens) == (80, 10)
+    assert ledger.reasoning_tokens == 14
+    assert ledger.total_tokens == 116
+    assert ledger.cache_hit_rate == pytest.approx(round(80 / (18 + 80), 4))
+
+    llm_trace = [entry for entry in _read_jsonl(trace_path) if entry.get("event") == "llm"]
+    assert all(entry["reasoning_tokens"] == 7 for entry in llm_trace)
+
+    settled = [
+        event.payload
+        for event in store.list_events(run_id)
+        if event.event_type == "budget.settled"
+    ]
+    assert len(settled) == 2
+    assert all(payload["reasoning_tokens"] == 7 for payload in settled)
+
+
 def test_design_and_orchestrate_default_artifacts_stay_outside_repo(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     state = tmp_path / "state"
@@ -2103,3 +2514,264 @@ else:
     )
     assert "GROUNDED_DRAFT" in capture.read_text(encoding="utf-8")
     assert result.result == "grounded"
+
+
+def test_pi_driver_native_provider_ignores_builtin_default_endpoint_and_preserves_openrouter_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.factory import build_provider
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    capture_file = tmp_path / "capture.json"
+    fake = tmp_path / "fake-pi-native-check"
+    fake.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if "--help" in sys.argv:
+    print("--mode json")
+    sys.exit(0)
+cfg_dir = os.environ.get("PI_CODING_AGENT_DIR")
+auth_link = None
+models_json = None
+if cfg_dir:
+    p = Path(cfg_dir)
+    if (p / "models.json").is_file():
+        models_json = (p / "models.json").read_text(encoding="utf-8")
+    if (p / "auth.json").is_symlink():
+        auth_link = str(os.readlink(p / "auth.json"))
+Path({str(capture_file)!r}).write_text(
+    json.dumps({{
+        "argv": sys.argv[1:],
+        "cfg_dir": cfg_dir,
+        "models_json": models_json,
+        "auth_link": auth_link,
+    }}),
+    encoding="utf-8",
+)
+msg = {{"role": "assistant", "stopReason": "stop", "content": [{{"type": "text", "text": "ok"}}],
+        "usage": {{"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}}}}
+print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    fake_home = tmp_path / "home"
+    ambient_pi = fake_home / ".pi" / "agent"
+    ambient_pi.mkdir(parents=True)
+    ambient_auth = ambient_pi / "auth.json"
+    ambient_auth.write_text('{"openrouter": {"apiKey": "saved-key"}}\n', encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OLYMPUS_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient-openai-12345678")
+
+    # Built-in default OpenAI provider (no --base-url) must NOT hijack a native pi_provider.
+    builtin_provider = build_provider(provider="openai", model="openai/gpt-4.1")
+    _reset_pi_availability_cache()
+    try:
+        driver = PiDriver(
+            binary=str(fake),
+            provider=builtin_provider,
+            pi_provider="openrouter",
+            thinking_level="high",
+            context_window=262144,
+        )
+        outcome = driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=workspace,
+                env_root=workspace,
+                system_prompt="",
+                user_prompt="hi",
+                actor="worker",
+                read_only=True,
+                model="openai/gpt-4.1",
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is True
+    captured = json.loads(capture_file.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[argv.index("--provider") + 1] == "openrouter"
+    # Finding #3: OpenRouter catalog ID 'openai/gpt-4.1' must NOT lose 'openai/'.
+    assert argv[argv.index("--model") + 1] == "openai/gpt-4.1"
+    # Finding #1: Built-in OpenAI endpoint must NOT be written into openrouter override.
+    doc = json.loads(captured["models_json"])
+    override = doc["providers"]["openrouter"]
+    assert "baseUrl" not in override
+    # Finding #2: Ambient ~/.pi/agent/auth.json is read in memory via $OLYMPUS_PI_GATEWAY_KEY
+    # without symlinking or serializing the credential to disk, so Pi cannot mutate ~/.pi/agent.
+    assert override["apiKey"] == "$OLYMPUS_PI_GATEWAY_KEY"
+    assert "saved-key" not in captured["models_json"]
+    assert captured["auth_link"] is None
+    assert override["modelOverrides"] == {"openai/gpt-4.1": {"contextWindow": 262144}}
+    assert ambient_auth.is_file()
+    assert not Path(captured["cfg_dir"]).exists()
+
+    # Finding #1 regression: providers.json overriding built-in 'openai' with a custom base_url
+    # MUST still be treated as a custom endpoint and passed into Pi's provider override.
+    providers_cfg = tmp_path / "providers.json"
+    providers_cfg.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai": {
+                        "dialect": "openai-chat",
+                        "default_model": "custom-model-v1",
+                        "base_url": "https://custom-proxy.example/v1",
+                        "api_key_env": "OPENAI_API_KEY",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom_from_file = build_provider(
+        provider="openai",
+        model="custom-model-v1",
+        providers_file=providers_cfg,
+    )
+    binding = custom_from_file.external_gateway_binding("custom-model-v1")
+    assert binding is not None
+    assert binding.is_custom_endpoint is True
+    assert binding.base_url == "https://custom-proxy.example/v1"
+
+    # Finding #2 regression: provider-level env map in ~/.pi/agent/auth.json is forwarded
+    # into subprocess env (and redacted) when credential references $VAR.
+    ambient_auth.write_text(
+        json.dumps(
+            {
+                "openrouter": {
+                    "type": "api_key",
+                    "key": "$AMBIENT_PROV_KEY",
+                    "env": {"AMBIENT_PROV_KEY": "sk-ambient-env-secret"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    from olympus.harness.pi import _prepare_gateway_config
+
+    probe_env: dict[str, str] = {"HOME": str(fake_home)}
+    prov_name, mod_id, cfg_dir, extra_secrets = _prepare_gateway_config(
+        probe_env,
+        "openai/gpt-4.1",
+        provider=builtin_provider,
+        pi_provider="openrouter",
+        context_window=262144,
+    )
+    try:
+        assert prov_name == "openrouter"
+        assert mod_id == "openai/gpt-4.1"
+        assert probe_env["AMBIENT_PROV_KEY"] == "sk-ambient-env-secret"
+        assert "sk-ambient-env-secret" in extra_secrets
+        assert cfg_dir is not None
+        doc2 = json.loads((cfg_dir / "models.json").read_text(encoding="utf-8"))
+        assert doc2["providers"]["openrouter"]["apiKey"] == "$AMBIENT_PROV_KEY"
+        assert "sk-ambient-env-secret" not in (cfg_dir / "models.json").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        if cfg_dir is not None:
+            shutil.rmtree(cfg_dir, ignore_errors=True)
+
+
+def test_pi_driver_redacts_short_and_custom_env_binding_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.auth import ExternalGatewayBinding
+
+    class _CustomBindingProvider:
+        model_name = "demo-model"
+
+        def external_gateway_binding(self, model: str | None = None) -> ExternalGatewayBinding:
+            del model
+            return ExternalGatewayBinding(
+                api="openai-completions",
+                base_url="https://custom.example/v1",
+                model_id="demo-model",
+                api_key_env="MY_CUSTOM_CRED_VAR",
+                is_custom_endpoint=True,
+            )
+
+    short_secret = "k9x2z"
+    monkeypatch.setenv("MY_CUSTOM_CRED_VAR", short_secret)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    trace = tmp_path / "trace.jsonl"
+    fake = tmp_path / "fake-pi-short-secret"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+if "--help" in sys.argv:
+    print("--mode json")
+    sys.exit(0)
+sec = os.environ["MY_CUSTOM_CRED_VAR"]
+print("stderr leak " + sec, file=sys.stderr, flush=True)
+msg = {
+    "role": "assistant",
+    "stopReason": "error",
+    "errorMessage": "auth failed: " + sec,
+    "content": [],
+}
+print(json.dumps({"type": "message_end", "message": msg}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    _reset_pi_availability_cache()
+    try:
+        outcome = PiDriver(
+            binary=str(fake),
+            provider=_CustomBindingProvider(),
+            pi_provider="custom-prov",
+        ).run_turn(
+            DriverTurnRequest(
+                workspace_path=tmp_path,
+                env_root=tmp_path,
+                actor="worker",
+                system_prompt="",
+                user_prompt="hi",
+                read_only=True,
+                model="demo-model",
+                trace_path=trace,
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+
+    assert outcome.completed is False
+    assert short_secret not in outcome.stop_reason
+    assert short_secret not in trace.read_text(encoding="utf-8")
+
+    # Finding #3 regression: even a literal secret value equal to 'keyless' must be redacted.
+    monkeypatch.setenv("MY_CUSTOM_CRED_VAR", "keyless")
+    trace2 = tmp_path / "trace-keyless.jsonl"
+    _reset_pi_availability_cache()
+    try:
+        outcome2 = PiDriver(
+            binary=str(fake),
+            provider=_CustomBindingProvider(),
+            pi_provider="custom-prov",
+        ).run_turn(
+            DriverTurnRequest(
+                workspace_path=tmp_path,
+                env_root=tmp_path,
+                actor="worker",
+                system_prompt="",
+                user_prompt="hi",
+                read_only=True,
+                model="demo-model",
+                trace_path=trace2,
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+    assert outcome2.completed is False
+    assert "keyless" not in outcome2.stop_reason
+    assert "keyless" not in trace2.read_text(encoding="utf-8")

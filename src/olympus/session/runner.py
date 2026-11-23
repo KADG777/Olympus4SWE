@@ -20,6 +20,7 @@ from typing import Any
 
 from olympus.core.contracts import (
     ApprovalTarget,
+    BudgetLedger,
     DesignSpec,
     GoalSpec,
     RunMode,
@@ -51,11 +52,13 @@ from olympus.harness.driver import (
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
 from olympus.session.contracts import (
+    ActorTokenUsage,
     GatePolicyName,
     PauseKind,
     SessionEnvelope,
     SessionStatus,
     StepMode,
+    TokenUsageSummary,
 )
 from olympus.session.policy import InteractiveMinimalPolicy
 from olympus.session.router import parse_reply
@@ -98,6 +101,9 @@ class SessionConfig:
     worker_driver: str | None = None
     reviewer_driver: str | None = None
     monitor_model: str | None = None
+    pi_provider: str | None = None
+    thinking_level: str | None = None
+    context_window: int | None = None
     provider_builder: ProviderBuilder | None = None
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -356,6 +362,7 @@ class SessionRunner:
                     run_id=run_id,
                     step_mode=self.config.step_mode,
                     workflow=snap["workflow_name"],
+                    token_usage=self._token_usage(run_id),
                 )
         try:
             definition = self._workflow_for_run(run_id, snap)
@@ -365,6 +372,7 @@ class SessionRunner:
                 run_id=run_id,
                 step_mode=self.config.step_mode,
                 workflow=snap["workflow_name"],
+                token_usage=self._token_usage(run_id),
             )
         if snap["status"] == RunStatus.COMPLETED:
             return self._incremental_reopen(run_id, definition, snap, text)
@@ -470,6 +478,9 @@ class SessionRunner:
             worker_driver=self.config.worker_driver,
             reviewer_driver=self.config.reviewer_driver,
             monitor_model=self.config.monitor_model,
+            pi_provider=self.config.pi_provider,
+            thinking_level=self.config.thinking_level,
+            context_window=self.config.context_window,
         )
 
     def _resolved_gate_policy(self, run_id: str | None) -> GatePolicyName:
@@ -562,6 +573,9 @@ class SessionRunner:
                 ("worker_driver", self.config.worker_driver),
                 ("reviewer_driver", self.config.reviewer_driver),
                 ("monitor_model", self.config.monitor_model),
+                ("pi_provider", self.config.pi_provider),
+                ("thinking_level", self.config.thinking_level),
+                ("context_window", self.config.context_window),
             )
             if value is not None
         }
@@ -593,7 +607,10 @@ class SessionRunner:
             execution_drivers=drivers,
             driver_registry=DriverRegistry().with_factories(
                 default_driver_factories(
-                    store=self.store, run_id=run_id, provider=active_provider
+                    store=self.store,
+                    run_id=run_id,
+                    provider=active_provider,
+                    execution_drivers=drivers,
                 )
             ),
             model_provider=self._model_provider,
@@ -1111,6 +1128,7 @@ class SessionRunner:
                 unresolved_blockers=[],
                 changed_files=self._changed_files(),
                 error=None,
+                token_usage=self._token_usage(run_id),
             )
         try:
             self.control.reopen_run(run_id=run_id, feedback=feedback, actor="human")
@@ -1120,6 +1138,7 @@ class SessionRunner:
                 run_id=run_id,
                 step_mode=self.config.step_mode,
                 workflow=snap["workflow_name"],
+                token_usage=self._token_usage(run_id),
             )
         augmented = self._augment_input(run_id, snap, feedback, "Follow-up instruction from user")
         self.store.append_event(
@@ -1147,6 +1166,48 @@ class SessionRunner:
             raise ValueError(f"Unknown approval gate: {gate}")
 
     # ------------------------------------------------------------------ envelope
+
+    def _token_usage(self, run_id: str) -> TokenUsageSummary:
+        """Run-wide token accounting from the BudgetLedger plus per-actor settled events."""
+        try:
+            ledger: BudgetLedger = self.store.get_run(run_id)["budget_ledger"]
+        except NotFoundError:
+            return TokenUsageSummary()
+        summary = TokenUsageSummary(
+            llm_calls=ledger.llm_calls_used,
+            input_tokens=ledger.input_tokens,
+            output_tokens=ledger.output_tokens,
+            reasoning_tokens=ledger.reasoning_tokens,
+            cache_read_tokens=ledger.cache_read_tokens,
+            cache_write_tokens=ledger.cache_write_tokens,
+            total_tokens=ledger.total_tokens,
+            cache_hit_rate=ledger.cache_hit_rate,
+        )
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return summary
+        by_actor: dict[str, ActorTokenUsage] = {}
+        for event in events:
+            if event.event_type != "budget.settled":
+                continue
+            usage = by_actor.setdefault(event.actor, ActorTokenUsage())
+            payload = event.payload
+            usage.llm_calls += 1
+            usage.input_tokens += max(0, int(payload.get("input_tokens") or 0))
+            usage.output_tokens += max(0, int(payload.get("output_tokens") or 0))
+            usage.reasoning_tokens += max(0, int(payload.get("reasoning_tokens") or 0))
+            usage.cache_read_tokens += max(0, int(payload.get("cache_read_tokens") or 0))
+            usage.cache_write_tokens += max(0, int(payload.get("cache_write_tokens") or 0))
+        for usage in by_actor.values():
+            usage.total_tokens = (
+                usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_read_tokens
+                + usage.cache_write_tokens
+            )
+        summary.by_actor = by_actor
+        return summary
 
     def _emit_pause(
         self,
@@ -1185,6 +1246,7 @@ class SessionRunner:
             unresolved_blockers=blockers,
             changed_files=self._changed_files(),
             error=None,
+            token_usage=self._token_usage(run_id),
         )
 
     def _emit_plan_handoff(
@@ -1238,6 +1300,7 @@ class SessionRunner:
             unresolved_blockers=[],
             changed_files=changed,
             error=None,
+            token_usage=self._token_usage(run_id),
         )
 
     def _fail(self, run_id: str, exc: BaseException) -> SessionEnvelope:
@@ -1275,6 +1338,7 @@ class SessionRunner:
             unresolved_blockers=[],
             changed_files=self._changed_files(),
             error=error,
+            token_usage=self._token_usage(run_id),
         )
 
     # ------------------------------------------------------------------ helpers

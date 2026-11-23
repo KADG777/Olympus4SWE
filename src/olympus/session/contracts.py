@@ -40,6 +40,32 @@ class GatePolicyName(StrEnum):
     DEFAULT = "default"
 
 
+class ActorTokenUsage(StrictModel):
+    """Token totals attributed to a single actor (e.g. ``align:proposer``)."""
+
+    llm_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    total_tokens: int = 0
+
+
+class TokenUsageSummary(StrictModel):
+    """Run-wide token, cache, and reasoning accounting for the session."""
+
+    llm_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    total_tokens: int = 0
+    cache_hit_rate: float = 0.0
+    by_actor: dict[str, ActorTokenUsage] = Field(default_factory=dict)
+
+
 class SessionEnvelope(StrictModel):
     """The single machine-readable contract every session invocation prints."""
 
@@ -52,6 +78,7 @@ class SessionEnvelope(StrictModel):
     unresolved_blockers: list[str] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)
     error: str | None = None
+    token_usage: TokenUsageSummary = Field(default_factory=TokenUsageSummary)
 
     @classmethod
     def failure(
@@ -62,6 +89,7 @@ class SessionEnvelope(StrictModel):
         step_mode: StepMode = StepMode.EXECUTE,
         workflow: str = "",
         message: str | None = None,
+        token_usage: TokenUsageSummary | None = None,
     ) -> SessionEnvelope:
         return cls(
             run_id=run_id,
@@ -73,13 +101,16 @@ class SessionEnvelope(StrictModel):
             unresolved_blockers=[],
             changed_files=[],
             error=error,
+            token_usage=token_usage or TokenUsageSummary(),
         )
 
 
 __all__ = [
+    "ActorTokenUsage",
     "GatePolicyName",
     "PauseKind",
     "SessionEnvelope",
     "SessionStatus",
     "StepMode",
+    "TokenUsageSummary",
 ]

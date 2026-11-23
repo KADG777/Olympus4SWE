@@ -2430,7 +2430,10 @@ class OrchestrateStage:
         spec = self._require_confirmed_spec(run_id)
         registry = self.driver_registry.with_factories(
             default_driver_factories(
-                store=self.store, run_id=run_id, provider=self.provider
+                store=self.store,
+                run_id=run_id,
+                provider=self.provider,
+                execution_drivers=self.execution_drivers,
             )
         )
         worker = registry.resolve(

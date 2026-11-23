@@ -463,8 +463,10 @@ class BudgetSummary(StrictModel):
     max_calls: int | None = None
     input_tokens: int
     output_tokens: int
+    reasoning_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_hit_rate: float = 0.0
     total_tokens: int
     max_tokens: int | None = None
     unknown_outcome_calls: int
@@ -631,6 +633,10 @@ class ReceiptLLM(StrictModel):
     calls: int
     input_tokens: int
     output_tokens: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
 
 
 class ReceiptTool(StrictModel):

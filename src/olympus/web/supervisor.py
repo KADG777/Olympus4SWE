@@ -367,7 +367,10 @@ class RunSupervisor:
                 execution_drivers=driver_config,
                 driver_registry=self.driver_registry.with_factories(
                     default_driver_factories(
-                        store=self.store, run_id=run_id, provider=active_provider
+                        store=self.store,
+                        run_id=run_id,
+                        provider=active_provider,
+                        execution_drivers=driver_config,
                     )
                 ),
                 model_provider=lambda model: self._builder({**provider_config, "model": model}),

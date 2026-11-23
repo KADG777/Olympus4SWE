@@ -27,13 +27,16 @@ from tests.evals.benchmarks.harbor_together import (
     ExecOutcome,
     SessionEnvelopeView,
     UserEnabledOlympusAgent,
+    _trial_token_usage,
     build_install_script,
+    build_launcher_parser,
     build_olympus_trial_config,
     is_stop_decision,
     parse_session_envelope,
     redact_base_url,
     redact_text,
     split_diff_output,
+    split_pi_model_name,
     stage_source_archive,
     strip_junk,
     validate_state_dir,
@@ -59,6 +62,7 @@ from tests.evals.benchmarks.local_docker_judge import (
     run_user_behavior,
     task_docker_image,
 )
+from tests.evals.benchmarks.token_usage import BUDGET_SETTLED_DB_MARKER
 
 # --------------------------------------------------------------------------- fakes
 
@@ -112,14 +116,18 @@ class _SessionHandler:
         repo: str = "/workspace",
         pi_installed: bool = False,
         install_rc: int = 0,
+        budget_rows: list[list[Any]] | None = None,
     ) -> None:
         self.envelopes = deque(envelopes)
         self.diffs = deque(diffs or [])
         self.repo = repo
         self.pi_installed = pi_installed
         self.install_rc = install_rc
+        self.budget_rows = budget_rows
 
     def __call__(self, command: str) -> _ExecResult:
+        if BUDGET_SETTLED_DB_MARKER in command:
+            return _ExecResult(json.dumps(self.budget_rows or []))
         if "HARBOR_DIFF_BEGIN_CUM" in command:
             return _ExecResult(self.diffs.popleft() if self.diffs else "")
         if "session start" in command or "session reply" in command:
@@ -181,8 +189,9 @@ def _envelope(
     pause_kind: str | None = None,
     unresolved_blockers: list[str] | None = None,
     changed_files: list[str] | None = None,
+    token_usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    envelope = {
         "run_id": run_id,
         "status": status,
         "pause_kind": pause_kind,
@@ -193,6 +202,9 @@ def _envelope(
         "changed_files": changed_files or [],
         "error": None,
     }
+    if token_usage is not None:
+        envelope["token_usage"] = token_usage
+    return envelope
 
 
 def _framed_diff(cumulative: str, incremental: str) -> str:
@@ -1911,3 +1923,441 @@ def test_together_trial_config_keeps_agent_env_secrets_out_of_persisted_config(
     rebuilt = UserEnabledOlympusAgent(logs_dir=tmp_path / "logs", **cfg.agent.kwargs)
     assert rebuilt._extra_env["OPENAI_API_KEY"] == secret
     assert secret in rebuilt._redaction_secrets
+
+
+# --------------------------------------------------------------------------- Pi passthrough
+
+
+def test_session_commands_forward_pi_controls(tmp_path: Path) -> None:
+    handler = _SessionHandler(
+        [
+            _envelope("needs_input", "Question?", pause_kind="clarify"),
+            _envelope("completed", "Done."),
+        ]
+    )
+    user = _StubUser(
+        [
+            _Decision(action="question", content="Yes."),
+            _Decision(action="stop", content="STOP"),
+        ]
+    )
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        pi_provider="qwen-token-plan-cn",
+        thinking_level="high",
+        context_window=262144,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, SimpleNamespace(metadata=None)))
+
+    start = next(cmd for cmd in environment.commands() if "session start" in cmd)
+    reply = next(cmd for cmd in environment.commands() if "session reply" in cmd)
+    for command in (start, reply):
+        assert "--pi-provider qwen-token-plan-cn" in command
+        assert "--thinking high" in command
+        assert "--context-window 262144" in command
+
+
+def test_pi_provider_owns_model_prefix_without_breaking_model_id() -> None:
+    assert split_pi_model_name(
+        "qwen-token-plan-cn/qwen3-max", pi_provider="qwen-token-plan-cn"
+    ) == (None, "qwen-token-plan-cn", "qwen3-max")
+    # Known API providers still split into the native --provider flag.
+    assert split_pi_model_name("anthropic/claude-sonnet-4-6") == (
+        "anthropic",
+        None,
+        "claude-sonnet-4-6",
+    )
+    # Unknown prefixes with no Pi provider stay untouched (org/model ids survive).
+    assert split_pi_model_name("meta-llama/Llama-3-8B") == (
+        None,
+        None,
+        "meta-llama/Llama-3-8B",
+    )
+
+
+def test_pi_provider_kwarg_strips_only_matching_model_prefix(tmp_path: Path) -> None:
+    agent = UserEnabledOlympusAgent(
+        logs_dir=tmp_path / "logs",
+        model_name="qwen-token-plan-cn/qwen3-max",
+        pi_provider="qwen-token-plan-cn",
+        olympus_install="none",
+    )
+    assert agent._provider == "auto"
+    assert agent._pi_provider == "qwen-token-plan-cn"
+    assert agent._model == "qwen3-max"
+    command = agent._session_command("start", message="hi")
+    assert "--pi-provider qwen-token-plan-cn" in command
+    assert "--model qwen3-max" in command
+    assert "--model qwen-token-plan-cn/qwen3-max" not in command
+
+    untouched = UserEnabledOlympusAgent(
+        logs_dir=tmp_path / "logs",
+        model_name="meta-llama/Llama-3-8B",
+        pi_provider="openrouter",
+        olympus_install="none",
+    )
+    assert untouched._model == "meta-llama/Llama-3-8B"
+
+
+def test_context_window_rejects_non_positive_values(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="context_window"):
+        UserEnabledOlympusAgent(
+            logs_dir=tmp_path / "logs",
+            model_name="openai/gpt-4o",
+            context_window="not-a-number",
+            olympus_install="none",
+        )
+    with pytest.raises(ValueError, match="context_window"):
+        UserEnabledOlympusAgent(
+            logs_dir=tmp_path / "logs",
+            model_name="openai/gpt-4o",
+            context_window=0,
+            olympus_install="none",
+        )
+
+
+# --------------------------------------------------------------------------- token usage
+
+
+_TOKEN_USAGE_PAYLOAD = {
+    "llm_calls": 3,
+    "input_tokens": 1000,
+    "output_tokens": 200,
+    "reasoning_tokens": 50,
+    "cache_read_tokens": 500,
+    "cache_write_tokens": 10,
+    "by_actor": {
+        "align:proposer": {
+            "calls": 3,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "reasoning_tokens": 50,
+            "cache_read_tokens": 500,
+            "cache_write_tokens": 10,
+        }
+    },
+}
+
+
+def test_token_usage_persisted_to_artifact_context_and_trajectory(tmp_path: Path) -> None:
+    handler = _SessionHandler(
+        [_envelope("completed", "Done.", token_usage=_TOKEN_USAGE_PAYLOAD)]
+    )
+    agent, environment = _make_agent(
+        tmp_path, handler, _StubUser([]), call_user_on_completion=False
+    )
+    context = SimpleNamespace(metadata=None)
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, context))
+
+    expected = {
+        "llm_calls": 3,
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "reasoning_tokens": 50,
+        "cache_read_tokens": 500,
+        "cache_write_tokens": 10,
+        "total_tokens": 1000 + 200 + 500 + 10,
+        "cache_hit_rate": round(500 / (1000 + 500), 4),
+        "by_actor": {
+            "align:proposer": {
+                "calls": 3,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "reasoning_tokens": 50,
+                "cache_read_tokens": 500,
+                "cache_write_tokens": 10,
+                "total_tokens": 1000 + 200 + 500 + 10,
+            }
+        },
+    }
+    artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
+    assert artifact == expected
+    assert context.metadata["token_usage"] == expected
+    assert context.n_input_tokens == 1510
+    assert context.n_output_tokens == 200
+    assert context.n_cache_tokens == 500
+    trajectory = json.loads((tmp_path / "logs" / "trajectory.json").read_text())
+    assert trajectory["token_usage"] == expected
+    assert trajectory["final_metrics"]["extra"]["token_usage"] == expected
+
+
+def test_token_usage_falls_back_to_budget_settled_events(tmp_path: Path) -> None:
+    handler = _SessionHandler(
+        [_envelope("completed", "Done.")],
+        budget_rows=[
+            ["align:proposer", {"used": 1, "input_tokens": 100, "cache_read_tokens": 40}],
+            ["build:worker", {"used": 2, "input_tokens": 50, "output_tokens": 10}],
+        ],
+    )
+    agent, environment = _make_agent(
+        tmp_path, handler, _StubUser([]), call_user_on_completion=False
+    )
+    context = SimpleNamespace(metadata=None)
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, context))
+
+    artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
+    assert artifact["llm_calls"] == 2
+    assert artifact["input_tokens"] == 150
+    assert artifact["output_tokens"] == 10
+    assert artifact["cache_read_tokens"] == 40
+    assert artifact["total_tokens"] == 150 + 10 + 40
+    assert artifact["by_actor"]["align:proposer"]["calls"] == 1
+    assert context.metadata["token_usage"] == artifact
+    assert context.n_input_tokens == 190
+    assert context.n_cache_tokens == 40
+
+
+def test_token_usage_artifact_is_zeroed_when_nothing_reported(tmp_path: Path) -> None:
+    handler = _SessionHandler([_envelope("completed", "Done.")])
+    agent, environment = _make_agent(
+        tmp_path, handler, _StubUser([]), call_user_on_completion=False
+    )
+    context = SimpleNamespace(metadata=None)
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, context))
+
+    artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
+    assert artifact["llm_calls"] == 0
+    assert artifact["total_tokens"] == 0
+    assert artifact["by_actor"] == {}
+    assert "token_usage" not in context.metadata
+    assert not hasattr(context, "n_input_tokens")
+
+
+def test_trial_token_usage_reads_agent_result_context() -> None:
+    result = SimpleNamespace(
+        agent_result=SimpleNamespace(
+            metadata={"token_usage": _TOKEN_USAGE_PAYLOAD},
+            n_input_tokens=None,
+            n_output_tokens=None,
+            n_cache_tokens=None,
+        )
+    )
+    usage = _trial_token_usage(result)
+    assert usage is not None
+    assert usage["total_tokens"] == 1710
+
+    fields_only = SimpleNamespace(
+        agent_result=SimpleNamespace(
+            metadata=None,
+            n_input_tokens=1500,
+            n_output_tokens=200,
+            n_cache_tokens=500,
+        )
+    )
+    rebuilt = _trial_token_usage(fields_only)
+    assert rebuilt is not None
+    assert rebuilt["input_tokens"] == 1000
+    assert rebuilt["cache_read_tokens"] == 500
+    assert rebuilt["total_tokens"] == 1700
+    assert _trial_token_usage(SimpleNamespace(agent_result=None)) is None
+
+
+# --------------------------------------------------------------------------- setup timeout
+
+
+def test_trial_config_sets_setup_timeout_and_forwards_pi_kwargs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SWT_SANDBOX", raising=False)
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix the append bug")
+    config = build_olympus_trial_config(
+        task,
+        model="openai/gpt-4o",
+        swe_together_root=root,
+        setup_timeout=1234.5,
+        agent_kwargs={
+            "pi_provider": "qwen-token-plan-cn",
+            "thinking_level": "high",
+            "context_window": 262144,
+        },
+    )
+    assert config.agent.override_setup_timeout_sec == 1234.5
+    assert config.agent.kwargs["pi_provider"] == "qwen-token-plan-cn"
+    assert config.agent.kwargs["thinking_level"] == "high"
+    assert config.agent.kwargs["context_window"] == 262144
+
+    default_config = build_olympus_trial_config(
+        task, model="openai/gpt-4o", swe_together_root=root
+    )
+    assert default_config.agent.override_setup_timeout_sec is None
+    assert UserEnabledOlympusAgent.DEFAULT_SETUP_TIMEOUT_SEC == 900.0
+
+
+def test_launcher_forwards_pi_controls_and_setup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SWT_SANDBOX", raising=False)
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix the append bug")
+
+    import tests.evals.benchmarks.harbor_together as harbor_module
+
+    captured: dict[str, Any] = {}
+    real_builder = harbor_module.build_olympus_trial_config
+
+    def _capture(task_dir: Path, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_builder(task_dir, **kwargs)
+
+    monkeypatch.setattr(harbor_module, "build_olympus_trial_config", _capture)
+    code = launch_main(
+        [
+            "--swe-together-root",
+            str(root),
+            "--task-dir",
+            str(task),
+            "--model",
+            "openai/gpt-4o",
+            "--pi-provider",
+            "qwen-token-plan-cn",
+            "--thinking",
+            "high",
+            "--context-window",
+            "262144",
+            "--agent-setup-timeout",
+            "1500",
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert code == 0
+    assert captured["setup_timeout"] == 1500.0
+    assert captured["agent_kwargs"] == {
+        "pi_provider": "qwen-token-plan-cn",
+        "thinking_level": "high",
+        "context_window": 262144,
+    }
+
+
+def test_launcher_parser_accepts_setup_timeout_alias() -> None:
+    args = build_launcher_parser().parse_args(
+        [
+            "--swe-together-root",
+            "/tmp/root",
+            "--model",
+            "openai/gpt-4o",
+            "--override-setup-timeout-sec",
+            "1200",
+        ]
+    )
+    assert args.override_setup_timeout_sec == 1200.0
+
+
+def test_token_usage_recovers_from_db_when_later_turn_drops_envelope(
+    tmp_path: Path,
+) -> None:
+    turn0 = _envelope(
+        "needs_input",
+        "Proceed?",
+        pause_kind="clarify",
+        token_usage={
+            "llm_calls": 1,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 50,
+            "cache_write_tokens": 0,
+        },
+    )
+    # Turn 1 produces no valid JSON envelope (e.g. timed out after settling extra tokens in DB).
+    handler = _SessionHandler(
+        [turn0, "unparseable timeout output"],
+        budget_rows=[
+            [
+                "align:proposer",
+                {"used": 1, "input_tokens": 100, "output_tokens": 20, "cache_read_tokens": 50},
+            ],
+            [
+                "build:worker",
+                {"used": 2, "input_tokens": 200, "output_tokens": 40, "cache_read_tokens": 100},
+            ],
+        ],
+    )
+    agent, environment = _make_agent(
+        tmp_path, handler, _StubUser(["Go ahead"]), call_user_on_completion=False
+    )
+    context = SimpleNamespace(metadata=None)
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, context))
+
+    artifact = json.loads((tmp_path / "logs" / "token_usage.json").read_text())
+    assert artifact["llm_calls"] == 2
+    assert artifact["input_tokens"] == 300
+    assert artifact["output_tokens"] == 60
+    assert artifact["cache_read_tokens"] == 150
+    assert context.n_input_tokens == 450
+
+
+def test_token_usage_recovers_from_db_when_later_turn_raises_or_returns_empty_by_actor(
+    tmp_path: Path,
+) -> None:
+    turn0 = _envelope(
+        "needs_input",
+        "Proceed?",
+        pause_kind="clarify",
+        token_usage={
+            "llm_calls": 1,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+    )
+    empty_actor_turn1 = _envelope(
+        "completed",
+        "Done.",
+        token_usage={"by_actor": {"align:proposer": {}}},
+    )
+    budget_rows = [
+        ["align:proposer", {"used": 1, "input_tokens": 100, "output_tokens": 20}],
+        ["build:worker", {"used": 2, "input_tokens": 200, "output_tokens": 40}],
+    ]
+
+    # Case A: later turn returns empty-count by_actor payload -> must recover 300 from DB.
+    handler_a = _SessionHandler([turn0, empty_actor_turn1], budget_rows=budget_rows)
+    agent_a, env_a = _make_agent(
+        tmp_path / "case_a", handler_a, _StubUser(["Go ahead"]), call_user_on_completion=False
+    )
+    ctx_a = SimpleNamespace(metadata=None)
+    asyncio.run(agent_a.setup(env_a))
+    asyncio.run(agent_a.run("Do the thing", env_a, ctx_a))
+    art_a = json.loads((tmp_path / "case_a" / "logs" / "token_usage.json").read_text())
+    assert art_a["input_tokens"] == 300
+
+    # Case B: later turn raises ConnectionError -> finally must recover 300 from DB.
+    handler_b = _SessionHandler([turn0], budget_rows=budget_rows)
+    orig_call = handler_b.__call__
+    turn_calls = 0
+
+    def _raising_handler(command: str) -> Any:
+        nonlocal turn_calls
+        if "olympus session" in command:
+            turn_calls += 1
+            if turn_calls == 2:
+                raise ConnectionError("container dropped")
+        return orig_call(command)
+
+    agent_b, env_b = _make_agent(
+        tmp_path / "case_b",
+        _raising_handler,
+        _StubUser(["Go ahead"]),
+        call_user_on_completion=False,
+    )
+    ctx_b = SimpleNamespace(metadata=None)
+    asyncio.run(agent_b.setup(env_b))
+    with pytest.raises(ConnectionError):
+        asyncio.run(agent_b.run("Do the thing", env_b, ctx_b))
+    art_b = json.loads((tmp_path / "case_b" / "logs" / "token_usage.json").read_text())
+    assert art_b["input_tokens"] == 300

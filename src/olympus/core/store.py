@@ -941,6 +941,7 @@ class RunStore:
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
         unknown: bool = False,
         cancelled: bool = False,
     ) -> BudgetLedger:
@@ -959,6 +960,7 @@ class RunStore:
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     unknown=unknown,
                 )
             new_rev = self._bump_run_field(
@@ -980,6 +982,7 @@ class RunStore:
                     "output_tokens": output_tokens,
                     "cache_read_tokens": cache_read_tokens,
                     "cache_write_tokens": cache_write_tokens,
+                    "reasoning_tokens": reasoning_tokens,
                     "unknown": unknown,
                 },
                 state_revision=new_rev,
@@ -996,6 +999,7 @@ class RunStore:
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
     ) -> bool:
         """Record external-harness LLM usage monotonically; return True if budget was exceeded."""
         with self._tx() as conn:
@@ -1010,6 +1014,7 @@ class RunStore:
                     "output_tokens": ledger.output_tokens + max(0, output_tokens),
                     "cache_read_tokens": ledger.cache_read_tokens + max(0, cache_read_tokens),
                     "cache_write_tokens": ledger.cache_write_tokens + max(0, cache_write_tokens),
+                    "reasoning_tokens": ledger.reasoning_tokens + max(0, reasoning_tokens),
                 }
             )
             if (
@@ -1037,6 +1042,7 @@ class RunStore:
                     "output_tokens": output_tokens,
                     "cache_read_tokens": cache_read_tokens,
                     "cache_write_tokens": cache_write_tokens,
+                    "reasoning_tokens": reasoning_tokens,
                     "over_budget": over_budget,
                 },
                 state_revision=new_rev,
