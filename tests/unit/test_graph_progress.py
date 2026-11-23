@@ -935,7 +935,18 @@ def test_classify_board_design_and_plan_gates(store: RunStore) -> None:
     )
 
 
-def test_classify_board_executing_worktree_task(store: RunStore) -> None:
+def test_classify_board_executing_worktree_task(store: RunStore, tmp_path: Path) -> None:
+    import subprocess
+
+    wt_dir = tmp_path / "wt-branch"
+    wt_dir.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "feat/wt-task-1"],
+        cwd=wt_dir,
+        check=True,
+        capture_output=True,
+    )
+
     run_id = _new_run(store, workflow_name="full_sdlc_tdd")
     spec = _approved_spec(store, run_id)
     _approved_design(store, run_id, spec)
@@ -944,7 +955,7 @@ def test_classify_board_executing_worktree_task(store: RunStore) -> None:
         update={
             "status": TaskStatus.RUNNING,
             "attempt": 1,
-            "worktree_path": "/tmp/repo/.olympus/sandboxes/run-progress-T1",
+            "worktree_path": str(wt_dir),
         }
     )
     store.save_plan(run_id, plan.model_copy(update={"tasks": [running]}))
@@ -964,7 +975,36 @@ def test_classify_board_executing_worktree_task(store: RunStore) -> None:
         None,
     )
     assert state.status_badge == "running"
-    assert state.worktree_branch == "olympus/run-progress-T1"
+    assert state.worktree_branch == "feat/wt-task-1"
+
+    for git_args in (
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+    (wt_dir / "f.txt").write_text("hi\n", encoding="utf-8")
+    for git_args in (
+        ["git", "add", "f.txt"],
+        ["git", "commit", "-m", "init"],
+        ["git", "checkout", "--detach", "HEAD"],
+    ):
+        subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+    assert _classify(store, run_id).worktree_branch is None
+
+
+def test_pantheon_stage_binding_matches_canonical_pipeline() -> None:
+    from olympus.graph.progress import PANTHEON_SEATS, PANTHEON_STAGE_BINDING
+
+    assert [stage for _god, stage, _label in PANTHEON_STAGE_BINDING] == [
+        "align",
+        "design",
+        "execute",
+        "review",
+        "verify",
+    ]
+    assert [god for god, _label in PANTHEON_SEATS] == [
+        god for god, _stage, _label in PANTHEON_STAGE_BINDING
+    ]
 
 
 def test_classify_board_review_and_verification_phases(store: RunStore) -> None:

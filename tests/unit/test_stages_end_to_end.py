@@ -859,7 +859,8 @@ def test_align_brownfield_binds_scope_and_fix_directive(tmp_path: Path) -> None:
 
     assert len(captured) == 1
     prompt = captured[0]
-    assert "Observed workspace files (2/2): README.md, src/mod.py" in prompt
+    assert "Observed workspace files (1/1): src/mod.py" in prompt
+    assert "README.md" not in prompt.split("Brownfield binding:")[0]
     assert "Brownfield binding:" in prompt
     assert "Base git ref: main" in prompt
     assert "Scoped paths (authoritative, workspace-relative): src/mod.py" in prompt

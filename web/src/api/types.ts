@@ -56,7 +56,7 @@ export type ReviewArtifact = GoalSpec | DesignSpec | TaskPlan;
 type Loose<T, K extends PropertyKey> = Omit<T, K & keyof T> & Partial<Pick<T, K & keyof T>>;
 type Defaults = "auto_advance" | "sync";
 
-export type CreateRunBody = Loose<Schemas["CreateRunRequest"], Defaults | "auto_approve">;
+export type CreateRunBody = Loose<Schemas["CreateRunRequest"], Defaults | "auto_approve" | "init_git">;
 export type CreateWorkspaceBody = Loose<Schemas["CreateWorkspaceRequest"], "create_if_missing" | "init_git">;
 
 export type CommandBody =

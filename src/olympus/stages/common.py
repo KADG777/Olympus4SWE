@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from pydantic import BaseModel
 
 from olympus.harness.loop import (
@@ -13,9 +15,32 @@ from olympus.harness.loop import (
 from olympus.tools.aci import WorkspaceToolkit
 
 
-def format_workspace_inventory(toolkit: WorkspaceToolkit, *, max_files: int = 40) -> str:
+def _matches_scope(rel_path: str, scope_paths: Sequence[str]) -> bool:
+    normalized = rel_path.lstrip("./")
+    for raw in scope_paths:
+        target = raw.strip().strip("/")
+        if not target:
+            continue
+        if normalized == target or normalized.startswith(f"{target}/"):
+            return True
+    return False
+
+
+def format_workspace_inventory(
+    toolkit: WorkspaceToolkit,
+    *,
+    max_files: int = 40,
+    scope_paths: Sequence[str] | None = None,
+) -> str:
     """Format a bounded deterministic inventory of existing workspace paths."""
-    files, total = toolkit.list_relative_files(max_files=max_files)
+    cleaned_scopes = [item.strip().strip("/") for item in (scope_paths or ()) if item.strip()]
+    if cleaned_scopes:
+        all_files, _ = toolkit.list_relative_files(max_files=5000)
+        matched = [path for path in all_files if _matches_scope(path, cleaned_scopes)]
+        files = matched[:max_files]
+        total = len(matched)
+    else:
+        files, total = toolkit.list_relative_files(max_files=max_files)
     if not files:
         return "Observed workspace files: (none)"
     suffix = f" (+{total - len(files)} more)" if total > len(files) else ""

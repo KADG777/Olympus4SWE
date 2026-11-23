@@ -591,6 +591,11 @@ export interface components {
             demo_id?: string | null;
             /** Goal */
             goal?: string | null;
+            /**
+             * Init Git
+             * @default false
+             */
+            init_git: boolean;
             /** Monitor Model */
             monitor_model?: string | null;
             provider_config?: components["schemas"]["ProviderConfig"];
@@ -2281,6 +2286,10 @@ export interface components {
         };
         /** WorkflowsResponse */
         WorkflowsResponse: {
+            /** Default Workflows */
+            default_workflows?: {
+                [key: string]: string;
+            };
             /**
              * Ok
              * @default true

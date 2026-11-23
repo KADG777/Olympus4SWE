@@ -18,9 +18,7 @@ export interface OracleCardProps {
   dimmed?: boolean;
   highlighted?: boolean;
   onOpenTab: (runId: string) => void;
-  /** Modular slot for T4 Quick Ruling Drawer trigger on human-held cards. */
   onQuickRule?: (runId: string) => void;
-  /** Optional custom footer action slot for downstream feature extensions. */
   actionSlot?: ReactNode;
 }
 

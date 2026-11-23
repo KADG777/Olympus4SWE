@@ -159,12 +159,17 @@ def _node_intake(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
     del params
     runtime = _runtime(state)
     run_id = _run_id(state)
-    scope_payload = {
+    workspace_mode = str(state.get("workspace_mode") or "brownfield")
+    task_type = str(state.get("task_type") or "feature")
+    raw_base_ref = state.get("base_ref")
+    base_ref = str(raw_base_ref) if isinstance(raw_base_ref, str) else None
+    scope_paths = [str(item) for item in (state.get("scope_paths") or [])]
+    scope_payload: dict[str, Any] = {
         "workspace_id": state.get("workspace_id"),
-        "workspace_mode": state.get("workspace_mode") or "brownfield",
-        "task_type": state.get("task_type") or "feature",
-        "base_ref": state.get("base_ref"),
-        "scope_paths": list(state.get("scope_paths") or []),
+        "workspace_mode": workspace_mode,
+        "task_type": task_type,
+        "base_ref": base_ref,
+        "scope_paths": scope_paths,
     }
     runtime.store.append_event(
         run_id=run_id,
@@ -178,6 +183,10 @@ def _node_intake(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
         provider=runtime.provider,
         store=runtime.store,
         run_id=run_id,
+        workspace_mode=workspace_mode,
+        task_type=task_type,
+        base_ref=base_ref,
+        scope_paths=scope_paths,
     )
     updates: dict[str, Any] = {"triage": result.model_dump(mode="json")}
 

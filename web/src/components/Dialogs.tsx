@@ -2,7 +2,6 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "rea
 
 import type { TaskType, WorkspaceMode } from "../api/types";
 import {
-  resolveDefaultWorkflow,
   TASK_TYPE_LABELS,
   WORKFLOW_SELECT_LABELS,
   WORKFLOW_SUMMARY,
@@ -117,7 +116,6 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
   const providers = options?.providers || [];
   const workspaces = state.workspaces || [];
 
-  // Pre-fill brownfield workspace from the active board workspace filter ONLY when the modal opens.
   useEffect(() => {
     if (state.newRunOpenSeq === 0 || state.newRunOpenSeq === lastOpenSeq.current) return;
     lastOpenSeq.current = state.newRunOpenSeq;
@@ -139,7 +137,6 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
     });
   }, [state.newRunOpenSeq, state.selectedWorkspaceId, workspaces]);
 
-  // If workspaces finish loading while workspaceId is still unset, pick the default without clobbering user choice.
   useEffect(() => {
     if (!workspaces.length) return;
     setForm((current) => {
@@ -163,10 +160,11 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
     if (dialog?.open) dialog.close();
   };
 
-  const autoWorkflow = resolveDefaultWorkflow(
-    form.demoId ? "brownfield" : form.workspaceMode,
-    form.taskType,
-  );
+  const effectiveScopeMode = form.demoId ? "brownfield" : form.workspaceMode;
+  const autoWorkflow =
+    options?.defaultWorkflows?.[`${effectiveScopeMode}:${form.taskType}`] ||
+    workflows[0]?.name ||
+    "";
   const demo = demos.find((item) => item.id === form.demoId);
   const effectiveWorkflowName =
     form.workflow || (demo?.default_workflow ? demo.default_workflow : autoWorkflow);

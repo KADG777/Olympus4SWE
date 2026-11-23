@@ -10,7 +10,7 @@ import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -81,6 +81,7 @@ class RunScope:
     task_type: str
     base_ref: str | None
     scope_paths: list[str]
+    workspace_source: Literal["explicit", "server_default", "none"] = "none"
 
 
 def _detect_git_repo(root: Path) -> tuple[bool, str | None]:
@@ -108,12 +109,24 @@ def _detect_git_repo(root: Path) -> tuple[bool, str | None]:
 
 
 def _default_workflow_for(workspace_mode: str, task_type: str) -> str:
-    """Deterministic default workflow when the caller omits ``workflow_name``."""
     if workspace_mode == "spec_only" or task_type == "blueprint":
         return "product_blueprint"
     if task_type == "fix":
         return "repo_fast_patch"
     return "full_sdlc_tdd"
+
+
+_WORKSPACE_MODES: tuple[str, ...] = ("brownfield", "greenfield", "spec_only")
+_TASK_TYPES: tuple[str, ...] = ("feature", "fix", "refactor", "blueprint")
+
+
+def default_workflow_matrix() -> dict[str, str]:
+    """Single-source default workflow mapping exposed via ``GET /api/workflows``."""
+    return {
+        f"{mode}:{task_type}": _default_workflow_for(mode, task_type)
+        for mode in _WORKSPACE_MODES
+        for task_type in _TASK_TYPES
+    }
 
 
 
@@ -150,8 +163,6 @@ class AriadneApp:
         self.default_workspace_id: str | None = None
         self.ensure_default_workspace()
 
-    # ------------------------------------------------------------------ workspaces
-
     def ensure_default_workspace(self) -> dict[str, Any] | None:
         """Idempotently register the server's default ``workspace_root`` on startup."""
         root = self.workspace_root
@@ -163,6 +174,7 @@ class AriadneApp:
             root_path=root,
             is_git_repo=is_git_repo,
             default_branch=default_branch,
+            exist_ok=True,
         )
         self.default_workspace_id = str(workspace["workspace_id"])
         return workspace
@@ -194,32 +206,35 @@ class AriadneApp:
 
         is_git_repo, default_branch = _detect_git_repo(root)
         if payload.init_git and not is_git_repo:
-            try:
-                subprocess.run(
-                    ["git", "init"],
-                    cwd=root,
-                    check=True,
-                    capture_output=True,
-                    timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise ValueError(f"git init failed in {root}: {exc}") from exc
+            self._init_git_repo(root)
             is_git_repo, default_branch = _detect_git_repo(root)
         workspace = self.store.register_workspace(
             name=(payload.name or "").strip() or root.name or "workspace",
             root_path=root,
             is_git_repo=is_git_repo,
             default_branch=default_branch,
+            exist_ok=False,
         )
         return {"ok": True, "workspace": workspace}
+
+    @staticmethod
+    def _init_git_repo(root: Path) -> None:
+        try:
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"git init failed in {root}: {exc}") from exc
 
     def delete_workspace(self, workspace_id: str) -> dict[str, Any]:
         """Unregister a workspace (metadata only); disk files and runs are untouched."""
         if not self.store.delete_workspace(workspace_id):
             raise NotFoundError(f"Unknown workspace_id: {workspace_id}")
         return {"ok": True, "workspace_id": workspace_id, "deleted": True}
-
-    # ------------------------------------------------------------------ run scope
 
     def prepare_run_scope(
         self,
@@ -230,18 +245,21 @@ class AriadneApp:
         task_type: str | None,
         base_ref: str | None,
         scope_paths: list[str] | None,
+        init_git: bool = False,
     ) -> RunScope:
         """Resolve and validate Scope x Type before any run row or LLM call exists."""
         mode = workspace_mode or "brownfield"
         kind = task_type or "feature"
         target: Path | None = None
         bound_id: str | None = None
+        workspace_source: Literal["explicit", "server_default", "none"] = "none"
         if workspace_id:
             workspace = self.store.get_workspace(workspace_id)
             if workspace is None:
                 raise ValueError(f"Unknown workspace_id: {workspace_id}")
             bound_id = str(workspace["workspace_id"])
             target = Path(str(workspace["root_path"]))
+            workspace_source = "explicit"
         if workspace_root:
             candidate = Path(workspace_root).expanduser().resolve()
             if target is not None and target.resolve() != candidate:
@@ -249,19 +267,26 @@ class AriadneApp:
                     f"workspace_id '{workspace_id}' does not match workspace_root {candidate}"
                 )
             target = candidate
+            workspace_source = "explicit"
 
         if mode == "greenfield":
             if target is None:
                 raise ValueError(
                     "greenfield requires a workspace_root target or a workspace_id to bind"
                 )
-            target = self._prepare_greenfield_target(target)
+            self._validate_greenfield_target(target)
+            normalized_scope = self._normalize_scope_paths(scope_paths, target)
+            target = self._materialize_greenfield_target(target)
             is_git_repo, default_branch = _detect_git_repo(target)
+            if init_git and not is_git_repo:
+                self._init_git_repo(target)
+                is_git_repo, default_branch = _detect_git_repo(target)
             registered = self.store.register_workspace(
                 name=target.name or "workspace",
                 root_path=target,
                 is_git_repo=is_git_repo,
                 default_branch=default_branch,
+                exist_ok=True,
             )
             bound_id = str(registered["workspace_id"])
         else:
@@ -272,13 +297,12 @@ class AriadneApp:
                 if existing is not None:
                     bound_id = str(existing["workspace_id"])
             elif target is None and mode == "brownfield" and self.workspace_root.is_dir():
-                # A brownfield oracle without an explicit target runs against the
-                # server's auto-registered default workspace.
                 bound_id = self.default_workspace_id
                 target = self.workspace_root
+                workspace_source = "server_default"
+            containment_root = target if target is not None else self.workspace_root
+            normalized_scope = self._normalize_scope_paths(scope_paths, containment_root)
 
-        containment_root = target if target is not None else self.workspace_root
-        normalized_scope = self._normalize_scope_paths(scope_paths, containment_root)
         return RunScope(
             workspace_id=bound_id,
             workspace_root=target,
@@ -286,10 +310,11 @@ class AriadneApp:
             task_type=kind,
             base_ref=(base_ref or "").strip() or None,
             scope_paths=normalized_scope,
+            workspace_source=workspace_source,
         )
 
     @staticmethod
-    def _prepare_greenfield_target(target: Path) -> Path:
+    def _validate_greenfield_target(target: Path) -> None:
         if target.exists():
             if not target.is_dir():
                 raise ValueError(f"greenfield target is not a directory: {target}")
@@ -297,11 +322,16 @@ class AriadneApp:
                 raise ValueError(
                     f"greenfield target directory must be empty: {target}"
                 )
-            return target
+            return
         if not target.parent.is_dir():
             raise ValueError(
                 f"greenfield parent directory does not exist: {target.parent}"
             )
+
+    @staticmethod
+    def _materialize_greenfield_target(target: Path) -> Path:
+        if target.exists():
+            return target
         try:
             target.mkdir()
         except OSError as exc:
@@ -352,6 +382,11 @@ class AriadneApp:
             ball_holder=ball_holder,
             include_archived=include_archived,
         )
+
+    def validated_board_payload(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+        """Validate one board snapshot against RunListResponse before SSE emission."""
+        payload = self.list_runs_payload(workspace_id=workspace_id)
+        return RunListResponse.model_validate(payload).model_dump(mode="json")
 
     def _workspace_for(self, run_id: str) -> Path:
         return self.supervisor.resolve_workspace(run_id)
@@ -570,6 +605,11 @@ class AriadneApp:
                         sync=sync_flag,
                     )
         elif action == "promote_to_execute":
+            if snap.get("workspace_mode") == "spec_only" and not snap.get("workspace_root"):
+                raise ValueError(
+                    "spec_only runs require an explicit bound target workspace "
+                    "before promoting to execute"
+                )
             target_workflow = str(body.get("workflow_name") or "full_sdlc_tdd").strip()
             target_def = load_workflow(target_workflow)
             if target_def.stop_after != "execute" or target_def.node("execute") is None:
@@ -839,7 +879,11 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
 
     @api.get("/api/workflows", response_model=WorkflowsResponse, responses=error_responses)
     def list_workflows() -> dict[str, Any]:
-        return {"ok": True, "workflows": service.supervisor.list_workflows()}
+        return {
+            "ok": True,
+            "workflows": service.supervisor.list_workflows(),
+            "default_workflows": default_workflow_matrix(),
+        }
 
     @api.get("/api/demos", response_model=DemosResponse, responses=error_responses)
     def list_demos() -> dict[str, Any]:
@@ -935,6 +979,7 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             task_type=payload.task_type,
             base_ref=payload.base_ref,
             scope_paths=payload.scope_paths,
+            init_git=payload.init_git,
         )
 
         default_goal = str(preset["raw_input"]) if preset else ""
@@ -950,7 +995,11 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         default_title = str(preset["title"]) if preset else raw_input[:60]
         if payload.workflow_name:
             resolved_workflow = payload.workflow_name
-        elif payload.workspace_mode is not None or payload.task_type is not None:
+        elif (
+            payload.workspace_mode is not None
+            or payload.task_type is not None
+            or payload.workspace_id is not None
+        ):
             resolved_workflow = _default_workflow_for(
                 scope.workspace_mode, scope.task_type
             )
@@ -958,6 +1007,15 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             resolved_workflow = str(preset["default_workflow"])
         else:
             resolved_workflow = "product_blueprint"
+        if (
+            scope.workspace_mode == "spec_only"
+            and scope.workspace_root is None
+            and load_workflow(resolved_workflow).stop_after == "execute"
+        ):
+            raise ValueError(
+                "spec_only runs cannot enter an execution workflow "
+                "without binding an explicit target workspace"
+            )
         started = service.supervisor.start_run(
             title=str(payload.title or default_title),
             raw_input=raw_input,
@@ -1134,8 +1192,11 @@ async def _board_sse_stream(
     once: bool,
 ) -> AsyncIterator[str]:
     """Board snapshot stream: 0.5s SQLite polls, aggregate-change emissions, 5s heartbeats."""
+    last_fingerprint = await asyncio.to_thread(
+        service.store.board_fingerprint, workspace_id=workspace_id
+    )
     initial = await asyncio.to_thread(
-        service.list_runs_payload, workspace_id=workspace_id
+        service.validated_board_payload, workspace_id=workspace_id
     )
     yield _sse_frame("board", initial)
     if once:
@@ -1148,8 +1209,16 @@ async def _board_sse_stream(
         if await request.is_disconnected():
             return
         ticks += 1
+        fingerprint = await asyncio.to_thread(
+            service.store.board_fingerprint, workspace_id=workspace_id
+        )
+        if fingerprint == last_fingerprint:
+            if ticks % 10 == 0:
+                yield ": heartbeat\n\n"
+            continue
+        last_fingerprint = fingerprint
         nxt = await asyncio.to_thread(
-            service.list_runs_payload, workspace_id=workspace_id
+            service.validated_board_payload, workspace_id=workspace_id
         )
         signature = json.dumps(nxt, ensure_ascii=False, sort_keys=True)
         if signature != last_signature:

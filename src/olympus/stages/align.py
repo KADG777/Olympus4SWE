@@ -190,7 +190,7 @@ class AlignStage:
         inventory = (
             "Observed workspace files: (skipped: greenfield target has no existing repository)"
             if greenfield
-            else format_workspace_inventory(toolkit)
+            else format_workspace_inventory(toolkit, scope_paths=scope_paths)
         )
         scope_block = _scope_directive(
             workspace_mode=workspace_mode,

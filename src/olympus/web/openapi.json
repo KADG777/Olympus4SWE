@@ -830,6 +830,11 @@
             ],
             "title": "Goal"
           },
+          "init_git": {
+            "default": false,
+            "title": "Init Git",
+            "type": "boolean"
+          },
           "monitor_model": {
             "anyOf": [
               {
@@ -5866,6 +5871,13 @@
       "WorkflowsResponse": {
         "additionalProperties": false,
         "properties": {
+          "default_workflows": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Default Workflows",
+            "type": "object"
+          },
           "ok": {
             "const": true,
             "default": true,

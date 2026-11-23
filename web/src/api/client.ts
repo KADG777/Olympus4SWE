@@ -154,8 +154,18 @@ export async function postCommand(runId: string, body: CommandBody): Promise<Com
 
 export interface WorkbenchOptions {
   workflows: WorkflowsResponse["workflows"];
+  defaultWorkflows: Record<string, string>;
   providers: ProvidersResponse["providers"];
   demos: DemosResponse["demos"];
+}
+
+export async function runExists(runId: string): Promise<boolean> {
+  try {
+    const response = await fetch(runPath(runId));
+    return response.status !== 404;
+  } catch {
+    return true;
+  }
 }
 
 export async function fetchWorkbenchOptions(): Promise<WorkbenchOptions> {
@@ -166,6 +176,7 @@ export async function fetchWorkbenchOptions(): Promise<WorkbenchOptions> {
   ]);
   return {
     workflows: workflows.workflows || [],
+    defaultWorkflows: workflows.default_workflows || {},
     providers: providers.providers || [],
     demos: demos.demos || [],
   };

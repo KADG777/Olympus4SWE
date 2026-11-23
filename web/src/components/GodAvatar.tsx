@@ -25,11 +25,6 @@ declare global {
 
 export const AVATAR_MANIFEST_CHANGE_EVENT = "olympus:avatar-manifest-change";
 
-/**
- * Declarative per-god avatar asset manifest.
- * Future generated portraits (idleSrc) and animated .webp or horizontal sprite-sheet
- * loops (workingSrc + optional frames/fps) drop in here with zero component rewrite.
- */
 export const PANTHEON_AVATAR_MANIFEST: PantheonAvatarManifest = {
   prometheus: {
     label: "Prometheus — Align & Needs",
@@ -114,10 +109,6 @@ function useWindowManifestOverride(): GodAvatarManifestOverride | undefined {
   return override;
 }
 
-/**
- * Built-in Warm Editorial Stone classical line-engraving emblems.
- * Strictly token-driven (currentColor + var(--*)) with zero raw colour literals.
- */
 function GodEmblemSvg({ god }: { god: PantheonGod }) {
   switch (god) {
     case "prometheus":

@@ -607,3 +607,68 @@ def test_quick_ruling_drawer_blocker_resolution_and_open_cockpit_escape_hatch(
         "data-active", "true"
     )
     page.close()
+
+
+def test_stale_drawer_response_keeps_other_drawer_open_and_preserves_tabs_past_limit(
+    board_server, browser
+):
+    store, _, url = board_server
+    first_id = "run-campus-waitlist"
+    other_id = store.create_run(run_id="other-paused", title="Other Paused Oracle")
+    store.set_run_status(other_id, RunStatus.PAUSED)
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+    page.goto(f"{url}/")
+
+    drawer = page.locator("#quick-ruling-drawer")
+    page.locator(f"[data-quick-rule='{first_id}']").click()
+    expect(drawer).to_have_attribute("data-run-id", first_id)
+
+    held = []
+    page.route(
+        f"**/api/runs/{first_id}/command",
+        lambda route: held.append((route, route.fetch())),
+    )
+    drawer.locator("#btn-drawer-blocker-retry").click()
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(25)
+    assert held
+
+    page.keyboard.press("Escape")
+    expect(drawer).to_have_count(0)
+    page.locator(f"[data-quick-rule='{other_id}']").click()
+    expect(drawer).to_have_attribute("data-run-id", other_id)
+
+    route, response = held[0]
+    route.fulfill(response=response)
+    page.wait_for_timeout(750)
+    expect(drawer).to_be_visible()
+    expect(drawer).to_have_attribute("data-run-id", other_id)
+    page.close()
+
+    # Pending ruling stays visible past 50 runs; open tabs survive 200+ runs on reload.
+    p2 = browser.new_page(viewport={"width": 1440, "height": 900})
+    p2.goto(f"{url}/")
+    keep_id = store.create_run(run_id="keep-older-tab", title="Older Open Tab")
+    p2.locator(f".oracle-card[data-run-id='{keep_id}'] .oracle-card-trigger").click()
+    tab = p2.locator(f"#open-tabs [data-run-id='{keep_id}']")
+    expect(tab).to_be_visible()
+    store.set_run_status(keep_id, RunStatus.PAUSED)
+    p2.locator("#nav-oracle-board").click()
+
+    for idx in range(52):
+        store.create_run(title=f"Newer run {idx}", run_id=f"newer-{idx}")
+    expect(p2.locator(".oracle-card[data-run-id='newer-51']")).to_be_visible()
+    expect(p2.locator(f"[data-quick-rule='{keep_id}']")).to_be_visible()
+
+    for idx in range(52, 205):
+        store.create_run(title=f"Newer run {idx}", run_id=f"newer-{idx}")
+    p2.reload()
+    expect(p2.locator(".oracle-card[data-run-id='newer-204']")).to_be_visible()
+    expect(tab).to_be_visible()
+    stored = p2.evaluate('JSON.parse(localStorage.getItem("olympus-open-tabs"))')
+    assert keep_id in stored
+    p2.close()

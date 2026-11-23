@@ -185,6 +185,7 @@ class CreateRunRequest(StrictModel):
     task_type: TaskType | None = None
     base_ref: str | None = None
     scope_paths: list[str] | None = None
+    init_git: bool = False
 
 
 class WorkflowRunResult(StrictModel):
@@ -847,6 +848,7 @@ class WorkflowSummary(StrictModel):
 class WorkflowsResponse(StrictModel):
     ok: Literal[True] = True
     workflows: list[WorkflowSummary]
+    default_workflows: dict[str, str] = Field(default_factory=dict)
 
 
 class DemoPreset(StrictModel):

@@ -1414,6 +1414,15 @@ def build_run_projection(
             "detail": err_msg,
             "actions": ["retry_workflow"],
         }
+    elif snap["status"] == RunStatus.PAUSED:
+        hitl_banner = {
+            "kind": "run_paused",
+            "tone": "info",
+            "task_id": None,
+            "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
+            "detail": "点击右上角「恢复运行」继续调度就绪任务",
+            "actions": ["resume"],
+        }
     elif spec is not None and not spec_approved:
         blockers = spec.unresolved_blockers()
         hitl_banner = {
@@ -1452,15 +1461,6 @@ def build_run_projection(
                 f"绑定需求指纹：{(plan.spec_hash or plan.design_hash or '')[:16]}…"
             ),
             "actions": ["approve_plan"],
-        }
-    elif snap["status"] == RunStatus.PAUSED:
-        hitl_banner = {
-            "kind": "run_paused",
-            "tone": "info",
-            "task_id": None,
-            "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
-            "detail": "点击右上角「恢复运行」继续调度就绪任务",
-            "actions": ["resume"],
         }
     elif blueprint_completed:
         hitl_banner = {
@@ -1614,22 +1614,31 @@ def build_run_projection(
         "latest_event_seq": events[-1].event_seq if events else 0,
     }
 
-def _workspace_name_for(
+def _resolve_workspace_meta(
     store: RunStore,
     snap: Mapping[str, Any],
     workspaces: Mapping[str, Mapping[str, Any]] | None,
-) -> str:
+    workspaces_by_root: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[str | None, str]:
     workspace_id = snap.get("workspace_id")
     if isinstance(workspace_id, str) and workspace_id:
         workspace = workspaces.get(workspace_id) if workspaces is not None else None
         if workspace is None:
             workspace = store.get_workspace(workspace_id)
         if workspace is not None:
-            return str(workspace["name"])
+            return workspace_id, str(workspace["name"])
     root = snap.get("workspace_root")
     if isinstance(root, str) and root.strip():
-        return Path(root).name or "Workspace"
-    return "Unassigned"
+        canonical = store.canonical_root(root)
+        matched = (
+            workspaces_by_root.get(canonical)
+            if workspaces_by_root is not None
+            else store.get_workspace_by_root(canonical)
+        )
+        if matched is not None:
+            return str(matched["workspace_id"]), str(matched["name"])
+        return None, Path(root).name or "Workspace"
+    return None, "Unassigned"
 
 
 def build_run_summary(
@@ -1637,6 +1646,7 @@ def build_run_summary(
     run_id: str,
     *,
     workspaces: Mapping[str, Mapping[str, Any]] | None = None,
+    workspaces_by_root: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Derive one Oracle Board card from the canonical deterministic classifier."""
     snap = store.get_run(run_id, include_approval_baselines=True)
@@ -1651,6 +1661,9 @@ def build_run_summary(
         plan_approved=approved[ApprovalTarget.TASK_PLAN],
     )
     state = classify_run_board(snap, events, workflow_view=workflow_view)
+    resolved_ws_id, resolved_ws_name = _resolve_workspace_meta(
+        store, snap, workspaces, workspaces_by_root
+    )
     return {
         "run_id": str(snap["run_id"]),
         "title": str(snap["title"]),
@@ -1660,8 +1673,8 @@ def build_run_summary(
         "workflow_name": str(snap.get("workflow_name") or "product_blueprint"),
         "created_at": str(snap["created_at"]),
         "updated_at": str(snap["updated_at"]),
-        "workspace_id": snap.get("workspace_id"),
-        "workspace_name": _workspace_name_for(store, snap, workspaces),
+        "workspace_id": resolved_ws_id,
+        "workspace_name": resolved_ws_name,
         "workspace_mode": str(snap.get("workspace_mode") or "brownfield"),
         "task_type": str(snap.get("task_type") or "feature"),
         "ball_holder": state.ball_holder,
@@ -1674,7 +1687,6 @@ def build_run_summary(
 
 
 def aggregate_pantheon(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate the 5 canonical Pantheon seats over classified Oracle cards."""
     seats: list[dict[str, Any]] = []
     for god, role_label in PANTHEON_SEATS:
         held = [
@@ -1711,8 +1723,9 @@ def build_board_payload(
     ball_holder: str | None = None,
     include_archived: bool = False,
 ) -> dict[str, Any]:
-    """Build the Oracle Board payload: classified cards plus Pantheon aggregates."""
-    workspaces = {str(item["workspace_id"]): item for item in store.list_workspaces()}
+    workspace_list = store.list_workspaces()
+    workspaces = {str(item["workspace_id"]): item for item in workspace_list}
+    workspaces_by_root = {str(item["root_path"]): item for item in workspace_list}
     rows = store.list_runs(
         limit=None,
         workspace_id=workspace_id,
@@ -1724,7 +1737,12 @@ def build_board_payload(
     for row in rows:
         try:
             summaries.append(
-                build_run_summary(store, str(row["run_id"]), workspaces=workspaces)
+                build_run_summary(
+                    store,
+                    str(row["run_id"]),
+                    workspaces=workspaces,
+                    workspaces_by_root=workspaces_by_root,
+                )
             )
         except NotFoundError:
             continue
@@ -1737,7 +1755,14 @@ def build_board_payload(
         if ball_holder is None or summary["ball_holder"] == ball_holder
     ]
     if limit is not None:
-        runs = runs[: max(limit, 0)]
+        cap = max(limit, 0)
+        if ball_holder is None and cap > 0:
+            human_runs = [item for item in runs if item["ball_holder"] == "human"]
+            other_runs = [item for item in runs if item["ball_holder"] != "human"]
+            remaining = max(cap - len(human_runs), 0)
+            runs = [*human_runs, *other_runs[:remaining]]
+        else:
+            runs = runs[:cap]
     return {
         "ok": True,
         "runs": runs,

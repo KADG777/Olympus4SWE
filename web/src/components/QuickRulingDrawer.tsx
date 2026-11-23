@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { postCommand } from "../api/client";
 import type { ApprovalAction, CommandBody, GoalSpec, RunProjection } from "../api/types";
 import { useRunStream, type StreamPhase } from "../api/useRunStream";
 import {
@@ -18,6 +17,7 @@ import {
 } from "../lib/labels";
 import {
   buildApprovalSnapshot,
+  executeRunCommand,
   resolvePointer,
   type ApprovalOrigin,
   type ApprovalSnapshot,
@@ -50,10 +50,12 @@ export function QuickRulingDrawer({
   const [notice, setNotice] = useState<{ tone: "warn" | "bad"; text: string } | null>(null);
 
   const drawerRef = useRef<HTMLElement>(null);
+  const activeRunIdRef = useRef<string | null>(runId);
   const projectionRef = useRef<RunProjection | null>(null);
   const snapshotRef = useRef<ApprovalSnapshot | null>(null);
   const originsRef = useRef<Partial<Record<ApprovalAction, ApprovalOrigin>>>({});
 
+  activeRunIdRef.current = runId;
   projectionRef.current = projection;
   snapshotRef.current = approvalSnapshot;
   originsRef.current = approvalOrigins;
@@ -133,53 +135,51 @@ export function QuickRulingDrawer({
     : "Ruling";
 
   const sendDrawerCommand = async (body: CommandBody, successMessage: string): Promise<void> => {
+    const targetRunId = runId;
     const current = projectionRef.current;
-    if (!current || current.run_id !== runId || busy) return;
+    if (!current || current.run_id !== targetRunId || busy) return;
     setBusy(true);
     setNotice(null);
-    const payload: CommandBody = {
-      operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      expected_state_revision: current.state_revision,
-      actor: "zeus",
-      ...body,
-    };
-    let outcome;
-    try {
-      outcome = await postCommand(runId, payload);
-    } catch (error) {
-      const msg = `操作请求失败：${(error as Error).message}`;
-      setNotice({ tone: "bad", text: msg });
-      workbench.toast(msg);
-      setBusy(false);
+    const result = await executeRunCommand(targetRunId, current.state_revision, body);
+    const stillActive =
+      activeRunIdRef.current === targetRunId &&
+      workbench.state.activeSurface === "board" &&
+      workbench.state.quickDrawerRunId === targetRunId;
+
+    if (result.kind === "network_error" || result.kind === "rejected") {
+      if (stillActive) {
+        setNotice({ tone: "bad", text: result.message });
+        setBusy(false);
+      }
+      workbench.toast(result.message);
       return;
     }
 
-    if (outcome.kind === "conflict") {
-      const fresh = outcome.projection;
-      if (fresh) {
-        applyDrawerProjection(fresh);
+    if (result.kind === "conflict") {
+      if (result.projection) {
+        if (stillActive) applyDrawerProjection(result.projection);
         workbench.refreshRuns().catch(() => undefined);
       }
-      const msg = `状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`;
-      setNotice({ tone: "warn", text: msg });
-      workbench.toast(msg);
-      setBusy(false);
+      if (stillActive) {
+        setNotice({ tone: "warn", text: result.message });
+        setBusy(false);
+      }
+      workbench.toast(result.message);
       return;
     }
 
-    if (outcome.kind === "rejected") {
-      const msg = `操作被拒绝：${outcome.error}`;
-      setNotice({ tone: "bad", text: msg });
-      workbench.toast(msg);
-      setBusy(false);
-      return;
-    }
-
-    applyDrawerProjection(outcome.projection);
-    setBusy(false);
     workbench.toast(successMessage);
+    if (stillActive) {
+      applyDrawerProjection(result.projection);
+      setBusy(false);
+    }
     await workbench.refreshRuns().catch(() => undefined);
-    workbench.closeQuickDrawer();
+    if (
+      activeRunIdRef.current === targetRunId &&
+      workbench.state.quickDrawerRunId === targetRunId
+    ) {
+      workbench.closeQuickDrawer();
+    }
   };
 
   const handleClarify = async (answers: Record<string, string>) => {

@@ -10,6 +10,7 @@ import {
   listRuns,
   listWorkspaces,
   postCommand,
+  runExists,
   seedDemo,
   type WorkbenchOptions,
 } from "../api/client";
@@ -73,11 +74,17 @@ function readStoredTabs(): string[] {
   }
 }
 
-function writeStoredTabs(tabs: string[]): void {
+function isStorageUnavailable(error: unknown): boolean {
+  return error instanceof DOMException || error instanceof ReferenceError;
+}
+
+function writeStoredTabs(tabs: string[]): boolean {
   try {
     localStorage.setItem(OPEN_TABS_KEY, JSON.stringify(tabs));
-  } catch {
-    // Storage may be unavailable (private mode); tabs still work in memory.
+    return true;
+  } catch (error) {
+    if (!isStorageUnavailable(error)) throw error;
+    return false;
   }
 }
 
@@ -216,7 +223,6 @@ export function resolvePointer(artifact: unknown, ref: string): { parts: string[
   return { parts, value };
 }
 
-/** Build a revision-pinned approval snapshot and retain matching origin locators. */
 export function buildApprovalSnapshot(
   projection: RunProjection,
   previousSnapshot: ApprovalSnapshot | null,
@@ -265,6 +271,47 @@ export function buildApprovalSnapshot(
     snapshot: { runId: projection.run_id, revision: projection.state_revision, reviews },
     origins,
   };
+}
+
+export type RunCommandResult =
+  | { kind: "ok"; projection: RunProjection }
+  | { kind: "conflict"; projection: RunProjection | null; message: string }
+  | { kind: "rejected"; message: string }
+  | { kind: "network_error"; message: string };
+
+/** Submit one revision-bound HITL command with unified operation_id and 409 conflict messaging. */
+export async function executeRunCommand(
+  runId: string,
+  expectedRevision: number,
+  body: CommandBody,
+): Promise<RunCommandResult> {
+  const payload: CommandBody = {
+    operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    expected_state_revision: expectedRevision,
+    actor: "zeus",
+    ...body,
+  };
+  let outcome;
+  try {
+    outcome = await postCommand(runId, payload);
+  } catch (error) {
+    return {
+      kind: "network_error",
+      message: `操作请求失败：${(error as Error).message}`,
+    };
+  }
+  if (outcome.kind === "conflict") {
+    const fresh = outcome.projection;
+    return {
+      kind: "conflict",
+      projection: fresh,
+      message: `状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`,
+    };
+  }
+  if (outcome.kind === "rejected") {
+    return { kind: "rejected", message: `操作被拒绝：${outcome.error}` };
+  }
+  return { kind: "ok", projection: outcome.projection };
 }
 
 export class Workbench {
@@ -393,9 +440,19 @@ export class Workbench {
       : (allData.runs || []).filter((run) => !run.is_archived);
 
     const knownIds = new Set(s.allRuns.map((run) => run.run_id));
-    const validatedTabs = s.openTabs.filter(
-      (id) => (knownIds.has(id) || id === queryRun) && !this.closedTabIds.has(id),
-    );
+    const truncated = (allData.runs || []).length >= 200;
+    const candidateTabs = s.openTabs.filter((id) => !this.closedTabIds.has(id));
+    let validatedTabs: string[];
+    if (!truncated) {
+      validatedTabs = candidateTabs.filter((id) => knownIds.has(id) || id === queryRun);
+    } else {
+      const checks = await Promise.all(
+        candidateTabs.map(async (id) =>
+          knownIds.has(id) || id === queryRun ? true : await runExists(id),
+        ),
+      );
+      validatedTabs = candidateTabs.filter((_, idx) => checks[idx]);
+    }
     if (queryRun && !this.closedTabIds.has(queryRun) && !validatedTabs.includes(queryRun)) {
       validatedTabs.unshift(queryRun);
     }
@@ -1078,34 +1135,21 @@ export class Workbench {
   async sendCommand(body: CommandBody, successMessage: string, runId = this.state.runId): Promise<void> {
     const s = this.state;
     if (!runId || runId !== s.runId || s.projection?.run_id !== runId) return;
-    const payload: CommandBody = {
-      operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      expected_state_revision: s.projection.state_revision,
-      actor: "zeus",
-      ...body,
-    };
-    let outcome;
-    try {
-      outcome = await postCommand(runId, payload);
-    } catch (error) {
-      if (this.state.runId === runId) this.toast(`操作请求失败：${(error as Error).message}`);
+    const result = await executeRunCommand(runId, s.projection.state_revision, body);
+    if (this.state.runId !== runId) return;
+    if (result.kind === "network_error" || result.kind === "rejected") {
+      this.toast(result.message);
       return;
     }
-    if (this.state.runId !== runId) return;
-    if (outcome.kind === "conflict") {
-      const fresh = outcome.projection;
-      if (fresh) {
-        this.applyProjection(fresh);
+    if (result.kind === "conflict") {
+      if (result.projection) {
+        this.applyProjection(result.projection);
         this.refreshRuns().catch(() => undefined);
       }
-      this.toast(`状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`);
+      this.toast(result.message);
       return;
     }
-    if (outcome.kind === "rejected") {
-      this.toast(`操作被拒绝：${outcome.error}`);
-      return;
-    }
-    this.applyProjection(outcome.projection);
+    this.applyProjection(result.projection);
     this.refreshRuns().catch(() => undefined);
     this.toast(successMessage);
   }

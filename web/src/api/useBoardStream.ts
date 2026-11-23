@@ -1,9 +1,3 @@
-/**
- * Continuous board-level SSE transport (`GET /api/board/stream`).
- *
- * Keeps the Oracle Board, Pantheon aggregates, and upper-sidebar pending-ruling
- * badge live even while the operator is inspecting an L2 Ariadne Cockpit tab.
- */
 import { useEffect, useRef } from "react";
 
 import { boardStreamUrl, listRuns } from "./client";

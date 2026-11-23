@@ -180,8 +180,6 @@ class RunStore:
                 continue
             conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
 
-    # ------------------------------------------------------------------ workspaces
-
     @staticmethod
     def canonical_root(root_path: Path | str) -> str:
         """Canonical absolute workspace root used as the registry's unique key."""
@@ -250,8 +248,9 @@ class RunStore:
         root_path: Path | str,
         is_git_repo: bool,
         default_branch: str | None = None,
+        exist_ok: bool = True,
     ) -> dict[str, Any]:
-        """Register a workspace; registering an existing canonical root is a no-op."""
+        """Register a workspace atomically; raises ValueError on duplicate when exist_ok=False."""
         canonical = self.canonical_root(root_path)
         with self._tx() as conn:
             existing = conn.execute(
@@ -263,6 +262,8 @@ class RunStore:
                 (canonical,),
             ).fetchone()
             if existing is not None:
+                if not exist_ok:
+                    raise ValueError(f"Workspace already registered: {canonical}")
                 return self._workspace_from_row(existing)
             workspace_id = new_id("ws")
             now = utc_now().isoformat()
@@ -1361,8 +1362,11 @@ class RunStore:
         clauses: list[str] = []
         params: list[Any] = []
         if workspace_id is not None:
-            clauses.append("r.workspace_id = ?")
-            params.append(workspace_id)
+            clauses.append(
+                "(r.workspace_id = ? OR (r.workspace_id IS NULL AND r.workspace_root = "
+                "(SELECT root_path FROM workspaces WHERE workspace_id = ?)))"
+            )
+            params.extend((workspace_id, workspace_id))
         if workspace_mode is not None:
             clauses.append("r.workspace_mode = ?")
             params.append(workspace_mode)
@@ -1382,14 +1386,61 @@ class RunStore:
                 f"""
                 SELECT r.run_id, r.title, r.mode, r.status, r.state_revision, r.workflow_name,
                        r.created_at, r.updated_at, r.workspace_id, r.workspace_mode,
-                       r.task_type, r.workspace_root, w.name AS workspace_name
+                       r.task_type, r.workspace_root,
+                       COALESCE(w.name, wr.name) AS workspace_name
                 FROM runs AS r
                 LEFT JOIN workspaces AS w ON w.workspace_id = r.workspace_id
+                LEFT JOIN workspaces AS wr
+                  ON r.workspace_id IS NULL AND wr.root_path = r.workspace_root
                 {where}ORDER BY r.rowid DESC {limit_sql}
                 """,
                 tuple(params),
             ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def board_fingerprint(self, *, workspace_id: str | None = None) -> tuple[Any, ...]:
+        """Lightweight SQLite change token for board SSE polling without full replay."""
+        conn = self._connect()
+        try:
+            run_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(MAX(rowid), 0) AS max_rowid,
+                       COALESCE(SUM(state_revision), 0) AS rev_sum,
+                       COALESCE(MAX(updated_at), '') AS max_updated
+                FROM runs
+                """
+            ).fetchone()
+            ev_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(MAX(rowid), 0) AS max_rowid FROM events"
+            ).fetchone()
+            ap_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(MAX(rowid), 0) AS max_rowid FROM approvals"
+            ).fetchone()
+            ws_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(MAX(rowid), 0) AS max_rowid,
+                       COALESCE(MAX(updated_at), '') AS max_updated
+                FROM workspaces
+                """
+            ).fetchone()
+            return (
+                workspace_id,
+                int(run_row["cnt"]),
+                int(run_row["max_rowid"]),
+                int(run_row["rev_sum"]),
+                str(run_row["max_updated"]),
+                int(ev_row["cnt"]),
+                int(ev_row["max_rowid"]),
+                int(ap_row["cnt"]),
+                int(ap_row["max_rowid"]),
+                int(ws_row["cnt"]),
+                int(ws_row["max_rowid"]),
+                str(ws_row["max_updated"]),
+            )
         finally:
             conn.close()
 

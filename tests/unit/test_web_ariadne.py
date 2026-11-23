@@ -2176,6 +2176,7 @@ def test_default_workflow_resolution_and_explicit_override(tmp_path: Path) -> No
         (
             {
                 "workspace_mode": "spec_only",
+                "workspace_root": str(repo),
                 "task_type": "feature",
                 "workflow_name": "repo_fast_patch",
             },
@@ -2393,12 +2394,20 @@ def test_oracle_board_projection_filters_pantheon_and_sse(tmp_path: Path) -> Non
 
     exec_spec = _board_spec("spec-exec")
     exec_design = _board_design(exec_spec, "design-exec")
+    exec_wt = root / ".olympus" / "sandboxes" / "run-board-exec-T1"
+    exec_wt.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "olympus/run-board-exec-T1"],
+        cwd=exec_wt,
+        check=True,
+        capture_output=True,
+    )
     exec_plan = _board_plan(
         exec_spec,
         "plan-exec",
         task_status=TaskStatus.RUNNING,
         attempt=1,
-        worktree_path=str(root / ".olympus" / "sandboxes" / "run-board-exec-T1"),
+        worktree_path=str(exec_wt),
     )
     _seed_board_run(
         store,
@@ -2782,3 +2791,192 @@ def test_static_mime_allowlist_serves_images_and_blocks_traversal(
             assert client.get("/static/..%2fhost%2folympus.db").status_code == 404
     finally:
         app.supervisor.shutdown()
+
+
+def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import patch
+
+    import olympus.graph.loader as graph_loader
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    (root / "src").mkdir()
+    (root / "src" / "inside.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "src" / "outside.py").write_text("y = 2\n", encoding="utf-8")
+
+    store = RunStore(tmp_path / "runs.db")
+    captured_prompts: list[str] = []
+
+    def _mock_responder(messages, _tools):
+        from olympus.providers.base import LLMResponse
+
+        if messages and "Requirements Alignment Architect" in messages[0].content:
+            captured_prompts.append(messages[1].content)
+        spec_json = GoalSpec(
+            goal="Verify scope hardening",
+            requirements=[
+                RequirementItem(
+                    id="R1",
+                    description="Scope contract holds",
+                    acceptance_criteria=["Tests pass"],
+                )
+            ],
+            out_of_scope=["Unrelated work"],
+        ).model_dump_json()
+        return LLMResponse(content=spec_json)
+
+    sup = RunSupervisor(
+        store=store,
+        workspace_root=root,
+        provider_builder=lambda **_: MockLLMProvider(responder=_mock_responder),
+    )
+    app = AriadneApp(store=store, workspace_root=root, supervisor=sup)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            ws_id = next(
+                ws["workspace_id"]
+                for ws in client.get("/api/workspaces").json()["workspaces"]
+                if ws["root_path"] == str(root.resolve())
+            )
+
+            # A1: workspace-less spec_only cannot directly invoke or promote to execute workflow.
+            reject_direct = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Plan only",
+                    "workspace_mode": "spec_only",
+                    "workflow_name": "full_sdlc_tdd",
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert reject_direct.status_code == 400
+
+            spec_only_run = store.create_run(
+                title="Spec only run",
+                workflow_name="product_blueprint",
+                workspace_mode="spec_only",
+                task_type="blueprint",
+                workspace_root=None,
+            )
+            reject_promote = client.post(
+                f"/api/runs/{spec_only_run}/command",
+                json={"action": "promote_to_execute", "auto_advance": False},
+            )
+            assert reject_promote.status_code == 400
+
+            # A2: greenfield validates scope_paths BEFORE mkdir/register, and supports init_git.
+            bad_target = tmp_path / "reject-greenfield"
+            bad_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Build new tool",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(bad_target),
+                    "scope_paths": ["."],
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert bad_resp.status_code == 400
+            assert not bad_target.exists()
+            assert store.get_workspace_by_root(bad_target) is None
+
+            git_target = tmp_path / "git-greenfield"
+            with patch.object(sup, "_launch", side_effect=lambda run_id, **_: {"run_id": run_id}):
+                git_resp = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Build git initialized tool",
+                        "workspace_mode": "greenfield",
+                        "workspace_root": str(git_target),
+                        "init_git": True,
+                        "provider_config": {"provider": "mock"},
+                    },
+                )
+            assert git_resp.status_code == 200
+            assert (git_target / ".git").exists()
+
+            # A3: triage receives scope kwargs, brownfield inventory respects scope_paths,
+            # and workspace_id-only issuance defaults to full_sdlc_tdd.
+            with patch.object(
+                graph_loader, "triage_input", wraps=graph_loader.triage_input
+            ) as spy_triage:
+                scoped_resp = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Fix inside module only",
+                        "workspace_mode": "brownfield",
+                        "task_type": "fix",
+                        "base_ref": "main",
+                        "scope_paths": ["src/inside.py"],
+                        "workflow_name": "product_blueprint",
+                        "provider_config": {"provider": "mock"},
+                        "sync": True,
+                    },
+                )
+            assert scoped_resp.status_code == 200
+            assert spy_triage.call_args is not None
+            for key in ("workspace_mode", "task_type", "base_ref", "scope_paths"):
+                assert key in spy_triage.call_args.kwargs
+            inventory_section = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert "src/inside.py" in inventory_section
+            assert "src/outside.py" not in inventory_section
+
+            with patch.object(sup, "_launch", side_effect=lambda run_id, **_: {"run_id": run_id}):
+                ws_only = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Add feature in workspace",
+                        "workspace_id": ws_id,
+                        "provider_config": {"provider": "mock"},
+                    },
+                )
+            assert ws_only.status_code == 200
+            assert store.get_run(ws_only.json()["run_id"])["workflow_name"] == "full_sdlc_tdd"
+
+            # A4: paused run agrees between Board (resolve_blocker) and L2 hitl_banner (run_paused).
+            paused_id = store.create_run(title="Paused spec parity")
+            store.save_spec(
+                paused_id,
+                GoalSpec(
+                    goal="Paused review",
+                    requirements=[
+                        RequirementItem(id="R1", description="Pause", acceptance_criteria=["Ok"])
+                    ],
+                ),
+            )
+            store.set_run_status(paused_id, RunStatus.PAUSED)
+            paused_card = next(
+                r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == paused_id
+            )
+            paused_l2 = client.get(f"/api/runs/{paused_id}").json()["projection"]["hitl_banner"]
+            assert paused_card["pending_action"] == "resolve_blocker"
+            assert paused_l2["kind"] == "run_paused"
+            assert paused_l2["actions"] == ["resume"]
+
+            # A8: legacy run with workspace_root matching a registered workspace appears in filter.
+            legacy_id = store.create_run(title="Legacy root match", workspace_root=root)
+            filtered_ids = {
+                r["run_id"]
+                for r in client.get("/api/runs", params={"workspace_id": ws_id}).json()["runs"]
+            }
+            assert legacy_id in filtered_ids
+
+            # S4: atomic duplicate registration rejection inside SQLite tx.
+            with pytest.raises(ValueError, match="Workspace already registered"):
+                store.register_workspace(
+                    name="dup",
+                    root_path=root,
+                    is_git_repo=True,
+                    exist_ok=False,
+                )
+
+            # Workflow defaults matrix exposed via /api/workflows.
+            wf_payload = client.get("/api/workflows").json()
+            assert wf_payload["default_workflows"]["brownfield:fix"] == "repo_fast_patch"
+            assert wf_payload["default_workflows"]["spec_only:feature"] == "product_blueprint"
+            assert wf_payload["default_workflows"]["greenfield:feature"] == "full_sdlc_tdd"
+    finally:
+        sup.shutdown()

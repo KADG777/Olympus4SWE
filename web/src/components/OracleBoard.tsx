@@ -8,9 +8,7 @@ import { OracleCard } from "./OracleCard";
 export interface OracleBoardProps {
   workbench: Workbench;
   state: WorkbenchState;
-  /** Modular slot for T4 Quick Ruling Drawer CTA on human-held cards. */
   onQuickRule?: (runId: string) => void;
-  /** Modular slot for T5 Bottom 5-God Pantheon Dock. */
   footerSlot?: ReactNode;
 }
 

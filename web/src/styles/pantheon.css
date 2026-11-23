@@ -1,7 +1,3 @@
-/* Bottom 5-God Pantheon Dock & Unified Avatar Asset Slot — Warm Editorial Stone */
-
-/* ── Unified Avatar Asset Slot ────────────────────────────────────────────── */
-
 .god-avatar {
   position: relative;
   display: inline-flex;
@@ -122,8 +118,6 @@
     transform: translateX(-100%);
   }
 }
-
-/* ── Bottom 5-God Pantheon Dock ───────────────────────────────────────────── */
 
 .pantheon-dock {
   display: flex;

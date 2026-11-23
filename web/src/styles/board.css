@@ -1,5 +1,3 @@
-/* L1 Oracle Board & Workspace Manager — Warm Editorial Stone */
-
 .board-shell {
   display: flex;
   flex-direction: column;
@@ -455,8 +453,6 @@
   border-block-start: 1px solid var(--rule);
   background: var(--surface-paper);
 }
-
-/* Workspace Manager Dialog */
 
 #workspace-manager-dialog {
   max-inline-size: min(640px, calc(100vw - 2 * var(--space-4)));

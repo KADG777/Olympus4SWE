@@ -7,6 +7,7 @@ resumed entry point can never disagree.
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -474,11 +475,9 @@ def is_blueprint_completed(
     )
 
 
-# ---------------------------------------------------------------- Oracle Board
-
-
 BallHolder = Literal["human", "agent", "done"]
 PantheonGod = Literal["prometheus", "athena", "hephaestus", "momus", "argus"]
+PantheonStage = Literal["align", "design", "execute", "review", "verify"]
 PendingAction = Literal[
     "clarify",
     "approve_spec",
@@ -489,13 +488,16 @@ PendingAction = Literal[
 ]
 SeatState = Literal["idle", "working", "waiting_on_human"]
 
-# Canonical pipeline order. Every seat maps 1:1 to a deterministic runtime stage.
-PANTHEON_SEATS: tuple[tuple[PantheonGod, str], ...] = (
-    ("prometheus", "Align"),
-    ("athena", "Design/Plan"),
-    ("hephaestus", "Build"),
-    ("momus", "Review"),
-    ("argus", "Verify"),
+PANTHEON_STAGE_BINDING: tuple[tuple[PantheonGod, PantheonStage, str], ...] = (
+    ("prometheus", "align", "Align"),
+    ("athena", "design", "Design/Plan"),
+    ("hephaestus", "execute", "Build"),
+    ("momus", "review", "Review"),
+    ("argus", "verify", "Verify"),
+)
+
+PANTHEON_SEATS: tuple[tuple[PantheonGod, str], ...] = tuple(
+    (god, label) for god, _stage, label in PANTHEON_STAGE_BINDING
 )
 
 _NODE_GODS: dict[str, PantheonGod] = {
@@ -524,8 +526,6 @@ _AGENT_BADGES: dict[PantheonGod, str] = {
 
 @dataclass(frozen=True)
 class BoardClassification:
-    """Deterministic Ball-in-Court and Pantheon attribution for one Oracle."""
-
     ball_holder: BallHolder
     active_god: PantheonGod
     pending_action: PendingAction | None
@@ -559,7 +559,6 @@ def _approval_flags(
 def _trailing_node(
     events: Sequence[RunEvent], workflow_view: Mapping[str, Any]
 ) -> str | None:
-    """Return the most recently active/failed graph node, if any."""
     paused = workflow_view.get("paused")
     paused_node = paused.get("node") if isinstance(paused, Mapping) else None
     candidates = (
@@ -628,7 +627,6 @@ def _stage_god(
     events: Sequence[RunEvent],
     workflow_view: Mapping[str, Any],
 ) -> PantheonGod:
-    """Attribute a blocked/failed/cancelled run to the god owning its stage."""
     node = _trailing_node(events, workflow_view)
     if node == "execute":
         return _execution_god(tasks, events)
@@ -644,7 +642,6 @@ def _phase_god(
     events: Sequence[RunEvent],
     workflow_view: Mapping[str, Any],
 ) -> PantheonGod:
-    """Attribute an in-flight run to the active graph node or execution phase."""
     node = _trailing_node(events, workflow_view)
     if node == "execute":
         return _execution_god(tasks, events)
@@ -658,11 +655,27 @@ def _phase_god(
 
 
 def _worktree_branch(tasks: Sequence[TaskNode]) -> str | None:
-    """Return the deterministic pseudo-branch of the first active sandbox worktree."""
+    """Return the checked-out Git branch of the first active sandbox worktree, if attached."""
     for task in tasks:
         worktree = getattr(task, "worktree_path", None)
-        if isinstance(worktree, str) and worktree.strip():
-            return f"olympus/{Path(worktree).name}"
+        if not isinstance(worktree, str) or not worktree.strip():
+            continue
+        path = Path(worktree)
+        if not path.is_dir():
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(path), "symbolic-ref", "-q", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        branch = proc.stdout.strip()
+        if proc.returncode == 0 and branch:
+            return branch
     return None
 
 

@@ -320,17 +320,6 @@ export const PENDING_ACTION_CTA: Record<NonNullable<PendingAction>, string> = {
   review_delivery: "Review Delivery",
 };
 
-/** Mirror backend `_default_workflow_for(workspace_mode, task_type)`. */
-export function resolveDefaultWorkflow(workspaceMode: WorkspaceMode, taskType: TaskType): string {
-  if (workspaceMode === "spec_only" || taskType === "blueprint") {
-    return "product_blueprint";
-  }
-  if (taskType === "fix") {
-    return "repo_fast_patch";
-  }
-  return "full_sdlc_tdd";
-}
-
 export function boardBadgeVariant(ballHolder: BallHolder, statusBadge: string): Variant {
   if (statusBadge === "failed" || statusBadge === "blocked") return "bad";
   if (statusBadge === "cancelled") return "muted";
