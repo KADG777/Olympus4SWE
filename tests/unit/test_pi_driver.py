@@ -1712,3 +1712,28 @@ def test_explicit_pi_stage_driver_fails_loudly_when_binary_missing(
 
     assert "not found" in str(excinfo.value)
     _reset_pi_availability_cache()
+
+
+def test_stage_driver_honors_parse_retries_when_validation_retries_zero(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    run_id = store.create_run(title="Parse retry")
+    driver = _ScriptedStageDriver(["not-json-at-all", json.dumps(_stage_goal_payload())])
+    stage = AlignStage(
+        store=store,
+        provider=MockLLMProvider(),
+        workspace_root=workspace,
+        execution_drivers=ExecutionDriversConfig(stage_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": driver}),
+    )
+
+    spec = stage.propose_spec(
+        run_id=run_id,
+        raw_goal="Expose a calculator module for developers",
+        strict_canonical=False,
+    )
+    assert len(driver.requests) == 2
+    assert spec.goal.startswith("Expose a calculator module")

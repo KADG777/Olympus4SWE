@@ -97,7 +97,11 @@ def run_structured_turn[T: BaseModel](
         )
 
     prompt = user_prompt
-    for attempt in range(max_validation_retries + 1):
+    parse_retries = 0
+    validation_retries = 0
+    attempt = 0
+    while True:
+        attempt += 1
         outcome = driver.run_turn(
             DriverTurnRequest(
                 workspace_path=workspace_root,
@@ -118,7 +122,7 @@ def run_structured_turn[T: BaseModel](
             store=store,
             run_id=run_id,
             actor=actor,
-            attempt=attempt + 1,
+            attempt=attempt,
         )
         if not outcome.completed:
             raise StructuredTurnError(
@@ -129,7 +133,8 @@ def run_structured_turn[T: BaseModel](
             candidate = parse_model_json(outcome.final_content, model_cls)
         except (json.JSONDecodeError, ValidationError) as exc:
             violations = [f"output is not valid {model_cls.__name__} JSON: {exc}"]
-            if attempt < max_validation_retries:
+            if parse_retries < max_parse_retries:
+                parse_retries += 1
                 prompt = _validation_prompt(
                     user_prompt, validation_header, violations, validation_instruction
                 )
@@ -142,7 +147,8 @@ def run_structured_turn[T: BaseModel](
         violations = list(validator(candidate)) if validator is not None else []
         if not violations:
             return candidate
-        if attempt < max_validation_retries:
+        if validation_retries < max_validation_retries:
+            validation_retries += 1
             prompt = _validation_prompt(
                 user_prompt, validation_header, violations, validation_instruction
             )
@@ -152,7 +158,6 @@ def run_structured_turn[T: BaseModel](
         raise ValueError(
             f"{model_cls.__name__} failed validation: {'; '.join(violations)}"
         )
-    raise AssertionError("unreachable: structured driver loop always returns or raises")
 
 
 __all__ = ["StructuredTurnError", "run_structured_turn"]

@@ -406,7 +406,7 @@ class DesignStage:
         run_id: str,
         auto_approve: bool = False,
         approver: str = "zeus",
-        max_steps: int = 10,
+        max_steps: int = 16,
     ) -> DesignSpec:
         """Draft a DesignSpec, repair it up to two times, then freeze it for review."""
         spec = self._require_confirmed_spec(run_id)

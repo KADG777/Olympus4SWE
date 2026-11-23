@@ -377,6 +377,7 @@ class _PiTurn:
         self._cancel_requested = False
         self._budget_exhausted_reason = ""
         self._max_steps_exceeded = False
+        self._budget_steer_sent = False
         self._stdin_closed = False
         self._steps = 0
         self._tool_started_at: dict[str, float] = {}
@@ -877,14 +878,40 @@ class _PiTurn:
                 "cache_write_tokens": cache_write_tokens,
             },
         )
+        stop_reason = str(message.get("stopReason") or "")
         if over_budget:
             with self._lock:
                 self._budget_exhausted_reason = "budget_exhausted: Pi exceeded configured budget"
             self.cancel(reason="budget_exhausted")
-        elif self._request.max_steps is not None and step > self._request.max_steps:
-            with self._lock:
-                self._max_steps_exceeded = True
-            self.cancel(reason="max_steps_exceeded")
+        elif self._request.max_steps is not None:
+            if (
+                self._request.max_steps >= 3
+                and step == self._request.max_steps - 2
+                and stop_reason == "toolUse"
+            ):
+                with self._lock:
+                    should_steer = not self._budget_steer_sent
+                    self._budget_steer_sent = True
+                if should_steer:
+                    threading.Thread(
+                        target=self.steer,
+                        args=(
+                            "Step budget is almost exhausted. Stop calling tools and emit your "
+                            "final response now.",
+                        ),
+                        kwargs={"source": "step_budget"},
+                        daemon=True,
+                    ).start()
+            elif step > self._request.max_steps:
+                allow_final_landing = (
+                    step == self._request.max_steps + 1
+                    and stop_reason == "stop"
+                    and bool(self._final_content.strip())
+                )
+                if not allow_final_landing:
+                    with self._lock:
+                        self._max_steps_exceeded = True
+                    self.cancel(reason="max_steps_exceeded")
 
     def _on_response(self, record: dict[str, Any]) -> None:
         if bool(record.get("success")):

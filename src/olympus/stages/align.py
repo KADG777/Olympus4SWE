@@ -198,7 +198,7 @@ class AlignStage:
         raw_goal: str,
         constraints: list[str] | None = None,
         enable_critique: bool = False,
-        max_steps: int = 10,
+        max_steps: int = 16,
         strict_canonical: bool = False,
         workspace_mode: str | None = None,
         task_type: str | None = None,
@@ -385,7 +385,7 @@ class AlignStage:
                 store=self.store,
                 run_id=run_id,
                 actor=f"align:critic-{perspective.value}",
-                max_steps=6,
+                max_steps=10,
                 trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
             )
             inventory = format_workspace_inventory(toolkit)
@@ -410,7 +410,7 @@ class AlignStage:
                 user_prompt=user_prompt,
                 model_cls=CritiqueOutput,
                 trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
-                max_steps=6,
+                max_steps=10,
             )
             return out.notes
 

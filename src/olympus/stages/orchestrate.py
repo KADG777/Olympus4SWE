@@ -599,7 +599,7 @@ class OrchestrateStage:
         run_id: str,
         auto_approve: bool = False,
         approver: str = "zeus",
-        max_steps: int = 10,
+        max_steps: int = 16,
         topology: str = "minimal_patch",
         use_design: bool = True,
     ) -> TaskPlan:
@@ -912,7 +912,7 @@ class OrchestrateStage:
             task_id=task.task_id,
             lease_generation=task.lease_generation,
             read_only=True,
-            max_steps=8,
+            max_steps=12,
             trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
             model=model,
         )
