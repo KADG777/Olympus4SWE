@@ -8,9 +8,18 @@ resumed entry point can never disagree.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, TypedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
-from olympus.core.contracts import ApprovalTarget, RunEvent, RunStatus, TaskPlan, TaskStatus
+from olympus.core.contracts import (
+    ApprovalTarget,
+    RunEvent,
+    RunStatus,
+    TaskNode,
+    TaskPlan,
+    TaskStatus,
+)
 from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
 from olympus.core.dag import validate_plan_topology
 from olympus.core.store import RunStore
@@ -465,10 +474,321 @@ def is_blueprint_completed(
     )
 
 
+# ---------------------------------------------------------------- Oracle Board
+
+
+BallHolder = Literal["human", "agent", "done"]
+PantheonGod = Literal["prometheus", "athena", "hephaestus", "momus", "argus"]
+PendingAction = Literal[
+    "clarify",
+    "approve_spec",
+    "approve_design",
+    "approve_plan",
+    "resolve_blocker",
+    "review_delivery",
+]
+SeatState = Literal["idle", "working", "waiting_on_human"]
+
+# Canonical pipeline order. Every seat maps 1:1 to a deterministic runtime stage.
+PANTHEON_SEATS: tuple[tuple[PantheonGod, str], ...] = (
+    ("prometheus", "Align"),
+    ("athena", "Design/Plan"),
+    ("hephaestus", "Build"),
+    ("momus", "Review"),
+    ("argus", "Verify"),
+)
+
+_NODE_GODS: dict[str, PantheonGod] = {
+    "intake": "prometheus",
+    "align": "prometheus",
+    "critic": "prometheus",
+    "gate_spec": "prometheus",
+    "design": "athena",
+    "validate_design": "athena",
+    "gate_design": "athena",
+    "plan": "athena",
+    "validate_plan": "athena",
+    "gate_plan": "athena",
+    "execute": "hephaestus",
+    "verify": "argus",
+}
+
+_AGENT_BADGES: dict[PantheonGod, str] = {
+    "prometheus": "aligning",
+    "athena": "planning",
+    "hephaestus": "running",
+    "momus": "reviewing",
+    "argus": "verifying",
+}
+
+
+@dataclass(frozen=True)
+class BoardClassification:
+    """Deterministic Ball-in-Court and Pantheon attribution for one Oracle."""
+
+    ball_holder: BallHolder
+    active_god: PantheonGod
+    pending_action: PendingAction | None
+    worktree_branch: str | None
+    status_badge: str
+    is_archived: bool
+
+
+def _approval_flags(
+    snap: Mapping[str, Any],
+    store: RunStore | None,
+) -> tuple[bool, bool, bool]:
+    """Read hash-bound gate approvals from the snapshot, falling back to the store."""
+    recorded = snap.get("artifact_approved")
+    if isinstance(recorded, Mapping):
+        return (
+            bool(recorded.get(ApprovalTarget.GOAL_SPEC)),
+            bool(recorded.get(ApprovalTarget.DESIGN_SPEC)),
+            bool(recorded.get(ApprovalTarget.TASK_PLAN)),
+        )
+    run_id = snap.get("run_id")
+    if store is not None and isinstance(run_id, str) and run_id:
+        return (
+            is_artifact_approved(store, run_id, "spec", snap),
+            is_artifact_approved(store, run_id, "design", snap),
+            is_artifact_approved(store, run_id, "plan", snap),
+        )
+    return False, False, False
+
+
+def _trailing_node(
+    events: Sequence[RunEvent], workflow_view: Mapping[str, Any]
+) -> str | None:
+    """Return the most recently active/failed graph node, if any."""
+    paused = workflow_view.get("paused")
+    paused_node = paused.get("node") if isinstance(paused, Mapping) else None
+    candidates = (
+        workflow_view.get("failed_node"),
+        paused_node,
+        workflow_view.get("current_node"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    for event in reversed(events):
+        if event.event_type == "graph.routed":
+            targets = _node_names(event.payload.get("to"))
+            if targets:
+                return targets[-1]
+            continue
+        node = event.payload.get("node")
+        if isinstance(node, str) and node and event.event_type in (
+            "graph.node_started",
+            "graph.node_finished",
+            "graph.paused",
+            "graph.node_error",
+            "graph.failed",
+        ):
+            return node
+    return None
+
+
+def _reviewed_attempts(events: Sequence[RunEvent]) -> set[tuple[str, int]]:
+    reviewed: set[tuple[str, int]] = set()
+    for event in events:
+        if event.event_type != "review.verdict_recorded":
+            continue
+        task_id = event.payload.get("task_id")
+        attempt = event.payload.get("attempt")
+        if isinstance(task_id, str) and isinstance(attempt, int):
+            reviewed.add((task_id, attempt))
+    return reviewed
+
+
+def _execution_god(tasks: Sequence[TaskNode], events: Sequence[RunEvent]) -> PantheonGod:
+    """Attribute the execute phase to the worker, reviewer, or verifier."""
+    if any(task.status == TaskStatus.RUNNING for task in tasks):
+        return "hephaestus"
+    verifying = [task for task in tasks if task.status == TaskStatus.VERIFYING]
+    if verifying:
+        reviewed = _reviewed_attempts(events)
+        if any((task.task_id, task.attempt) in reviewed for task in verifying):
+            return "momus"
+        return "argus"
+    blocked = [
+        task for task in tasks
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
+    ]
+    if blocked:
+        return "momus" if any(task.review_cycle > 0 for task in blocked) else "argus"
+    if tasks and all(
+        task.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for task in tasks
+    ):
+        return "argus"
+    return "hephaestus"
+
+
+def _stage_god(
+    tasks: Sequence[TaskNode],
+    events: Sequence[RunEvent],
+    workflow_view: Mapping[str, Any],
+) -> PantheonGod:
+    """Attribute a blocked/failed/cancelled run to the god owning its stage."""
+    node = _trailing_node(events, workflow_view)
+    if node == "execute":
+        return _execution_god(tasks, events)
+    if node is not None:
+        return _NODE_GODS.get(node, "argus")
+    if tasks:
+        return _execution_god(tasks, events)
+    return "prometheus"
+
+
+def _phase_god(
+    tasks: Sequence[TaskNode],
+    events: Sequence[RunEvent],
+    workflow_view: Mapping[str, Any],
+) -> PantheonGod:
+    """Attribute an in-flight run to the active graph node or execution phase."""
+    node = _trailing_node(events, workflow_view)
+    if node == "execute":
+        return _execution_god(tasks, events)
+    if node is not None:
+        god = _NODE_GODS.get(node)
+        if god is not None:
+            return god
+    if tasks:
+        return _execution_god(tasks, events)
+    return "prometheus"
+
+
+def _worktree_branch(tasks: Sequence[TaskNode]) -> str | None:
+    """Return the deterministic pseudo-branch of the first active sandbox worktree."""
+    for task in tasks:
+        worktree = getattr(task, "worktree_path", None)
+        if isinstance(worktree, str) and worktree.strip():
+            return f"olympus/{Path(worktree).name}"
+    return None
+
+
+def classify_run_board(
+    snap: Mapping[str, Any],
+    events: Sequence[RunEvent],
+    *,
+    store: RunStore | None = None,
+    workflow_view: Mapping[str, Any] | None = None,
+) -> BoardClassification:
+    """Classify one Oracle into its Ball-in-Court and Pantheon state.
+
+    This is the single source of truth behind ``GET /api/runs``,
+    ``GET /api/board/stream``, the Pantheon Dock aggregates, and the L2
+    cockpit handoff semantics, so those surfaces can never disagree.
+    """
+    raw_status = snap.get("status")
+    status = raw_status if isinstance(raw_status, RunStatus) else RunStatus(str(raw_status))
+    plan: TaskPlan | None = snap.get("plan")
+    spec = snap.get("spec")
+    design = snap.get("design")
+    tasks: list[TaskNode] = list(plan.tasks) if plan is not None else []
+
+    spec_approved, design_approved, plan_approved = _approval_flags(snap, store)
+    view = workflow_view
+    if view is None:
+        view = build_workflow_view(
+            str(snap.get("workflow_name") or "product_blueprint"),
+            events,
+            status,
+            spec_approved=spec_approved,
+            design_approved=design_approved,
+            plan_approved=plan_approved,
+        )
+    stop_after = view.get("stop_after")
+    worktree = _worktree_branch(tasks)
+
+    if status == RunStatus.CANCELLED:
+        return BoardClassification(
+            "done",
+            _stage_god(tasks, events, view),
+            None,
+            worktree,
+            "cancelled",
+            True,
+        )
+
+    if status == RunStatus.COMPLETED:
+        blueprint = (stop_after or "execute") != "execute" or is_blueprint_completed(
+            plan=plan,
+            plan_approved=plan_approved,
+            run_status=status,
+            stop_after=stop_after,
+        )
+        return BoardClassification(
+            "done",
+            "athena" if blueprint else "argus",
+            None,
+            worktree,
+            "blueprint" if blueprint else "delivered",
+            False,
+        )
+
+    if status in (RunStatus.PAUSED, RunStatus.FAILED):
+        return BoardClassification(
+            "human",
+            _stage_god(tasks, events, view),
+            "resolve_blocker",
+            worktree,
+            "paused" if status == RunStatus.PAUSED else "failed",
+            False,
+        )
+
+    if status == RunStatus.AWAITING_HUMAN:
+        if spec is not None and not spec_approved:
+            if spec.unresolved_blockers():
+                return BoardClassification(
+                    "human", "prometheus", "clarify", worktree, "clarify", False
+                )
+            return BoardClassification(
+                "human", "prometheus", "approve_spec", worktree, "approve_spec", False
+            )
+        if design is not None and not design_approved:
+            return BoardClassification(
+                "human", "athena", "approve_design", worktree, "approve_design", False
+            )
+        if plan is not None and not plan_approved:
+            return BoardClassification(
+                "human", "athena", "approve_plan", worktree, "approve_plan", False
+            )
+        if tasks and all(
+            task.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for task in tasks
+        ):
+            return BoardClassification(
+                "human", "argus", "review_delivery", worktree, "review_delivery", False
+            )
+        return BoardClassification(
+            "human",
+            _stage_god(tasks, events, view),
+            "resolve_blocker",
+            worktree,
+            "blocked",
+            False,
+        )
+
+    god = _phase_god(tasks, events, view)
+    if status == RunStatus.CREATED:
+        badge = "created"
+    elif god == "athena" and status == RunStatus.DESIGNING:
+        badge = "designing"
+    else:
+        badge = _AGENT_BADGES[god]
+    return BoardClassification("agent", god, None, worktree, badge, False)
+
+
 __all__ = [
     "GATE_SPECS",
+    "PANTHEON_SEATS",
+    "BallHolder",
+    "BoardClassification",
     "GateSpec",
+    "PantheonGod",
+    "PendingAction",
+    "SeatState",
     "build_workflow_view",
+    "classify_run_board",
     "is_artifact_approved",
     "is_blueprint_completed",
     "resolve_resume_node",

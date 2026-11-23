@@ -6,8 +6,9 @@ import json
 import re
 import sqlite3
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -2196,3 +2197,586 @@ def test_default_workflow_resolution_and_explicit_override(tmp_path: Path) -> No
                 supervisor.wait(run_id, timeout=60.0)
     finally:
         supervisor.shutdown()
+
+
+def _board_spec(spec_id: str, *, blocking: bool = False) -> GoalSpec:
+    return GoalSpec(
+        spec_id=spec_id,
+        goal=f"Board projection fixture {spec_id}",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Board cards classify deterministically",
+                acceptance_criteria=["One classifier backs every surface"],
+            )
+        ],
+        open_ambiguities=(
+            [
+                AmbiguityItem(
+                    id="A1",
+                    question="Which surface owns the decision?",
+                    impact="Board routing",
+                    options=["classifier", "projection"],
+                    blocking=True,
+                )
+            ]
+            if blocking
+            else []
+        ),
+    )
+
+
+def _board_design(spec: GoalSpec, design_id: str) -> DesignSpec:
+    return DesignSpec(
+        design_id=design_id,
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        architecture_summary="A single deterministic projection owns board state.",
+        modules=[
+            DesignModule(
+                id="M1",
+                name="Projection",
+                responsibility="Classify every Oracle exactly once",
+                requirement_refs=["R1"],
+                target_paths=["src/olympus/web/projection.py"],
+            )
+        ],
+    )
+
+
+def _board_plan(
+    spec: GoalSpec,
+    plan_id: str,
+    *,
+    task_status: TaskStatus = TaskStatus.WAITING,
+    attempt: int = 0,
+    review_cycle: int = 0,
+    worktree_path: str | None = None,
+) -> TaskPlan:
+    return TaskPlan(
+        plan_id=plan_id,
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1",
+                title="Project the board",
+                objective="Classify the Oracle",
+                requirement_refs=["R1"],
+                write_scope=["src/olympus/web/projection.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="T1-C1",
+                        kind=CheckKind.COMMAND,
+                        description="pytest board projection",
+                        command="pytest -q",
+                    )
+                ],
+                status=task_status,
+                attempt=attempt,
+                review_cycle=review_cycle,
+                worktree_path=worktree_path,
+            )
+        ],
+    )
+
+
+def _board_approve(store: RunStore, run_id: str, gate: str, artifact: object) -> None:
+    from olympus.graph.progress import GATE_SPECS
+
+    gate_spec = GATE_SPECS[gate]
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=gate_spec["target"],
+            target_id=getattr(artifact, gate_spec["id_attr"]),
+            target_hash=artifact.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+
+def _seed_board_run(
+    store: RunStore,
+    run_id: str,
+    *,
+    workspace_id: str | None,
+    workspace_mode: str = "brownfield",
+    task_type: str = "feature",
+    workflow_name: str = "product_blueprint",
+    status: RunStatus = RunStatus.AWAITING_HUMAN,
+    spec: GoalSpec | None = None,
+    design: DesignSpec | None = None,
+    plan: TaskPlan | None = None,
+    approve: tuple[str, ...] = (),
+) -> str:
+    store.create_run(
+        title=f"Oracle {run_id}",
+        workflow_name=workflow_name,
+        run_id=run_id,
+        workspace_id=workspace_id,
+        workspace_mode=workspace_mode,
+        task_type=task_type,
+        workspace_root=store.get_workspace(workspace_id)["root_path"] if workspace_id else None,
+    )
+    if spec is not None:
+        store.save_spec(run_id, spec)
+        if "spec" in approve:
+            _board_approve(store, run_id, "spec", spec)
+    if design is not None:
+        store.save_design(run_id, design)
+        if "design" in approve:
+            _board_approve(store, run_id, "design", design)
+    if plan is not None:
+        store.save_plan(run_id, plan)
+        if "plan" in approve:
+            _board_approve(store, run_id, "plan", plan)
+    store.set_run_status(run_id, status, actor="test")
+    return run_id
+
+
+def test_oracle_board_projection_filters_pantheon_and_sse(tmp_path: Path) -> None:
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    ws_a = store.register_workspace(
+        name="Alpha", root_path=tmp_path / "alpha", is_git_repo=False
+    )
+    ws_b = store.register_workspace(
+        name="Beta", root_path=tmp_path / "beta", is_git_repo=False
+    )
+    a = str(ws_a["workspace_id"])
+    b = str(ws_b["workspace_id"])
+
+    clarify_spec = _board_spec("spec-clarify", blocking=True)
+    _seed_board_run(
+        store, "run-board-clarify", workspace_id=a, spec=clarify_spec
+    )
+
+    specc_spec = _board_spec("spec-specc")
+    _seed_board_run(
+        store,
+        "run-board-specc",
+        workspace_id=a,
+        task_type="fix",
+        spec=specc_spec,
+    )
+
+    design_spec = _board_spec("spec-design")
+    design = _board_design(design_spec, "design-board")
+    _seed_board_run(
+        store,
+        "run-board-design",
+        workspace_id=b,
+        spec=design_spec,
+        design=design,
+        approve=("spec",),
+    )
+
+    plan_spec = _board_spec("spec-plan")
+    plan_design = _board_design(plan_spec, "design-plan")
+    plan = _board_plan(plan_spec, "plan-board")
+    _seed_board_run(
+        store,
+        "run-board-plan",
+        workspace_id=b,
+        workspace_mode="greenfield",
+        spec=plan_spec,
+        design=plan_design,
+        plan=plan,
+        approve=("spec", "design"),
+    )
+
+    exec_spec = _board_spec("spec-exec")
+    exec_design = _board_design(exec_spec, "design-exec")
+    exec_plan = _board_plan(
+        exec_spec,
+        "plan-exec",
+        task_status=TaskStatus.RUNNING,
+        attempt=1,
+        worktree_path=str(root / ".olympus" / "sandboxes" / "run-board-exec-T1"),
+    )
+    _seed_board_run(
+        store,
+        "run-board-exec",
+        workspace_id=a,
+        workspace_mode="greenfield",
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=exec_spec,
+        design=exec_design,
+        plan=exec_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-exec",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    review_spec = _board_spec("spec-review")
+    review_design = _board_design(review_spec, "design-review")
+    review_plan = _board_plan(
+        review_spec, "plan-review", task_status=TaskStatus.VERIFYING, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-review",
+        workspace_id=a,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=review_spec,
+        design=review_design,
+        plan=review_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-review",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+    store.append_event(
+        run_id="run-board-review",
+        stage="verify",
+        event_type="review.verdict_recorded",
+        actor="argus",
+        payload={"task_id": "T1", "attempt": 1, "passed": True},
+    )
+
+    verify_spec = _board_spec("spec-verify")
+    verify_design = _board_design(verify_spec, "design-verify")
+    verify_plan = _board_plan(
+        verify_spec, "plan-verify", task_status=TaskStatus.VERIFYING, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-verify",
+        workspace_id=b,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=verify_spec,
+        design=verify_design,
+        plan=verify_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-verify",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    blocked_spec = _board_spec("spec-blocked")
+    blocked_design = _board_design(blocked_spec, "design-blocked")
+    blocked_plan = _board_plan(
+        blocked_spec, "plan-blocked", task_status=TaskStatus.BLOCKED, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-blocked",
+        workspace_id=b,
+        workflow_name="full_sdlc_tdd",
+        spec=blocked_spec,
+        design=blocked_design,
+        plan=blocked_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    blueprint_spec = _board_spec("spec-blueprint")
+    blueprint_design = _board_design(blueprint_spec, "design-blueprint")
+    blueprint_plan = _board_plan(blueprint_spec, "plan-blueprint")
+    _seed_board_run(
+        store,
+        "run-board-blueprint",
+        workspace_id=a,
+        status=RunStatus.COMPLETED,
+        spec=blueprint_spec,
+        design=blueprint_design,
+        plan=blueprint_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    delivered_spec = _board_spec("spec-delivered")
+    delivered_design = _board_design(delivered_spec, "design-delivered")
+    delivered_plan = _board_plan(
+        delivered_spec, "plan-delivered", task_status=TaskStatus.ACCEPTED, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-delivered",
+        workspace_id=a,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.COMPLETED,
+        spec=delivered_spec,
+        design=delivered_design,
+        plan=delivered_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    _seed_board_run(
+        store, "run-board-cancelled", workspace_id=a, status=RunStatus.CANCELLED
+    )
+
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            board = client.get("/api/runs")
+            assert board.status_code == 200, board.text
+            payload = board.json()
+            runs = {run["run_id"]: run for run in payload["runs"]}
+            assert len(payload["runs"]) == 10
+            assert "run-board-cancelled" not in runs
+            assert payload["pending_ruling_total"] == 5
+            assert payload["active_workspace_id"] is None
+            assert [seat["god"] for seat in payload["pantheon"]] == [
+                "prometheus",
+                "athena",
+                "hephaestus",
+                "momus",
+                "argus",
+            ]
+            seats = {seat["god"]: seat for seat in payload["pantheon"]}
+            assert seats["prometheus"] == {
+                "god": "prometheus",
+                "role_label": "Align",
+                "state": "waiting_on_human",
+                "active_count": 0,
+                "waiting_count": 2,
+                "oracle_ids": ["run-board-specc", "run-board-clarify"],
+            }
+            assert (
+                seats["athena"]["state"],
+                seats["athena"]["waiting_count"],
+                seats["athena"]["oracle_ids"],
+            ) == ("waiting_on_human", 2, ["run-board-plan", "run-board-design"])
+            assert (seats["hephaestus"]["state"], seats["hephaestus"]["active_count"]) == (
+                "working",
+                1,
+            )
+            assert (seats["momus"]["state"], seats["momus"]["oracle_ids"]) == (
+                "working",
+                ["run-board-review"],
+            )
+            assert (
+                seats["argus"]["state"],
+                seats["argus"]["active_count"],
+                seats["argus"]["waiting_count"],
+            ) == ("waiting_on_human", 1, 1)
+
+            expected = {
+                "run-board-clarify": ("human", "prometheus", "clarify", "clarify"),
+                "run-board-specc": ("human", "prometheus", "approve_spec", "approve_spec"),
+                "run-board-design": ("human", "athena", "approve_design", "approve_design"),
+                "run-board-plan": ("human", "athena", "approve_plan", "approve_plan"),
+                "run-board-exec": ("agent", "hephaestus", None, "running"),
+                "run-board-review": ("agent", "momus", None, "reviewing"),
+                "run-board-verify": ("agent", "argus", None, "verifying"),
+                "run-board-blocked": ("human", "argus", "resolve_blocker", "blocked"),
+                "run-board-blueprint": ("done", "athena", None, "blueprint"),
+                "run-board-delivered": ("done", "argus", None, "delivered"),
+            }
+            for run_id, (ball, god, action, badge) in expected.items():
+                run = runs[run_id]
+                assert (run["ball_holder"], run["active_god"]) == (ball, god), run_id
+                assert (run["pending_action"], run["status_badge"]) == (action, badge), run_id
+                assert run["is_archived"] is False
+            assert runs["run-board-exec"]["worktree_branch"] == "olympus/run-board-exec-T1"
+            assert runs["run-board-exec"]["workspace_name"] == "Alpha"
+            assert runs["run-board-exec"]["workspace_mode"] == "greenfield"
+            assert runs["run-board-exec"]["task_type"] == "feature"
+            assert runs["run-board-delivered"]["workspace_id"] == a
+            assert runs["run-board-plan"]["workspace_name"] == "Beta"
+
+            archived = client.get("/api/runs", params={"include_archived": "true"}).json()
+            archived_runs = {run["run_id"]: run for run in archived["runs"]}
+            assert archived_runs["run-board-cancelled"]["is_archived"] is True
+            assert archived_runs["run-board-cancelled"]["ball_holder"] == "done"
+            assert len(archived["runs"]) == 11
+
+            alpha = client.get(
+                "/api/runs", params={"workspace_id": a}
+            ).json()
+            assert {run["run_id"] for run in alpha["runs"]} == {
+                "run-board-clarify",
+                "run-board-specc",
+                "run-board-exec",
+                "run-board-review",
+                "run-board-blueprint",
+                "run-board-delivered",
+            }
+            assert alpha["active_workspace_id"] == a
+            assert alpha["pending_ruling_total"] == 2
+
+            greenfield = client.get(
+                "/api/runs", params={"workspace_mode": "greenfield"}
+            ).json()
+            assert {run["run_id"] for run in greenfield["runs"]} == {
+                "run-board-plan",
+                "run-board-exec",
+            }
+
+            fixes = client.get("/api/runs", params={"task_type": "fix"}).json()
+            assert [run["run_id"] for run in fixes["runs"]] == ["run-board-specc"]
+
+            agents = client.get("/api/runs", params={"ball_holder": "agent"}).json()
+            assert {run["run_id"] for run in agents["runs"]} == {
+                "run-board-exec",
+                "run-board-review",
+                "run-board-verify",
+            }
+            assert agents["pending_ruling_total"] == 5
+
+            humans = client.get("/api/runs", params={"ball_holder": "human"}).json()
+            assert {run["run_id"] for run in humans["runs"]} == {
+                "run-board-clarify",
+                "run-board-specc",
+                "run-board-design",
+                "run-board-plan",
+                "run-board-blocked",
+            }
+
+            combined = client.get(
+                "/api/runs",
+                params={"workspace_id": a, "task_type": "feature"},
+            ).json()
+            assert {run["run_id"] for run in combined["runs"]} == {
+                "run-board-clarify",
+                "run-board-exec",
+                "run-board-review",
+                "run-board-blueprint",
+                "run-board-delivered",
+            }
+
+            assert client.get(
+                "/api/runs", params={"workspace_mode": "desktop"}
+            ).status_code == 400
+            assert client.get(
+                "/api/runs", params={"ball_holder": "nobody"}
+            ).status_code == 400
+
+            workspaces = client.get("/api/workspaces").json()["workspaces"]
+            by_id = {workspace["workspace_id"]: workspace for workspace in workspaces}
+            assert (
+                by_id[a]["active_oracle_count"],
+                by_id[a]["pending_ruling_count"],
+            ) == (2, 2)
+            assert (
+                by_id[b]["active_oracle_count"],
+                by_id[b]["pending_ruling_count"],
+            ) == (1, 3)
+
+            stream = client.get("/api/board/stream", params={"once": "1", "workspace_id": a})
+            assert stream.status_code == 200
+            assert stream.headers["content-type"].startswith("text/event-stream")
+            assert stream.text.startswith("event: board\n")
+            stream_payload = json.loads(
+                next(
+                    line[len("data: ") :]
+                    for line in stream.text.splitlines()
+                    if line.startswith("data: ")
+                )
+            )
+            assert stream_payload == client.get(
+                "/api/runs", params={"workspace_id": a}
+            ).json()
+            all_stream = client.get("/api/board/stream", params={"once": "1"})
+            all_payload = json.loads(
+                next(
+                    line[len("data: ") :]
+                    for line in all_stream.text.splitlines()
+                    if line.startswith("data: ")
+                )
+            )
+            assert all_payload == payload
+    finally:
+        app.supervisor.shutdown()
+
+
+def _next_board_frame(lines: Iterator[str]) -> dict[str, Any]:
+    data: str | None = None
+    for line in lines:
+        if line.startswith("data: "):
+            data = line[len("data: ") :]
+        elif line == "" and data is not None:
+            return json.loads(data)
+    raise AssertionError("board stream ended before a frame arrived")
+
+
+def test_board_stream_emits_on_change_and_exits_on_disconnect(tmp_path: Path) -> None:
+    import threading
+
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    _seed_board_run(
+        store,
+        "run-live",
+        workspace_id=None,
+        spec=_board_spec("spec-live", blocking=True),
+    )
+    try:
+        with (
+            TestClient(create_fastapi_app(app)) as client,
+            client.stream("GET", "/api/board/stream") as stream,
+        ):
+            assert stream.status_code == 200
+            lines = stream.iter_lines()
+            first = _next_board_frame(lines)
+            first_run = first["runs"][0]
+            assert first_run["ball_holder"] == "human"
+            assert first_run["pending_action"] == "clarify"
+
+            timer = threading.Timer(
+                0.75, lambda: store.set_run_status("run-live", RunStatus.PAUSED)
+            )
+            timer.start()
+            second = _next_board_frame(lines)
+            timer.join(timeout=5)
+            second_run = second["runs"][0]
+            assert second_run["status"] == "paused"
+            assert second_run["pending_action"] == "resolve_blocker"
+            assert second_run["status_badge"] == "paused"
+        # Exiting the stream context closes the connection; a clean exit means no hang.
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_static_mime_allowlist_serves_images_and_blocks_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import olympus.web.server as web_server
+
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (static_dir / "portrait.webp").write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
+    (static_dir / "emblem.svg").write_text("<svg/>", encoding="utf-8")
+    (static_dir / "payload.bin").write_bytes(b"bin")
+    monkeypatch.setattr(web_server, "_STATIC_DIR", static_dir)
+
+    root = tmp_path / "host"
+    root.mkdir()
+    app = AriadneApp(store=RunStore(root / "olympus.db"), workspace_root=root)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            png = client.get("/static/icon.png")
+            assert png.status_code == 200
+            assert png.headers["content-type"] == "image/png"
+            webp = client.get("/static/portrait.webp")
+            assert webp.status_code == 200
+            assert webp.headers["content-type"] == "image/webp"
+            svg = client.get("/static/emblem.svg")
+            assert svg.status_code == 200
+            assert svg.headers["content-type"] == "image/svg+xml"
+            assert client.get("/static/payload.bin").status_code == 404
+            assert client.get("/static/missing.png").status_code == 404
+            assert client.get("/static/..%2fhost%2folympus.db").status_code == 404
+    finally:
+        app.supervisor.shutdown()

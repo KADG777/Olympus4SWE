@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/board/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Stream Board */
+        get: operations["stream_board_api_board_stream_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/demos": {
         parameters: {
             query?: never;
@@ -1204,6 +1221,27 @@ export interface components {
             /** Watchdog Verdict */
             watchdog_verdict?: string | null;
         };
+        /** PantheonSeatSummary */
+        PantheonSeatSummary: {
+            /** Active Count */
+            active_count: number;
+            /**
+             * God
+             * @enum {string}
+             */
+            god: "prometheus" | "athena" | "hephaestus" | "momus" | "argus";
+            /** Oracle Ids */
+            oracle_ids: string[];
+            /** Role Label */
+            role_label: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "idle" | "working" | "waiting_on_human";
+            /** Waiting Count */
+            waiting_count: number;
+        };
         /** PauseCommand */
         PauseCommand: {
             /**
@@ -1631,6 +1669,8 @@ export interface components {
         };
         /** RunListResponse */
         RunListResponse: {
+            /** Active Workspace Id */
+            active_workspace_id?: string | null;
             /** Default Run Id */
             default_run_id?: string | null;
             /**
@@ -1639,6 +1679,10 @@ export interface components {
              * @constant
              */
             ok: true;
+            /** Pantheon */
+            pantheon: components["schemas"]["PantheonSeatSummary"][];
+            /** Pending Ruling Total */
+            pending_ruling_total: number;
             /** Runs */
             runs: components["schemas"]["RunSummary"][];
         };
@@ -1735,22 +1779,54 @@ export interface components {
         };
         /** RunSummary */
         RunSummary: {
+            /**
+             * Active God
+             * @enum {string}
+             */
+            active_god: "prometheus" | "athena" | "hephaestus" | "momus" | "argus";
+            /**
+             * Ball Holder
+             * @enum {string}
+             */
+            ball_holder: "human" | "agent" | "done";
             /** Created At */
             created_at: string;
+            /** Is Archived */
+            is_archived: boolean;
             /** Mode */
             mode: string;
+            /** Pending Action */
+            pending_action?: ("clarify" | "approve_spec" | "approve_design" | "approve_plan" | "resolve_blocker" | "review_delivery") | null;
             /** Run Id */
             run_id: string;
             /** State Revision */
             state_revision: number;
             /** Status */
             status: string;
+            /** Status Badge */
+            status_badge: string;
+            /**
+             * Task Type
+             * @enum {string}
+             */
+            task_type: "feature" | "fix" | "refactor" | "blueprint";
             /** Title */
             title: string;
             /** Updated At */
             updated_at: string;
             /** Workflow Name */
             workflow_name: string;
+            /** Workspace Id */
+            workspace_id?: string | null;
+            /**
+             * Workspace Mode
+             * @enum {string}
+             */
+            workspace_mode: "brownfield" | "greenfield" | "spec_only";
+            /** Workspace Name */
+            workspace_name: string;
+            /** Worktree Branch */
+            worktree_branch?: string | null;
         };
         /**
          * SchemaField
@@ -1774,6 +1850,8 @@ export interface components {
         };
         /** SeedDemoResponse */
         SeedDemoResponse: {
+            /** Active Workspace Id */
+            active_workspace_id?: string | null;
             /** Default Run Id */
             default_run_id?: string | null;
             /**
@@ -1782,6 +1860,10 @@ export interface components {
              * @constant
              */
             ok: true;
+            /** Pantheon */
+            pantheon: components["schemas"]["PantheonSeatSummary"][];
+            /** Pending Ruling Total */
+            pending_ruling_total: number;
             /** Runs */
             runs: components["schemas"]["RunSummary"][];
             /** Seeded */
@@ -2231,6 +2313,11 @@ export interface components {
         };
         /** WorkspaceSummary */
         WorkspaceSummary: {
+            /**
+             * Active Oracle Count
+             * @default 0
+             */
+            active_oracle_count: number;
             /** Created At */
             created_at: string;
             /** Default Branch */
@@ -2239,6 +2326,11 @@ export interface components {
             is_git_repo: boolean;
             /** Name */
             name: string;
+            /**
+             * Pending Ruling Count
+             * @default 0
+             */
+            pending_ruling_count: number;
             /** Root Path */
             root_path: string;
             /** Updated At */
@@ -2255,6 +2347,38 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    stream_board_api_board_stream_get: {
+        parameters: {
+            query?: {
+                workspace_id?: string | null;
+                once?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-Sent Events board stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     list_demos_api_demos_get: {
         parameters: {
             query?: never;
@@ -2317,6 +2441,11 @@ export interface operations {
         parameters: {
             query?: {
                 limit?: number;
+                workspace_id?: string | null;
+                workspace_mode?: ("brownfield" | "greenfield" | "spec_only") | null;
+                task_type?: ("feature" | "fix" | "refactor" | "blueprint") | null;
+                ball_holder?: ("human" | "agent" | "done") | null;
+                include_archived?: boolean;
             };
             header?: never;
             path?: never;

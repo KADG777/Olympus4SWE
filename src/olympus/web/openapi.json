@@ -2677,6 +2677,60 @@
         "title": "LiveProgress",
         "type": "object"
       },
+      "PantheonSeatSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "active_count": {
+            "title": "Active Count",
+            "type": "integer"
+          },
+          "god": {
+            "enum": [
+              "prometheus",
+              "athena",
+              "hephaestus",
+              "momus",
+              "argus"
+            ],
+            "title": "God",
+            "type": "string"
+          },
+          "oracle_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Oracle Ids",
+            "type": "array"
+          },
+          "role_label": {
+            "title": "Role Label",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "idle",
+              "working",
+              "waiting_on_human"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "waiting_count": {
+            "title": "Waiting Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "god",
+          "role_label",
+          "state",
+          "active_count",
+          "waiting_count",
+          "oracle_ids"
+        ],
+        "title": "PantheonSeatSummary",
+        "type": "object"
+      },
       "PauseCommand": {
         "additionalProperties": false,
         "properties": {
@@ -3907,6 +3961,17 @@
       "RunListResponse": {
         "additionalProperties": false,
         "properties": {
+          "active_workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Workspace Id"
+          },
           "default_run_id": {
             "anyOf": [
               {
@@ -3924,6 +3989,17 @@
             "title": "Ok",
             "type": "boolean"
           },
+          "pantheon": {
+            "items": {
+              "$ref": "#/components/schemas/PantheonSeatSummary"
+            },
+            "title": "Pantheon",
+            "type": "array"
+          },
+          "pending_ruling_total": {
+            "title": "Pending Ruling Total",
+            "type": "integer"
+          },
           "runs": {
             "items": {
               "$ref": "#/components/schemas/RunSummary"
@@ -3933,7 +4009,9 @@
           }
         },
         "required": [
-          "runs"
+          "runs",
+          "pantheon",
+          "pending_ruling_total"
         ],
         "title": "RunListResponse",
         "type": "object"
@@ -4273,13 +4351,56 @@
       "RunSummary": {
         "additionalProperties": false,
         "properties": {
+          "active_god": {
+            "enum": [
+              "prometheus",
+              "athena",
+              "hephaestus",
+              "momus",
+              "argus"
+            ],
+            "title": "Active God",
+            "type": "string"
+          },
+          "ball_holder": {
+            "enum": [
+              "human",
+              "agent",
+              "done"
+            ],
+            "title": "Ball Holder",
+            "type": "string"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
           },
+          "is_archived": {
+            "title": "Is Archived",
+            "type": "boolean"
+          },
           "mode": {
             "title": "Mode",
             "type": "string"
+          },
+          "pending_action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "clarify",
+                  "approve_spec",
+                  "approve_design",
+                  "approve_plan",
+                  "resolve_blocker",
+                  "review_delivery"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Action"
           },
           "run_id": {
             "title": "Run Id",
@@ -4293,6 +4414,20 @@
             "title": "Status",
             "type": "string"
           },
+          "status_badge": {
+            "title": "Status Badge",
+            "type": "string"
+          },
+          "task_type": {
+            "enum": [
+              "feature",
+              "fix",
+              "refactor",
+              "blueprint"
+            ],
+            "title": "Task Type",
+            "type": "string"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -4304,6 +4439,41 @@
           "workflow_name": {
             "title": "Workflow Name",
             "type": "string"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          },
+          "workspace_mode": {
+            "enum": [
+              "brownfield",
+              "greenfield",
+              "spec_only"
+            ],
+            "title": "Workspace Mode",
+            "type": "string"
+          },
+          "workspace_name": {
+            "title": "Workspace Name",
+            "type": "string"
+          },
+          "worktree_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worktree Branch"
           }
         },
         "required": [
@@ -4314,7 +4484,14 @@
           "state_revision",
           "workflow_name",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "workspace_name",
+          "workspace_mode",
+          "task_type",
+          "ball_holder",
+          "active_god",
+          "status_badge",
+          "is_archived"
         ],
         "title": "RunSummary",
         "type": "object"
@@ -4354,6 +4531,17 @@
       "SeedDemoResponse": {
         "additionalProperties": false,
         "properties": {
+          "active_workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Workspace Id"
+          },
           "default_run_id": {
             "anyOf": [
               {
@@ -4370,6 +4558,17 @@
             "default": true,
             "title": "Ok",
             "type": "boolean"
+          },
+          "pantheon": {
+            "items": {
+              "$ref": "#/components/schemas/PantheonSeatSummary"
+            },
+            "title": "Pantheon",
+            "type": "array"
+          },
+          "pending_ruling_total": {
+            "title": "Pending Ruling Total",
+            "type": "integer"
           },
           "runs": {
             "items": {
@@ -4388,7 +4587,9 @@
         },
         "required": [
           "seeded",
-          "runs"
+          "runs",
+          "pantheon",
+          "pending_ruling_total"
         ],
         "title": "SeedDemoResponse",
         "type": "object"
@@ -5730,6 +5931,11 @@
       "WorkspaceSummary": {
         "additionalProperties": false,
         "properties": {
+          "active_oracle_count": {
+            "default": 0,
+            "title": "Active Oracle Count",
+            "type": "integer"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -5752,6 +5958,11 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "pending_ruling_count": {
+            "default": 0,
+            "title": "Pending Ruling Count",
+            "type": "integer"
           },
           "root_path": {
             "title": "Root Path",
@@ -5785,6 +5996,62 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/board/stream": {
+      "get": {
+        "operationId": "stream_board_api_board_stream_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "once",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Once",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events board stream"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "Stream Board"
+      }
+    },
     "/api/demos": {
       "get": {
         "operationId": "list_demos_api_demos_get",
@@ -5853,6 +6120,96 @@
               "default": 50,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workspace_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "brownfield",
+                    "greenfield",
+                    "spec_only"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Mode"
+            }
+          },
+          {
+            "in": "query",
+            "name": "task_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "feature",
+                    "fix",
+                    "refactor",
+                    "blueprint"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ball_holder",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "human",
+                    "agent",
+                    "done"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ball Holder"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
             }
           }
         ],

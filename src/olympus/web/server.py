@@ -25,9 +25,15 @@ from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
-from olympus.web.projection import build_run_projection, read_recorded_attempt
+from olympus.web.projection import (
+    build_board_payload,
+    build_run_projection,
+    build_workspace_counts,
+    read_recorded_attempt,
+)
 from olympus.web.schemas import (
     AttemptArtifactsResponse,
+    BallHolder,
     CommandRequest,
     CommandResponse,
     ConflictResponse,
@@ -44,8 +50,10 @@ from olympus.web.schemas import (
     RunProjection,
     RunProjectionResponse,
     SeedDemoResponse,
+    TaskType,
     WorkflowsResponse,
     WorkspaceListResponse,
+    WorkspaceMode,
     WorkspaceResponse,
 )
 from olympus.web.supervisor import RunSupervisor
@@ -58,6 +66,8 @@ _STATIC_MIME_TYPES: dict[str, str] = {
     ".js": "text/javascript; charset=utf-8",
     ".html": "text/html; charset=utf-8",
     ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".webp": "image/webp",
 }
 
 
@@ -158,7 +168,12 @@ class AriadneApp:
         return workspace
 
     def list_workspaces_payload(self) -> dict[str, Any]:
-        return {"ok": True, "workspaces": self.store.list_workspaces()}
+        counts = build_workspace_counts(self.store)
+        workspaces = [
+            {**workspace, **counts.get(str(workspace["workspace_id"]), {})}
+            for workspace in self.store.list_workspaces()
+        ]
+        return {"ok": True, "workspaces": workspaces}
 
     def create_workspace(self, payload: CreateWorkspaceRequest) -> dict[str, Any]:
         """Register a local repository; never mutates an existing workspace tree."""
@@ -318,13 +333,25 @@ class AriadneApp:
         with self._retry_guard:
             return self._retry_locks.setdefault(operation_id, threading.Lock())
 
-    def list_runs_payload(self, *, limit: int = 50) -> dict[str, Any]:
-        runs = self.store.list_runs(limit=limit)
-        return {
-            "ok": True,
-            "runs": runs,
-            "default_run_id": runs[0]["run_id"] if runs else None,
-        }
+    def list_runs_payload(
+        self,
+        *,
+        limit: int | None = 50,
+        workspace_id: str | None = None,
+        workspace_mode: str | None = None,
+        task_type: str | None = None,
+        ball_holder: str | None = None,
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        return build_board_payload(
+            self.store,
+            limit=limit,
+            workspace_id=workspace_id,
+            workspace_mode=workspace_mode,
+            task_type=task_type,
+            ball_holder=ball_holder,
+            include_archived=include_archived,
+        )
 
     def _workspace_for(self, run_id: str) -> Path:
         return self.supervisor.resolve_workspace(run_id)
@@ -789,8 +816,22 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         return {"ok": True, "service": "olympus-ariadne", "version": "0.1.0"}
 
     @api.get("/api/runs", response_model=RunListResponse, responses=error_responses)
-    def list_runs(limit: int = 50) -> dict[str, Any]:
-        return service.list_runs_payload(limit=limit)
+    def list_runs(
+        limit: int = 50,
+        workspace_id: str | None = None,
+        workspace_mode: WorkspaceMode | None = None,
+        task_type: TaskType | None = None,
+        ball_holder: BallHolder | None = None,
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        return service.list_runs_payload(
+            limit=limit,
+            workspace_id=workspace_id,
+            workspace_mode=workspace_mode,
+            task_type=task_type,
+            ball_holder=ball_holder,
+            include_archived=include_archived,
+        )
 
     @api.get("/api/providers", response_model=ProvidersResponse, responses=error_responses)
     def list_providers() -> dict[str, Any]:
@@ -961,7 +1002,7 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             service.workspace_root,
             artifacts_root=service.artifacts_root,
         )
-        return {"ok": True, "seeded": seeded, **service.list_runs_payload()}
+        return {"ok": True, "seeded": seeded, **service.list_runs_payload(include_archived=True)}
 
     @api.get(
         "/api/runs/{run_id}/stream",
@@ -985,6 +1026,35 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
                 run_id,
                 initial=initial,
                 after_seq=after_seq,
+                once=once == 1,
+            ),
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @api.get(
+        "/api/board/stream",
+        response_class=_EventStreamResponse,
+        responses={
+            200: {
+                "description": "Server-Sent Events board stream",
+                "content": {"text/event-stream": {"schema": {"type": "string"}}},
+            },
+            **error_responses,
+        },
+    )
+    async def stream_board(
+        request: Request, workspace_id: str | None = None, once: int = 0
+    ) -> _EventStreamResponse:
+        return _EventStreamResponse(
+            _board_sse_stream(
+                service,
+                request,
+                workspace_id=workspace_id,
                 once=once == 1,
             ),
             headers={
@@ -1054,6 +1124,39 @@ async def _sse_stream(
         if previews != last_previews:
             yield _sse_frame("activity", {"run_id": run_id, "previews": previews})
             last_previews = previews
+
+
+async def _board_sse_stream(
+    service: AriadneApp,
+    request: Request,
+    *,
+    workspace_id: str | None,
+    once: bool,
+) -> AsyncIterator[str]:
+    """Board snapshot stream: 0.5s SQLite polls, aggregate-change emissions, 5s heartbeats."""
+    initial = await asyncio.to_thread(
+        service.list_runs_payload, workspace_id=workspace_id
+    )
+    yield _sse_frame("board", initial)
+    if once:
+        return
+
+    last_signature = json.dumps(initial, ensure_ascii=False, sort_keys=True)
+    ticks = 0
+    while True:
+        await asyncio.sleep(0.5)
+        if await request.is_disconnected():
+            return
+        ticks += 1
+        nxt = await asyncio.to_thread(
+            service.list_runs_payload, workspace_id=workspace_id
+        )
+        signature = json.dumps(nxt, ensure_ascii=False, sort_keys=True)
+        if signature != last_signature:
+            last_signature = signature
+            yield _sse_frame("board", nxt)
+        elif ticks % 10 == 0:
+            yield ": heartbeat\n\n"
 
 
 def serve_ariadne(

@@ -1348,16 +1348,46 @@ class RunStore:
         ).fetchone()
         return bool(row is not None and row["decision"] in _APPROVED_DECISIONS)
 
-    def list_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        *,
+        limit: int | None = 50,
+        workspace_id: str | None = None,
+        workspace_mode: str | None = None,
+        task_type: str | None = None,
+        include_archived: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List runs newest-first with optional Scope/Type/archive filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            clauses.append("r.workspace_id = ?")
+            params.append(workspace_id)
+        if workspace_mode is not None:
+            clauses.append("r.workspace_mode = ?")
+            params.append(workspace_mode)
+        if task_type is not None:
+            clauses.append("r.task_type = ?")
+            params.append(task_type)
+        if not include_archived:
+            clauses.append("r.status != ?")
+            params.append(RunStatus.CANCELLED.value)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(limit)
         conn = self._connect()
         try:
             rows = conn.execute(
-                """
-                SELECT run_id, title, mode, status, state_revision, workflow_name,
-                       created_at, updated_at
-                FROM runs ORDER BY rowid DESC LIMIT ?
+                f"""
+                SELECT r.run_id, r.title, r.mode, r.status, r.state_revision, r.workflow_name,
+                       r.created_at, r.updated_at, r.workspace_id, r.workspace_mode,
+                       r.task_type, r.workspace_root, w.name AS workspace_name
+                FROM runs AS r
+                LEFT JOIN workspaces AS w ON w.workspace_id = r.workspace_id
+                {where}ORDER BY r.rowid DESC {limit_sql}
                 """,
-                (limit,),
+                tuple(params),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
