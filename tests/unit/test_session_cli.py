@@ -1479,3 +1479,53 @@ def test_delivery_checks_and_symlinked_sandboxes_never_pollute_target_repo(
     assert rejected["status"] == "failed"
     assert "inside" in str(rejected["error"])
     assert not (repo2 / ".olympus").exists()
+
+
+def test_session_start_records_stage_driver_option_and_defaults_to_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OLYMPUS_STAGE_DRIVER", raising=False)
+    monkeypatch.delenv("OLYMPUS_WORKER_DRIVER", raising=False)
+    monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            "--stage-driver",
+            "native",
+            *_base(repo, tmp_path / "state-explicit"),
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    explicit = RunStore(tmp_path / "state-explicit" / "olympus.db").get_run(
+        str(start["run_id"])
+    )["execution_drivers"]
+    assert explicit["stage_driver"] == "native"
+    assert explicit["worker_driver"] == "auto"
+    assert explicit["reviewer_driver"] == "auto"
+
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    _patch_provider(monkeypatch, script)
+    code, default_start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--gate-policy",
+            "default",
+            *_base(repo, tmp_path / "state-default"),
+        ]
+    )
+    assert code == 0, json.dumps(default_start, indent=2)
+    recorded = RunStore(tmp_path / "state-default" / "olympus.db").get_run(
+        str(default_start["run_id"])
+    )["execution_drivers"]
+    assert recorded["stage_driver"] == "auto"

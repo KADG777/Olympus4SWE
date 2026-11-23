@@ -20,9 +20,11 @@ from olympus.core.contracts import (
 from olympus.core.control import RunControl
 from olympus.core.dag import validate_goal_spec
 from olympus.core.store import RunStore
+from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
 from olympus.harness.loop import AgentLoop
+from olympus.harness.structured import run_structured_turn
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory
+from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -141,11 +143,15 @@ class AlignStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         trace_dir: Path | None = None,
+        execution_drivers: ExecutionDriversConfig | None = None,
+        driver_registry: DriverRegistry | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
         self.workspace_root = Path(workspace_root).resolve()
         self.trace_dir = trace_dir
+        self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
+        self.driver_registry = driver_registry
 
     def _trace_file(self, run_id: str, name: str) -> Path | None:
         if self.trace_dir is None:
@@ -176,6 +182,13 @@ class AlignStage:
         ``brownfield`` run binds its scoped paths and git ref into the prompt.
         """
         self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -243,10 +256,19 @@ class AlignStage:
             exhausted_violations.extend(violations)
             return candidate
 
-        draft = loop.run_structured(
+        draft = run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="align:proposer",
             system_prompt=_ALIGN_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model_cls=GoalSpec,
+            trace_path=self._trace_file(run_id, "align-proposer"),
+            max_steps=max_steps,
             max_validation_retries=1,
             validation_header="[GOALSPEC VALIDATION FAILED]",
             validation_instruction=(
@@ -314,6 +336,13 @@ class AlignStage:
         critique_schema = json.dumps(CritiqueOutput.model_json_schema(), ensure_ascii=False)
 
         def run_one(perspective: CritiquePerspective) -> list[CritiqueNote]:
+            driver, driver_model = resolve_stage_driver(
+                settings=self.execution_drivers,
+                registry=self.driver_registry,
+                provider=self.provider,
+                store=self.store,
+                run_id=run_id,
+            )
             toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
             loop = AgentLoop(
                 provider=self.provider,
@@ -334,10 +363,19 @@ class AlignStage:
                 f"Set perspective='{perspective.value}' on every note.\n"
                 f"Return JSON matching schema:\n{critique_schema}"
             )
-            out = loop.run_structured(
+            out = run_structured_turn(
+                loop=loop,
+                driver=driver,
+                driver_model=driver_model,
+                store=self.store,
+                run_id=run_id,
+                workspace_root=self.workspace_root,
+                actor=f"align:critic-{perspective.value}",
                 system_prompt=sys_prompt,
                 user_prompt=user_prompt,
                 model_cls=CritiqueOutput,
+                trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
+                max_steps=6,
             )
             return out.notes
 

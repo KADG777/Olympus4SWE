@@ -6,12 +6,21 @@ from collections.abc import Sequence
 
 from pydantic import BaseModel
 
+from olympus.core.store import RunStore
+from olympus.harness.driver import (
+    AgentDriver,
+    DriverRegistry,
+    ExecutionDriversConfig,
+    default_driver_factories,
+    resolve_driver_spec,
+)
 from olympus.harness.loop import (
     AgentLoop,
     extract_json_payload,
     parse_model_json,
     strip_schema_meta_keys,
 )
+from olympus.providers.base import LLMProvider
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -75,10 +84,30 @@ def run_structured_loop[T: BaseModel](
     )
 
 
+def resolve_stage_driver(
+    *,
+    settings: ExecutionDriversConfig | None,
+    registry: DriverRegistry | None,
+    provider: LLMProvider,
+    store: RunStore,
+    run_id: str,
+) -> tuple[AgentDriver | None, str | None]:
+    """Resolve the planning-stage driver; ``None`` means the native ``AgentLoop``."""
+    config = settings or ExecutionDriversConfig.resolve()
+    spec = resolve_driver_spec(config.stage_driver, provider=provider)
+    if spec.partition("@")[0] == "native":
+        return None, None
+    resolved_registry = (registry or DriverRegistry()).with_factories(
+        default_driver_factories(store=store, run_id=run_id)
+    )
+    return resolved_registry.resolve_external(spec)
+
+
 __all__ = [
     "extract_json_payload",
     "format_workspace_inventory",
     "parse_model_json",
+    "resolve_stage_driver",
     "run_structured_loop",
     "strip_schema_meta_keys",
 ]

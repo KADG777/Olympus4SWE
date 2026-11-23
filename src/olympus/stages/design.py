@@ -23,9 +23,11 @@ from olympus.core.contracts import (
 from olympus.core.control import RunControl
 from olympus.core.dag import validate_design_spec, validate_goal_spec
 from olympus.core.store import RunStore
+from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
 from olympus.harness.loop import AgentLoop
+from olympus.harness.structured import run_structured_turn
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory
+from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
 from olympus.tools.aci import WorkspaceToolkit
 
 # Free-form prose below this length can never carry a frozen contract.
@@ -364,10 +366,15 @@ class DesignStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
+        *,
+        execution_drivers: ExecutionDriversConfig | None = None,
+        driver_registry: DriverRegistry | None = None,
     ) -> None:
         self.store = store
         self.provider = provider
         self.workspace_root = Path(workspace_root).resolve()
+        self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
+        self.driver_registry = driver_registry
         self.artifacts_root = (
             artifacts_root
             if artifacts_root is not None
@@ -411,6 +418,13 @@ class DesignStage:
             detail={"spec_id": spec.spec_id, "spec_hash": spec.content_hash},
         )
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
         inventory = format_workspace_inventory(toolkit)
         schema_json = json.dumps(DesignSpec.model_json_schema(), ensure_ascii=False)
         trace_path = self._run_dir(run_id) / "traces" / "designer.jsonl"
@@ -448,10 +462,19 @@ class DesignStage:
         def raise_exhausted(candidate: DesignSpec, violations: list[str]) -> DesignSpec:
             raise DesignValidationError(violations)
 
-        design = loop.run_structured(
+        design = run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="design:architect",
             system_prompt=_DESIGN_SYSTEM_PROMPT,
             user_prompt=base_prompt,
             model_cls=DesignSpec,
+            trace_path=trace_path,
+            max_steps=max_steps,
             max_validation_retries=2,
             validation_header="[DESIGN VALIDATION FAILED]",
             validation_instruction=(
