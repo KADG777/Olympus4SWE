@@ -859,7 +859,11 @@ class RunControl:
         actor: str = "zeus",
         command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Idempotently reset a BLOCKED/FAILED task back to READY for another cycle."""
+        """Idempotently reset a BLOCKED/FAILED task back to READY for another cycle.
+
+        ``attempt`` is preserved so the next lease acquisition stays monotonic and
+        ``OrchestrateStage`` reopens the retained sandbox instead of a clean checkout.
+        """
 
         def mutate_retry(task: TaskNode) -> TaskNode:
             if task.status not in (TaskStatus.BLOCKED, TaskStatus.FAILED):
@@ -872,7 +876,13 @@ class RunControl:
                 else task.last_error
             )
             return task.model_copy(
-                update={"status": TaskStatus.READY, "review_cycle": 0, "last_error": new_error}
+                update={
+                    "status": TaskStatus.READY,
+                    "attempt": task.attempt,
+                    "review_cycle": 0,
+                    "last_error": new_error,
+                    "in_place_recoveries": task.in_place_recoveries + 1,
+                }
             )
 
         return self._apply_task_command(

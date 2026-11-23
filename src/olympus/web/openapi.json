@@ -3821,6 +3821,14 @@
         "title": "RetryWorkflowCommand",
         "type": "object"
       },
+      "ReviewAxis": {
+        "enum": [
+          "spec",
+          "standards"
+        ],
+        "title": "ReviewAxis",
+        "type": "string"
+      },
       "ReviewEntry": {
         "additionalProperties": false,
         "properties": {
@@ -3918,6 +3926,10 @@
       "ReviewFinding": {
         "additionalProperties": false,
         "properties": {
+          "axis": {
+            "$ref": "#/components/schemas/ReviewAxis",
+            "default": "spec"
+          },
           "file_path": {
             "title": "File Path",
             "type": "string"
@@ -3943,6 +3955,28 @@
             "title": "Message",
             "type": "string"
           },
+          "repro_command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repro Command"
+          },
+          "requirement_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requirement Ref"
+          },
           "severity": {
             "$ref": "#/components/schemas/ReviewSeverity"
           },
@@ -3956,6 +3990,28 @@
               }
             ],
             "title": "Suggestion"
+          },
+          "verification_output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Output"
+          },
+          "verified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified"
           }
         },
         "required": [
@@ -4027,6 +4083,12 @@
               }
             ],
             "title": "Checked Commit"
+          },
+          "dropped_unverified_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Dropped Unverified Count",
+            "type": "integer"
           },
           "findings": {
             "items": {
@@ -5091,6 +5153,12 @@
             "title": "Design Refs",
             "type": "array"
           },
+          "in_place_recoveries": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "In Place Recoveries",
+            "type": "integer"
+          },
           "kind": {
             "$ref": "#/components/schemas/TaskKind",
             "default": "implement"
@@ -5162,6 +5230,13 @@
             "minLength": 1,
             "title": "Title",
             "type": "string"
+          },
+          "verified_repro_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Verified Repro Commands",
+            "type": "array"
           },
           "worktree_path": {
             "anyOf": [

@@ -37,6 +37,8 @@ class DiffGateResult:
     violations: tuple[DiffGateViolation, ...]
     allowed_write_scope: tuple[str, ...]
     forbidden_globs: tuple[str, ...]
+    advisory_out_of_scope: tuple[str, ...] = ()
+    strict_scope: bool = True
 
     @property
     def rejected(self) -> bool:
@@ -57,6 +59,11 @@ class DiffGateResult:
             else:
                 detail = "outside authorized write_scope"
             lines.append(f"- {violation.path} ({detail})")
+        if self.advisory_out_of_scope:
+            lines.append(
+                "Advisory out-of-declared-scope paths (non-blocking): "
+                f"{json.dumps(list(self.advisory_out_of_scope))}"
+            )
         lines.append(
             "No changes were reverted. Move these paths back inside the authorized scope "
             "or request a scope change, then retry."
@@ -69,13 +76,20 @@ def evaluate_sandbox_changes(
     *,
     allowed_write_scope: Sequence[str],
     forbidden_globs: Sequence[str],
+    strict_scope: bool = True,
 ) -> DiffGateResult:
-    """Classify each changed relative path using the shared WorkspacePolicy matcher."""
+    """Classify each changed relative path using the shared WorkspacePolicy matcher.
+
+    ``forbidden_globs`` are always hard violations. Paths outside ``allowed_write_scope``
+    are hard violations under ``strict_scope=True`` (concurrent waves) and advisory audit
+    metadata under ``strict_scope=False`` (single-task/serial execution).
+    """
     policy = WorkspacePolicy(
         allowed_write_scope=allowed_write_scope,
         forbidden_write_scope=forbidden_globs,
     )
     violations: list[DiffGateViolation] = []
+    advisory: list[str] = []
     for rel in sorted(set(changed_paths)):
         matched = policy.forbidden_match(rel)
         if matched is not None:
@@ -87,12 +101,17 @@ def evaluate_sandbox_changes(
                 )
             )
         elif not policy.allows_relative_path(rel):
-            violations.append(DiffGateViolation(path=rel, reason=OUTSIDE_SCOPE_REASON))
+            if strict_scope:
+                violations.append(DiffGateViolation(path=rel, reason=OUTSIDE_SCOPE_REASON))
+            else:
+                advisory.append(rel)
     return DiffGateResult(
         changed_paths=tuple(changed_paths),
         violations=tuple(violations),
         allowed_write_scope=tuple(allowed_write_scope),
         forbidden_globs=tuple(forbidden_globs),
+        advisory_out_of_scope=tuple(advisory),
+        strict_scope=strict_scope,
     )
 
 
@@ -102,10 +121,12 @@ def run_diff_gate(
     *,
     allowed_write_scope: Sequence[str],
     forbidden_globs: Sequence[str],
+    strict_scope: bool = True,
 ) -> DiffGateResult:
     """Collect worker mutations in the sandbox and evaluate them against its scope."""
     return evaluate_sandbox_changes(
         collect_sandbox_changes(handle, baseline),
         allowed_write_scope=allowed_write_scope,
         forbidden_globs=forbidden_globs,
+        strict_scope=strict_scope,
     )

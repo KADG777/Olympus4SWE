@@ -306,10 +306,22 @@ def test_stage2_end_to_end_rework_cold_review_and_dag_unlock(tmp_path: Path) -> 
                             "findings": [
                                 {
                                     "id": "F-1",
+                                    "axis": "spec",
                                     "severity": "important",
                                     "file_path": "math_lib.py",
                                     "line": 2,
-                                    "message": "Raises ZeroDivisionError instead of ValueError",
+                                    "requirement_ref": "R1",
+                                    "repro_command": (
+                                        'python3 -c "import math_lib\n'
+                                        "try:\n"
+                                        "    math_lib.divide(1, 0)\n"
+                                        "except ValueError:\n"
+                                        "    raise SystemExit(0)\n"
+                                        'raise SystemExit(1)"'
+                                    ),
+                                    "message": (
+                                        "Raises ZeroDivisionError instead of ValueError"
+                                    ),
                                 }
                             ],
                         }

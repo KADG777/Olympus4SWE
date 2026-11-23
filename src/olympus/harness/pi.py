@@ -542,6 +542,7 @@ class _PiTurn:
         env = _build_pi_env(self._request)
         env["OLYMPUS_PI_WRITE_SCOPE"] = json.dumps(self._request.write_scope)
         env["OLYMPUS_PI_FORBIDDEN_GLOBS"] = json.dumps(self._request.forbidden_globs)
+        env["OLYMPUS_PI_STRICT_SCOPE"] = "1" if self._request.strict_scope else "0"
         provider_name, model_id, cfg_dir, extra_secrets = _prepare_gateway_config(
             env, self._request.model, provider=self._provider
         )

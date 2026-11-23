@@ -18,7 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 from olympus.cli.app import app
-from olympus.core.contracts import ApprovalTarget, GoalSpec, RunStatus
+from olympus.core.contracts import ApprovalTarget, GoalSpec, RunStatus, TaskStatus
 from olympus.core.store import RunStore
 from olympus.graph.loader import WORKFLOW_DIR
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolCall, ToolSpec
@@ -42,6 +42,15 @@ _DIVIDE_CHECK = (
 _SUBTRACT_CHECK = (
     "python3 -c \"import calculator; assert calculator.subtract(5, 2) == 3\""
 )
+_FAILING_CHECK = 'python3 -c "raise SystemExit(1)"'
+
+
+def _flag_check(flag: Path) -> str:
+    return (
+        'python3 -c "import calculator, pathlib; '
+        "assert calculator.divide(6, 2) == 3; "
+        f"assert pathlib.Path('{flag}').is_file()\""
+    )
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -77,9 +86,10 @@ class SessionScript:
         self.design: list[str] = []
         self.plan: list[str] = []
         self.router: list[str] = []
-        self.workers: list[tuple[str, str]] = []
+        self.workers: list[tuple[str, str] | None] = []
         self.worker_rounds = 0
         self.planner_prompts: list[str] = []
+        self.worker_prompts: list[str] = []
 
     def provider(self) -> MockLLMProvider:
         return MockLLMProvider(responder=self._respond)
@@ -120,7 +130,11 @@ class SessionScript:
                 self.worker_rounds += 1
                 return LLMResponse(content="Implementation finished.")
             assert self.workers, "worker response queue exhausted"
-            relative, content = self.workers.pop(0)
+            self.worker_prompts.append(user)
+            entry = self.workers.pop(0)
+            if entry is None:
+                return LLMResponse(content="Implementation finished.")
+            relative, content = entry
             match = re.search(r"Sandbox workspace root: (.+)", user)
             assert match is not None
             sandbox = Path(match.group(1).strip())
@@ -764,6 +778,196 @@ def test_blocked_pause_hint_without_design_restarts_from_align(
     assert recovery["recovery_node"] == "align"
 
 
+def test_execution_blocked_hint_recovers_in_place_on_retained_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    unblock_flag = tmp_path / "human-unblock.flag"
+    hint = "The flag was missing; keep calculator.py and continue without rewriting it."
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan(command=_flag_check(unblock_flag))))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 3)
+    script.workers.append(None)
+    script.router.append(json.dumps({"action": "revise", "feedback": hint}))
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(blocked, indent=2)
+    assert blocked["pause_kind"] == "blocked"
+    run_id = str(blocked["run_id"])
+    store = RunStore(state / "olympus.db")
+    plan_before = store.get_run(run_id)["plan"]
+    assert plan_before is not None
+    blocked_task = plan_before.tasks[0]
+    assert blocked_task.task_id == "T1"
+    assert blocked_task.status == TaskStatus.BLOCKED
+    assert blocked_task.attempt == 3
+    assert blocked_task.review_cycle == 3
+    assert blocked_task.in_place_recoveries == 0
+    assert len(script.worker_prompts) == 3
+    assert len(script.planner_prompts) == 1
+
+    sandbox = state / "sandboxes" / f"{run_id}-T1"
+    assert (sandbox / "calculator.py").read_text(encoding="utf-8") == _CALC_CODE
+    unblock_flag.write_text("ready\n", encoding="utf-8")
+
+    code, recovered = _invoke(["reply", run_id, hint, *_base(repo, state)])
+    assert code == 0, json.dumps(recovered, indent=2)
+    assert recovered["status"] == "completed"
+    assert recovered["changed_files"] == ["calculator.py"]
+    assert (repo / "calculator.py").read_text(encoding="utf-8") == _CALC_CODE
+
+    plan_after = store.get_run(run_id)["plan"]
+    assert plan_after is not None
+    assert plan_after.plan_id == plan_before.plan_id
+    task = plan_after.tasks[0]
+    assert task.task_id == "T1"
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 4
+    assert task.review_cycle == 0
+    assert task.in_place_recoveries == 1
+    assert len(script.planner_prompts) == 1
+    assert script.plan == []
+    assert script.align == []
+    assert script.design == []
+
+    assert len(script.worker_prompts) == 4
+    repair_prompt = script.worker_prompts[-1]
+    assert "[IN-PLACE REPAIR]" in repair_prompt
+    assert f"Sandbox workspace root: {sandbox}" in repair_prompt
+    assert f"[Human hint]: {hint}" in repair_prompt
+
+    events = store.list_events(run_id)
+    continued = [event.payload for event in events if event.event_type == "session.continued"]
+    assert len(continued) == 1
+    assert continued[0]["feedback"] == hint
+    assert continued[0]["recovery_mode"] == "in_place"
+    assert continued[0]["recovery_node"] == "execute"
+    assert continued[0]["retried_task_ids"] == ["T1"]
+    retried = [event for event in events if event.event_type == "task.retried_by_human"]
+    assert len(retried) == 1
+    assert retried[0].payload["hint"] == hint
+    assert not any(event.event_type == "run.revision_requested" for event in events)
+
+
+def test_execution_blocked_in_place_recovery_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    hints = [
+        "Keep the current file and adjust only the zero guard.",
+        "Inspect the retained file before editing it again.",
+        "Try a smaller change inside calculator.py.",
+    ]
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan(command=_FAILING_CHECK)))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 9)
+    script.router.extend(json.dumps({"action": "revise", "feedback": hint}) for hint in hints)
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(blocked, indent=2)
+    assert blocked["pause_kind"] == "blocked"
+    run_id = str(blocked["run_id"])
+    store = RunStore(state / "olympus.db")
+
+    for expected_in_place, expected_attempt in ((1, 6), (2, 9)):
+        code, envelope = _invoke(
+            ["reply", run_id, hints[expected_in_place - 1], *_base(repo, state)]
+        )
+        assert code == 0, json.dumps(envelope, indent=2)
+        assert envelope["status"] == "needs_input"
+        assert envelope["pause_kind"] == "blocked"
+        task = store.get_run(run_id)["plan"].tasks[0]
+        assert task.status == TaskStatus.BLOCKED
+        assert task.in_place_recoveries == expected_in_place
+        assert task.attempt == expected_attempt
+        assert task.review_cycle == 3
+
+    worker_calls_before = len(script.worker_prompts)
+    planner_calls_before = len(script.planner_prompts)
+    code, exhausted = _invoke(["reply", run_id, hints[2], *_base(repo, state)])
+    assert code == 0, json.dumps(exhausted, indent=2)
+    assert exhausted["status"] == "needs_input"
+    assert exhausted["pause_kind"] == "blocked"
+    assert "max_in_place_recoveries = 2" in str(exhausted["message"])
+    task = store.get_run(run_id)["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.in_place_recoveries == 2
+    assert task.attempt == 9
+    assert len(script.worker_prompts) == worker_calls_before
+    assert len(script.planner_prompts) == planner_calls_before
+    assert script.workers == []
+    assert store.get_run(run_id)["status"] == RunStatus.AWAITING_HUMAN
+
+    events = store.list_events(run_id)
+    continued = [event for event in events if event.event_type == "session.continued"]
+    assert len(continued) == 2
+    assert all(event.payload["recovery_mode"] == "in_place" for event in continued)
+    assert all(event.payload["recovery_node"] == "execute" for event in continued)
+    assert not any(event.event_type == "run.revision_requested" for event in events)
+
+
+def test_planning_blocked_recovery_is_bounded_at_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    state = tmp_path / "state"
+    hint = "Keep the write scopes disjoint and retry the plan."
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.extend(json.dumps(_invalid_overlapping_plan()) for _ in range(12))
+    script.router.extend(json.dumps({"action": "revise", "feedback": hint}) for _ in range(4))
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(blocked, indent=2)
+    assert blocked["pause_kind"] == "blocked"
+    run_id = str(blocked["run_id"])
+    store = RunStore(state / "olympus.db")
+
+    for expected in (1, 2, 3):
+        code, envelope = _invoke(["reply", run_id, hint, *_base(repo, state)])
+        assert code == 0, json.dumps(envelope, indent=2)
+        assert envelope["status"] == "needs_input"
+        assert envelope["pause_kind"] == "blocked"
+        continued = [
+            event.payload
+            for event in store.list_events(run_id)
+            if event.event_type == "session.continued"
+        ]
+        assert len(continued) == expected
+        assert continued[-1]["recovery_node"] == "plan"
+        assert "recovery_mode" not in continued[-1]
+        assert hint in continued[-1]["raw_input"]
+    assert script.plan == []
+    assert len(script.planner_prompts) == 3 * 4
+
+    planner_calls_before = len(script.planner_prompts)
+    code, exhausted = _invoke(["reply", run_id, hint, *_base(repo, state)])
+    assert code == 0, json.dumps(exhausted, indent=2)
+    assert exhausted["status"] == "needs_input"
+    assert exhausted["pause_kind"] == "blocked"
+    assert "max_plan_recoveries = 3" in str(exhausted["message"])
+    assert len(script.planner_prompts) == planner_calls_before
+    continued = [
+        event for event in store.list_events(run_id) if event.event_type == "session.continued"
+    ]
+    assert len(continued) == 3
+    assert not any(event.payload.get("recovery_mode") == "in_place" for event in continued)
+    assert store.get_run(run_id)["status"] == RunStatus.AWAITING_HUMAN
+
+
 def test_post_completion_reply_reopens_and_applies_follow_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -831,6 +1035,13 @@ def test_post_completion_reply_reopens_and_applies_follow_up(
     event_types = {event.event_type for event in store.list_events(run_id)}
     assert "run.reopened" in event_types
     assert "session.continued" in event_types
+    continued = [
+        event.payload
+        for event in store.list_events(run_id)
+        if event.event_type == "session.continued"
+    ]
+    assert continued[-1]["reopened"] is True
+    assert "recovery_mode" not in continued[-1]
 
 
 def test_state_dir_inside_workspace_is_rejected_without_creating_files(
@@ -2136,3 +2347,93 @@ def test_session_reopen_completed_custom_align_workflow(
     assert code2 == 0, reopened
     assert reopened["workflow"] == "custom_blueprint"
     assert reopened["error"] is None
+
+
+def test_explicit_revise_prefix_while_execution_blocked_triggers_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    # Negation wording ("never") would be classified as unknown by the NL router if not
+    # parsed deterministically before parse_reply; no script.router entry is queued.
+    revision = "revise: never modify tests and remove division"
+    script = SessionScript()
+    script.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
+    script.design.extend([json.dumps(_design()), json.dumps(_design())])
+    script.plan.extend([json.dumps(_plan(command=_FAILING_CHECK)), json.dumps(_plan())])
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 6)
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0 and blocked["pause_kind"] == "blocked", blocked
+    run_id = str(blocked["run_id"])
+
+    code2, reply = _invoke(["reply", run_id, revision, *_base(repo, state)])
+    assert code2 == 0, reply
+    store = RunStore(state / "olympus.db")
+    events = store.list_events(run_id)
+    assert any(e.event_type == "run.revision_requested" for e in events)
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("recovery_mode") != "in_place"
+
+
+def test_budget_paused_execution_resumes_in_place_without_replanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.core.contracts import RunStatus, TaskStatus
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 4)
+    script.router.append(json.dumps({"action": "revise", "feedback": "Continue execution"}))
+    _patch_provider(monkeypatch, script)
+
+    # Start in plan-only mode to get an approved bound plan, then simulate a budget pause
+    # where the task returned to READY and the run paused in AWAITING_HUMAN / BLOCKED.
+    code, handoff = _invoke(
+        ["start", "Build a calculator library", "--step-mode", "plan_only", *_base(repo, state)]
+    )
+    assert code == 0 and handoff["pause_kind"] == "plan_handoff", handoff
+    run_id = str(handoff["run_id"])
+    store = RunStore(state / "olympus.db")
+    snap = store.get_run(run_id)
+    assert snap["plan"] is not None
+    task = snap["plan"].tasks[0]
+    store.save_plan(
+        run_id,
+        snap["plan"].model_copy(
+            update={"tasks": [task.model_copy(update={"status": TaskStatus.READY})]}
+        ),
+        actor="chronos",
+    )
+    snap2 = store.get_run(run_id)
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        expected_revision=int(snap2["state_revision"]),
+        actor="chronos",
+        stage="verify",
+        detail={"reason": "Paused due to budget limit"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="session",
+        event_type="session.paused",
+        actor="session",
+        payload={"pause_kind": "blocked", "node": None, "reason": "Budget paused"},
+    )
+
+    code2, resumed = _invoke(
+        ["reply", run_id, "Continue execution", "--step-mode", "execute", *_base(repo, state)]
+    )
+    assert code2 == 0 and resumed["status"] == "completed", resumed
+    events = store.list_events(run_id)
+    assert not any(e.event_type == "run.revision_requested" for e in events)
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("recovery_mode") == "resume_execution"

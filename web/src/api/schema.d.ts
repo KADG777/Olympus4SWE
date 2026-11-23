@@ -1673,6 +1673,11 @@ export interface components {
             /** Target Hash */
             target_hash?: string | null;
         };
+        /**
+         * ReviewAxis
+         * @enum {string}
+         */
+        ReviewAxis: "spec" | "standards";
         /** ReviewEntry */
         ReviewEntry: {
             /** Change */
@@ -1693,6 +1698,8 @@ export interface components {
         };
         /** ReviewFinding */
         ReviewFinding: {
+            /** @default spec */
+            axis: components["schemas"]["ReviewAxis"];
             /** File Path */
             file_path: string;
             /** Id */
@@ -1701,9 +1708,17 @@ export interface components {
             line?: number | null;
             /** Message */
             message: string;
+            /** Repro Command */
+            repro_command?: string | null;
+            /** Requirement Ref */
+            requirement_ref?: string | null;
             severity: components["schemas"]["ReviewSeverity"];
             /** Suggestion */
             suggestion?: string | null;
+            /** Verification Output */
+            verification_output?: string | null;
+            /** Verified */
+            verified?: boolean | null;
         };
         /** ReviewSection */
         ReviewSection: {
@@ -1725,6 +1740,11 @@ export interface components {
             attempt: number;
             /** Checked Commit */
             checked_commit?: string | null;
+            /**
+             * Dropped Unverified Count
+             * @default 0
+             */
+            dropped_unverified_count: number;
             /** Findings */
             findings?: components["schemas"]["ReviewFinding"][];
             /**
@@ -2085,6 +2105,11 @@ export interface components {
             depends_on?: string[];
             /** Design Refs */
             design_refs?: string[];
+            /**
+             * In Place Recoveries
+             * @default 0
+             */
+            in_place_recoveries: number;
             /** @default implement */
             kind: components["schemas"]["TaskKind"];
             /** Last Error */
@@ -2121,6 +2146,8 @@ export interface components {
             task_id: string;
             /** Title */
             title: string;
+            /** Verified Repro Commands */
+            verified_repro_commands?: string[];
             /** Worktree Path */
             worktree_path?: string | null;
             /** Write Scope */
