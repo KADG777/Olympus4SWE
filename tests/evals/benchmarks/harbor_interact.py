@@ -171,6 +171,7 @@ class InteractOptions:
     pi_package: str = "@earendil-works/pi-coding-agent"
     install_pi: bool | None = None
     pi_bin: str | None = None
+    pi_bundle: str | None = None
     step_roles: str | None = None
     plan_path: str = "/tmp/plan.md"
     initial_question: str = DEFAULT_INITIAL_QUESTION
@@ -545,17 +546,24 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                 '      UV_BOOT="$UV_BOOT_TRY"',
                 "    fi",
                 "  fi",
+                "  export UV_HTTP_TIMEOUT=120",
+                "  _uv_venv() {",
+                '    for _i in 1 2 3; do "$@" venv --quiet --python 3.13 "$VENV_DIR" '
+                "&& return 0; sleep 2; done",
+                "    return 1",
+                "  }",
                 '  if [ -n "$UV_BIN" ]; then',
-                '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
+                '    _uv_venv "$UV_BIN"',
                 f'    "$UV_BIN" pip install --quiet --python "$VENV_DIR/bin/python" {target}',
                 '  elif [ -n "$UV_BOOT" ]; then',
                 '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
-                '"$PY" -m uv venv --quiet --python 3.13 "$VENV_DIR"',
+                '_uv_venv "$PY" -m uv',
                 '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
                 f'"$PY" -m uv pip install --quiet --python "$VENV_DIR/bin/python" {target}',
                 "  elif command -v curl >/dev/null 2>&1; then",
-                "    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1",
-                '    "$HOME/.local/bin/uv" venv --quiet --python 3.13 "$VENV_DIR"',
+                "    curl -LsSf --retry 4 --retry-delay 2 https://astral.sh/uv/install.sh "
+                "| sh >/dev/null 2>&1",
+                '    _uv_venv "$HOME/.local/bin/uv"',
                 '    "$HOME/.local/bin/uv" pip install --quiet '
                 f'--python "$VENV_DIR/bin/python" {target}',
                 "  else",
@@ -586,6 +594,35 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
 
     async def _install_pi(self, environment: Any) -> None:
         options = self._interact
+        if options.pi_bundle:
+            bundle = Path(options.pi_bundle).expanduser().resolve()
+            if not bundle.is_file():
+                raise FileNotFoundError(f"Pi bundle not found: {bundle}")
+            await environment.upload_file(bundle, "/tmp/olympus-pi-bundle.tar.gz")
+            command = "\n".join(
+                [
+                    "set -eu",
+                    f"PI_DIR={shlex.quote(PI_PREFIX)}",
+                    'if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                    'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                    'tar -xzf /tmp/olympus-pi-bundle.tar.gz -C "$PI_DIR"',
+                    'rm -f /tmp/olympus-pi-bundle.tar.gz',
+                    'PI_BIN="$PI_DIR/bin/pi"',
+                    'chmod 755 "$PI_BIN"',
+                    'if [ -w /usr/local/bin ] && [ "$PI_BIN" != "/usr/local/bin/pi" ]; then '
+                    'ln -sf "$PI_BIN" /usr/local/bin/pi; fi',
+                    '"$PI_BIN" --version >/dev/null',
+                    'echo "$PI_BIN"',
+                ]
+            )
+            result = await self._exec(environment, command, timeout_sec=300)
+            candidates = [
+                line.strip()
+                for line in (result.stdout or "").splitlines()
+                if line.strip().startswith("/")
+            ]
+            self._installed_pi_bin = candidates[-1] if candidates else f"{PI_PREFIX}/bin/pi"
+            return
         pkg = shlex.quote(options.pi_package)
         command = "\n".join(
             [
@@ -614,16 +651,18 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                 'aarch64|arm64) NARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac',
                 '    NODE_DIR="$PI_DIR/node"',
                 '    mkdir -p "$NODE_DIR"',
-                '    curl -fsSL '
+                '    curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors '
                 '"https://nodejs.org/dist/v22.21.1/node-v22.21.1-linux-${NARCH}.tar.gz" '
-                '| tar -xz -C "$NODE_DIR" --strip-components=1',
+                '-o /tmp/olympus-node.tar.gz',
+                '    tar -xzf /tmp/olympus-node.tar.gz -C "$NODE_DIR" --strip-components=1',
+                '    rm -f /tmp/olympus-node.tar.gz',
                 '    NODE_BIN="$NODE_DIR/bin"',
                 "  elif command -v npm >/dev/null 2>&1; then",
                 '    NODE_BIN=$(dirname "$(command -v npm)")',
                 "  else",
                 "    echo 'curl or Node.js >= 22.19 with npm is required' >&2; exit 1",
                 "  fi",
-                '  PATH="$NODE_BIN:$PATH" "$NODE_BIN/npm" install -g --ignore-scripts '
+                '  PATH="$NODE_BIN:$PATH" npm install -g --ignore-scripts '
                 f'--prefix "$PI_DIR" {pkg} >/dev/null',
                 '  WRAP="$PI_DIR/bin/pi-olympus"',
                 '  printf \'#!/bin/sh\\nexport PATH="%s:$PATH"\\nexec "%s/bin/pi" "$@"\\n\' '

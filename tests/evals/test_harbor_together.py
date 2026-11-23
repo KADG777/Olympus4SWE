@@ -1842,3 +1842,33 @@ def test_overlapping_upstream_judge_calls_isolate_and_restore_gateway_model(
     observed = asyncio.run(_run_overlap())
     assert observed == {"A": "anthropic/gateway-A", "B": "anthropic/gateway-B"}
     assert llm_cfg.judge_model is baseline
+
+
+def test_together_install_pi_uploads_and_extracts_local_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "pi-bundle.tar.gz"
+    bundle.write_bytes(b"fake-tarball")
+    uploaded: list[tuple[Path, str]] = []
+    commands: list[str] = []
+
+    class _FakeEnv:
+        async def upload_file(self, source_path: Path, target_path: str) -> None:
+            uploaded.append((Path(source_path), target_path))
+
+        async def exec(self, command: str, **_kwargs: Any) -> Any:
+            commands.append(command)
+            if "tar -xzf /tmp/olympus-pi-bundle.tar.gz" in command:
+                return SimpleNamespace(
+                    stdout="/opt/olympus-pi/bin/pi\n", stderr="", return_code=0
+                )
+            return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+    agent = UserEnabledOlympusAgent(
+        logs_dir=tmp_path / "logs",
+        model_name="openai/gpt-4o",
+        pi_bundle=str(bundle),
+        olympus_install="none",
+    )
+    asyncio.run(agent._install_pi(_FakeEnv()))
+    assert uploaded == [(bundle.resolve(), "/tmp/olympus-pi-bundle.tar.gz")]
+    assert agent._extra_env["OLYMPUS_PI_BIN"] == "/opt/olympus-pi/bin/pi"
+    assert any("tar -xzf /tmp/olympus-pi-bundle.tar.gz" in cmd for cmd in commands)

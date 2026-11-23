@@ -2115,3 +2115,19 @@ def test_interact_install_script_falls_back_to_curl_when_pip_fails(tmp_path: Pat
     env = {**os.environ, "PATH": str(bin_dir), "HOME": str(tmp_path), "CALLS": str(calls)}
     subprocess.run(["/bin/bash", "-c", script], capture_output=True, env=env, check=False)
     assert calls.exists()
+
+
+def test_interact_install_pi_uploads_and_extracts_local_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "pi-bundle.tar.gz"
+    bundle.write_bytes(b"fake-tarball")
+
+    def _handler(command: str, *_args: Any) -> ExecResult:
+        if "tar -xzf /tmp/olympus-pi-bundle.tar.gz" in command:
+            return ExecResult(stdout="/opt/olympus/pi/bin/pi\n", stderr="", return_code=0)
+        return ExecResult(stdout="", stderr="", return_code=0)
+
+    env = FakeEnvironment(handler=_handler)
+    agent = _agent(tmp_path, pi_bundle=str(bundle))
+    asyncio.run(agent.setup(env))
+    assert any(dst == "/tmp/olympus-pi-bundle.tar.gz" for _src, dst, _text in env.uploads)
+    assert agent._installed_pi_bin == "/opt/olympus/pi/bin/pi"
