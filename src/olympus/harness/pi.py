@@ -105,6 +105,18 @@ def _redact_secrets(text: str, secrets: tuple[str, ...]) -> str:
     return redacted
 
 
+def _redact_value(value: Any, secrets: tuple[str, ...]) -> Any:
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        return _redact_secrets(value, secrets)
+    if isinstance(value, dict):
+        return {k: _redact_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item, secrets) for item in value]
+    return value
+
+
 def pi_available(*, binary: str | None = None) -> bool:
     """Return True when the Pi CLI resolves and passes its cached ``--help`` probe."""
     requested = (binary or os.getenv("OLYMPUS_PI_BIN", "") or "pi").strip()
@@ -349,12 +361,18 @@ class _TraceWriter:
         self._path = path
         self._lock = threading.Lock()
         self._handle: Any = None
+        self._secrets: tuple[str, ...] = ()
+
+    def set_secrets(self, secrets: tuple[str, ...]) -> None:
+        with self._lock:
+            self._secrets = secrets
 
     def append(self, entry: dict[str, Any]) -> None:
         if self._path is None:
             return
-        record = {"timestamp": utc_now().isoformat(), **entry}
         with self._lock:
+            safe_entry = _redact_value(entry, self._secrets)
+            record = {"timestamp": utc_now().isoformat(), **safe_entry}
             if self._handle is None:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 self._handle = self._path.open("a", encoding="utf-8")
@@ -531,6 +549,7 @@ class _PiTurn:
         self._gateway_model = model_id
         self._gateway_config_dir = cfg_dir
         self._redaction_secrets = _collect_redaction_secrets(env, extra_secrets)
+        self._trace.set_secrets(self._redaction_secrets)
         command = self._build_command()
         self._trace.append(
             {
@@ -1014,7 +1033,7 @@ class _PiTurn:
         if self._budget_exhausted_reason:
             return False, self._budget_exhausted_reason, ""
         if self._max_steps_exceeded:
-            return False, "max_steps_exceeded", ""
+            return False, "max_steps_exceeded", self._final_content
         if self._prompt_error:
             return False, self._pi_error_reason(self._prompt_error), ""
         if self._cancel_requested:

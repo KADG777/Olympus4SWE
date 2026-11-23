@@ -1958,6 +1958,56 @@ def test_router_blocks_negated_defaults_questions_and_unchanged_refusals() -> No
     )
     assert keep_intent.action == "unknown"
 
+    # Conditional warnings and questions about defaults must never auto-fill blockers.
+    cond_intent = parse_reply(
+        provider=MockLLMProvider(responses=[LLMResponse(content="not json")]),
+        message="If we use your default assumptions, we might lose data.",
+        snapshot=snap,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert cond_intent.action == "unknown"
+    assert cond_intent.answers == {}
+
+    # Rejecting defaults while supplying one explicit ID must keep only that explicit ID.
+    spec2 = GoalSpec.model_validate(
+        {
+            **_goal_spec(),
+            "open_ambiguities": [
+                {
+                    "id": "backend",
+                    "question": "Choose backend?",
+                    "impact": "Storage",
+                    "blocking": True,
+                    "default_assumption": "isolation",
+                },
+                {
+                    "id": "limit",
+                    "question": "Choose limit?",
+                    "impact": "Quota",
+                    "blocking": True,
+                    "default_assumption": "20",
+                },
+            ],
+        }
+    )
+    snap2 = {"status": RunStatus.AWAITING_HUMAN, "spec": spec2, "design": None, "plan": None}
+    mixed_intent = parse_reply(
+        provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps(
+                        {"action": "clarify", "answers": {"backend": "guessed", "limit": "20"}}
+                    )
+                )
+            ]
+        ),
+        message="Do not use your default assumptions.\nbackend: exact choice",
+        snapshot=snap2,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert mixed_intent.action == "clarify"
+    assert mixed_intent.answers == {"backend": "exact choice"}
+
 
 def test_session_reply_preserves_builtin_workflow_and_explicit_stage_driver_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2046,3 +2096,43 @@ def test_session_reply_preserves_builtin_workflow_and_explicit_stage_driver_over
     assert failed["status"] == "failed"
     assert "PiDriver requires" in str(failed["error"])
     _reset_pi_availability_cache()
+
+
+def test_session_reopen_completed_custom_align_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import re
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    custom = tmp_path / "custom.yaml"
+    original = (WORKFLOW_DIR / "product_blueprint.yaml").read_text(encoding="utf-8")
+    renamed = re.sub(r"(?m)(:\s*)align$", r"\1custom_align", original)
+    custom.write_text(
+        renamed.replace("name: product_blueprint", "name: custom_blueprint"),
+        encoding="utf-8",
+    )
+    script = SessionScript()
+    script.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.router.append(json.dumps({"action": "reopen", "feedback": "Add validation rule"}))
+    _patch_provider(monkeypatch, script)
+
+    code, started = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workflow",
+            str(custom),
+            *_base(repo, state),
+        ]
+    )
+    assert code == 0 and started["status"] == "completed", started
+    code2, reopened = _invoke(
+        ["reply", str(started["run_id"]), "Add validation rule", *_base(repo, state)]
+    )
+    assert code2 == 0, reopened
+    assert reopened["workflow"] == "custom_blueprint"
+    assert reopened["error"] is None

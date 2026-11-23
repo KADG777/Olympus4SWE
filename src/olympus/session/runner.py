@@ -939,7 +939,7 @@ class SessionRunner:
         return self._drive(
             run_id=run_id,
             raw_input=augmented,
-            start_from="align",
+            start_from=self._stage_node_name(definition, "align_goal"),
             definition=definition,
         )
 

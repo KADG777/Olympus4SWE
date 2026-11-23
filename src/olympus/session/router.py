@@ -206,8 +206,12 @@ _DEFAULT_ACCEPTANCE_PATTERNS = tuple(
     )
 )
 _QUESTION_PREFIX_RE = re.compile(
-    r"^\s*(?:what|which|why|how|who|when|where|can\s+you\s+explain|could\s+you\s+explain|"
-    r"tell\s+me\s+what|list\s+(?:the|your)|show\s+me)\b"
+    r"^\s*(?:what|which|why|how|who|when|where|should\s+we|can\s+you\s+explain|"
+    r"could\s+you\s+explain|tell\s+me\s+what|list\s+(?:the|your)|show\s+me)\b"
+)
+_CONDITIONAL_DEFAULTS_RE = re.compile(
+    r"\b(?:if|unless|whether|suppose|supposing|what\s+if|in\s+case)\b[^.!?\n]{0,60}"
+    r"\b(?:defaults?|assumptions?|recommendations?)\b"
 )
 _DEFAULT_ACCEPTANCE_CJK = (
     "按默认",
@@ -318,6 +322,7 @@ def _is_default_delegation(text: str) -> bool:
     lowered = text.casefold()
     if (
         _is_question(text)
+        or _CONDITIONAL_DEFAULTS_RE.search(lowered)
         or _negated_approval(lowered)
         or _negated_revision(lowered)
         or _negated_defaults(lowered)
@@ -415,7 +420,11 @@ def _keyword_fallback(
             resolutions=resolutions,
             message="Keyword fallback: explicit blocker answers",
         )
-    revise = any(token in text for token in _REVISE_TOKENS) and not _negated_revision(text)
+    revise = (
+        any(token in text for token in _REVISE_TOKENS)
+        and not _negated_revision(text)
+        and not _CONDITIONAL_DEFAULTS_RE.search(text)
+    )
     if _negated_approval(text):
         # A negated approval is never an approval: treat an explicit revision ask
         # as a revision and everything else as ambiguous, so no gate is confirmed.
@@ -470,14 +479,20 @@ def _sanitize(
     }
     explicit_answers, explicit_resolutions = _extract_explicit_clarifications(message, snapshot)
     lowered = message.casefold()
-    if not explicit_answers and not explicit_resolutions and (
-        _negated_defaults(lowered) or _negated_revision(lowered)
+    asks_about_defaults = _is_question(message) and any(
+        token in lowered for token in ("default", "assumption", "recommend", "默认", "推荐")
+    )
+    if (
+        _negated_defaults(lowered)
+        or _negated_revision(lowered)
+        or _CONDITIONAL_DEFAULTS_RE.search(lowered)
+        or asks_about_defaults
     ):
-        # A refusal ("do not use your default assumptions", "do not change anything")
-        # must never be promoted into blocker answers by the LLM router.
-        answers = {}
-        resolutions = {}
-    elif not answers and not resolutions:
+        # Never accept LLM-guessed answers when the user rejected defaults, asked a
+        # question about defaults, or posed a conditional warning; keep only explicit IDs.
+        answers = dict(explicit_answers)
+        resolutions = dict(explicit_resolutions)
+    else:
         answers.update(explicit_answers)
         resolutions.update(explicit_resolutions)
     defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
@@ -523,7 +538,7 @@ def _sanitize(
         # A pure "do not change anything" reply is never an approval.
         action = "unknown"
         feedback = ""
-    if action == "reopen" and _negated_approval(lowered):
+    if action == "reopen" and (_negated_approval(lowered) or _negated_defaults(lowered)):
         # A refusal must never reopen a completed run, even if the router guessed so.
         action = "unknown"
         feedback = ""

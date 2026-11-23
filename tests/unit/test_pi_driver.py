@@ -1935,3 +1935,78 @@ def test_design_and_orchestrate_default_artifacts_stay_outside_repo(tmp_path: Pa
     assert design.artifacts_root == state / "runs"
     assert orch.artifacts_root == state / "runs"
     assert not (workspace / ".olympus").exists()
+
+
+def test_pi_driver_redacts_milestone_records_and_preserves_draft_on_max_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import BaseModel
+
+    from olympus.harness.loop import AgentLoop
+    from olympus.harness.structured import run_structured_turn
+
+    class _Payload(BaseModel):
+        result: str
+
+    secret = "sk-milestone-trace-sentinel-98765"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    trace = tmp_path / "trace.jsonl"
+    capture = tmp_path / "cap-prompt.txt"
+    fake = tmp_path / "fake-pi-redact-cap"
+    fake.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if "--help" in sys.argv:
+    print("--mode json")
+    sys.exit(0)
+def emit(reason, text="", **extra):
+    msg = {{"role": "assistant", "stopReason": reason,
+            "content": [{{"type": "text", "text": text}}], **extra}}
+    print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
+if sys.argv[-1] == "redact":
+    emit("error", errorMessage="gateway error: " + os.environ["OPENAI_API_KEY"])
+elif "--no-tools" in sys.argv:
+    Path({str(capture)!r}).write_text(sys.argv[-1], encoding="utf-8")
+    verdict = "grounded" if "GROUNDED_DRAFT" in sys.argv[-1] else "bad"
+    emit("stop", json.dumps({{"result": verdict}}))
+else:
+    emit("toolUse", "GROUNDED_DRAFT")
+    emit("toolUse", "")
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    driver = PiDriver(binary=str(fake))
+
+    err_outcome = driver.run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="plan",
+            system_prompt="sys",
+            user_prompt="redact",
+            read_only=True,
+            max_steps=1,
+            trace_path=trace,
+        )
+    )
+    assert err_outcome.completed is False
+    assert secret not in err_outcome.stop_reason
+    assert secret not in trace.read_text(encoding="utf-8")
+
+    result = run_structured_turn(
+        loop=AgentLoop(provider=MockLLMProvider()),
+        driver=driver,
+        driver_model=None,
+        store=None,
+        run_id=None,
+        workspace_root=tmp_path,
+        actor="plan",
+        system_prompt="Return JSON",
+        user_prompt="Extract facts",
+        model_cls=_Payload,
+        max_steps=1,
+    )
+    assert "GROUNDED_DRAFT" in capture.read_text(encoding="utf-8")
+    assert result.result == "grounded"
