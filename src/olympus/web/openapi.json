@@ -783,6 +783,17 @@
             "title": "Auto Approve",
             "type": "boolean"
           },
+          "base_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Ref"
+          },
           "constraints": {
             "anyOf": [
               {
@@ -855,10 +866,41 @@
             ],
             "title": "Reviewer Driver"
           },
+          "scope_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope Paths"
+          },
           "sync": {
             "default": false,
             "title": "Sync",
             "type": "boolean"
+          },
+          "task_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "feature",
+                  "fix",
+                  "refactor",
+                  "blueprint"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Type"
           },
           "title": {
             "anyOf": [
@@ -892,6 +934,33 @@
               }
             ],
             "title": "Workflow Name"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          },
+          "workspace_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "brownfield",
+                  "greenfield",
+                  "spec_only"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Mode"
           },
           "workspace_root": {
             "anyOf": [
@@ -1024,6 +1093,42 @@
           "run_id"
         ],
         "title": "CreateRunResponse",
+        "type": "object"
+      },
+      "CreateWorkspaceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "create_if_missing": {
+            "default": false,
+            "title": "Create If Missing",
+            "type": "boolean"
+          },
+          "init_git": {
+            "default": false,
+            "title": "Init Git",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "root_path": {
+            "minLength": 1,
+            "title": "Root Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root_path"
+        ],
+        "title": "CreateWorkspaceRequest",
         "type": "object"
       },
       "CritiqueNote": {
@@ -1435,6 +1540,31 @@
           "owner_module_id"
         ],
         "title": "DataEntity",
+        "type": "object"
+      },
+      "DeleteWorkspaceResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "default": true,
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "title": "DeleteWorkspaceResponse",
         "type": "object"
       },
       "DeliverableKind": {
@@ -5554,6 +5684,98 @@
         ],
         "title": "WorkflowsResponse",
         "type": "object"
+      },
+      "WorkspaceListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "workspaces": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceSummary"
+            },
+            "title": "Workspaces",
+            "type": "array"
+          }
+        },
+        "required": [
+          "workspaces"
+        ],
+        "title": "WorkspaceListResponse",
+        "type": "object"
+      },
+      "WorkspaceResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WorkspaceSummary"
+          }
+        },
+        "required": [
+          "workspace"
+        ],
+        "title": "WorkspaceResponse",
+        "type": "object"
+      },
+      "WorkspaceSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "is_git_repo": {
+            "title": "Is Git Repo",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "root_path": {
+            "title": "Root Path",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "name",
+          "root_path",
+          "is_git_repo",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "WorkspaceSummary",
+        "type": "object"
       }
     }
   },
@@ -6220,6 +6442,119 @@
           }
         },
         "summary": "List Workflows"
+      }
+    },
+    "/api/workspaces": {
+      "get": {
+        "operationId": "list_workspaces_api_workspaces_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "List Workspaces"
+      },
+      "post": {
+        "operationId": "create_workspace_api_workspaces_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "Create Workspace"
+      }
+    },
+    "/api/workspaces/{workspace_id}": {
+      "delete": {
+        "operationId": "delete_workspace_api_workspaces__workspace_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteWorkspaceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "summary": "Delete Workspace"
       }
     },
     "/healthz": {

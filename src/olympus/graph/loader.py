@@ -159,6 +159,20 @@ def _node_intake(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
     del params
     runtime = _runtime(state)
     run_id = _run_id(state)
+    scope_payload = {
+        "workspace_id": state.get("workspace_id"),
+        "workspace_mode": state.get("workspace_mode") or "brownfield",
+        "task_type": state.get("task_type") or "feature",
+        "base_ref": state.get("base_ref"),
+        "scope_paths": list(state.get("scope_paths") or []),
+    }
+    runtime.store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.scope_bound",
+        actor="intake",
+        payload=scope_payload,
+    )
     result = triage_input(
         state.get("raw_input", ""),
         provider=runtime.provider,
@@ -196,6 +210,10 @@ def _node_align(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, A
         enable_critique=False,
         max_steps=runtime.max_steps,
         strict_canonical=bool(params.get("strict_canonical", True)),
+        workspace_mode=state.get("workspace_mode"),
+        task_type=state.get("task_type"),
+        base_ref=state.get("base_ref"),
+        scope_paths=list(state.get("scope_paths") or []),
     )
     if bool(params.get("auto_approve", False)) and not spec.unresolved_blockers():
         spec = stage.confirm_spec(run_id=run_id, approver=runtime.approver)

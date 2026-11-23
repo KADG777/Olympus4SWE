@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import subprocess
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,8 @@ from olympus.web.schemas import (
     ConflictResponse,
     CreateRunRequest,
     CreateRunResponse,
+    CreateWorkspaceRequest,
+    DeleteWorkspaceResponse,
     DemosResponse,
     ErrorResponse,
     EventsResponse,
@@ -41,6 +45,8 @@ from olympus.web.schemas import (
     RunProjectionResponse,
     SeedDemoResponse,
     WorkflowsResponse,
+    WorkspaceListResponse,
+    WorkspaceResponse,
 )
 from olympus.web.supervisor import RunSupervisor
 
@@ -53,6 +59,52 @@ _STATIC_MIME_TYPES: dict[str, str] = {
     ".html": "text/html; charset=utf-8",
     ".svg": "image/svg+xml",
 }
+
+
+@dataclass(frozen=True)
+class RunScope:
+    """Deterministic Scope x Type binding resolved before any run or LLM call."""
+
+    workspace_id: str | None
+    workspace_root: Path | None
+    workspace_mode: str
+    task_type: str
+    base_ref: str | None
+    scope_paths: list[str]
+
+
+def _detect_git_repo(root: Path) -> tuple[bool, str | None]:
+    """Read-only git metadata; returns ``(is_repo, current_branch)``."""
+    if not (root / ".git").exists():
+        return False, None
+    for args in (
+        ("rev-parse", "--abbrev-ref", "HEAD"),
+        ("symbolic-ref", "--short", "HEAD"),
+    ):
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True, None
+        branch = proc.stdout.strip()
+        if proc.returncode == 0 and branch and branch != "HEAD":
+            return True, branch
+    return True, None
+
+
+def _default_workflow_for(workspace_mode: str, task_type: str) -> str:
+    """Deterministic default workflow when the caller omits ``workflow_name``."""
+    if workspace_mode == "spec_only" or task_type == "blueprint":
+        return "product_blueprint"
+    if task_type == "fix":
+        return "repo_fast_patch"
+    return "full_sdlc_tdd"
+
 
 
 class AriadneApp:
@@ -85,6 +137,182 @@ class AriadneApp:
         )
         self._retry_guard = threading.Lock()
         self._retry_locks: dict[str, threading.Lock] = {}
+        self.default_workspace_id: str | None = None
+        self.ensure_default_workspace()
+
+    # ------------------------------------------------------------------ workspaces
+
+    def ensure_default_workspace(self) -> dict[str, Any] | None:
+        """Idempotently register the server's default ``workspace_root`` on startup."""
+        root = self.workspace_root
+        if not root.is_dir():
+            return None
+        is_git_repo, default_branch = _detect_git_repo(root)
+        workspace = self.store.register_workspace(
+            name=root.name or "workspace",
+            root_path=root,
+            is_git_repo=is_git_repo,
+            default_branch=default_branch,
+        )
+        self.default_workspace_id = str(workspace["workspace_id"])
+        return workspace
+
+    def list_workspaces_payload(self) -> dict[str, Any]:
+        return {"ok": True, "workspaces": self.store.list_workspaces()}
+
+    def create_workspace(self, payload: CreateWorkspaceRequest) -> dict[str, Any]:
+        """Register a local repository; never mutates an existing workspace tree."""
+        root = Path(payload.root_path).expanduser().resolve()
+        if self.store.get_workspace_by_root(root) is not None:
+            raise ValueError(f"Workspace already registered: {root}")
+        if not root.exists():
+            if not payload.create_if_missing:
+                raise ValueError(f"workspace_root not found: {payload.root_path}")
+            if not root.parent.is_dir():
+                raise ValueError(f"Workspace parent directory does not exist: {root.parent}")
+            try:
+                root.mkdir()
+            except OSError as exc:
+                raise ValueError(f"Cannot create workspace directory {root}: {exc}") from exc
+        elif not root.is_dir():
+            raise ValueError(f"workspace_root is not a directory: {root}")
+
+        is_git_repo, default_branch = _detect_git_repo(root)
+        if payload.init_git and not is_git_repo:
+            try:
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ValueError(f"git init failed in {root}: {exc}") from exc
+            is_git_repo, default_branch = _detect_git_repo(root)
+        workspace = self.store.register_workspace(
+            name=(payload.name or "").strip() or root.name or "workspace",
+            root_path=root,
+            is_git_repo=is_git_repo,
+            default_branch=default_branch,
+        )
+        return {"ok": True, "workspace": workspace}
+
+    def delete_workspace(self, workspace_id: str) -> dict[str, Any]:
+        """Unregister a workspace (metadata only); disk files and runs are untouched."""
+        if not self.store.delete_workspace(workspace_id):
+            raise NotFoundError(f"Unknown workspace_id: {workspace_id}")
+        return {"ok": True, "workspace_id": workspace_id, "deleted": True}
+
+    # ------------------------------------------------------------------ run scope
+
+    def prepare_run_scope(
+        self,
+        *,
+        workspace_id: str | None,
+        workspace_root: str | None,
+        workspace_mode: str | None,
+        task_type: str | None,
+        base_ref: str | None,
+        scope_paths: list[str] | None,
+    ) -> RunScope:
+        """Resolve and validate Scope x Type before any run row or LLM call exists."""
+        mode = workspace_mode or "brownfield"
+        kind = task_type or "feature"
+        target: Path | None = None
+        bound_id: str | None = None
+        if workspace_id:
+            workspace = self.store.get_workspace(workspace_id)
+            if workspace is None:
+                raise ValueError(f"Unknown workspace_id: {workspace_id}")
+            bound_id = str(workspace["workspace_id"])
+            target = Path(str(workspace["root_path"]))
+        if workspace_root:
+            candidate = Path(workspace_root).expanduser().resolve()
+            if target is not None and target.resolve() != candidate:
+                raise ValueError(
+                    f"workspace_id '{workspace_id}' does not match workspace_root {candidate}"
+                )
+            target = candidate
+
+        if mode == "greenfield":
+            if target is None:
+                raise ValueError(
+                    "greenfield requires a workspace_root target or a workspace_id to bind"
+                )
+            target = self._prepare_greenfield_target(target)
+            is_git_repo, default_branch = _detect_git_repo(target)
+            registered = self.store.register_workspace(
+                name=target.name or "workspace",
+                root_path=target,
+                is_git_repo=is_git_repo,
+                default_branch=default_branch,
+            )
+            bound_id = str(registered["workspace_id"])
+        else:
+            if target is not None and not target.is_dir():
+                raise ValueError(f"workspace_root not found: {target}")
+            if target is not None and bound_id is None:
+                existing = self.store.get_workspace_by_root(target)
+                if existing is not None:
+                    bound_id = str(existing["workspace_id"])
+            elif target is None and mode == "brownfield" and self.workspace_root.is_dir():
+                # A brownfield oracle without an explicit target runs against the
+                # server's auto-registered default workspace.
+                bound_id = self.default_workspace_id
+                target = self.workspace_root
+
+        containment_root = target if target is not None else self.workspace_root
+        normalized_scope = self._normalize_scope_paths(scope_paths, containment_root)
+        return RunScope(
+            workspace_id=bound_id,
+            workspace_root=target,
+            workspace_mode=mode,
+            task_type=kind,
+            base_ref=(base_ref or "").strip() or None,
+            scope_paths=normalized_scope,
+        )
+
+    @staticmethod
+    def _prepare_greenfield_target(target: Path) -> Path:
+        if target.exists():
+            if not target.is_dir():
+                raise ValueError(f"greenfield target is not a directory: {target}")
+            if any(target.iterdir()):
+                raise ValueError(
+                    f"greenfield target directory must be empty: {target}"
+                )
+            return target
+        if not target.parent.is_dir():
+            raise ValueError(
+                f"greenfield parent directory does not exist: {target.parent}"
+            )
+        try:
+            target.mkdir()
+        except OSError as exc:
+            raise ValueError(f"Cannot create greenfield workspace {target}: {exc}") from exc
+        return target
+
+    @staticmethod
+    def _normalize_scope_paths(scope_paths: list[str] | None, root: Path) -> list[str]:
+        """Validate containment and return canonical workspace-relative POSIX paths."""
+        if not scope_paths:
+            return []
+        resolved_root = Path(root).expanduser().resolve()
+        normalized: list[str] = []
+        for raw in scope_paths:
+            candidate = raw.strip()
+            if not candidate:
+                raise ValueError("scope_paths entries must not be blank")
+            resolved = (resolved_root / candidate).resolve()
+            if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+                raise ValueError(
+                    f"scope path '{raw}' must resolve strictly inside {resolved_root}"
+                )
+            relative = resolved.relative_to(resolved_root).as_posix()
+            if relative not in normalized:
+                normalized.append(relative)
+        return normalized
 
     def _retry_lock_for(self, operation_id: str) -> threading.Lock:
         with self._retry_guard:
@@ -626,6 +854,22 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
                     )
         raise NotFoundError("No matching current delivery evidence")
 
+    @api.get("/api/workspaces", response_model=WorkspaceListResponse, responses=error_responses)
+    def list_workspaces() -> dict[str, Any]:
+        return service.list_workspaces_payload()
+
+    @api.post("/api/workspaces", response_model=WorkspaceResponse, responses=error_responses)
+    def create_workspace(payload: CreateWorkspaceRequest) -> dict[str, Any]:
+        return service.create_workspace(payload)
+
+    @api.delete(
+        "/api/workspaces/{workspace_id}",
+        response_model=DeleteWorkspaceResponse,
+        responses=read_responses,
+    )
+    def delete_workspace(workspace_id: str) -> dict[str, Any]:
+        return service.delete_workspace(workspace_id)
+
     @api.post(
         "/api/runs",
         response_model=CreateRunResponse,
@@ -634,19 +878,23 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
     def create_run(payload: CreateRunRequest) -> dict[str, Any]:
         demo_id = (payload.demo_id or "").strip()
         preset: dict[str, Any] | None = None
-        resolved_ws: Path | str | None = payload.workspace_root
+        requested_root = payload.workspace_root
         if demo_id:
             preset, demo_ws = materialize_benchmark_demo(
                 demo_id,
                 workspace_parent=service.workspace_root / ".olympus" / "workspaces",
             )
-            if not resolved_ws:
-                resolved_ws = demo_ws
-        elif resolved_ws:
-            ws_candidate = Path(str(resolved_ws)).resolve()
-            if not ws_candidate.is_dir():
-                raise FileNotFoundError(f"workspace_root not found: {resolved_ws}")
-            resolved_ws = ws_candidate
+            if not requested_root:
+                requested_root = str(demo_ws)
+
+        scope = service.prepare_run_scope(
+            workspace_id=payload.workspace_id,
+            workspace_root=requested_root,
+            workspace_mode=payload.workspace_mode,
+            task_type=payload.task_type,
+            base_ref=payload.base_ref,
+            scope_paths=payload.scope_paths,
+        )
 
         default_goal = str(preset["raw_input"]) if preset else ""
         raw_input = str(payload.raw_input or payload.goal or default_goal).strip()
@@ -659,11 +907,20 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         else:
             constraints = []
         default_title = str(preset["title"]) if preset else raw_input[:60]
-        default_workflow = str(preset["default_workflow"]) if preset else "product_blueprint"
+        if payload.workflow_name:
+            resolved_workflow = payload.workflow_name
+        elif payload.workspace_mode is not None or payload.task_type is not None:
+            resolved_workflow = _default_workflow_for(
+                scope.workspace_mode, scope.task_type
+            )
+        elif preset:
+            resolved_workflow = str(preset["default_workflow"])
+        else:
+            resolved_workflow = "product_blueprint"
         started = service.supervisor.start_run(
             title=str(payload.title or default_title),
             raw_input=raw_input,
-            workflow_name=str(payload.workflow_name or default_workflow),
+            workflow_name=resolved_workflow,
             provider_config=payload.provider_config.model_dump(exclude_none=True),
             worker_driver=payload.worker_driver,
             reviewer_driver=payload.reviewer_driver,
@@ -671,7 +928,12 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             auto_approve=payload.auto_approve,
             sync=payload.sync,
             constraints=constraints,
-            workspace_root=resolved_ws,
+            workspace_root=scope.workspace_root,
+            workspace_id=scope.workspace_id,
+            workspace_mode=scope.workspace_mode,
+            task_type=scope.task_type,
+            base_ref=scope.base_ref,
+            scope_paths=scope.scope_paths,
         )
         return {"ok": True, **started}
 

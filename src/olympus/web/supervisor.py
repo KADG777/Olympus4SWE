@@ -379,6 +379,11 @@ class RunSupervisor:
                 "constraints": self._recorded_constraints(run_id),
                 "topology": definition.topology,
                 "route": None,
+                "workspace_id": snap.get("workspace_id"),
+                "workspace_mode": snap.get("workspace_mode") or "brownfield",
+                "task_type": snap.get("task_type") or "feature",
+                "base_ref": snap.get("base_ref"),
+                "scope_paths": list(snap.get("scope_paths") or []),
                 "_runtime": runtime,
             }
             if snap["spec"] is not None:
@@ -696,6 +701,11 @@ class RunSupervisor:
         sync: bool = False,
         constraints: list[str] | None = None,
         workspace_root: Path | str | None = None,
+        workspace_id: str | None = None,
+        workspace_mode: str = "brownfield",
+        task_type: str = "feature",
+        base_ref: str | None = None,
+        scope_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a run and drive its workflow until a human gate or completion."""
         definition = load_workflow(workflow_name)
@@ -705,12 +715,18 @@ class RunSupervisor:
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
         )
+        normalized_scope = [str(item) for item in (scope_paths or [])]
         run_id = self.store.create_run(
             title=title,
             workflow_name=definition.name,
             provider_config=config,
             execution_drivers=driver_config.model_dump(mode="json"),
             workspace_root=workspace_root,
+            workspace_id=workspace_id,
+            workspace_mode=workspace_mode,
+            task_type=task_type,
+            base_ref=base_ref,
+            scope_paths=normalized_scope,
             actor="supervisor",
         )
         cleaned_constraints = [str(c).strip() for c in (constraints or []) if str(c).strip()]
@@ -722,6 +738,11 @@ class RunSupervisor:
             payload={
                 "raw_input": raw_input,
                 "constraints": cleaned_constraints,
+                "workspace_id": workspace_id,
+                "workspace_mode": workspace_mode,
+                "task_type": task_type,
+                "base_ref": base_ref,
+                "scope_paths": normalized_scope,
             },
         )
         with self._guard:

@@ -768,3 +768,99 @@ def test_stage2_planner_inventory_and_clarification_propagation(tmp_path: Path) 
         assert len(prompt_list) == 1
         assert "Preserve insertion order" in prompt_list[0]
         assert "Return an empty dict {} rather than None" in prompt_list[0]
+
+
+def test_align_greenfield_skips_host_inventory_and_injects_directive(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    _init_git_repo(host)
+    (host / "src").mkdir()
+    (host / "src" / "host_only.py").write_text("x = 1\n", encoding="utf-8")
+    target = tmp_path / "standalone"
+    target.mkdir()
+    store = RunStore(host / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Greenfield align", mode=RunMode.EXECUTION)
+    captured: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        captured.append(messages[1].content)
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "goal": "Build a standalone todo app",
+                    "requirements": [
+                        {
+                            "id": "R1",
+                            "description": "Create and list todos",
+                            "acceptance_criteria": ["Todos persist across restarts"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    AlignStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=target,
+    ).propose_spec(
+        run_id=run_id,
+        raw_goal="Build a standalone todo app",
+        workspace_mode="greenfield",
+        task_type="feature",
+    )
+
+    assert len(captured) == 1
+    prompt = captured[0]
+    assert "GREENFIELD contract" in prompt
+    assert "skipped: greenfield" in prompt
+    assert "host_only.py" not in prompt
+    assert "Observed workspace files (1/1)" not in prompt
+
+
+def test_align_brownfield_binds_scope_and_fix_directive(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Fix align", mode=RunMode.EXECUTION)
+    captured: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        captured.append(messages[1].content)
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "goal": "Fix the module",
+                    "requirements": [
+                        {
+                            "id": "R1",
+                            "description": "Fix src/mod.py",
+                            "acceptance_criteria": ["Compile cleanly"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    AlignStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    ).propose_spec(
+        run_id=run_id,
+        raw_goal="Fix the module",
+        workspace_mode="brownfield",
+        task_type="fix",
+        base_ref="main",
+        scope_paths=["src/mod.py"],
+    )
+
+    assert len(captured) == 1
+    prompt = captured[0]
+    assert "Observed workspace files (2/2): README.md, src/mod.py" in prompt
+    assert "Brownfield binding:" in prompt
+    assert "Base git ref: main" in prompt
+    assert "Scoped paths (authoritative, workspace-relative): src/mod.py" in prompt
+    assert "Fix task directive" in prompt

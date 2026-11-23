@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -1843,3 +1844,355 @@ def test_run_snapshot_exposes_recorded_output_versions_with_task_graph(tmp_path:
         (1, original.content_hash, False),
     ]
     assert versions[0]["summary"] == "任务计划 v2 已就绪，包含 1 个任务"
+
+
+def _minimal_goal_responder(
+    messages: Sequence[object], tools: Sequence[object]
+) -> LLMResponse:
+    del messages, tools
+    return LLMResponse(
+        content=json.dumps(
+            {
+                "goal": "Deliver the requested outcome",
+                "requirements": [
+                    {
+                        "id": "R1",
+                        "description": "Deliver the requested outcome",
+                        "acceptance_criteria": ["Passes the stated acceptance check"],
+                    }
+                ],
+            }
+        )
+    )
+
+
+def _mock_scope_supervisor(store: RunStore, workspace_root: Path) -> RunSupervisor:
+    return RunSupervisor(
+        store=store,
+        workspace_root=workspace_root,
+        provider_builder=lambda **_: MockLLMProvider(responder=_minimal_goal_responder),
+    )
+
+
+def _create_run_and_settle(
+    client: TestClient, app: AriadneApp, payload: dict[str, object]
+) -> tuple[str, dict[str, object]]:
+    response = client.post("/api/runs", json=payload)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    app.supervisor.wait(str(body["run_id"]), timeout=60.0)
+    return str(body["run_id"]), body
+
+
+def test_workspace_registry_http_lifecycle_and_disk_is_untouched(tmp_path: Path) -> None:
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            listed = client.get("/api/workspaces")
+            assert listed.status_code == 200
+            workspaces = listed.json()["workspaces"]
+            assert len(workspaces) == 1
+            assert workspaces[0]["root_path"] == str(root.resolve())
+            assert workspaces[0]["name"] == root.name
+            assert workspaces[0]["is_git_repo"] is False
+
+            # Startup auto-registration is idempotent, not a duplicate row.
+            rebuilt = AriadneApp(store=store, workspace_root=root)
+            assert rebuilt.default_workspace_id == workspaces[0]["workspace_id"]
+            assert len(client.get("/api/workspaces").json()["workspaces"]) == 1
+
+            missing = client.post(
+                "/api/workspaces", json={"root_path": str(tmp_path / "missing")}
+            )
+            assert missing.status_code == 400
+            assert "not found" in missing.json()["error"]
+
+            project = tmp_path / "project-a"
+            created = client.post(
+                "/api/workspaces",
+                json={
+                    "name": "Project A",
+                    "root_path": str(project),
+                    "create_if_missing": True,
+                },
+            )
+            assert created.status_code == 200, created.text
+            workspace = created.json()["workspace"]
+            assert workspace["name"] == "Project A"
+            assert Path(workspace["root_path"]) == project.resolve()
+            assert workspace["is_git_repo"] is False
+
+            duplicate = client.post(
+                "/api/workspaces", json={"root_path": str(project)}
+            )
+            assert duplicate.status_code == 400
+            assert "already registered" in duplicate.json()["error"]
+
+            git_project = tmp_path / "project-git"
+            git_project.mkdir()
+            git_created = client.post(
+                "/api/workspaces",
+                json={"root_path": str(git_project), "init_git": True},
+            )
+            assert git_created.status_code == 200, git_created.text
+            assert git_created.json()["workspace"]["is_git_repo"] is True
+
+            marker = project / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            deleted = client.delete(f"/api/workspaces/{workspace['workspace_id']}")
+            assert deleted.status_code == 200
+            assert deleted.json() == {
+                "ok": True,
+                "workspace_id": workspace["workspace_id"],
+                "deleted": True,
+            }
+            assert marker.read_text(encoding="utf-8") == "keep\n"
+            assert client.delete(
+                f"/api/workspaces/{workspace['workspace_id']}"
+            ).status_code == 404
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_brownfield_run_validates_scope_before_any_llm_call(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(repo / ".olympus" / "olympus.db")
+    supervisor = _mock_scope_supervisor(store, repo)
+    app = AriadneApp(store=store, workspace_root=repo, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            missing_root = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "workspace_root": str(tmp_path / "nope"),
+                },
+            )
+            assert missing_root.status_code == 400
+            assert "workspace_root not found" in missing_root.json()["error"]
+
+            escaped = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "scope_paths": ["../outside.txt"],
+                },
+            )
+            assert escaped.status_code == 400
+            assert "strictly inside" in escaped.json()["error"]
+
+            root_itself = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "scope_paths": ["."],
+                },
+            )
+            assert root_itself.status_code == 400
+            assert store.list_runs() == []
+
+            run_id, body = _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "base_ref": "main",
+                    "scope_paths": ["src/mod.py", "./src/../src"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert body["workflow"] == "product_blueprint"
+            snapshot = store.get_run(run_id)
+            assert snapshot["workspace_mode"] == "brownfield"
+            assert snapshot["task_type"] == "fix"
+            assert snapshot["base_ref"] == "main"
+            assert snapshot["scope_paths"] == ["src/mod.py", "src"]
+            assert snapshot["workspace_id"] == app.default_workspace_id
+            assert snapshot["workspace_root"] == str(repo.resolve())
+
+            events = store.list_events(run_id)
+            recorded = next(
+                event for event in events if event.event_type == "graph.input_recorded"
+            )
+            assert recorded.payload["workspace_mode"] == "brownfield"
+            assert recorded.payload["task_type"] == "fix"
+            assert recorded.payload["base_ref"] == "main"
+            assert recorded.payload["scope_paths"] == ["src/mod.py", "src"]
+            assert recorded.payload["workspace_id"] == app.default_workspace_id
+            bound = next(
+                event for event in events if event.event_type == "graph.scope_bound"
+            )
+            assert bound.payload["workspace_mode"] == "brownfield"
+            assert bound.payload["task_type"] == "fix"
+            assert bound.payload["scope_paths"] == ["src/mod.py", "src"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_greenfield_run_creates_empty_workspace_and_rejects_populated_dirs(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "host"
+    (host / "src").mkdir(parents=True)
+    (host / "src" / "host_only.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(host / ".olympus" / "olympus.db")
+    supervisor = _mock_scope_supervisor(store, host)
+    app = AriadneApp(store=store, workspace_root=host, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            target = tmp_path / "brand-new"
+            run_id, _ = _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "task_type": "feature",
+                    "workspace_root": str(target),
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert target.is_dir()
+            assert list(target.iterdir()) == []
+            snapshot = store.get_run(run_id)
+            assert snapshot["workspace_mode"] == "greenfield"
+            assert snapshot["task_type"] == "feature"
+            assert snapshot["workspace_id"] is not None
+            registered = store.get_workspace(str(snapshot["workspace_id"]))
+            assert registered is not None
+            assert registered["root_path"] == str(target.resolve())
+            assert store.get_workspace_by_root(target) is not None
+
+            populated = tmp_path / "populated"
+            populated.mkdir()
+            (populated / "existing.txt").write_text("keep\n", encoding="utf-8")
+            rejected = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(populated),
+                },
+            )
+            assert rejected.status_code == 400
+            assert "must be empty" in rejected.json()["error"]
+            assert (populated / "existing.txt").read_text(encoding="utf-8") == "keep\n"
+
+            unbound = client.post(
+                "/api/runs",
+                json={"raw_input": "Build a standalone todo app", "workspace_mode": "greenfield"},
+            )
+            assert unbound.status_code == 400
+            assert "greenfield requires" in unbound.json()["error"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_greenfield_align_skips_host_inventory_over_http(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    (host / "src").mkdir(parents=True)
+    (host / "src" / "host_only.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(host / ".olympus" / "olympus.db")
+    captured_prompts: list[str] = []
+
+    def responder(messages: Sequence[object], tools: Sequence[object]) -> LLMResponse:
+        del tools
+        captured_prompts.append(str(getattr(messages[1], "content", "")))
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "goal": "Build a standalone todo app",
+                    "requirements": [
+                        {
+                            "id": "R1",
+                            "description": "Create and list todos",
+                            "acceptance_criteria": ["Todos persist across restarts"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=host,
+        provider_builder=lambda **_: MockLLMProvider(responder=responder),
+    )
+    app = AriadneApp(store=store, workspace_root=host, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            target = tmp_path / "oracle-board"
+            _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "task_type": "feature",
+                    "workspace_root": str(target),
+                    "workflow_name": "product_blueprint",
+                    "sync": True,
+                },
+            )
+        assert captured_prompts, "AlignStage never received a prompt"
+        prompt = captured_prompts[0]
+        assert "GREENFIELD contract" in prompt
+        assert "skipped: greenfield" in prompt
+        assert "host_only.py" not in prompt
+    finally:
+        supervisor.shutdown()
+
+
+def test_default_workflow_resolution_and_explicit_override(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunStore(repo / ".olympus" / "olympus.db")
+    supervisor = RunSupervisor(store=store, workspace_root=repo)
+    app = AriadneApp(store=store, workspace_root=repo, supervisor=supervisor)
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"workspace_mode": "spec_only", "task_type": "feature"}, "product_blueprint"),
+        ({"workspace_mode": "brownfield", "task_type": "blueprint"}, "product_blueprint"),
+        ({"workspace_mode": "brownfield", "task_type": "fix"}, "repo_fast_patch"),
+        ({"workspace_mode": "brownfield", "task_type": "feature"}, "full_sdlc_tdd"),
+        ({}, "product_blueprint"),
+        (
+            {
+                "workspace_mode": "spec_only",
+                "task_type": "feature",
+                "workflow_name": "repo_fast_patch",
+            },
+            "repo_fast_patch",
+        ),
+    ]
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            for fields, expected in cases:
+                response = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": f"Deliver the {expected} outcome",
+                        "provider_config": {"provider": "mock"},
+                        **fields,
+                    },
+                )
+                assert response.status_code == 200, response.text
+                run_id = str(response.json()["run_id"])
+                assert store.get_run(run_id)["workflow_name"] == expected
+                supervisor.wait(run_id, timeout=60.0)
+    finally:
+        supervisor.shutdown()

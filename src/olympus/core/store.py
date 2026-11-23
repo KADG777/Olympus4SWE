@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS commands (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    root_path TEXT NOT NULL UNIQUE,
+    is_git_repo INTEGER NOT NULL,
+    default_branch TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -159,11 +169,137 @@ class RunStore:
             "provider_config_json": "provider_config_json TEXT",
             "execution_drivers_json": "execution_drivers_json TEXT",
             "workspace_root": "workspace_root TEXT",
+            "workspace_id": "workspace_id TEXT",
+            "workspace_mode": "workspace_mode TEXT NOT NULL DEFAULT 'brownfield'",
+            "task_type": "task_type TEXT NOT NULL DEFAULT 'feature'",
+            "base_ref": "base_ref TEXT",
+            "scope_paths_json": "scope_paths_json TEXT",
         }
         for column, ddl in additions.items():
             if column in existing:
                 continue
             conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+
+    # ------------------------------------------------------------------ workspaces
+
+    @staticmethod
+    def canonical_root(root_path: Path | str) -> str:
+        """Canonical absolute workspace root used as the registry's unique key."""
+        return str(Path(root_path).expanduser().resolve())
+
+    @staticmethod
+    def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "workspace_id": row["workspace_id"],
+            "name": row["name"],
+            "root_path": row["root_path"],
+            "is_git_repo": bool(row["is_git_repo"]),
+            "default_branch": row["default_branch"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_workspaces(self) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces ORDER BY rowid ASC
+                """
+            ).fetchall()
+            return [self._workspace_from_row(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE workspace_id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()
+            return self._workspace_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def get_workspace_by_root(self, root_path: Path | str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE root_path = ?
+                """,
+                (self.canonical_root(root_path),),
+            ).fetchone()
+            return self._workspace_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def register_workspace(
+        self,
+        *,
+        name: str,
+        root_path: Path | str,
+        is_git_repo: bool,
+        default_branch: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a workspace; registering an existing canonical root is a no-op."""
+        canonical = self.canonical_root(root_path)
+        with self._tx() as conn:
+            existing = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE root_path = ?
+                """,
+                (canonical,),
+            ).fetchone()
+            if existing is not None:
+                return self._workspace_from_row(existing)
+            workspace_id = new_id("ws")
+            now = utc_now().isoformat()
+            conn.execute(
+                """
+                INSERT INTO workspaces (
+                    workspace_id, name, root_path, is_git_repo, default_branch,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    name,
+                    canonical,
+                    int(is_git_repo),
+                    default_branch,
+                    now,
+                    now,
+                ),
+            )
+            return {
+                "workspace_id": workspace_id,
+                "name": name,
+                "root_path": canonical,
+                "is_git_repo": bool(is_git_repo),
+                "default_branch": default_branch,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    def delete_workspace(self, workspace_id: str) -> bool:
+        """Remove a workspace registry row only; disk files and runs stay untouched."""
+        with self._tx() as conn:
+            cursor = conn.execute(
+                "DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            )
+            return cursor.rowcount > 0
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -407,6 +543,11 @@ class RunStore:
         provider_config: dict[str, Any] | None = None,
         execution_drivers: dict[str, Any] | None = None,
         workspace_root: Path | str | None = None,
+        workspace_id: str | None = None,
+        workspace_mode: str = "brownfield",
+        task_type: str = "feature",
+        base_ref: str | None = None,
+        scope_paths: Sequence[str] | None = None,
     ) -> str:
         rid = run_id or new_id("run")
         policy = budget_policy or BudgetPolicy()
@@ -418,6 +559,8 @@ class RunStore:
             else None
         )
         ws_root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
+        cleaned_scope = [str(item) for item in (scope_paths or [])]
+        scope_json = json.dumps(cleaned_scope, ensure_ascii=False) if cleaned_scope else None
         with self._tx() as conn:
             conn.execute(
                 """
@@ -426,8 +569,9 @@ class RunStore:
                     budget_policy_json, budget_ledger_json,
                     spec_json, plan_json, design_json,
                     workflow_name, provider_config_json, execution_drivers_json, workspace_root,
+                    workspace_id, workspace_mode, task_type, base_ref, scope_paths_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rid,
@@ -441,6 +585,11 @@ class RunStore:
                     provider_json,
                     json.dumps(execution_drivers) if execution_drivers is not None else None,
                     ws_root,
+                    workspace_id,
+                    workspace_mode,
+                    task_type,
+                    base_ref,
+                    scope_json,
                     now,
                     now,
                 ),
@@ -456,6 +605,11 @@ class RunStore:
                     "mode": mode.value,
                     "workflow_name": workflow_name,
                     "workspace_root": ws_root,
+                    "workspace_id": workspace_id,
+                    "workspace_mode": workspace_mode,
+                    "task_type": task_type,
+                    "base_ref": base_ref,
+                    "scope_paths": cleaned_scope,
                 },
                 state_revision=1,
             )
@@ -551,6 +705,13 @@ class RunStore:
                 json.loads(row["execution_drivers_json"]) if row["execution_drivers_json"] else None
             ),
             "workspace_root": row["workspace_root"],
+            "workspace_id": row["workspace_id"],
+            "workspace_mode": row["workspace_mode"] or "brownfield",
+            "task_type": row["task_type"] or "feature",
+            "base_ref": row["base_ref"],
+            "scope_paths": (
+                json.loads(row["scope_paths_json"]) if row["scope_paths_json"] else []
+            ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

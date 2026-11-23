@@ -89,6 +89,48 @@ class ProviderConfig(StrictModel):
     providers_file: str | None = None
 
 
+WorkspaceMode = Literal["brownfield", "greenfield", "spec_only"]
+TaskType = Literal["feature", "fix", "refactor", "blueprint"]
+
+
+class WorkspaceSummary(StrictModel):
+    workspace_id: str
+    name: str
+    root_path: str
+    is_git_repo: bool
+    default_branch: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class WorkspaceListResponse(StrictModel):
+    ok: Literal[True] = True
+    workspaces: list[WorkspaceSummary]
+
+
+class CreateWorkspaceRequest(StrictModel):
+    name: str | None = None
+    root_path: str = Field(min_length=1)
+    create_if_missing: bool = False
+    init_git: bool = False
+
+    @field_validator("root_path")
+    @classmethod
+    def _validate_root_path(cls, value: str) -> str:
+        return _strip_non_empty(value)
+
+
+class WorkspaceResponse(StrictModel):
+    ok: Literal[True] = True
+    workspace: WorkspaceSummary
+
+
+class DeleteWorkspaceResponse(StrictModel):
+    ok: Literal[True] = True
+    workspace_id: str
+    deleted: bool = True
+
+
 class CreateRunRequest(StrictModel):
     raw_input: str | None = None
     goal: str | None = None
@@ -103,6 +145,11 @@ class CreateRunRequest(StrictModel):
     sync: bool = False
     constraints: list[str] | None = None
     workspace_root: str | None = None
+    workspace_id: str | None = None
+    workspace_mode: WorkspaceMode | None = None
+    task_type: TaskType | None = None
+    base_ref: str | None = None
+    scope_paths: list[str] | None = None
 
 
 class WorkflowRunResult(StrictModel):
@@ -814,10 +861,12 @@ __all__ = [
     "ConflictResponse",
     "CreateRunRequest",
     "CreateRunResponse",
+    "CreateWorkspaceRequest",
     "DagEdge",
     "DagNode",
     "DagView",
     "DeliveryAcceptance",
+    "DeleteWorkspaceResponse",
     "DemoPreset",
     "DemosResponse",
     "ErrorResponse",
@@ -847,6 +896,9 @@ __all__ = [
     "SwimlaneRow",
     "TraceabilityMatrix",
     "WaterfallTurn",
+    "WorkspaceListResponse",
+    "WorkspaceResponse",
+    "WorkspaceSummary",
     "WorkflowSummary",
     "WorkflowView",
     "WorkflowsResponse",
