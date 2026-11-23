@@ -319,10 +319,3 @@ body[data-rail="collapsed"] .thread-list,
   margin-block-end: var(--space-4);
   flex-wrap: wrap;
 }
-
-.legend-dash {
-  display: inline-block;
-  inline-size: 16px;
-  border-block-start: 1px dashed var(--rule-hard);
-  vertical-align: middle;
-}

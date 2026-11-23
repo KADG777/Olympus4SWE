@@ -16,7 +16,7 @@ import type { DagEdgeView, DagNodeView } from "../types";
 
 export { edgeKey, hasCycle };
 
-/** Fixed 1:1 physical card size, shared with the workflow graph. */
+/** Fixed 1:1 physical card size for task DAG cards. */
 export const NODE_W = CARD_W;
 export const NODE_H = CARD_H;
 /** Vertical band above the first card row that hosts the Wave column headers. */

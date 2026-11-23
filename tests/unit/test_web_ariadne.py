@@ -785,7 +785,9 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert graph_css.status_code == 200
         assert graph_css.headers["content-type"].startswith("text/css")
         assert ".ag-task-card" in graph_css.text
-        assert ".ag-wf-card" in graph_css.text
+        app_css = client.get("/static/assets/ariadne.css")
+        assert app_css.status_code == 200
+        assert ".wf-stage-col" in app_css.text
 
         assert client.get("/static/app.js").status_code == 404
         assert client.get("/static/ui.js").status_code == 404

@@ -1,7 +1,7 @@
 import { Component, lazy, Suspense, useMemo, useState, type ErrorInfo, type ReactNode } from "react";
 
 import { Notice } from "./ui";
-import type { DagGraphProps, WorkflowGraphProps } from "../graph/types";
+import type { DagGraphProps } from "../graph/types";
 
 type GraphModule = typeof import("../graph/ariadne-graph");
 
@@ -214,30 +214,6 @@ export function DagGraphHost(props: DagGraphProps) {
         ) : LazyDag ? (
           <Suspense fallback={null}>
             <LazyDag {...props} />
-          </Suspense>
-        ) : null}
-      </GraphErrorBoundary>
-    </div>
-  );
-}
-
-export function WorkflowGraphHost(props: WorkflowGraphProps) {
-  const [Loaded] = useState(() => cachedGraphModule?.WorkflowGraphView ?? null);
-  const LazyWorkflow = useMemo(
-    () =>
-      Loaded
-        ? null
-        : lazy(() => loadGraphModule().then((module) => ({ default: module.WorkflowGraphView }))),
-    [Loaded, props.runId],
-  );
-  return (
-    <div className="graph-host" id="workflow-graph" data-graph-host="workflow">
-      <GraphErrorBoundary name="编排工作流" resetKey={props.runId}>
-        {Loaded ? (
-          <Loaded {...props} />
-        ) : LazyWorkflow ? (
-          <Suspense fallback={null}>
-            <LazyWorkflow {...props} />
           </Suspense>
         ) : null}
       </GraphErrorBoundary>

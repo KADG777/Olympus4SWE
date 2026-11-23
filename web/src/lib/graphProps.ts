@@ -1,14 +1,11 @@
 import type { RunProjection } from "../api/types";
-import type { DagGraphProps, DagPill, DagTone, WorkflowGraphProps } from "../graph/types";
+import type { DagGraphProps, DagPill, DagTone } from "../graph/types";
 import {
   LIVE_TASK_STATUSES,
-  NODE_LABELS,
   RETRY_MESSAGE,
   RETRY_NEXT_STEP,
   statusMeta,
   taskDisplayStatus,
-  workflowCurrentNode,
-  WORKFLOW_STATUS_TEXT,
 } from "./labels";
 
 const TOOL_MARKS: Record<string, string> = { ok: "✓", error: "✕", denied: "⊘" };
@@ -76,46 +73,6 @@ export function dagGraphProps(
       critical: Boolean(edge.critical),
       blocked: Boolean(edge.blocked_edge),
       running: !edge.blocked_edge && LIVE_TASK_STATUSES.has(displayStatus.get(edge.to) || ""),
-    })),
-  };
-}
-
-export function workflowGraphProps(
-  projection: RunProjection,
-  selectedId: string | null,
-  onSelect: (id: string) => void,
-): WorkflowGraphProps {
-  const workflow = projection.workflow;
-  const graph = workflow.graph;
-  const statuses = workflow.node_statuses || {};
-  const taken = new Set((workflow.traversed_edges || []).map((edge) => `${edge.source}\u2192${edge.target}`));
-  return {
-    runId: projection.run_id,
-    selectedId,
-    focusId: workflowCurrentNode(workflow),
-    onSelect,
-    ariaLabel: "工作流拓扑有向图",
-    emptyMessage: "当前工作流未提供拓扑描述",
-    nodes: (graph?.nodes || []).map((node) => {
-      const status = statuses[node.name] || "pending";
-      const label = NODE_LABELS[node.name] || node.name;
-      const meta = statusMeta(status);
-      const statusText = WORKFLOW_STATUS_TEXT[status] || `${meta.glyph} ${meta.label}`;
-      return {
-        id: node.name,
-        label,
-        kind: node.kind || "",
-        status,
-        statusText,
-        title: `${label} · ${node.kind || node.name}`,
-        ariaLabel: `${label} (${node.name}) ${statusText}`,
-      };
-    }),
-    edges: (graph?.edges || []).map((edge) => ({
-      source: edge.source,
-      target: edge.target,
-      conditional: Boolean(edge.conditional),
-      traversed: taken.has(`${edge.source}\u2192${edge.target}`),
     })),
   };
 }

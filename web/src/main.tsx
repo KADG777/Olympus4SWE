@@ -8,6 +8,7 @@ import "./styles/hitl.css";
 import "./styles/views.css";
 import "./styles/cards.css";
 import "./styles/topology.css";
+import "./styles/workflow-stages.css";
 import "./styles/table.css";
 import "./styles/waterfall.css";
 import "./styles/dock.css";

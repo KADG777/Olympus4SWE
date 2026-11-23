@@ -1,5 +1,5 @@
 import type { RunProjection } from "../api/types";
-import { dagGraphProps, workflowGraphProps } from "../lib/graphProps";
+import { dagGraphProps } from "../lib/graphProps";
 import {
   currentStage,
   DELIVERY_STATUS,
@@ -14,7 +14,8 @@ import {
 } from "../lib/labels";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { RecordedArtifactCards } from "./Artifacts";
-import { DagGraphHost, WorkflowGraphHost } from "./GraphHost";
+import { DagGraphHost } from "./GraphHost";
+import { WorkflowStages } from "./WorkflowStages";
 import { Badge, StatCells } from "./ui";
 
 function StageLivePanel({ workbench, state, projection }: { workbench: Workbench; state: WorkbenchState; projection: RunProjection | null }) {
@@ -257,18 +258,18 @@ export function TopologyView({ workbench, state }: { workbench: Workbench; state
             <span className="legend-item">✕ 中断/阻塞</span>
             <span className="legend-item">◷ 待确认</span>
             <span className="legend-item">— 已跳过</span>
-            <span className="legend-item">
-              <span className="legend-swatch" data-tone="traversed" aria-hidden="true" /> 已执行路径
-            </span>
-            <span className="legend-item">
-              <span className="legend-dash" aria-hidden="true" /> 未走条件路由 / 修复回边
-            </span>
           </div>
         </header>
         {projection ? (
-          <WorkflowGraphHost {...workflowGraphProps(projection, state.workflowNode, workbench.selectWorkflowNode)} />
+          <WorkflowStages
+            projection={projection}
+            selectedId={state.workflowNode}
+            onSelect={workbench.selectWorkflowNode}
+            hasDag={hasDag}
+            dagVisible={!dagHidden}
+          />
         ) : (
-          <div className="graph-host" id="workflow-graph" data-graph-host="workflow" />
+          <div className="wf-board" id="workflow-graph" data-workflow-view="staged" />
         )}
       </section>
 

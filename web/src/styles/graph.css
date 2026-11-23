@@ -255,62 +255,6 @@
   color: var(--ok);
 }
 
-.ag-wf-card[data-node-kind="gate"]::before {
-  content: "";
-  position: absolute;
-  inset-block: 10px;
-  inset-inline-start: -1px;
-  inline-size: 3px;
-  border-radius: 0 var(--shape-pill) var(--shape-pill) 0;
-  background: var(--accent);
-  pointer-events: none;
-}
-
-.ag-card-kind[data-kind="gate"] {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent-fg);
-}
-
-.ag-wf-card[data-node-kind="validator"] {
-  border-block-start-style: double;
-  border-block-start-width: 3px;
-}
-
-.ag-card-kind[data-kind="validator"] {
-  background: transparent;
-  font-family: var(--face-mono);
-  letter-spacing: 0.04em;
-}
-
-/* Skipped: recessed into the page, dashed and muted, clearly not "still waiting". */
-.ag-wf-card[data-tone="skipped"] {
-  border-style: dashed;
-  border-color: var(--rule-hard);
-  background: var(--surface-sunk);
-  color: var(--text-muted);
-}
-
-.ag-wf-card[data-tone="skipped"] .ag-card-title,
-.ag-wf-card[data-tone="skipped"] .ag-card-meta,
-.ag-wf-card[data-tone="skipped"] .ag-card-kind {
-  color: var(--text-muted);
-}
-
-.ag-wf-card[data-tone="skipped"] .ag-card-kind {
-  border-color: var(--rule-hard);
-  background: transparent;
-}
-
-.ag-wf-card[data-tone="skipped"] .ag-card-status {
-  background: transparent;
-  color: var(--text-muted);
-}
-
-.ag-wf-card[data-tone="skipped"]::before {
-  opacity: 0.45;
-}
-
 .ag-edge {
   transition: opacity var(--motion-fast);
 }
@@ -343,28 +287,12 @@
   animation: ag-edge-flow 900ms linear infinite;
 }
 
-/* Workflow trajectory: the taken path in full contrast; untaken routes and loops recede. */
-.ag-edge[data-tone="traversed"] .ag-edge-path {
-  stroke: var(--text-ink);
-  stroke-width: 1.8;
-}
-
-.ag-edge[data-tone="conditional"] {
-  opacity: 0.7;
-}
-
 .ag-edge[data-lineage="dim"] {
   opacity: 0.16;
 }
 
 .ag-edge[data-lineage="related"] {
   opacity: 1;
-}
-
-.ag-edge[data-tone="conditional"] .ag-edge-path {
-  stroke-width: 1.2;
-  stroke-dasharray: 5 4;
-  stroke-linecap: butt;
 }
 
 .ag-toolbar {
@@ -462,8 +390,4 @@
 
 .ag-arrow[data-tone="running"] path {
   fill: var(--live);
-}
-
-.ag-arrow[data-tone="traversed"] path {
-  fill: var(--text-ink);
 }
