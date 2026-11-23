@@ -819,3 +819,65 @@ def remove_run_sandboxes(
         for entry in sorted(tmp_root.iterdir()):
             if entry.is_dir() and entry.name.startswith(prefix):
                 shutil.rmtree(entry, ignore_errors=True)
+
+
+ACCEPTED_DELETIONS_FILE = "accepted_deletions.json"
+
+
+def load_accepted_deletions(run_dir: Path) -> set[str]:
+    """Load the persisted set of repo-relative paths deleted by accepted tasks."""
+    path = run_dir / ACCEPTED_DELETIONS_FILE
+    if not path.is_file():
+        return set()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str) and item}
+
+
+def save_accepted_deletions(run_dir: Path, paths: set[str]) -> None:
+    """Persist repo-relative paths deleted by accepted tasks so downstream sandboxes apply them."""
+    path = run_dir / ACCEPTED_DELETIONS_FILE
+    if not paths:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(paths), ensure_ascii=False), encoding="utf-8")
+
+
+def remove_deleted_paths(
+    dst_root: Path,
+    rel_paths: Sequence[str],
+    *,
+    forbidden_write_scope: Sequence[str] = (),
+) -> None:
+    """Remove deleted or renamed source paths from a sandbox, overlay, or workspace root."""
+    if not rel_paths or not dst_root.exists():
+        return
+    resolved_root = dst_root.resolve()
+    policy = (
+        WorkspacePolicy(forbidden_write_scope=list(forbidden_write_scope))
+        if forbidden_write_scope
+        else None
+    )
+    for rel in rel_paths:
+        if policy is not None and policy.forbidden_match(rel) is not None:
+            continue
+        target = dst_root / rel
+        try:
+            if not target.resolve(strict=False).is_relative_to(resolved_root):
+                continue
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+                parent = target.parent
+                while parent != dst_root and parent.is_relative_to(dst_root):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
+        except OSError:
+            continue

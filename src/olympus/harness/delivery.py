@@ -11,7 +11,13 @@ from typing import Any
 
 from olympus.core.contracts import TaskPlan, new_id
 from olympus.core.fingerprint import content_hash
-from olympus.harness.worktree import build_sandbox_env, create_sandbox, remove_sandbox
+from olympus.harness.worktree import (
+    build_sandbox_env,
+    create_sandbox,
+    load_accepted_deletions,
+    remove_deleted_paths,
+    remove_sandbox,
+)
 
 DELIVERY_EVENT = "delivery.checks_completed"
 _INTERNAL_DIRS = {".git", ".olympus"}
@@ -74,6 +80,9 @@ def run_delivery_checks(
             )
             workspace = sandbox.workspace_path
             failure_reason = "无法核验交付快照"
+            accepted_deletions = sorted(load_accepted_deletions(run_dir))
+            if accepted_deletions:
+                remove_deleted_paths(workspace, accepted_deletions)
             if overlay_dir.is_dir():
                 shutil.copytree(overlay_dir, workspace, dirs_exist_ok=True)
             version = _delivery_version(workspace, sandbox.base_commit)

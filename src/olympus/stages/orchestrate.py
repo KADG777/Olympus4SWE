@@ -11,7 +11,6 @@ import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event, Lock
@@ -65,7 +64,6 @@ from olympus.harness.native import NativeDriver
 from olympus.harness.structured import run_structured_turn
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
-    SandboxBaseline,
     SandboxHandle,
     absorb_verification_artifacts,
     archive_sandbox_recovery,
@@ -73,9 +71,12 @@ from olympus.harness.worktree import (
     capture_sandbox_diff,
     clean_ephemeral_artifacts,
     create_sandbox,
+    load_accepted_deletions,
     load_sandbox_baseline,
+    remove_deleted_paths,
     remove_run_sandboxes,
     remove_sandbox,
+    save_accepted_deletions,
     save_sandbox_baseline,
     snapshot_sandbox_state,
     sync_upstream_files,
@@ -198,12 +199,17 @@ def _copy_matching_scope(
     src_root: Path,
     dst_root: Path,
     write_scope: list[str] | None,
+    *,
+    forbidden_write_scope: Sequence[str] = (),
 ) -> None:
-    """Copy non-ignored files from src_root to dst_root, optionally filtered by write_scope."""
+    """Copy non-ignored files from src_root to dst_root, respecting write_scope and forbidden."""
     if not src_root.exists():
         return
     # Share the tool-gating matcher so glob scopes deliver exactly what they authorize.
-    policy = WorkspacePolicy(allowed_write_scope=write_scope)
+    policy = WorkspacePolicy(
+        allowed_write_scope=write_scope,
+        forbidden_write_scope=list(forbidden_write_scope),
+    )
     for p in sorted(src_root.rglob("*")):
         if not p.is_file():
             continue
@@ -212,6 +218,8 @@ def _copy_matching_scope(
         if any(part in ignored for part in rel_path.parts):
             continue
         rel = rel_path.as_posix()
+        if forbidden_write_scope and policy.forbidden_match(rel) is not None:
+            continue
         if write_scope is not None and not policy.allows_relative_path(rel):
             continue
         dst = dst_root / rel
@@ -219,28 +227,6 @@ def _copy_matching_scope(
         shutil.copy2(p, dst)
 
 
-def _remove_deleted_paths(dst_root: Path, rel_paths: Sequence[str]) -> None:
-    """Propagate worker-deleted or renamed source paths to overlay/workspace roots."""
-    if not rel_paths or not dst_root.exists():
-        return
-    resolved_root = dst_root.resolve()
-    for rel in rel_paths:
-        target = dst_root / rel
-        with suppress(OSError):
-            if not target.resolve(strict=False).is_relative_to(resolved_root):
-                continue
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-                parent = target.parent
-                while parent != dst_root and parent.is_relative_to(dst_root):
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        break
-                    parent = parent.parent
-
-
-_ACCEPTED_DELETIONS_FILE = "accepted_deletions.json"
 _FREEZE_CONSTRAINT_RE = re.compile(
     r"\b(?:(?:do not|don't|must not|never|cannot)\s+"
     r"(?:modify|edit|touch|change|alter|overwrite|delete|remove|rewrite)"
@@ -252,30 +238,6 @@ _PATH_TOKEN_RE = re.compile(
     r"(?<![\w./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.*?\[\]-]*)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})(?![\w./-])"
 )
 _IGNORED_PATH_LITERALS = frozenset({"e.g", "i.e", "etc"})
-
-
-def _load_accepted_deletions(run_dir: Path) -> set[str]:
-    """Load the persisted set of repo-relative paths deleted by accepted tasks."""
-    path = run_dir / _ACCEPTED_DELETIONS_FILE
-    if not path.is_file():
-        return set()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    if not isinstance(raw, list):
-        return set()
-    return {item for item in raw if isinstance(item, str) and item}
-
-
-def _save_accepted_deletions(run_dir: Path, paths: set[str]) -> None:
-    """Persist repo-relative paths deleted by accepted tasks so downstream sandboxes apply them."""
-    path = run_dir / _ACCEPTED_DELETIONS_FILE
-    if not paths:
-        path.unlink(missing_ok=True)
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sorted(paths), ensure_ascii=False), encoding="utf-8")
 
 
 def _normalize_repo_rel_pattern(token: str) -> str | None:
@@ -309,20 +271,20 @@ def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
             return [norm]
         return []
     for match in _PATH_TOKEN_RE.finditer(stripped):
-        raw = match.group(1) or match.group(2)
+        backticked = match.group(1)
+        raw = backticked or match.group(2)
         if not raw:
             continue
         norm = _normalize_repo_rel_pattern(raw)
         if norm is None:
             continue
-        if (
-            (
-                "/" in norm
-                or any(ch in norm for ch in "*?[")
-                or (workspace_root / norm).exists()
-            )
-            and norm not in candidates
-        ):
+        is_explicit_path = (
+            "/" in norm
+            or any(ch in norm for ch in "*?[")
+            or (workspace_root / norm).exists()
+            or (backticked is not None and "." in norm)
+        )
+        if is_explicit_path and norm not in candidates:
             candidates.append(norm)
     return candidates
 
@@ -651,11 +613,11 @@ _SECRET_ENV_NAME = re.compile(
     r"(?i)(token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)"
 )
 _INLINE_PYTHON_C = re.compile(r"\bpython[\d.]*\b[^\n]*\s-c\s")
+_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)"')
 _BROKEN_PROBE_EXIT_CODES = frozenset({126, 127})
 _PROBE_ENV_ALLOWLIST = frozenset(
     {
         "PATH",
-        "HOME",
         "USER",
         "LOGNAME",
         "LANG",
@@ -708,7 +670,10 @@ def _probe_is_broken(*, command: str, returncode: int | None, output: str) -> bo
         return True
     if returncode == 2 and "syntax error" in output.lower():
         return True
-    return "SyntaxError" in output and _INLINE_PYTHON_C.search(command) is not None
+    if "SyntaxError" in output and _INLINE_PYTHON_C.search(command) is not None:
+        files = _TRACEBACK_FILE_RE.findall(output)
+        return bool(files) and files[-1] == "<string>"
+    return False
 
 
 def _build_probe_env(
@@ -717,6 +682,7 @@ def _build_probe_env(
     sandbox_root: Path,
     host_root: Path,
     tmp_dir: Path,
+    home_dir: Path,
 ) -> dict[str, str]:
     """Build a minimal allowlisted environment for isolated reviewer repro probes."""
     env: dict[str, str] = {}
@@ -725,6 +691,7 @@ def _build_probe_env(
             env[key] = value
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
+    env["HOME"] = str(home_dir)
 
     venv_candidates: list[Path] = [sandbox_root / ".venv", host_root / ".venv"]
     current_prefix = Path(sys.executable).resolve().parent.parent
@@ -1022,6 +989,10 @@ class OrchestrateStage:
                         "last_error": None,
                         "accepted_risk_reason": None,
                         "verified_repro_commands": [],
+                        "acceptance_checks": [
+                            check.model_copy(update={"passed": False, "evidence_ref": None})
+                            for check in task.acceptance_checks
+                        ],
                     }
                 )
                 for task in candidate.tasks
@@ -1297,60 +1268,83 @@ class OrchestrateStage:
         self, *, command: str, sandbox: SandboxHandle
     ) -> _ReproResult:
         """Execute one reviewer repro command inside an isolated temp snapshot."""
-        with tempfile.TemporaryDirectory(prefix="olympus-probe-") as tmp_root:
-            probe_ws = Path(tmp_root) / "ws"
-            probe_tmp = Path(tmp_root) / "tmp"
-            probe_tmp.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(
-                sandbox.workspace_path,
-                probe_ws,
-                symlinks=True,
-                ignore_dangling_symlinks=True,
-                ignore=shutil.ignore_patterns(".git", ".olympus", ".venv", "__pycache__"),
-            )
-            env = _build_probe_env(
-                probe_ws,
-                sandbox_root=sandbox.workspace_path,
-                host_root=self.workspace_root,
-                tmp_dir=probe_tmp,
-            )
-            try:
-                proc = subprocess.run(
-                    ["bash", "-lc", command],
-                    cwd=probe_ws,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=_REPRO_TIMEOUT_SECONDS,
-                    check=False,
+        try:
+            with tempfile.TemporaryDirectory(prefix="olympus-probe-") as tmp_root:
+                probe_ws = Path(tmp_root) / "ws"
+                probe_tmp = Path(tmp_root) / "tmp"
+                probe_home = Path(tmp_root) / "home"
+                probe_tmp.mkdir(parents=True, exist_ok=True)
+                probe_home.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    sandbox.workspace_path,
+                    probe_ws,
+                    symlinks=True,
+                    ignore_dangling_symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", ".olympus", ".venv", "__pycache__"),
                 )
-            except subprocess.TimeoutExpired as exc:
-                captured = "\n".join(
-                    part
-                    for part in (
-                        exc.stdout if isinstance(exc.stdout, str) else "",
-                        exc.stderr if isinstance(exc.stderr, str) else "",
+                # Strip symlinks pointing outside the isolated probe snapshot so relative writes
+                # inside probe_ws can never follow a link out to the real sandbox or host disk.
+                resolved_probe = probe_ws.resolve()
+                for dirpath, dirnames, filenames in os.walk(probe_ws):
+                    root_path = Path(dirpath)
+                    for name in list(dirnames) + list(filenames):
+                        entry = root_path / name
+                        if not entry.is_symlink():
+                            continue
+                        try:
+                            target = entry.resolve(strict=False)
+                        except OSError:
+                            entry.unlink(missing_ok=True)
+                            continue
+                        if not target.is_relative_to(resolved_probe):
+                            entry.unlink(missing_ok=True)
+                            if name in dirnames:
+                                dirnames.remove(name)
+                env = _build_probe_env(
+                    probe_ws,
+                    sandbox_root=sandbox.workspace_path,
+                    host_root=self.workspace_root,
+                    tmp_dir=probe_tmp,
+                    home_dir=probe_home,
+                )
+                try:
+                    proc = subprocess.run(
+                        ["bash", "--norc", "--noprofile", "-c", command],
+                        cwd=probe_ws,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        timeout=_REPRO_TIMEOUT_SECONDS,
+                        check=False,
                     )
-                    if part
-                )
-                output = _redact_probe_output(
-                    f"probe timed out after {_REPRO_TIMEOUT_SECONDS:g}s\n{captured}".strip(),
-                    env,
-                )
-                return _ReproResult(returncode=None, output=output, broken=True)
-            except OSError as exc:
+                except subprocess.TimeoutExpired as exc:
+                    captured = "\n".join(
+                        part
+                        for part in (
+                            exc.stdout if isinstance(exc.stdout, str) else "",
+                            exc.stderr if isinstance(exc.stderr, str) else "",
+                        )
+                        if part
+                    )
+                    output = _redact_probe_output(
+                        f"probe timed out after {_REPRO_TIMEOUT_SECONDS:g}s\n{captured}".strip(),
+                        env,
+                    )
+                    return _ReproResult(returncode=None, output=output, broken=True)
+                combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
                 return _ReproResult(
-                    returncode=None,
-                    output=f"probe could not start: {type(exc).__name__}",
-                    broken=True,
+                    returncode=proc.returncode,
+                    output=_redact_probe_output(combined, env),
+                    broken=_probe_is_broken(
+                        command=command, returncode=proc.returncode, output=combined
+                    ),
                 )
-            combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+        except (OSError, shutil.Error, UnicodeError) as exc:
             return _ReproResult(
-                returncode=proc.returncode,
-                output=_redact_probe_output(combined, env),
-                broken=_probe_is_broken(
-                    command=command, returncode=proc.returncode, output=combined
-                ),
+                returncode=None,
+                output=f"probe failed to execute: {type(exc).__name__}",
+                broken=True,
             )
 
     def _verify_review_verdict(
@@ -1361,9 +1355,8 @@ class OrchestrateStage:
         task: TaskNode,
         sandbox: SandboxHandle,
         verdict: ReviewVerdict,
-        task_baseline: SandboxBaseline,
         art_dir: Path,
-    ) -> tuple[ReviewVerdict, SandboxBaseline]:
+    ) -> ReviewVerdict:
         """Deterministically keep only run-proven Axis A blockers from an Argus verdict."""
         valid_req_ids = frozenset(req.id for req in spec.requirements)
         findings: list[ReviewFinding] = []
@@ -1480,7 +1473,7 @@ class OrchestrateStage:
                 "verified_repro_commands": list(verified_commands),
             },
         )
-        return verified_verdict, task_baseline
+        return verified_verdict
 
     def _recheck_verified_repro_commands(
         self,
@@ -1488,9 +1481,8 @@ class OrchestrateStage:
         run_id: str,
         task: TaskNode,
         sandbox: SandboxHandle,
-        task_baseline: SandboxBaseline,
         art_dir: Path,
-    ) -> tuple[list[str], list[str], list[str], SandboxBaseline]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """0-token pre-check: re-run the previous cycle's proven failing commands."""
         failures: list[str] = []
         still_verified: list[str] = []
@@ -1541,7 +1533,7 @@ class OrchestrateStage:
                 "results": results,
             },
         )
-        return failures, still_verified, resolved, task_baseline
+        return failures, still_verified, resolved
 
     def _run_worker_turn(
         self,
@@ -1655,7 +1647,7 @@ class OrchestrateStage:
                 dict.fromkeys((*forbidden_contracts, *sibling_write_scopes, *spec_forbidden))
             )
             with self._promotion_lock:
-                accepted_deletions = sorted(_load_accepted_deletions(self._run_dir(run_id)))
+                accepted_deletions = sorted(load_accepted_deletions(self._run_dir(run_id)))
             if sandbox.reused:
                 task_baseline = load_sandbox_baseline(sandbox)
                 assert task_baseline is not None
@@ -1668,7 +1660,7 @@ class OrchestrateStage:
                 )
             else:
                 _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
-                _remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
+                remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
                 task_baseline = snapshot_sandbox_state(sandbox)
             save_sandbox_baseline(sandbox, task_baseline)
             rework_ctx = (
@@ -1978,15 +1970,12 @@ class OrchestrateStage:
                     repro_failures,
                     still_verified_repros,
                     resolved_repro_commands,
-                    task_baseline,
                 ) = self._recheck_verified_repro_commands(
                     run_id=run_id,
                     task=verifying,
                     sandbox=sandbox,
-                    task_baseline=task_baseline,
                     art_dir=art_dir,
                 )
-                save_sandbox_baseline(sandbox, task_baseline)
                 if repro_failures:
                     _write_manifest_md(
                         art_dir=art_dir,
@@ -2060,13 +2049,12 @@ class OrchestrateStage:
                     )
                 )
 
-            verdict, task_baseline = self._verify_review_verdict(
+            verdict = self._verify_review_verdict(
                 run_id=run_id,
                 spec=spec,
                 task=verifying,
                 sandbox=sandbox,
                 verdict=verdict,
-                task_baseline=task_baseline,
                 art_dir=art_dir,
             )
             (art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json").write_text(
@@ -2124,6 +2112,79 @@ class OrchestrateStage:
                 else c
                 for c in updated_checks
             ]
+            removed_artifact_set = set(removed_artifacts)
+            promotion_paths: list[str] = []
+            seen_paths: set[str] = set()
+            deleted_paths: list[str] = []
+            recreated_paths: set[str] = set()
+            promotion_policy = WorkspacePolicy(
+                allowed_write_scope=verifying.write_scope,
+                forbidden_write_scope=hard_forbidden,
+            )
+            for rel in gate.changed_paths:
+                if rel in removed_artifact_set:
+                    continue
+                if promotion_policy.forbidden_match(rel) is not None:
+                    continue
+                candidate = sandbox.workspace_path / rel
+                if not candidate.is_file() and not candidate.is_symlink():
+                    deleted_paths.append(rel)
+                    continue
+                recreated_paths.add(rel)
+                if rel not in seen_paths:
+                    seen_paths.add(rel)
+                    promotion_paths.append(rel)
+
+            with self._promotion_lock:
+                run_status = self.store.get_run(run_id)["status"]
+                if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                    interrupted.set()
+                    retain_sandbox = run_status == RunStatus.PAUSED
+                    return self._return_interrupted_task(run_id, verifying)
+                try:
+                    remove_deleted_paths(
+                        overlay_dir, deleted_paths, forbidden_write_scope=hard_forbidden
+                    )
+                    if promotion_paths:
+                        _copy_matching_scope(
+                            sandbox.workspace_path,
+                            overlay_dir,
+                            promotion_paths,
+                        )
+                    persisted_deletions = load_accepted_deletions(self._run_dir(run_id))
+                    persisted_deletions.difference_update(recreated_paths)
+                    persisted_deletions.update(deleted_paths)
+                    save_accepted_deletions(self._run_dir(run_id), persisted_deletions)
+                    if mode == RunMode.EXECUTION and apply_to_workspace:
+                        remove_deleted_paths(
+                            self.workspace_root,
+                            deleted_paths,
+                            forbidden_write_scope=hard_forbidden,
+                        )
+                        if promotion_paths:
+                            _copy_matching_scope(
+                                sandbox.workspace_path,
+                                self.workspace_root,
+                                promotion_paths,
+                            )
+                except OSError as exc:
+                    _write_manifest_md(
+                        art_dir=art_dir,
+                        task=verifying,
+                        diff_text=diff_text,
+                        checks=final_checks,
+                        verdict=verdict,
+                        receipt=loop_res.receipt,
+                    )
+                    return retain(
+                        self._fail_or_requeue(
+                            run_id=run_id,
+                            task=verifying,
+                            reason=f"Failed to promote task changes: {exc}",
+                            checks=final_checks,
+                        )
+                    )
+
             try:
                 accepted = self.store.update_task_with_lease(
                     run_id,
@@ -2150,40 +2211,6 @@ class OrchestrateStage:
                     return self._return_interrupted_task(run_id, verifying)
                 raise
 
-            removed_artifact_set = set(removed_artifacts)
-            promotion_paths = list(verifying.write_scope)
-            seen_paths = set(promotion_paths)
-            deleted_paths: list[str] = []
-            recreated_paths: set[str] = set()
-            promotion_policy = WorkspacePolicy(
-                allowed_write_scope=verifying.write_scope,
-                forbidden_write_scope=hard_forbidden,
-            )
-            for rel in gate.changed_paths:
-                if rel in removed_artifact_set:
-                    continue
-                if promotion_policy.forbidden_match(rel) is not None:
-                    continue
-                candidate = sandbox.workspace_path / rel
-                if not candidate.exists() and not candidate.is_symlink():
-                    deleted_paths.append(rel)
-                    continue
-                recreated_paths.add(rel)
-                if rel not in seen_paths:
-                    seen_paths.add(rel)
-                    promotion_paths.append(rel)
-            with self._promotion_lock:
-                _copy_matching_scope(sandbox.workspace_path, overlay_dir, promotion_paths)
-                _remove_deleted_paths(overlay_dir, deleted_paths)
-                persisted_deletions = _load_accepted_deletions(self._run_dir(run_id))
-                persisted_deletions.difference_update(recreated_paths)
-                persisted_deletions.update(deleted_paths)
-                _save_accepted_deletions(self._run_dir(run_id), persisted_deletions)
-                if mode == RunMode.EXECUTION and apply_to_workspace:
-                    _copy_matching_scope(
-                        sandbox.workspace_path, self.workspace_root, promotion_paths
-                    )
-                    _remove_deleted_paths(self.workspace_root, deleted_paths)
             _write_manifest_md(
                 art_dir=art_dir,
                 task=accepted,

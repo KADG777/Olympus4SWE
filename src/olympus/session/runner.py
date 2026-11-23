@@ -67,12 +67,18 @@ _EXECUTE_TYPES = frozenset({"execute_task_dag"})
 _PLAN_ONLY_STOP = "plan"
 _MAX_IN_PLACE_RECOVERIES = 2
 _MAX_PLAN_RECOVERIES = 3
-_EXPLICIT_REVISION_RE = re.compile(r"^\s*(?:revise|reopen)\s*[:：]\s*\S", re.IGNORECASE)
+_EXPLICIT_REVISION_RE = re.compile(
+    r"^\s*(?:revise|reopen)\s*[:：]\s*(.+)$", re.IGNORECASE | re.DOTALL
+)
 
 
-def _is_explicit_revision_directive(text: str) -> bool:
-    """Return True when the human explicitly issued a ``revise:`` or ``reopen:`` directive."""
-    return _EXPLICIT_REVISION_RE.match(text) is not None
+def _parse_explicit_revision_directive(text: str) -> str | None:
+    """Return the revision body when the human explicitly issued ``revise:`` or ``reopen:``."""
+    match = _EXPLICIT_REVISION_RE.match(text)
+    if match is None:
+        return None
+    body = match.group(1).strip()
+    return body or None
 
 
 @dataclass(frozen=True)
@@ -368,6 +374,9 @@ class SessionRunner:
             )
 
         pause_kind, gate, node = self._pause_state(run_id)
+        explicit_revision = _parse_explicit_revision_directive(text)
+        if explicit_revision is not None:
+            return self._revise(run_id, definition, snap, explicit_revision)
         intent = parse_reply(
             provider=self._provider(run_id),
             message=text,
@@ -430,11 +439,7 @@ class SessionRunner:
 
         if intent.action in ("revise", "reopen"):
             feedback = intent.feedback or text
-            if (
-                pause_kind == PauseKind.BLOCKED
-                and intent.action == "revise"
-                and not _is_explicit_revision_directive(text)
-            ):
+            if pause_kind == PauseKind.BLOCKED and intent.action == "revise":
                 return self._recover_blocked(run_id, definition, snap, feedback)
             return self._revise(run_id, definition, snap, feedback)
 
@@ -782,28 +787,78 @@ class SessionRunner:
         blocked = self._execution_blocked_tasks(run_id, snap)
         if blocked:
             return self._recover_blocked_in_place(run_id, definition, snap, clean, blocked)
+        if self._has_bound_approved_plan(run_id, snap):
+            plan: TaskPlan | None = snap["plan"]
+            pending = [
+                task
+                for task in (plan.tasks if plan is not None else [])
+                if task.status in (TaskStatus.READY, TaskStatus.WAITING)
+            ]
+            if pending:
+                return self._resume_execution_in_place(run_id, definition, snap, clean)
         return self._recover_blocked_planning(run_id, definition, snap, clean)
 
-    def _execution_blocked_tasks(
-        self, run_id: str, snap: dict[str, Any]
-    ) -> list[TaskNode]:
-        """Return BLOCKED tasks only for an approved, upstream-bound executable plan."""
+    def _has_bound_approved_plan(self, run_id: str, snap: dict[str, Any]) -> bool:
+        """Return True when the run has an approved TaskPlan bound to approved upstream specs."""
         plan: TaskPlan | None = snap["plan"]
         if plan is None:
-            return []
-        blocked = [task for task in plan.tasks if task.status == TaskStatus.BLOCKED]
-        if not blocked:
-            return []
+            return False
         if not self.store.is_approved(
             run_id=run_id,
             target=ApprovalTarget.TASK_PLAN,
             target_id=plan.plan_id,
             target_hash=plan.content_hash,
         ):
+            return False
+        return is_plan_bound_to_upstream(self.store, run_id, snap)
+
+    def _execution_blocked_tasks(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> list[TaskNode]:
+        """Return BLOCKED tasks only for an approved, upstream-bound executable plan."""
+        if not self._has_bound_approved_plan(run_id, snap):
             return []
-        if not is_plan_bound_to_upstream(self.store, run_id, snap):
+        plan: TaskPlan | None = snap["plan"]
+        if plan is None:
             return []
-        return blocked
+        return [task for task in plan.tasks if task.status == TaskStatus.BLOCKED]
+
+    def _resume_execution_in_place(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+    ) -> SessionEnvelope:
+        """Resume an execution pause (e.g. budget pause) without invalidating the approved plan."""
+        if snap["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
+            with suppress(ValueError, ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="human",
+                    stage="session",
+                    detail={"recovery_mode": "resume_execution", "feedback": hint},
+                )
+        execute_node = self._stage_node_name(definition, "execute_task_dag")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={
+                "feedback": hint,
+                "recovery_mode": "resume_execution",
+                "recovery_node": execute_node,
+            },
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=self._current_input(run_id, snap),
+            start_from=execute_node,
+            definition=definition,
+        )
 
     def _recover_blocked_in_place(
         self,
@@ -918,7 +973,7 @@ class SessionRunner:
             payload = event.payload
             if "recovery_node" not in payload:
                 continue
-            if payload.get("recovery_mode") == "in_place":
+            if payload.get("recovery_mode") in ("in_place", "resume_execution"):
                 continue
             count += 1
         return count

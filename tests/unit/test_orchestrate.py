@@ -5119,6 +5119,249 @@ def test_tracked_ephemeral_suffix_deletion_is_promoted_to_workspace(tmp_path: Pa
     assert not (tmp_path / "legacy.bak").exists()
 
 
+def test_probe_strips_external_symlink_and_keeps_worker_syntax_error_as_real_defect(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("SAFE\n", encoding="utf-8")
+    _init_repo(repo)
+    store, run_id = _confirmed_run(repo, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py", "ext_link.txt"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def write_broken(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("def broken(:\n", encoding="utf-8")
+        (ws / "ext_link.txt").symlink_to(outside)
+
+    provider, _ = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Syntax error in worker module and symlink probe",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "ext_link.txt",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": "printf MUTATED > ext_link.txt",
+                        "message": "Probe attempting to write through external symlink",
+                    },
+                    {
+                        "id": "F2",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": "python3 -c 'import feature'",
+                        "message": "feature.py has a genuine SyntaxError",
+                    },
+                ],
+            }
+        ]
+    )
+    snap = _retained_stage(
+        store, repo, _AttemptWorker([write_broken]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert outside.read_text(encoding="utf-8") == "SAFE\n"
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+    event = next(
+        e.payload for e in store.list_events(run_id) if e.event_type == "review.verdict_verified"
+    )
+    assert event["verified_important"] == 1
+    assert event["verified_repro_commands"] == ["python3 -c 'import feature'"]
+
+
+def test_delivery_checks_respect_accepted_deletions_and_file_to_dir_replacement(
+    tmp_path: Path,
+) -> None:
+    from olympus.core.contracts import DeliveryCheck
+
+    _init_repo(tmp_path)
+    (tmp_path / "old.py").write_text("OLD = True\n", encoding="utf-8")
+    (tmp_path / "foo").write_text("LEGACY_FILE = True\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "old.py", "foo"], cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add old.py and foo"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    base = _single_task_plan(
+        spec=spec,
+        write_scope=["old.py", "foo", "foo/**"],
+        max_cycles=1,
+        checks=[
+            {
+                "id": "CHK-REV",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Review",
+            }
+        ],
+    )
+    plan = base.model_copy(
+        update={
+            "delivery_checks": [
+                DeliveryCheck(
+                    requirement_id="R1",
+                    criterion_index=1,
+                    command="test ! -e old.py && test -f foo/bar.py",
+                )
+            ]
+        }
+    )
+    _approve_plan(store, run_id, plan)
+
+    def replace_paths(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "old.py").unlink()
+        (ws / "foo").unlink()
+        (ws / "foo").mkdir()
+        (ws / "foo" / "bar.py").write_text("BAR = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([replace_paths]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert not (tmp_path / "old.py").exists()
+    assert (tmp_path / "foo" / "bar.py").read_text(encoding="utf-8") == "BAR = True\n"
+    delivery = next(
+        e.payload for e in store.list_events(run_id) if e.event_type == "delivery.checks_completed"
+    )
+    assert delivery["results"][0]["exit_code"] == 0
+
+
+def test_backticked_nonexistent_frozen_path_blocked_and_untouched_scope_not_overwritten(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "other.py").write_text("BASE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "other.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add other.py"], cwd=tmp_path, check=True, capture_output=True
+    )
+    # Uncommitted host edit in other.py must NOT be overwritten when worker only edits feature.py.
+    (tmp_path / "other.py").write_text("LOCAL_EDIT = 2\n", encoding="utf-8")
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    original = store.get_run(run_id)["spec"]
+    assert original is not None
+    spec = original.model_copy(
+        update={"constraints": ["Do not modify `new.lock` under any circumstances"]}
+    )
+    store.save_spec(run_id, spec)
+    AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path).confirm_spec(
+        run_id=run_id, approver="zeus"
+    )
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py", "other.py"],
+            max_cycles=2,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def worker(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        if attempt == 1:
+            (ws / "new.lock").write_text("LOCKED\n", encoding="utf-8")
+        else:
+            (ws / "new.lock").unlink(missing_ok=True)
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([worker]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    rejections = [
+        e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"
+    ]
+    assert rejections and "new.lock" in rejections[0].payload["violating_paths"]
+    assert not (tmp_path / "new.lock").exists()
+    assert (tmp_path / "other.py").read_text(encoding="utf-8") == "LOCAL_EDIT = 2\n"
+
+
+def test_propose_plan_strips_prefilled_acceptance_check_outcomes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    raw = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[
+            {
+                "id": "CHK-H",
+                "kind": CheckKind.HUMAN.value,
+                "description": "Manual verification",
+                "passed": True,
+                "evidence_ref": "forged://evidence",
+            }
+        ],
+    ).model_dump(mode="json")
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages, tools
+        return LLMResponse(content=json.dumps(raw))
+
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    proposed = stage.propose_plan(run_id=run_id, auto_approve=True)
+    check = proposed.tasks[0].acceptance_checks[0]
+    assert check.passed is False
+    assert check.evidence_ref is None
+
+
 
 
 

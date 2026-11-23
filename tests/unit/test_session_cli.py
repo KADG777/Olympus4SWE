@@ -2355,13 +2355,14 @@ def test_explicit_revise_prefix_while_execution_blocked_triggers_revision(
     repo = tmp_path / "repo"
     state = tmp_path / "state"
     _init_git_repo(repo)
-    revision = "revise: remove the division feature from the requirements"
+    # Negation wording ("never") would be classified as unknown by the NL router if not
+    # parsed deterministically before parse_reply; no script.router entry is queued.
+    revision = "revise: never modify tests and remove division"
     script = SessionScript()
     script.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
     script.design.extend([json.dumps(_design()), json.dumps(_design())])
     script.plan.extend([json.dumps(_plan(command=_FAILING_CHECK)), json.dumps(_plan())])
     script.workers.extend([("calculator.py", _CALC_CODE)] * 6)
-    script.router.append(json.dumps({"action": "revise", "feedback": revision}))
     _patch_provider(monkeypatch, script)
 
     code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
@@ -2375,3 +2376,64 @@ def test_explicit_revise_prefix_while_execution_blocked_triggers_revision(
     assert any(e.event_type == "run.revision_requested" for e in events)
     continuations = [e.payload for e in events if e.event_type == "session.continued"]
     assert continuations and continuations[-1].get("recovery_mode") != "in_place"
+
+
+def test_budget_paused_execution_resumes_in_place_without_replanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.core.contracts import RunStatus, TaskStatus
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 4)
+    script.router.append(json.dumps({"action": "revise", "feedback": "Continue execution"}))
+    _patch_provider(monkeypatch, script)
+
+    # Start in plan-only mode to get an approved bound plan, then simulate a budget pause
+    # where the task returned to READY and the run paused in AWAITING_HUMAN / BLOCKED.
+    code, handoff = _invoke(
+        ["start", "Build a calculator library", "--step-mode", "plan_only", *_base(repo, state)]
+    )
+    assert code == 0 and handoff["pause_kind"] == "plan_handoff", handoff
+    run_id = str(handoff["run_id"])
+    store = RunStore(state / "olympus.db")
+    snap = store.get_run(run_id)
+    assert snap["plan"] is not None
+    task = snap["plan"].tasks[0]
+    store.save_plan(
+        run_id,
+        snap["plan"].model_copy(
+            update={"tasks": [task.model_copy(update={"status": TaskStatus.READY})]}
+        ),
+        actor="chronos",
+    )
+    snap2 = store.get_run(run_id)
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        expected_revision=int(snap2["state_revision"]),
+        actor="chronos",
+        stage="verify",
+        detail={"reason": "Paused due to budget limit"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="session",
+        event_type="session.paused",
+        actor="session",
+        payload={"pause_kind": "blocked", "node": None, "reason": "Budget paused"},
+    )
+
+    code2, resumed = _invoke(
+        ["reply", run_id, "Continue execution", "--step-mode", "execute", *_base(repo, state)]
+    )
+    assert code2 == 0 and resumed["status"] == "completed", resumed
+    events = store.list_events(run_id)
+    assert not any(e.event_type == "run.revision_requested" for e in events)
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("recovery_mode") == "resume_execution"
