@@ -44,6 +44,17 @@ class EndpointTarget:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ExternalGatewayBinding:
+    """Wire-protocol gateway descriptor exported to external agent drivers."""
+
+    api: str
+    base_url: str
+    model_id: str
+    api_key: str = ""
+    api_key_env: str | None = None
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     """Parse KEY=VALUE or ``export KEY=VALUE`` entries from a dotenv-style file."""
     expanded = path.expanduser()
@@ -160,6 +171,28 @@ class PooledProvider:
         self.dialect = dialect
         self.pool = pool
         self.timeout = timeout
+
+    def external_gateway_binding(
+        self, model: str | None = None
+    ) -> ExternalGatewayBinding | None:
+        """Return the active endpoint + wire dialect for external CLI drivers."""
+        endpoint = self.pool.active
+        wire_api = str(getattr(self.dialect, "wire_api", "") or "").strip()
+        if endpoint is None or not endpoint.base_url.strip() or not wire_api:
+            return None
+        chosen = (model or self.model_name or "").strip()
+        if not chosen:
+            return None
+        if "/" in chosen:
+            prefix, rest = chosen.split("/", 1)
+            if prefix.strip().lower() in {"openai", "anthropic"} and rest.strip():
+                chosen = rest.strip()
+        return ExternalGatewayBinding(
+            api=wire_api,
+            base_url=endpoint.base_url.strip(),
+            model_id=chosen,
+            api_key=endpoint.api_key,
+        )
 
     def complete(
         self,

@@ -118,7 +118,7 @@ def _is_external_driver_eligible(provider: LLMProvider | None) -> bool:
         return False
     if str(getattr(provider, "provider_name", "") or "").strip().lower() == "mock":
         return False
-    if bool(getattr(provider, "supports_external_driver", False)):
+    if getattr(provider, "supports_external_driver", False) is True:
         return True
     from olympus.providers.auth import PooledProvider
 
@@ -208,8 +208,9 @@ def default_driver_factories(
     *,
     store: RunStore | None,
     run_id: str | None,
+    provider: LLMProvider | None = None,
 ) -> dict[str, DriverFactory]:
     """Lazily build the external drivers shipped with Olympus (never at import time)."""
     from olympus.harness.pi import PiDriver
 
-    return {"pi": lambda: PiDriver(store=store, run_id=run_id)}
+    return {"pi": lambda: PiDriver(store=store, run_id=run_id, provider=provider)}

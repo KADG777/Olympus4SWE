@@ -2148,3 +2148,118 @@ def test_interact_gateway_env_falls_back_to_host_provider_env(
     assert gw_env is not None
     assert gw_env["OPENAI_API_KEY"] == secret
     assert gw_env["OPENAI_BASE_URL"] == "https://gateway.example/v1"
+
+
+def test_fastmcp_does_not_replay_non_expiry_rpc_error_mentioning_32600() -> None:
+    from tests.evals.benchmarks.fastmcp_client import (
+        McpHttpClient,
+        McpRpcError,
+        is_session_expiry_error,
+    )
+
+    err = McpRpcError(
+        -32042,
+        "Unhandled upstream exception",
+        "MCP 'tools/list' failed: {'code': -32042, 'data': {'previous': -32600}}",
+    )
+    assert is_session_expiry_error(err) is False
+
+    calls: list[str] = []
+
+    class _FakeClient(McpHttpClient):
+        def _post(self, message: dict[str, Any]) -> dict[str, Any] | None:
+            method = str(message.get("method") or "")
+            calls.append(method)
+            if method == "initialize":
+                self.session_id = "sess-1"
+                return {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+            if method == "notifications/initialized":
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {
+                    "code": -32042,
+                    "message": "Unhandled upstream exception",
+                    "data": {"previous": -32600},
+                },
+            }
+
+    client = _FakeClient(url="http://localhost:8000/mcp")
+    with pytest.raises(McpRpcError):
+        client.list_tools()
+    assert calls == ["initialize", "notifications/initialized", "tools/list"]
+
+
+def test_interact_bridge_retries_pi_error_failed_timeout_and_subprocess_timeout(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import Mock, patch
+
+    from tests.evals.benchmarks.interact_bridge import (
+        InteractBridge,
+        build_parser,
+        config_from_args,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    args = build_parser().parse_args(
+        [
+            "--phase",
+            "plan",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--plan-out",
+            str(tmp_path / "plan.md"),
+            "--goal",
+            "Build feature",
+            "--infra-retry-backoff",
+            "0",
+        ]
+    )
+    cfg = config_from_args(args)
+    client = Mock()
+    cases = [
+        subprocess.CompletedProcess(
+            [],
+            0,
+            json.dumps(
+                {
+                    "status": "needs_input",
+                    "pause_kind": "blocked",
+                    "message": "pi driver stopped before returning TaskPlan: pi_error",
+                    "run_id": "run-1",
+                }
+            ),
+            "",
+        ),
+        subprocess.CompletedProcess(
+            [],
+            1,
+            json.dumps(
+                {
+                    "status": "failed",
+                    "error": "provider_error: read timed out",
+                    "run_id": "run-1",
+                }
+            ),
+            "",
+        ),
+        subprocess.TimeoutExpired([], 1),
+    ]
+    for first in cases:
+        client.reset_mock()
+        bridge = InteractBridge(cfg, client=client, environ={})
+        with patch(
+            "tests.evals.benchmarks.interact_bridge.subprocess.run",
+            side_effect=[
+                first,
+                subprocess.CompletedProcess([], 0, '{"status":"completed"}', ""),
+            ],
+        ) as run_mock:
+            bridge.run()
+        assert run_mock.call_count == 2
+        assert client.ask_user.call_count == 0

@@ -1890,3 +1890,24 @@ def test_together_agent_forwards_host_provider_env_in_memory_and_redacts(
     assert agent._extra_env["OPENAI_API_KEY"] == secret
     assert agent._extra_env["OPENAI_BASE_URL"] == "https://gateway.example/v1"
     assert secret in agent._redaction_secrets
+
+
+def test_together_trial_config_keeps_agent_env_secrets_out_of_persisted_config(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-agent-env-sentinel-12345"
+    root, task, _trial = _make_task_and_trial(tmp_path)
+    (task / "instruction.md").write_text("Fix bug", encoding="utf-8")
+    cfg = build_olympus_trial_config(
+        task,
+        model="openai/gpt-4o",
+        agent_env={"OPENAI_API_KEY": secret, "OLYMPUS_SAFE_FLAG": "1"},
+        swe_together_root=root,
+    )
+    assert "OPENAI_API_KEY" not in cfg.agent.env
+    assert cfg.agent.env == {"OLYMPUS_SAFE_FLAG": "1"}
+    assert secret not in json.dumps(cfg.agent.kwargs)
+    assert secret not in json.dumps(cfg.agent.env)
+    rebuilt = UserEnabledOlympusAgent(logs_dir=tmp_path / "logs", **cfg.agent.kwargs)
+    assert rebuilt._extra_env["OPENAI_API_KEY"] == secret
+    assert secret in rebuilt._redaction_secrets

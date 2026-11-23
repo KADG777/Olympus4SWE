@@ -1785,3 +1785,153 @@ for raw in sys.stdin:
     assert outcome.completed is True
     assert outcome.stop_reason == "final_response"
     assert outcome.final_content == '{"ok": true}'
+
+
+def test_auto_driver_rejects_unconfigured_mock_and_invalidates_path_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from olympus.harness.driver import resolve_driver_spec
+    from olympus.harness.pi import pi_available
+
+    good_dir = tmp_path / "good"
+    bad_dir = tmp_path / "bad"
+    good_dir.mkdir()
+    bad_dir.mkdir()
+    good_pi = good_dir / "pi"
+    good_pi.write_text("#!/bin/sh\necho '--mode json rpc'\n", encoding="utf-8")
+    good_pi.chmod(0o755)
+    bad_pi = bad_dir / "pi"
+    bad_pi.write_text("#!/bin/sh\necho 'usage: pi'\n", encoding="utf-8")
+    bad_pi.chmod(0o755)
+
+    _reset_pi_availability_cache()
+    monkeypatch.delenv("OLYMPUS_PI_BIN", raising=False)
+    monkeypatch.setenv("PATH", f"{good_dir}:{os.environ.get('PATH', '')}")
+    assert pi_available() is True
+    assert resolve_driver_spec("auto", provider=Mock()) == "native"
+
+    monkeypatch.setenv("PATH", f"{bad_dir}:{os.environ.get('PATH', '')}")
+    assert pi_available() is False
+    _reset_pi_availability_cache()
+
+
+def test_pi_driver_provider_binding_secret_redaction_and_error_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.providers.factory import build_provider
+
+    captured = tmp_path / "models.json"
+    trace = tmp_path / "pi-trace.jsonl"
+    fake = tmp_path / "fake-pi-gw"
+    fake.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if "--help" in sys.argv:
+    print("--mode json rpc")
+    sys.exit(0)
+cfg = Path(os.environ["PI_CODING_AGENT_DIR"]) / "models.json"
+Path({str(captured)!r}).write_text(cfg.read_text(), encoding="utf-8")
+sys.stdin.readline()
+key = os.environ["OLYMPUS_PI_GATEWAY_KEY"]
+print("provider read timed out: " + key, file=sys.stderr, flush=True)
+print(json.dumps({{
+    "type": "message_end",
+    "message": {{
+        "role": "assistant",
+        "stopReason": "error",
+        "errorMessage": "provider read timed out",
+    }},
+}}), flush=True)
+print(json.dumps({{"type": "agent_settled", "aborted": False}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    env = {
+        "OPENAI_BASE_URL": "https://ambient-openai.invalid/v1",
+        "OPENAI_API_KEY": "sk-ambient-openai-sentinel-999",
+        "ANTHROPIC_BASE_URL": "https://ambient-anthropic.invalid",
+        "ANTHROPIC_API_KEY": "sk-selected-anthropic-sentinel-888",
+        "PI_CODING_AGENT_DIR": "",
+    }
+    provider = build_provider(
+        provider="anthropic",
+        model="custom-model",
+        base_url="https://selected-gateway.invalid",
+        environ=env,
+        user_providers_path=None,
+    )
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    outcome = PiDriver(binary=str(fake), provider=provider).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="plan",
+            system_prompt="Return JSON",
+            user_prompt="Plan",
+            read_only=True,
+            model=provider.model_name,
+            trace_path=trace,
+        )
+    )
+    cfg = json.loads(captured.read_text(encoding="utf-8"))["providers"]["olympus-gateway"]
+    assert cfg["baseUrl"] == "https://selected-gateway.invalid"
+    assert cfg["api"] == "anthropic-messages"
+    assert cfg["apiKey"] == "$OLYMPUS_PI_GATEWAY_KEY"
+    assert "sk-selected-anthropic-sentinel-888" not in captured.read_text(encoding="utf-8")
+    assert "sk-selected-anthropic-sentinel-888" not in trace.read_text(encoding="utf-8")
+    assert outcome.completed is False
+    assert "pi_error" in outcome.stop_reason
+    assert "timed out" in outcome.stop_reason
+
+
+def test_pi_driver_cleans_up_gateway_dir_on_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    from olympus.harness.pi import pi_available
+
+    fake = tmp_path / "vanishing-pi"
+    fake.write_text("#!/bin/sh\necho '--mode json rpc'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-vanish-sentinel-777")
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    driver = PiDriver(binary=str(fake))
+    # Prime the help probe, then remove the binary before spawn.
+    assert pi_available(binary=str(fake)) is True
+    fake.unlink()
+    before = set(Path(tempfile.gettempdir()).glob("olympus-pi-cfg-*"))
+    with pytest.raises(PiNotAvailableError):
+        driver.run_turn(
+            DriverTurnRequest(
+                workspace_path=tmp_path,
+                env_root=tmp_path,
+                actor="plan",
+                system_prompt="",
+                user_prompt="hi",
+                read_only=True,
+                model="openai/gpt-4o",
+            )
+        )
+    after = set(Path(tempfile.gettempdir()).glob("olympus-pi-cfg-*"))
+    assert after - before == set()
+    _reset_pi_availability_cache()
+
+
+def test_design_and_orchestrate_default_artifacts_stay_outside_repo(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    state = tmp_path / "state"
+    state.mkdir()
+    _init_repo(workspace)
+    store = RunStore(state / "olympus.db")
+    design = DesignStage(store=store, provider=MockLLMProvider(), workspace_root=workspace)
+    orch = OrchestrateStage(store=store, provider=MockLLMProvider(), workspace_root=workspace)
+    assert design.artifacts_root == state / "runs"
+    assert orch.artifacts_root == state / "runs"
+    assert not (workspace / ".olympus").exists()

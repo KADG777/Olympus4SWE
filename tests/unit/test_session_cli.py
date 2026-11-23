@@ -1896,3 +1896,153 @@ def test_session_start_records_stage_driver_option_and_defaults_to_auto(
         str(default_start["run_id"])
     )["execution_drivers"]
     assert recorded["stage_driver"] == "auto"
+
+
+def test_router_blocks_negated_defaults_questions_and_unchanged_refusals() -> None:
+    from olympus.core.contracts import GoalSpec, RunStatus
+    from olympus.providers.base import MockLLMProvider
+    from olympus.providers.types import LLMResponse
+    from olympus.session.contracts import PauseKind
+    from olympus.session.router import parse_reply
+
+    spec = GoalSpec.model_validate(
+        {
+            **_goal_spec(),
+            "open_ambiguities": [
+                {
+                    "id": "backend",
+                    "question": "Choose backend?",
+                    "impact": "Determines storage isolation",
+                    "blocking": True,
+                    "default_assumption": "Use isolated storage",
+                }
+            ],
+        }
+    )
+    snap = {"status": RunStatus.AWAITING_HUMAN, "spec": spec, "design": None, "plan": None}
+
+    for phrase in ("Do not use your default assumptions.", "Do not change anything."):
+        provider = MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps(
+                        {"action": "clarify", "answers": {"backend": "Use isolated storage"}}
+                    )
+                )
+            ]
+        )
+        intent = parse_reply(
+            provider=provider,
+            message=phrase,
+            snapshot=snap,
+            pause_kind=PauseKind.CLARIFY,
+        )
+        assert intent.action == "unknown", (phrase, intent)
+        assert intent.answers == {}
+
+    malformed = MockLLMProvider(responses=[LLMResponse(content="not json")])
+    q_intent = parse_reply(
+        provider=malformed,
+        message="What are the default assumptions?",
+        snapshot=snap,
+        pause_kind=PauseKind.CLARIFY,
+    )
+    assert q_intent.action == "unknown"
+
+    malformed2 = MockLLMProvider(responses=[LLMResponse(content="not json")])
+    keep_intent = parse_reply(
+        provider=malformed2,
+        message="Keep everything unchanged.",
+        snapshot=snap,
+        pause_kind=PauseKind.BLOCKED,
+    )
+    assert keep_intent.action == "unknown"
+
+
+def test_session_reply_preserves_builtin_workflow_and_explicit_stage_driver_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.plan.append("not-json-plan")
+    script.plan.append("not-json-plan")
+    script.plan.append("not-json-plan")
+    _patch_provider(monkeypatch, script)
+
+    code, start = _invoke(
+        [
+            "start",
+            "Build a calculator library",
+            "--workflow",
+            "repo_fast_patch",
+            "--stage-driver",
+            "native",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code == 0, json.dumps(start, indent=2)
+    assert start["pause_kind"] == "blocked"
+    run_id = str(start["run_id"])
+
+    # Reply omitting --workflow must reload repo_fast_patch and recover at plan.
+    script2 = SessionScript()
+    script2.router.append(json.dumps({"action": "revise", "feedback": "Use calc.py"}))
+    script2.plan.append(json.dumps(_plan()))
+    _patch_provider(monkeypatch, script2)
+    code2, resumed = _invoke(
+        [
+            "reply",
+            run_id,
+            "Use calc.py",
+            "--step-mode",
+            "plan_only",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code2 == 0, json.dumps(resumed, indent=2)
+    assert resumed["workflow"] == "repo_fast_patch"
+    assert resumed["pause_kind"] == "plan_handoff"
+    events = RunStore(state / "olympus.db").list_events(run_id)
+    continued = [e for e in events if e.event_type == "session.continued"]
+    assert continued[-1].payload["recovery_node"] == "plan"
+
+    # Explicit --stage-driver pi on reply must not be ignored even when snapshot recorded native.
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(tmp_path / "missing-pi"))
+    from olympus.harness.pi import _reset_pi_availability_cache
+
+    _reset_pi_availability_cache()
+    script3 = SessionScript()
+    script3.router.append(json.dumps({"action": "revise", "feedback": "Try with pi"}))
+    _patch_provider(monkeypatch, script3)
+    code3, failed = _invoke(
+        [
+            "reply",
+            run_id,
+            "Try with pi",
+            "--stage-driver",
+            "pi",
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state),
+            "--provider",
+            "mock",
+        ]
+    )
+    assert code3 == 1
+    assert failed["status"] == "failed"
+    assert "PiDriver requires" in str(failed["error"])
+    _reset_pi_availability_cache()

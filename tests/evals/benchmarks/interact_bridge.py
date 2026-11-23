@@ -121,13 +121,21 @@ _NEGATED_SHIP_MARKERS = (
 )
 _INFRA_ERROR_RE = re.compile(
     r"provider_error"
+    r"|\bpi_error\b"
     r"|timed\s*out"
     r"|timeout"
     r"|connection\s*(?:error|refused|reset|aborted)"
+    r"|econnreset"
+    r"|socket\s+hang\s+up"
     r"|rate\s*limit"
+    r"|service\s+unavailable"
+    r"|bad\s+gateway"
+    r"|gateway\s+timeout"
+    r"|overloaded"
     r"|http\s+5\d{2}"
     r"|http\s+5xx"
-    r"|\b50[234]\b",
+    r"|\b50[234]\b"
+    r"|\b529\b",
     re.IGNORECASE,
 )
 
@@ -161,16 +169,18 @@ def _redact_value(value: Any, environ: dict[str, str]) -> Any:
 
 
 def is_infrastructure_block(envelope: dict[str, Any]) -> bool:
-    """Return True when a session pause is a transient provider/infra failure.
+    """Return True when a session pause or failure is a transient provider/infra failure.
 
-    Such pauses must never be forwarded to the maintainer through ``ask_user``:
+    Such errors must never be forwarded to the maintainer through ``ask_user``:
     a human cannot answer a provider timeout, so the bridge retries locally and
     fails cleanly if the infrastructure stays down.
     """
-    if envelope.get("status") != "needs_input":
-        return False
-    pause_kind = str(envelope.get("pause_kind") or "").strip().lower()
-    if pause_kind not in ("", "blocked"):
+    status = str(envelope.get("status") or "").strip().lower()
+    if status == "needs_input":
+        pause_kind = str(envelope.get("pause_kind") or "").strip().lower()
+        if pause_kind not in ("", "blocked"):
+            return False
+    elif status != "failed":
         return False
     detail = " ".join(
         str(envelope.get(field) or "") for field in ("message", "error")
@@ -196,9 +206,16 @@ def append_jsonl(
 class BridgeError(RuntimeError):
     """A bridge-level failure carrying the process exit code to report."""
 
-    def __init__(self, message: str, exit_code: int = EXIT_SESSION_FAILED) -> None:
+    def __init__(
+        self,
+        message: str,
+        exit_code: int = EXIT_SESSION_FAILED,
+        *,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -552,13 +569,39 @@ class InteractBridge:
     def invoke_with_infra_retry(
         self, subcommand: str, message: str, *, step_mode: str
     ) -> dict[str, Any]:
-        """Invoke the session, retrying transient infrastructure blocks locally."""
-        envelope = self.invoke(subcommand, message, step_mode=step_mode)
+        """Invoke the session, retrying transient infrastructure blocks and timeouts locally."""
         attempt = 0
-        while (
-            is_infrastructure_block(envelope)
-            and attempt < self.config.infra_retries
-        ):
+        while True:
+            try:
+                envelope = self.invoke(subcommand, message, step_mode=step_mode)
+            except BridgeError as exc:
+                if not exc.retryable or attempt >= self.config.infra_retries:
+                    raise
+                attempt += 1
+                self.log(
+                    "session.infra_retry",
+                    subcommand=subcommand,
+                    step_mode=step_mode,
+                    attempt=attempt,
+                    max_retries=self.config.infra_retries,
+                    detail=str(exc),
+                )
+                if self.config.infra_retry_backoff > 0:
+                    time.sleep(self.config.infra_retry_backoff)
+                continue
+            if not is_infrastructure_block(envelope):
+                return envelope
+            if attempt >= self.config.infra_retries:
+                detail = str(
+                    envelope.get("error")
+                    or envelope.get("message")
+                    or "unknown infrastructure failure"
+                )
+                raise BridgeError(
+                    f"session {subcommand} stopped on an infrastructure error after "
+                    f"{attempt + 1} attempt(s): {detail}",
+                    EXIT_SESSION_FAILED,
+                )
             attempt += 1
             self.log(
                 "session.infra_retry",
@@ -570,19 +613,6 @@ class InteractBridge:
             )
             if self.config.infra_retry_backoff > 0:
                 time.sleep(self.config.infra_retry_backoff)
-            envelope = self.invoke(subcommand, message, step_mode=step_mode)
-        if is_infrastructure_block(envelope):
-            detail = str(
-                envelope.get("error")
-                or envelope.get("message")
-                or "unknown infrastructure failure"
-            )
-            raise BridgeError(
-                f"session {subcommand} stopped on an infrastructure error after "
-                f"{attempt + 1} attempt(s): {detail}",
-                EXIT_SESSION_FAILED,
-            )
-        return envelope
 
     def invoke(self, subcommand: str, message: str, *, step_mode: str) -> dict[str, Any]:
         argv = self.session_argv(subcommand, message, step_mode)
@@ -601,7 +631,8 @@ class InteractBridge:
         except subprocess.TimeoutExpired as exc:
             self.log("session.timeout", subcommand=subcommand, step_mode=step_mode)
             raise BridgeError(
-                f"olympus session {subcommand} timed out after {self.config.session_timeout}s"
+                f"olympus session {subcommand} timed out after {self.config.session_timeout}s",
+                retryable=True,
             ) from exc
         except OSError as exc:
             raise BridgeError(

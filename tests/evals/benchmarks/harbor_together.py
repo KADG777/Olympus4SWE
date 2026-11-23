@@ -126,6 +126,25 @@ def _resolve_user_api_base(
     return None
 
 
+def _register_agent_env_secrets(env: Mapping[str, str]) -> str:
+    ref = f"env-ref:{uuid.uuid4().hex}"
+    _user_api_key_refs()[ref] = json.dumps(dict(env))
+    return ref
+
+
+def _resolve_agent_env_secrets(agent_env_ref: str | None) -> dict[str, str]:
+    if not agent_env_ref:
+        return {}
+    raw = _user_api_key_refs().get(agent_env_ref)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+
+
 _SENSITIVE_URL_QUERY_RE = re.compile(
     r"(?:key|token|secret|auth|pass|pwd|sig|cred)", re.IGNORECASE
 )
@@ -842,6 +861,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         pi_bundle: str | None = None,
         install_pi: bool | None = None,
         extra_env: Mapping[str, str] | None = None,
+        agent_env_ref: str | None = None,
         # Reactive user simulator
         user_model_name: str = "anthropic/claude-opus-4-6",
         user_api_base: str | None = None,
@@ -902,7 +922,10 @@ class UserEnabledOlympusAgent(BaseAgent):
             if install_pi is not None
             else any(_driver_uses_pi(value) for value in driver_settings)
         )
-        self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
+        self._extra_env = {
+            **_resolve_agent_env_secrets(agent_env_ref),
+            **{str(key): str(value) for key, value in (extra_env or {}).items()},
+        }
         # Fallback for Harbor < 0.27 (no MODEL_CONNECTION): forward active provider
         # credentials in memory at runtime without persisting them in TrialConfig.
         provider_key = self._provider.casefold()
@@ -1782,6 +1805,16 @@ def build_olympus_trial_config(
     if isinstance(raw_base, str) and raw_base:
         sim_kwargs["user_api_base_ref"] = _register_user_api_base(raw_base)
 
+    safe_agent_env: dict[str, str] = {}
+    secret_agent_env: dict[str, str] = {}
+    for key, value in (agent_env or {}).items():
+        if _SENSITIVE_ENV_RE.search(str(key)):
+            secret_agent_env[str(key)] = str(value)
+        else:
+            safe_agent_env[str(key)] = str(value)
+    if secret_agent_env:
+        sim_kwargs["agent_env_ref"] = _register_agent_env_secrets(secret_agent_env)
+
     (
         AgentConfigClass,
         EnvironmentConfigClass,
@@ -1796,7 +1829,7 @@ def build_olympus_trial_config(
         base_url=base_url,
         override_timeout_sec=agent_timeout,
         kwargs=sim_kwargs,
-        env=dict(agent_env or {}),
+        env=safe_agent_env,
     )
     environment_config = EnvironmentConfigClass(
         type=env_type,

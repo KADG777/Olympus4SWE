@@ -35,6 +35,15 @@ class McpHttpError(McpError):
         super().__init__(message)
 
 
+class McpRpcError(McpError):
+    """The MCP server returned a JSON-RPC error object."""
+
+    def __init__(self, code: int | None, rpc_message: str, detail: str) -> None:
+        self.code = code
+        self.rpc_message = rpc_message
+        super().__init__(detail)
+
+
 class McpToolError(McpError):
     """The MCP server reported ``isError: true`` for a tool call."""
 
@@ -44,22 +53,21 @@ class McpToolError(McpError):
         super().__init__(f"MCP tool {tool!r} failed: {message}")
 
 
-_SESSION_EXPIRY_MARKERS = ("session not found", "-32600")
-
-
 def is_session_expiry_error(exc: McpError) -> bool:
     """Return True when ``exc`` reports an expired MCP transport session.
 
     Streamable-HTTP servers signal an expired session either with HTTP ``404``
-    or with JSON-RPC error code ``-32600`` (``Session not found``). Tool-level
-    errors never qualify even when their text mentions sessions.
+    or with primary JSON-RPC error code ``-32600`` / ``Session not found`` in
+    the error message. Tool-level errors and secondary ``error.data`` fields
+    never qualify.
     """
     if isinstance(exc, McpToolError):
         return False
-    if isinstance(exc, McpHttpError) and exc.status_code == 404:
-        return True
-    message = str(exc).casefold()
-    return any(marker in message for marker in _SESSION_EXPIRY_MARKERS)
+    if isinstance(exc, McpHttpError):
+        return exc.status_code == 404 or "session not found" in str(exc).casefold()
+    if isinstance(exc, McpRpcError):
+        return exc.code == -32600 or "session not found" in exc.rpc_message.casefold()
+    return "session not found" in str(exc).casefold()
 
 
 def parse_sse_messages(text: str) -> list[dict[str, Any]]:
@@ -239,6 +247,15 @@ class McpHttpClient:
             raise McpError(f"MCP {method!r} returned no response")
         error = response.get("error")
         if error:
+            if isinstance(error, dict):
+                raw_code = error.get("code")
+                code = (
+                    raw_code
+                    if isinstance(raw_code, int) and not isinstance(raw_code, bool)
+                    else None
+                )
+                rpc_message = str(error.get("message") or "")
+                raise McpRpcError(code, rpc_message, f"MCP {method!r} failed: {error}")
             raise McpError(f"MCP {method!r} failed: {error}")
         return response.get("result")
 

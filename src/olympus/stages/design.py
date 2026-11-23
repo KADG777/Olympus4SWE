@@ -27,7 +27,11 @@ from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
 from olympus.harness.loop import AgentLoop
 from olympus.harness.structured import run_structured_turn
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
+from olympus.stages.common import (
+    default_artifacts_root,
+    format_workspace_inventory,
+    resolve_stage_driver,
+)
 from olympus.tools.aci import WorkspaceToolkit
 
 # Free-form prose below this length can never carry a frozen contract.
@@ -378,7 +382,7 @@ class DesignStage:
         self.artifacts_root = (
             artifacts_root
             if artifacts_root is not None
-            else self.workspace_root / ".olympus" / "runs"
+            else default_artifacts_root(store, self.workspace_root)
         )
 
     def _run_dir(self, run_id: str) -> Path:

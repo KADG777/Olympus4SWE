@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -84,6 +85,17 @@ def run_structured_loop[T: BaseModel](
     )
 
 
+def default_artifacts_root(store: RunStore, workspace_root: Path) -> Path:
+    """Keep default stage traces outside the repository when the DB lives outside it."""
+    db_path = getattr(store, "db_path", None)
+    if db_path is not None and str(db_path) != ":memory:":
+        db_parent = Path(db_path).expanduser().resolve().parent
+        ws = workspace_root.resolve()
+        if db_parent != ws and not db_parent.is_relative_to(ws):
+            return db_parent / "runs"
+    return workspace_root / ".olympus" / "runs"
+
+
 def resolve_stage_driver(
     *,
     settings: ExecutionDriversConfig | None,
@@ -98,12 +110,13 @@ def resolve_stage_driver(
     if spec.partition("@")[0] == "native":
         return None, None
     resolved_registry = (registry or DriverRegistry()).with_factories(
-        default_driver_factories(store=store, run_id=run_id)
+        default_driver_factories(store=store, run_id=run_id, provider=provider)
     )
     return resolved_registry.resolve_external(spec)
 
 
 __all__ = [
+    "default_artifacts_root",
     "extract_json_payload",
     "format_workspace_inventory",
     "parse_model_json",

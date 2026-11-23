@@ -73,7 +73,11 @@ from olympus.harness.worktree import (
 )
 from olympus.providers.base import LLMProvider
 from olympus.providers.factory import build_provider
-from olympus.stages.common import format_workspace_inventory, resolve_stage_driver
+from olympus.stages.common import (
+    default_artifacts_root,
+    format_workspace_inventory,
+    resolve_stage_driver,
+)
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
 if TYPE_CHECKING:
@@ -525,7 +529,7 @@ class OrchestrateStage:
         self.artifacts_root = (
             artifacts_root
             if artifacts_root is not None
-            else self.workspace_root / ".olympus" / "runs"
+            else default_artifacts_root(store, self.workspace_root)
         )
         self.sandbox_root = Path(sandbox_root).resolve() if sandbox_root is not None else None
 
@@ -1568,7 +1572,9 @@ class OrchestrateStage:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
         registry = self.driver_registry.with_factories(
-            default_driver_factories(store=self.store, run_id=run_id)
+            default_driver_factories(
+                store=self.store, run_id=run_id, provider=self.provider
+            )
         )
         worker = registry.resolve(
             resolve_driver_spec(self.execution_drivers.worker_driver, provider=self.provider),

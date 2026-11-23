@@ -170,6 +170,8 @@ _NEGATED_REVISION_PATTERNS = tuple(
         r"\b(?:do\s+not|don'?t|cannot|can'?t|won'?t|will\s+not|shouldn'?t|should\s+not|wouldn'?t|never|no\s+need\s+to|stop)\b[^.!?,;\n]{0,40}\b(?:change|modify|edit|revise|rework|redo|touch|reopen|alter|update)\b",
         r"\bno\s+(?:changes?|modifications?|edits?|revisions?|further\s+work)\b",
         r"\bleave\s+(?:it|everything|this|that)\s+as\s+is\b",
+        r"\bkeep\s+(?:it|everything|this|that|all)\s+(?:as\s+is|unchanged|the\s+same)\b",
+        r"\bstay\s+(?:as\s+is|unchanged)\b",
         r"\bnothing\s+(?:else\s+)?to\s+(?:change|fix|do|modify|update)\b",
     )
 )
@@ -193,13 +195,19 @@ _DEFAULT_ACCEPTANCE_PATTERNS = tuple(
     for pattern in (
         r"\b(?:use|using|accept|accepting|apply|applying|take|taking|adopt|adopting|"
         r"go\s+with|going\s+with|proceed\s+with|proceeding\s+with|follow|following|"
-        r"stick\s+with|sticking\s+with)\b[^.!?\n]{0,60}\b(?:defaults?|default\s+assumptions?|"
-        r"recommendations?|recommended\s+(?:answers?|options?|choices?|defaults?|assumptions?)|"
+        r"stick\s+with|sticking\s+with|ok\s+with|okay\s+with|fine\s+with)\b[^.!?\n]{0,60}"
+        r"\b(?:defaults?|default\s+assumptions?|recommendations?|recommended\s+"
+        r"(?:answers?|options?|choices?|defaults?|assumptions?)|"
         r"your\s+(?:best\s+)?(?:defaults?|recommendations?|assumptions?))\b",
         r"\b(?:go\s+with|proceed\s+with|stick\s+with)\s+(?:the\s+|your\s+)?"
         r"(?:defaults?|recommendations?)\b",
-        r"\bdefault\s+(?:assumptions?|answers?|choices?)\b",
+        r"^\s*(?:the\s+|your\s+)?(?:defaults?|default\s+(?:assumptions?|answers?|choices?)|"
+        r"recommendations?)\s*[.!]?\s*$",
     )
+)
+_QUESTION_PREFIX_RE = re.compile(
+    r"^\s*(?:what|which|why|how|who|when|where|can\s+you\s+explain|could\s+you\s+explain|"
+    r"tell\s+me\s+what|list\s+(?:the|your)|show\s+me)\b"
 )
 _DEFAULT_ACCEPTANCE_CJK = (
     "按默认",
@@ -296,10 +304,24 @@ def _default_blocker_answers(
     return answers, resolutions
 
 
+def _is_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("?", "？")):
+        return True
+    return _QUESTION_PREFIX_RE.search(stripped.casefold()) is not None
+
+
 def _is_default_delegation(text: str) -> bool:
     """True when the text affirmatively delegates decisions to recorded defaults."""
     lowered = text.casefold()
-    if _negated_approval(lowered) or _negated_revision(lowered) or _negated_defaults(lowered):
+    if (
+        _is_question(text)
+        or _negated_approval(lowered)
+        or _negated_revision(lowered)
+        or _negated_defaults(lowered)
+    ):
         return False
     return any(pattern.search(lowered) for pattern in _DEFAULT_ACCEPTANCE_PATTERNS) or any(
         token in lowered for token in _DEFAULT_ACCEPTANCE_CJK
@@ -447,10 +469,17 @@ def _sanitize(
         if key.strip() in valid_resolutions and value.strip()
     }
     explicit_answers, explicit_resolutions = _extract_explicit_clarifications(message, snapshot)
-    if not answers and not resolutions:
+    lowered = message.casefold()
+    if not explicit_answers and not explicit_resolutions and (
+        _negated_defaults(lowered) or _negated_revision(lowered)
+    ):
+        # A refusal ("do not use your default assumptions", "do not change anything")
+        # must never be promoted into blocker answers by the LLM router.
+        answers = {}
+        resolutions = {}
+    elif not answers and not resolutions:
         answers.update(explicit_answers)
         resolutions.update(explicit_resolutions)
-    lowered = message.casefold()
     defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
     if defaults is not None:
         # A human delegation to defaults resolves every remaining blocker

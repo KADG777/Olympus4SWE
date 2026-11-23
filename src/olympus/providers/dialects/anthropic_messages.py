@@ -27,6 +27,7 @@ from olympus.providers.types import (
 class AnthropicMessagesDialect:
     """Sends ``/v1/messages`` through the official Anthropic SDK."""
 
+    wire_api: str = "anthropic-messages"
     max_tokens: int = 4096
     http_client: httpx.Client | None = None
 

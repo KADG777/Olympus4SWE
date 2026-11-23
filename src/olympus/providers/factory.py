@@ -9,6 +9,7 @@ from pathlib import Path
 from olympus.providers.auth import (
     CredentialPool,
     EndpointTarget,
+    ExternalGatewayBinding,
     PooledProvider,
     apply_url_rewrites,
     resolve_env_mapping,
@@ -211,6 +212,56 @@ def _env_value(env: Mapping[str, str], name: str | None) -> str | None:
     if not name:
         return None
     return _clean(env.get(name))
+
+
+def resolve_external_gateway_from_env(
+    env: Mapping[str, str], model: str | None
+) -> ExternalGatewayBinding | None:
+    """Resolve an external driver gateway binding from standard provider env vars."""
+    if not model or not model.strip():
+        return None
+    cleaned = model.strip()
+    prefix: str | None = None
+    model_id = cleaned
+    if "/" in cleaned:
+        raw_prefix, rest = cleaned.split("/", 1)
+        lowered = raw_prefix.strip().lower()
+        if lowered in {"openai", "anthropic"} and rest.strip():
+            prefix = lowered
+            model_id = rest.strip()
+
+    anthropic_base = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    openai_base = (env.get("OPENAI_BASE_URL") or "").strip()
+    anthropic_key_env = (
+        "ANTHROPIC_API_KEY"
+        if (env.get("ANTHROPIC_API_KEY") or "").strip()
+        else ("ANTHROPIC_AUTH_TOKEN" if (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip() else "")
+    )
+    openai_key_env = "OPENAI_API_KEY" if (env.get("OPENAI_API_KEY") or "").strip() else ""
+
+    if prefix == "anthropic" or (prefix is None and anthropic_base and not openai_base):
+        if anthropic_base and anthropic_key_env:
+            return ExternalGatewayBinding(
+                api="anthropic-messages",
+                base_url=anthropic_base,
+                model_id=model_id,
+                api_key_env=anthropic_key_env,
+            )
+    elif openai_base and openai_key_env:
+        return ExternalGatewayBinding(
+            api="openai-completions",
+            base_url=openai_base,
+            model_id=model_id,
+            api_key_env=openai_key_env,
+        )
+    elif anthropic_base and anthropic_key_env:
+        return ExternalGatewayBinding(
+            api="anthropic-messages",
+            base_url=anthropic_base,
+            model_id=model_id,
+            api_key_env=anthropic_key_env,
+        )
+    return None
 
 
 def _clean(raw: str | None) -> str | None:

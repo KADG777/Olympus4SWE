@@ -75,6 +75,7 @@ class OpenAIChatCompat:
 class OpenAIChatDialect:
     """Sends ``/chat/completions`` through the official OpenAI SDK."""
 
+    wire_api: str = "openai-completions"
     compat: OpenAIChatCompat = field(default_factory=OpenAIChatCompat)
     max_tokens: int | None = None
     http_client: httpx.Client | None = None
