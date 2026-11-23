@@ -1625,32 +1625,35 @@ def test_together_hides_user_api_base_token_in_trial_config_and_redacts_setup_er
 ) -> None:
     from unittest.mock import AsyncMock
 
-    token = "synthetic-gateway-token-987654"
     root, task, _trial = _make_task_and_trial(tmp_path)
     (task / "instruction.md").write_text("Fix bug")
-    gateway = f"https://gateway.example/v1?token={token}"
-    cfg = build_olympus_trial_config(
-        task,
-        model="openai/gpt-4o",
-        user_api_base=gateway,
-        swe_together_root=root,
-    )
-    serialized = (
-        cfg.model_dump_json() if hasattr(cfg, "model_dump_json") else json.dumps(cfg.agent.kwargs)
-    )
-    assert token not in serialized
-    rebuilt = UserEnabledOlympusAgent(logs_dir=tmp_path / "rebuilt", **cfg.agent.kwargs)
-    assert rebuilt._user_api_base == gateway
+    for idx, token in enumerate(("synthetic-gateway-token-987654", "Q7zK")):
+        gateway = f"https://gateway.example/v1?token={token}"
+        cfg = build_olympus_trial_config(
+            task,
+            model="openai/gpt-4o",
+            user_api_base=gateway,
+            swe_together_root=root,
+        )
+        serialized = (
+            cfg.model_dump_json()
+            if hasattr(cfg, "model_dump_json")
+            else json.dumps(cfg.agent.kwargs)
+        )
+        assert token not in serialized
+        logs_dir = tmp_path / f"rebuilt-{idx}"
+        rebuilt = UserEnabledOlympusAgent(logs_dir=logs_dir, **cfg.agent.kwargs)
+        assert rebuilt._user_api_base == gateway
 
-    monkeypatch.setattr(
-        rebuilt,
-        "_install_olympus",
-        AsyncMock(return_value=ExecOutcome("", f"install failed for {token}", 1)),
-    )
-    with pytest.raises(RuntimeError) as excinfo:
-        asyncio.run(rebuilt.setup(None))
-    assert token not in str(excinfo.value)
-    assert token not in (tmp_path / "rebuilt" / "setup-install.txt").read_text(encoding="utf-8")
+        monkeypatch.setattr(
+            rebuilt,
+            "_install_olympus",
+            AsyncMock(return_value=ExecOutcome("", f"install failed for {token}", 1)),
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            asyncio.run(rebuilt.setup(None))
+        assert token not in str(excinfo.value)
+        assert token not in (logs_dir / "setup-install.txt").read_text(encoding="utf-8")
 
 
 def test_together_install_script_falls_back_to_curl_when_pip_fails(tmp_path: Path) -> None:

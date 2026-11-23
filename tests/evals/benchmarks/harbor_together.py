@@ -126,6 +126,11 @@ def _resolve_user_api_base(
     return None
 
 
+_SENSITIVE_URL_QUERY_RE = re.compile(
+    r"(?:key|token|secret|auth|pass|pwd|sig|cred)", re.IGNORECASE
+)
+
+
 def _extract_url_secrets(url: str | None) -> tuple[str, ...]:
     """Return credentials or query-token values embedded in a gateway URL."""
     if not url:
@@ -138,8 +143,8 @@ def _extract_url_secrets(url: str | None) -> tuple[str, ...]:
         found.append(f"{parts.username}:{parts.password}")
     if parts.query:
         found.append(parts.query)
-        for _key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=False):
-            if len(value) >= 6:
+        for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=False):
+            if value and (len(value) >= 6 or _SENSITIVE_URL_QUERY_RE.search(key)):
                 found.append(value)
     return tuple(dict.fromkeys(found))
 

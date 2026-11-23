@@ -88,19 +88,26 @@ def _assert_state_outside_workspace(
     root = Path(workspace).expanduser().resolve()
     candidate = Path(state_dir).expanduser().resolve()
     toplevel = _git_toplevel(root)
+    targets = (
+        ("--state-dir", candidate),
+        ("--state-dir/sandboxes", (candidate / "sandboxes").resolve()),
+        ("--state-dir/runs", (candidate / "runs").resolve()),
+        ("--state-dir/olympus.db", (candidate / "olympus.db").resolve()),
+    )
     for boundary in (root, toplevel):
         if boundary is None:
             continue
-        if candidate == boundary or candidate.is_relative_to(boundary):
-            scope = (
-                "the target workspace"
-                if boundary == root
-                else f"the enclosing git repository {boundary} of the target workspace"
-            )
-            raise ValueError(
-                f"--state-dir {candidate} is inside {scope}; "
-                "headless session state must live outside the repository"
-            )
+        scope = (
+            "the target workspace"
+            if boundary == root
+            else f"the enclosing git repository {boundary} of the target workspace"
+        )
+        for label, resolved in targets:
+            if resolved == boundary or resolved.is_relative_to(boundary):
+                raise ValueError(
+                    f"{label} {resolved} is inside {scope}; "
+                    "headless session state must live outside the repository"
+                )
     return candidate
 
 

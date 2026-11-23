@@ -1430,3 +1430,52 @@ def test_explicit_ambiguity_answer_resolves_blocker_when_router_json_fails(
     )
     assert code == 0, json.dumps(clarified, indent=2)
     assert not clarified["unresolved_blockers"]
+
+
+def test_delivery_checks_and_symlinked_sandboxes_never_pollute_target_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.harness import delivery
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    plan = _plan()
+    plan["delivery_checks"] = [
+        {"requirement_id": "R1", "criterion_index": 1, "command": _DIVIDE_CHECK},
+    ]
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(plan))
+    script.workers.append(("calculator.py", _CALC_CODE))
+    _patch_provider(monkeypatch, script)
+
+    observed: list[tuple[Path, Path]] = []
+    real_create = delivery.create_sandbox
+
+    def _observe(*args: object, **kwargs: object) -> object:
+        handle = real_create(*args, **kwargs)  # type: ignore[arg-type] -- forwarding mock wrapper
+        observed.append((handle.workspace_path, handle.tmp_dir))
+        return handle
+
+    monkeypatch.setattr(delivery, "create_sandbox", _observe)
+    code, result = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0, json.dumps(result, indent=2)
+    assert result["status"] == "completed"
+    assert observed
+    for worktree, tmp_dir in observed:
+        assert not worktree.resolve().is_relative_to(repo.resolve())
+        assert not tmp_dir.resolve().is_relative_to(repo.resolve())
+    assert not (repo / ".olympus").exists()
+
+    repo2 = tmp_path / "repo2"
+    state2 = tmp_path / "state2"
+    _init_git_repo(repo2)
+    state2.mkdir()
+    (state2 / "sandboxes").symlink_to(repo2 / ".olympus" / "sandboxes", target_is_directory=True)
+    code2, rejected = _invoke(["start", "Build a calculator library", *_base(repo2, state2)])
+    assert code2 == 1
+    assert rejected["status"] == "failed"
+    assert "inside" in str(rejected["error"])
+    assert not (repo2 / ".olympus").exists()

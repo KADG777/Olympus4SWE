@@ -1536,7 +1536,9 @@ class OrchestrateStage:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 if snap["status"] == RunStatus.CANCELLED:
-                    remove_run_sandboxes(self.workspace_root, run_id)
+                    remove_run_sandboxes(
+                        self.workspace_root, run_id, sandbox_root=self.sandbox_root
+                    )
                 return snap
             design: DesignSpec | None = snap.get("design")
             plan: TaskPlan | None = snap["plan"]
@@ -1731,6 +1733,7 @@ class OrchestrateStage:
                             workspace_root=self.workspace_root,
                             overlay_dir=run_dir / "accepted_overlay",
                             run_dir=run_dir,
+                            sandbox_root=self.sandbox_root,
                         )
                         try:
                             self.store.append_event(
@@ -1763,7 +1766,9 @@ class OrchestrateStage:
                     except ConcurrencyConflictError:
                         continue
                     if target_status == RunStatus.COMPLETED:
-                        remove_run_sandboxes(self.workspace_root, run_id)
+                        remove_run_sandboxes(
+                            self.workspace_root, run_id, sandbox_root=self.sandbox_root
+                        )
                     return self.store.get_run(run_id)
 
                 if not snap["budget_ledger"].can_reserve(policy):
