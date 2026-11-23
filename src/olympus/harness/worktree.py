@@ -30,6 +30,12 @@ class SandboxHandle:
 
     @property
     def baseline_path(self) -> Path:
+        if not self.workspace_path.resolve().is_relative_to(self.repo_root.resolve()):
+            return (
+                self.workspace_path.resolve().parent
+                / ".sandbox_baselines"
+                / f"{self.workspace_path.name}.json"
+            )
         return (
             self.repo_root
             / ".olympus"
@@ -89,15 +95,26 @@ def _open_retained_sandbox(root: Path, sandbox_dir: Path) -> SandboxHandle | Non
 
 
 def create_sandbox(
-    repo_root: Path | str, *, label: str, reuse: bool = False
+    repo_root: Path | str,
+    *,
+    label: str,
+    reuse: bool = False,
+    sandbox_root: Path | str | None = None,
 ) -> SandboxHandle:
     """Create an isolated git worktree when inside a git repo, else copy workspace.
 
     With ``reuse=True`` a healthy retained sandbox is reopened as-is so a retried
-    attempt keeps every uncommitted file from its previous turn.
+    attempt keeps every uncommitted file from its previous turn. ``sandbox_root``
+    keeps sandbox worktrees (and their baselines/tmp dirs) outside the target
+    repository so headless sessions never pollute the repo with ``.olympus``.
     """
     root = Path(repo_root).resolve()
-    sandbox_dir = root / ".olympus" / "sandboxes" / _safe_label(label)
+    safe_label = _safe_label(label)
+    sandbox_dir = (
+        Path(sandbox_root).resolve() / safe_label
+        if sandbox_root is not None
+        else root / ".olympus" / "sandboxes" / safe_label
+    )
     if sandbox_dir.exists():
         if reuse:
             retained = _open_retained_sandbox(root, sandbox_dir)
@@ -608,24 +625,39 @@ def remove_sandbox(handle: SandboxHandle) -> None:
     handle.baseline_path.unlink(missing_ok=True)
 
 
-def remove_run_sandboxes(repo_root: Path | str, run_id: str) -> None:
+def remove_run_sandboxes(
+    repo_root: Path | str,
+    run_id: str,
+    *,
+    sandbox_root: Path | str | None = None,
+) -> None:
     """Reclaim every retained sandbox, baseline, and temp dir belonging to ``run_id``."""
     root = Path(repo_root).resolve()
     prefix = f"{_safe_label(run_id)}-"
     git_host = is_git_repo(root)
-    sandboxes = root / ".olympus" / "sandboxes"
+    if sandbox_root is not None:
+        sandboxes = Path(sandbox_root).resolve()
+        external = not sandboxes.is_relative_to(root)
+        baselines = (
+            sandboxes / ".sandbox_baselines"
+            if external
+            else root / ".olympus" / "sandbox_baselines"
+        )
+        tmp_root = sandboxes / ".sandbox_tmp" if external else root / ".olympus" / "sandbox_tmp"
+    else:
+        sandboxes = root / ".olympus" / "sandboxes"
+        baselines = root / ".olympus" / "sandbox_baselines"
+        tmp_root = root / ".olympus" / "sandbox_tmp"
     if sandboxes.is_dir():
         for entry in sorted(sandboxes.iterdir()):
             if entry.is_dir() and entry.name.startswith(prefix):
                 if git_host:
                     _run_git(root, "worktree", "remove", "--force", str(entry))
                 shutil.rmtree(entry, ignore_errors=True)
-    baselines = root / ".olympus" / "sandbox_baselines"
     if baselines.is_dir():
         for entry in sorted(baselines.iterdir()):
             if entry.name.startswith(prefix):
                 entry.unlink(missing_ok=True)
-    tmp_root = root / ".olympus" / "sandbox_tmp"
     if tmp_root.is_dir():
         for entry in sorted(tmp_root.iterdir()):
             if entry.is_dir() and entry.name.startswith(prefix):

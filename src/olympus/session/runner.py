@@ -1,0 +1,1175 @@
+"""Synchronous headless session driver over the existing workflow graph runtime.
+
+The runner owns no harness-specific concepts: it composes ``RunStore``,
+``RunControl``, declarative workflows, the wave graph, and stage handlers exactly
+as the Web supervisor does, but exposes one blocking call per CLI invocation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import sqlite3
+import subprocess
+import tempfile
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from olympus.core.contracts import (
+    ApprovalTarget,
+    GoalSpec,
+    RunMode,
+    RunStatus,
+    TaskNode,
+    TaskPlan,
+    TaskStatus,
+)
+from olympus.core.control import RunControl
+from olympus.core.fingerprint import content_hash
+from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
+from olympus.graph.engine import END, run_graph
+from olympus.graph.loader import (
+    WorkflowDefinition,
+    WorkflowRuntime,
+    build_graph,
+    load_workflow,
+)
+from olympus.graph.progress import GATE_SPECS, resolve_resume_node
+from olympus.harness.driver import (
+    DriverRegistry,
+    ExecutionDriversConfig,
+    default_driver_factories,
+)
+from olympus.providers.base import LLMProvider, MockLLMProvider
+from olympus.providers.factory import build_provider
+from olympus.session.contracts import (
+    GatePolicyName,
+    PauseKind,
+    SessionEnvelope,
+    SessionStatus,
+    StepMode,
+)
+from olympus.session.policy import InteractiveMinimalPolicy
+from olympus.session.router import parse_reply
+
+ProviderBuilder = Callable[..., LLMProvider]
+
+_GATE_BY_NODE: dict[str, str] = {spec["node"]: gate for gate, spec in GATE_SPECS.items()}
+_EXECUTE_TYPES = frozenset({"execute_task_dag"})
+_PLAN_ONLY_STOP = "plan"
+
+
+@dataclass(frozen=True)
+class SessionConfig:
+    """Everything one session invocation needs; providers stay injectable."""
+
+    workspace_root: Path
+    state_dir: Path | None = None
+    workflow: str = "full_sdlc_tdd"
+    workflow_explicit: bool = True
+    gate_policy: GatePolicyName | None = None
+    step_mode: StepMode = StepMode.EXECUTE
+    provider: str = "auto"
+    model: str | None = None
+    base_url: str | None = None
+    worker_driver: str | None = None
+    reviewer_driver: str | None = None
+    monitor_model: str | None = None
+    provider_builder: ProviderBuilder | None = None
+    extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+def _assert_state_outside_workspace(
+    workspace: Path | str, state_dir: Path | str
+) -> Path:
+    root = Path(workspace).expanduser().resolve()
+    candidate = Path(state_dir).expanduser().resolve()
+    toplevel = _git_toplevel(root)
+    targets = (
+        ("--state-dir", candidate),
+        ("--state-dir/sandboxes", (candidate / "sandboxes").resolve()),
+        ("--state-dir/runs", (candidate / "runs").resolve()),
+        ("--state-dir/olympus.db", (candidate / "olympus.db").resolve()),
+    )
+    for boundary in (root, toplevel):
+        if boundary is None:
+            continue
+        scope = (
+            "the target workspace"
+            if boundary == root
+            else f"the enclosing git repository {boundary} of the target workspace"
+        )
+        for label, resolved in targets:
+            if resolved == boundary or resolved.is_relative_to(boundary):
+                raise ValueError(
+                    f"{label} {resolved} is inside {scope}; "
+                    "headless session state must live outside the repository"
+                )
+    return candidate
+
+
+def resolve_state_dir(workspace: Path | str, state_dir: Path | str | None) -> Path:
+    """Return an external state directory, never nested inside the target repo."""
+    root = Path(workspace).resolve()
+    if state_dir is None:
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+        candidate = Path(tempfile.gettempdir()) / "olympus-session" / digest
+    else:
+        candidate = Path(state_dir).expanduser().resolve()
+    candidate = _assert_state_outside_workspace(root, candidate)
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _git_toplevel(path: Path | str) -> Path | None:
+    """Return the enclosing git work tree root for ``path``, when there is one."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    return Path(raw).resolve()
+
+
+def _yaml_workflow_path(value: str | Path) -> Path | None:
+    """Return the absolute path of a custom ``.yaml``/``.yml`` workflow argument."""
+    candidate = Path(value).expanduser()
+    if candidate.suffix.lower() in (".yaml", ".yml"):
+        return candidate.resolve()
+    return None
+
+
+_ACTIONABLE_CHARS = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
+
+
+def _looks_actionable(text: str) -> bool:
+    """True when a completed-run reply carries a concrete follow-up request."""
+    return len(_ACTIONABLE_CHARS.findall(text)) >= 3
+
+
+def resolve_workspace_binding(
+    *,
+    requested: Path | str | None,
+    state_dir: Path | str | None,
+    run_id: str | None,
+) -> Path | None:
+    """Bind one CLI invocation to the repository that owns the run.
+
+    ``start`` has no recorded run yet and just resolves ``--workspace``. A ``reply``
+    must never resume inside a different repository: when ``--workspace`` is omitted
+    the recorded root wins, and an explicit mismatch raises ``ValueError`` before any
+    runner, database, or trace file is created.
+    """
+    requested_path = (
+        Path(requested).expanduser().resolve() if requested is not None else None
+    )
+    if requested_path is not None and state_dir is not None:
+        _assert_state_outside_workspace(requested_path, state_dir)
+    if run_id is None:
+        return requested_path
+    recorded = _recorded_workspace(state_dir, run_id)
+    if recorded is None:
+        return requested_path
+    if state_dir is not None:
+        _assert_state_outside_workspace(recorded, state_dir)
+    if requested_path is None:
+        return recorded
+    if requested_path != recorded:
+        raise ValueError(
+            f"--workspace {requested_path} does not match the run's recorded workspace "
+            f"{recorded}; a reply must resume in the repository that started the run"
+        )
+    return recorded
+
+
+def _recorded_workspace(state_dir: Path | str | None, run_id: str) -> Path | None:
+    if state_dir is None:
+        return None
+    db_path = Path(state_dir).expanduser().resolve() / "olympus.db"
+    if not db_path.is_file() or db_path.stat().st_size == 0:
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT workspace_root FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    if row is None or not row[0]:
+        return None
+    return Path(str(row[0])).resolve()
+
+
+def plan_only_definition(definition: WorkflowDefinition) -> WorkflowDefinition:
+    """Drop execution nodes/edges so a plan-only run can never mutate the repo."""
+    execute_nodes = {node.name for node in definition.nodes if node.type in _EXECUTE_TYPES}
+    nodes = [node for node in definition.nodes if node.name not in execute_nodes]
+    edges = []
+    for edge in definition.edges:
+        if edge.source in execute_nodes:
+            continue
+        target = END if edge.target in execute_nodes else edge.target
+        edges.append(edge.model_copy(update={"target": target}))
+    routers = []
+    for router in definition.routers:
+        if router.at in execute_nodes:
+            continue
+        rules = {
+            key: (END if target in execute_nodes else target)
+            for key, target in router.rules.items()
+        }
+        default = END if router.default in execute_nodes else router.default
+        routers.append(router.model_copy(update={"rules": rules, "default": default}))
+    return definition.model_copy(
+        update={"nodes": nodes, "edges": edges, "routers": routers, "stop_after": _PLAN_ONLY_STOP}
+    )
+
+
+class SessionRunner:
+    """Drive one ``olympus session start`` / ``reply`` invocation to an envelope."""
+
+    def __init__(self, config: SessionConfig) -> None:
+        self.config = config
+        self.workspace_root = Path(config.workspace_root).resolve()
+        self.state_dir = resolve_state_dir(self.workspace_root, config.state_dir)
+        self.artifacts_root = self.state_dir / "runs"
+        self.sandbox_root = self.state_dir / "sandboxes"
+        self.store = RunStore(self.state_dir / "olympus.db")
+        self.control = RunControl(self.store)
+
+    # ------------------------------------------------------------------ public API
+
+    def start(
+        self,
+        *,
+        goal: str,
+        title: str | None = None,
+        constraints: list[str] | None = None,
+    ) -> SessionEnvelope:
+        """Create a run and drive it until a pause or completion."""
+        clean_goal = goal.strip()
+        if not clean_goal:
+            return SessionEnvelope.failure(
+                error="session start requires a non-empty goal",
+                step_mode=self.config.step_mode,
+            )
+        try:
+            definition = load_workflow(self.config.workflow)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a stable failed envelope
+            return SessionEnvelope.failure(
+                error=str(exc), step_mode=self.config.step_mode, workflow=self.config.workflow
+            )
+        workflow_path = _yaml_workflow_path(self.config.workflow)
+        clean_constraints = [str(item).strip() for item in (constraints or []) if str(item).strip()]
+        drivers = self._drivers_config()
+        provider_config = self._provider_config()
+        run_id = self.store.create_run(
+            title=title or clean_goal[:60],
+            mode=RunMode.EXECUTION,
+            workflow_name=definition.name,
+            provider_config=provider_config,
+            execution_drivers=drivers.model_dump(mode="json"),
+            workspace_root=self.workspace_root,
+            actor="session",
+        )
+        toplevel = _git_toplevel(self.workspace_root)
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.started",
+            actor="session",
+            payload={
+                "raw_input": clean_goal,
+                "constraints": clean_constraints,
+                "workflow": definition.name,
+                "workflow_path": str(workflow_path) if workflow_path is not None else None,
+                "workflow_hash": content_hash(definition.model_dump(mode="json")),
+                "workspace_root": str(self.workspace_root),
+                "git_toplevel": str(toplevel) if toplevel is not None else None,
+                "step_mode": self.config.step_mode.value,
+                "gate_policy": self._resolved_gate_policy(run_id).value,
+            },
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=clean_goal,
+            start_from=None,
+            definition=definition,
+        )
+
+    def reply(self, *, run_id: str, message: str) -> SessionEnvelope:
+        """Route one free-form reply and continue the same workflow."""
+        text = message.strip()
+        try:
+            snap = self.store.get_run(run_id)
+        except NotFoundError as exc:
+            return SessionEnvelope.failure(
+                error=str(exc), run_id=run_id, step_mode=self.config.step_mode
+            )
+        recorded = snap.get("workspace_root")
+        if recorded:
+            recorded_root = Path(str(recorded)).resolve()
+            if recorded_root != self.workspace_root:
+                return SessionEnvelope.failure(
+                    error=(
+                        f"--workspace {self.workspace_root} does not match the run's recorded "
+                        f"workspace {recorded_root}; refusing to continue in a different "
+                        "repository"
+                    ),
+                    run_id=run_id,
+                    step_mode=self.config.step_mode,
+                    workflow=snap["workflow_name"],
+                )
+        try:
+            definition = self._workflow_for_run(run_id, snap)
+        except Exception as exc:  # noqa: BLE001 -- surface workflow load failure as SessionEnvelope
+            return SessionEnvelope.failure(
+                error=str(exc),
+                run_id=run_id,
+                step_mode=self.config.step_mode,
+                workflow=snap["workflow_name"],
+            )
+        if snap["status"] == RunStatus.COMPLETED:
+            return self._incremental_reopen(run_id, definition, snap, text)
+        if not text:
+            return self._current_pause_envelope(
+                snap, message="Reply was empty; please answer the pending question."
+            )
+
+        pause_kind, gate, node = self._pause_state(run_id)
+        intent = parse_reply(
+            provider=self._provider(run_id),
+            message=text,
+            snapshot=snap,
+            pause_kind=pause_kind,
+            gate=gate,
+            completed=False,
+        )
+        if intent.action == "clarify":
+            try:
+                self.control.clarify_spec(
+                    run_id=run_id,
+                    answers=intent.answers,
+                    resolutions=intent.resolutions,
+                    actor="human",
+                )
+            except (ValueError, ConcurrencyConflictError) as exc:
+                return self._emit_pause(
+                    run_id,
+                    pause_kind or PauseKind.CLARIFY,
+                    node=node,
+                    reason=str(exc),
+                    message=str(exc),
+                )
+            return self._continue(run_id, definition)
+
+        if intent.action == "approve":
+            if pause_kind == PauseKind.PLAN_HANDOFF:
+                if self.config.step_mode == StepMode.EXECUTE:
+                    return self._continue(run_id, definition)
+                return self._emit_pause(
+                    run_id,
+                    PauseKind.PLAN_HANDOFF,
+                    node=node,
+                    reason="Plan already approved; re-run with --step-mode execute to implement.",
+                )
+            pending_gate = gate or self._gate_from_node(node)
+            if pending_gate is None:
+                return self._emit_pause(
+                    run_id,
+                    PauseKind.APPROVAL,
+                    node=node,
+                    reason="No pending approval gate to confirm.",
+                    message=(
+                        "No pending approval gate to confirm; send clarification or "
+                        "revision feedback."
+                    ),
+                )
+            try:
+                self._approve_gate(run_id, pending_gate)
+            except (ValueError, ConcurrencyConflictError) as exc:
+                return self._emit_pause(
+                    run_id,
+                    pause_kind or PauseKind.APPROVAL,
+                    node=node,
+                    reason=str(exc),
+                    message=str(exc),
+                )
+            return self._continue(run_id, definition)
+
+        if intent.action in ("revise", "reopen"):
+            return self._revise(run_id, definition, snap, intent.feedback or text)
+
+        fallback_kind = pause_kind or PauseKind.APPROVAL
+        focus = self._pause_message(
+            fallback_kind,
+            snap,
+            node=node,
+            reason="Could not map the reply to a safe session action.",
+        )
+        return self._emit_pause(
+            run_id,
+            fallback_kind,
+            node=node,
+            reason="Could not map the reply to a safe session action.",
+            message=(
+                "I could not map that reply to a safe action. Please answer the pending "
+                "question IDs explicitly, or say 'revise: <change>' / 'approve'.\n"
+                f"{focus}"
+            ),
+        )
+
+    # ------------------------------------------------------------------ internals
+
+    def _drivers_config(self) -> ExecutionDriversConfig:
+        return ExecutionDriversConfig.resolve(
+            worker_driver=self.config.worker_driver,
+            reviewer_driver=self.config.reviewer_driver,
+            monitor_model=self.config.monitor_model,
+        )
+
+    def _resolved_gate_policy(self, run_id: str | None) -> GatePolicyName:
+        if self.config.gate_policy is not None:
+            return self.config.gate_policy
+        if run_id is not None:
+            try:
+                events = self.store.list_events(run_id)
+            except NotFoundError:
+                events = []
+            for event in reversed(events):
+                if event.event_type != "session.started":
+                    continue
+                raw = event.payload.get("gate_policy")
+                if raw:
+                    try:
+                        return GatePolicyName(str(raw))
+                    except ValueError:
+                        break
+                break
+        return GatePolicyName.INTERACTIVE_MINIMAL
+
+    def _provider_config(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+            }.items()
+            if value not in (None, "")
+        }
+
+    def _provider(self, run_id: str | None = None) -> LLMProvider:
+        provider = self.config.provider
+        model = self.config.model
+        base_url = self.config.base_url
+        if (
+            run_id is not None
+            and provider in (None, "", "auto")
+            and model is None
+            and base_url is None
+        ):
+            try:
+                recorded = self.store.get_run(run_id).get("provider_config") or {}
+            except NotFoundError:
+                recorded = {}
+            provider = str(recorded.get("provider") or provider or "auto")
+            model = recorded.get("model", model)
+            base_url = recorded.get("base_url", base_url)
+        if self.config.provider_builder is not None:
+            return self.config.provider_builder(
+                provider=provider or "auto",
+                model=model,
+                base_url=base_url,
+            )
+        if (provider or "").strip().lower() == "mock":
+            return MockLLMProvider(model_name=model) if model else MockLLMProvider()
+        return build_provider(
+            provider=provider or "auto",
+            model=model,
+            base_url=base_url,
+            **self.config.extra_provider_kwargs,
+        )
+
+    def _model_provider(self, model: str | None) -> LLMProvider:
+        builder = self.config.provider_builder or build_provider
+        kwargs: dict[str, Any] = {}
+        if self.config.provider_builder is None:
+            kwargs.update(self.config.extra_provider_kwargs)
+        return builder(
+            provider=self.config.provider or "auto",
+            model=model or self.config.model,
+            base_url=self.config.base_url,
+            **kwargs,
+        )
+
+    def _runtime(self, run_id: str, definition: WorkflowDefinition) -> WorkflowRuntime:
+        snap = self.store.get_run(run_id)
+        recorded_drivers = snap.get("execution_drivers")
+        drivers = (
+            ExecutionDriversConfig.model_validate(recorded_drivers)
+            if recorded_drivers
+            else self._drivers_config()
+        )
+        policy_name = self._resolved_gate_policy(run_id)
+        policy = (
+            InteractiveMinimalPolicy()
+            if policy_name == GatePolicyName.INTERACTIVE_MINIMAL
+            else None
+        )
+        return WorkflowRuntime(
+            store=self.store,
+            workspace_root=self.workspace_root,
+            artifacts_root=self.artifacts_root,
+            provider=self._provider(run_id),
+            auto_approve=False,
+            approver=f"session:{policy_name.value}",
+            topology=definition.topology,
+            apply_to_workspace=self.config.step_mode == StepMode.EXECUTE,
+            gate_policy=policy,
+            sandbox_root=self.sandbox_root,
+            execution_drivers=drivers,
+            driver_registry=DriverRegistry().with_factories(
+                default_driver_factories(store=self.store, run_id=run_id)
+            ),
+            model_provider=self._model_provider,
+        )
+
+    def _effective_definition(self, definition: WorkflowDefinition) -> WorkflowDefinition:
+        if self.config.step_mode == StepMode.PLAN_ONLY:
+            return plan_only_definition(definition)
+        return definition
+
+    def _drive(
+        self,
+        *,
+        run_id: str,
+        raw_input: str,
+        start_from: str | None,
+        definition: WorkflowDefinition,
+    ) -> SessionEnvelope:
+        effective = self._effective_definition(definition)
+        try:
+            runtime = self._runtime(run_id, effective)
+            graph = build_graph(effective)
+        except Exception as exc:  # noqa: BLE001 -- surface graph/runtime setup failure as SessionEnvelope
+            return self._fail(run_id, exc)
+        snap = self.store.get_run(run_id)
+        state: dict[str, Any] = {
+            "run_id": run_id,
+            "raw_input": raw_input,
+            "constraints": self._constraints(run_id),
+            "topology": effective.topology,
+            "route": None,
+            "_runtime": runtime,
+        }
+        for key in ("spec", "design", "plan"):
+            artifact = snap.get(key)
+            if artifact is not None:
+                state[key] = artifact.model_dump(mode="json")
+        try:
+            result = run_graph(
+                graph,
+                state,
+                max_steps=max(12, runtime.max_steps * 3),
+                start_from=start_from,
+            )
+        except Exception as exc:  # noqa: BLE001 - unrecoverable infrastructure error
+            return self._fail(run_id, exc)
+
+        paused_node = result.get("_paused_node")
+        pause_reason = str(result.get("_pause_reason") or "")
+        final = self.store.get_run(run_id)
+        if paused_node:
+            kind = self._coerce_pause_kind(result.get("pause_kind"), paused_node, final)
+            self._mark_awaiting_human(run_id, final, paused_node, pause_reason)
+            return self._emit_pause(run_id, kind, node=str(paused_node), reason=pause_reason)
+
+        spec: GoalSpec | None = final["spec"]
+        plan: TaskPlan | None = final["plan"]
+        if spec is not None and spec.unresolved_blockers():
+            self._mark_awaiting_human(run_id, final, "gate_spec", "unresolved blockers")
+            return self._emit_pause(
+                run_id, PauseKind.CLARIFY, node="gate_spec", reason="unresolved blockers"
+            )
+        if self.config.step_mode == StepMode.PLAN_ONLY:
+            return self._emit_plan_handoff(run_id, final, plan)
+        if (
+            effective.stop_after != "execute"
+            and plan is not None
+            and self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.TASK_PLAN,
+                target_id=plan.plan_id,
+                target_hash=plan.content_hash,
+            )
+            and final["status"] != RunStatus.COMPLETED
+        ):
+            # Blueprint workflows intentionally stop after the approved plan.
+            with suppress(ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.COMPLETED,
+                    expected_revision=int(final["state_revision"]),
+                    actor="session",
+                    stage="graph",
+                    detail={"workflow": effective.name, "stop_after": effective.stop_after},
+                )
+            return self._completed_envelope(run_id, self.store.get_run(run_id))
+        blocked = [
+            task
+            for task in (plan.tasks if plan is not None else [])
+            if task.status == TaskStatus.BLOCKED
+        ]
+        if blocked or final["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
+            reason = self._blocked_reason(blocked)
+            self._mark_awaiting_human(run_id, final, None, reason)
+            return self._emit_pause(run_id, PauseKind.BLOCKED, node=None, reason=reason)
+        if final["status"] != RunStatus.COMPLETED:
+            with suppress(ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.COMPLETED,
+                    expected_revision=int(final["state_revision"]),
+                    actor="session",
+                    stage="graph",
+                    detail={"workflow": effective.name, "step_mode": self.config.step_mode.value},
+                )
+            final = self.store.get_run(run_id)
+        return self._completed_envelope(run_id, final)
+
+    def _continue(self, run_id: str, definition: WorkflowDefinition) -> SessionEnvelope:
+        snap = self.store.get_run(run_id)
+        effective = self._effective_definition(definition)
+        entry = resolve_resume_node(effective, snap, store=self.store)
+        if entry is None:
+            if self.config.step_mode == StepMode.PLAN_ONLY:
+                return self._emit_plan_handoff(run_id, snap, snap["plan"])
+            if snap["status"] != RunStatus.COMPLETED:
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.COMPLETED,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="session",
+                    stage="graph",
+                    detail={"workflow": effective.name, "reason": "no_resume_entry"},
+                )
+                snap = self.store.get_run(run_id)
+            return self._completed_envelope(run_id, snap)
+        return self._drive(
+            run_id=run_id,
+            raw_input=self._current_input(run_id, snap),
+            start_from=entry,
+            definition=definition,
+        )
+
+    def _revise(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        feedback: str,
+    ) -> SessionEnvelope:
+        clean = feedback.strip()
+        if not clean:
+            return self._emit_pause(
+                run_id,
+                PauseKind.BLOCKED,
+                node=None,
+                reason="Revision feedback was empty.",
+                message="Revision feedback was empty; describe the change you want.",
+            )
+        try:
+            if snap["status"] == RunStatus.COMPLETED:
+                self.control.reopen_run(run_id=run_id, feedback=clean, actor="human")
+            else:
+                self.control.request_revision(run_id=run_id, feedback=clean, actor="human")
+        except (ValueError, ConcurrencyConflictError) as exc:
+            return self._emit_pause(
+                run_id, PauseKind.BLOCKED, node=None, reason=str(exc), message=str(exc)
+            )
+        augmented = self._augment_input(run_id, snap, clean, "User revision feedback")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={"raw_input": augmented, "feedback": clean},
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=augmented,
+            start_from="align",
+            definition=definition,
+        )
+
+    def _workflow_for_run(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> WorkflowDefinition:
+        """Reload the workflow the run was started with, custom YAML included.
+
+        ``reply`` accepts an explicit ``--workflow`` path; it must name the same
+        workflow the run recorded. When the flag is omitted, the path persisted by
+        ``start`` wins so custom YAML workflows survive the pause/resume boundary.
+        """
+        recorded_name = str(snap["workflow_name"])
+        requested_path = _yaml_workflow_path(self.config.workflow)
+        if requested_path is not None:
+            candidate: str | Path = requested_path
+        else:
+            recorded_path = self._recorded_workflow_path(run_id)
+            candidate = (
+                recorded_path
+                if recorded_path is not None and not self.config.workflow_explicit
+                else self.config.workflow
+            )
+        definition = load_workflow(candidate)
+        if definition.name != recorded_name:
+            raise ValueError(
+                f"Workflow '{definition.name}' does not match the run's workflow "
+                f"'{recorded_name}'"
+            )
+        recorded_hash = self._recorded_workflow_hash(run_id)
+        if recorded_hash is not None:
+            actual_hash = content_hash(definition.model_dump(mode="json"))
+            if actual_hash != recorded_hash:
+                raise ValueError(
+                    f"Workflow definition for '{definition.name}' does not match the "
+                    "workflow that started this run"
+                )
+        return definition
+
+    def _recorded_workflow_path(self, run_id: str) -> Path | None:
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return None
+        for event in events:
+            if event.event_type != "session.started":
+                continue
+            raw = event.payload.get("workflow_path")
+            if not raw:
+                return None
+            path = Path(str(raw))
+            return path if path.is_file() else None
+        return None
+
+    def _recorded_workflow_hash(self, run_id: str) -> str | None:
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return None
+        for event in events:
+            if event.event_type != "session.started":
+                continue
+            raw = event.payload.get("workflow_hash")
+            return str(raw) if raw else None
+        return None
+
+    def _incremental_reopen(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        message: str,
+    ) -> SessionEnvelope:
+        if not message:
+            return self._completed_envelope(run_id, snap)
+        intent = parse_reply(
+            provider=self._provider(run_id),
+            message=message,
+            snapshot=snap,
+            pause_kind=None,
+            gate=None,
+            completed=True,
+        )
+        feedback = intent.feedback.strip() or message
+        if intent.action not in ("reopen", "revise") or not _looks_actionable(feedback):
+            # Empty, punctuation-only, or unparseable replies must never reopen a
+            # finished run: keep the completed status and ask for a concrete request.
+            return SessionEnvelope(
+                run_id=run_id,
+                status=SessionStatus.NEEDS_INPUT,
+                pause_kind=None,
+                step_mode=self.config.step_mode,
+                workflow=snap["workflow_name"],
+                message=(
+                    "This run is already completed, and the reply did not describe a "
+                    "concrete follow-up change. Send a specific correction (for example "
+                    "'revise: <change>') to reopen it."
+                ),
+                unresolved_blockers=[],
+                changed_files=self._changed_files(),
+                error=None,
+            )
+        try:
+            self.control.reopen_run(run_id=run_id, feedback=feedback, actor="human")
+        except (ValueError, ConcurrencyConflictError) as exc:
+            return SessionEnvelope.failure(
+                error=str(exc),
+                run_id=run_id,
+                step_mode=self.config.step_mode,
+                workflow=snap["workflow_name"],
+            )
+        augmented = self._augment_input(run_id, snap, feedback, "Follow-up instruction from user")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={"raw_input": augmented, "feedback": feedback, "reopened": True},
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=augmented,
+            start_from="align",
+            definition=definition,
+        )
+
+    def _approve_gate(self, run_id: str, gate: str) -> None:
+        if gate == "spec":
+            self.control.confirm_spec(run_id=run_id, approver="human")
+        elif gate == "design":
+            self.control.approve_design(run_id=run_id, approver="human")
+        elif gate == "plan":
+            self.control.approve_plan(run_id=run_id, approver="human")
+        else:
+            raise ValueError(f"Unknown approval gate: {gate}")
+
+    # ------------------------------------------------------------------ envelope
+
+    def _emit_pause(
+        self,
+        run_id: str,
+        kind: PauseKind,
+        *,
+        node: str | None,
+        reason: str,
+        message: str | None = None,
+    ) -> SessionEnvelope:
+        snap = self.store.get_run(run_id)
+        spec: GoalSpec | None = snap["spec"]
+        blockers = spec.unresolved_blockers() if spec is not None else []
+        text = message or self._pause_message(kind, snap, node=node, reason=reason)
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.paused",
+            actor="session",
+            payload={
+                "pause_kind": kind.value,
+                "node": node,
+                "gate": self._gate_from_node(node),
+                "reason": reason,
+                "message": text,
+                "unresolved_blockers": blockers,
+            },
+        )
+        return SessionEnvelope(
+            run_id=run_id,
+            status=SessionStatus.NEEDS_INPUT,
+            pause_kind=kind,
+            step_mode=self.config.step_mode,
+            workflow=snap["workflow_name"],
+            message=text,
+            unresolved_blockers=blockers,
+            changed_files=self._changed_files(),
+            error=None,
+        )
+
+    def _emit_plan_handoff(
+        self,
+        run_id: str,
+        snap: dict[str, Any],
+        plan: TaskPlan | None,
+    ) -> SessionEnvelope:
+        self._mark_awaiting_human(run_id, snap, "gate_plan", "plan_only handoff")
+        return self._emit_pause(
+            run_id,
+            PauseKind.PLAN_HANDOFF,
+            node="gate_plan",
+            reason="plan_only step reached its terminal handoff",
+            message=self._plan_message(plan),
+        )
+
+    def _current_pause_envelope(
+        self, snap: dict[str, Any], *, message: str
+    ) -> SessionEnvelope:
+        pause_kind, _gate, node = self._pause_state(str(snap["run_id"]))
+        return self._emit_pause(
+            str(snap["run_id"]),
+            pause_kind or PauseKind.BLOCKED,
+            node=node,
+            reason=message,
+            message=message,
+        )
+
+    def _completed_envelope(self, run_id: str, snap: dict[str, Any]) -> SessionEnvelope:
+        changed = self._changed_files()
+        message = (
+            f"Session completed with {len(changed)} changed file(s)."
+            if changed
+            else "Session completed with no workspace changes."
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.completed",
+            actor="session",
+            payload={"changed_files": changed, "message": message},
+        )
+        return SessionEnvelope(
+            run_id=run_id,
+            status=SessionStatus.COMPLETED,
+            pause_kind=None,
+            step_mode=self.config.step_mode,
+            workflow=snap["workflow_name"],
+            message=message,
+            unresolved_blockers=[],
+            changed_files=changed,
+            error=None,
+        )
+
+    def _fail(self, run_id: str, exc: BaseException) -> SessionEnvelope:
+        error = str(exc) or exc.__class__.__name__
+        try:
+            snap = self.store.get_run(run_id)
+        except NotFoundError:
+            return SessionEnvelope.failure(
+                error=error, run_id=run_id, step_mode=self.config.step_mode
+            )
+        if snap["status"] not in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            with suppress(ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.FAILED,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="session",
+                    stage="session",
+                    detail={"error": error},
+                )
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.failed",
+            actor="session",
+            payload={"error": error},
+        )
+        return SessionEnvelope(
+            run_id=run_id,
+            status=SessionStatus.FAILED,
+            pause_kind=None,
+            step_mode=self.config.step_mode,
+            workflow=snap["workflow_name"],
+            message=error,
+            unresolved_blockers=[],
+            changed_files=self._changed_files(),
+            error=error,
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _mark_awaiting_human(
+        self,
+        run_id: str,
+        snap: dict[str, Any],
+        node: str | None,
+        reason: str,
+    ) -> None:
+        if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            return
+        if snap["status"] == RunStatus.AWAITING_HUMAN:
+            return
+        with suppress(ConcurrencyConflictError):
+            self.store.set_run_status(
+                run_id,
+                RunStatus.AWAITING_HUMAN,
+                expected_revision=int(snap["state_revision"]),
+                actor="session",
+                stage="session",
+                detail={"paused_node": node, "pause_reason": reason},
+            )
+
+    def _pause_state(self, run_id: str) -> tuple[PauseKind | None, str | None, str | None]:
+        try:
+            events = self.store.list_events(run_id)
+        except NotFoundError:
+            return None, None, None
+        for event in reversed(events):
+            if event.event_type == "session.paused":
+                kind_raw = event.payload.get("pause_kind")
+                try:
+                    kind = PauseKind(str(kind_raw)) if kind_raw else None
+                except ValueError:
+                    kind = None
+                gate_raw = event.payload.get("gate")
+                node_raw = event.payload.get("node")
+                return (
+                    kind,
+                    str(gate_raw) if gate_raw else None,
+                    str(node_raw) if node_raw else None,
+                )
+            if event.event_type in ("session.completed", "session.failed"):
+                return None, None, None
+        return None, None, None
+
+    def _coerce_pause_kind(
+        self, raw: Any, paused_node: str, snap: dict[str, Any]
+    ) -> PauseKind:
+        if isinstance(raw, str):
+            try:
+                return PauseKind(raw)
+            except ValueError:
+                pass
+        return self._infer_pause_kind(paused_node, snap)
+
+    def _infer_pause_kind(self, paused_node: str, snap: dict[str, Any]) -> PauseKind:
+        gate = self._gate_from_node(paused_node)
+        if gate is not None:
+            if gate == "spec":
+                spec: GoalSpec | None = snap["spec"]
+                if spec is not None and spec.unresolved_blockers():
+                    return PauseKind.CLARIFY
+                return PauseKind.APPROVAL
+            return PauseKind.APPROVAL
+        return PauseKind.BLOCKED
+
+    @staticmethod
+    def _gate_from_node(node: str | None) -> str | None:
+        if node is None:
+            return None
+        return _GATE_BY_NODE.get(node)
+
+    def _pause_message(
+        self,
+        kind: PauseKind,
+        snap: dict[str, Any],
+        *,
+        node: str | None,
+        reason: str,
+    ) -> str:
+        spec: GoalSpec | None = snap["spec"]
+        if kind == PauseKind.CLARIFY:
+            lines: list[str] = []
+            if spec is not None:
+                for ambiguity in spec.open_ambiguities:
+                    if ambiguity.blocking and not ambiguity.answer:
+                        options = (
+                            f" (options: {', '.join(ambiguity.options)})"
+                            if ambiguity.options
+                            else ""
+                        )
+                        lines.append(f"{ambiguity.id}: {ambiguity.question}{options}")
+                for note in spec.minority_notes:
+                    if note.severity.value == "blocking" and not note.resolved:
+                        lines.append(f"{note.id}: {note.summary}")
+            if lines:
+                return "\n".join(lines)
+            return reason or "Additional clarification is required."
+        if kind == PauseKind.APPROVAL:
+            gate = self._gate_from_node(node)
+            if gate is not None:
+                label = GATE_SPECS[gate]["label"]
+                return reason or f"{label} is awaiting human approval."
+            return reason or "The run is awaiting human approval."
+        if kind == PauseKind.PLAN_HANDOFF:
+            return self._plan_message(snap["plan"])
+        return reason or "The run is blocked and needs human guidance."
+
+    @staticmethod
+    def _plan_message(plan: TaskPlan | None) -> str:
+        if plan is None:
+            return "Plan step finished without a TaskPlan."
+        tasks = "; ".join(f"{task.task_id}: {task.title}" for task in plan.tasks)
+        return (
+            f"Plan {plan.plan_id} is approved with {len(plan.tasks)} task(s): {tasks}. "
+            "Re-run with --step-mode execute to implement it."
+        )
+
+    @staticmethod
+    def _blocked_reason(blocked: list[TaskNode]) -> str:
+        if not blocked:
+            return "The workflow paused and needs human review."
+        details = "; ".join(
+            f"{task.task_id}: {task.last_error or 'blocked'}" for task in blocked
+        )
+        return f"Task execution blocked: {details}"
+
+    def _current_input(self, run_id: str, snap: dict[str, Any]) -> str:
+        for event in reversed(self.store.list_events(run_id)):
+            if event.event_type in ("session.started", "session.continued"):
+                raw = event.payload.get("raw_input")
+                if isinstance(raw, str) and raw.strip():
+                    return raw
+        return str(snap["title"])
+
+    def _constraints(self, run_id: str) -> list[str]:
+        for event in reversed(self.store.list_events(run_id)):
+            if event.event_type in ("session.started", "session.continued"):
+                items = event.payload.get("constraints")
+                if isinstance(items, list):
+                    return [str(item).strip() for item in items if str(item).strip()]
+        return []
+
+    def _augment_input(
+        self,
+        run_id: str,
+        snap: dict[str, Any],
+        feedback: str,
+        heading: str,
+    ) -> str:
+        base = self._current_input(run_id, snap)
+        return f"{base}\n\n{heading}:\n{feedback}"
+
+    def _changed_files(self) -> list[str]:
+        if self.config.step_mode == StepMode.PLAN_ONLY:
+            return []
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=self.workspace_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return []
+        if proc.returncode != 0:
+            return []
+        paths: list[str] = []
+        for line in proc.stdout.splitlines():
+            if not line.strip():
+                continue
+            payload = line[3:].strip() if len(line) > 3 else ""
+            if " -> " in payload:
+                payload = payload.split(" -> ", 1)[1]
+            payload = payload.strip().strip('"')
+            if payload:
+                paths.append(payload)
+        return sorted(dict.fromkeys(paths))
+
+
+__all__ = [
+    "SessionConfig",
+    "SessionRunner",
+    "plan_only_definition",
+    "resolve_state_dir",
+    "resolve_workspace_binding",
+]

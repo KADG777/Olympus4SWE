@@ -31,6 +31,8 @@ def sandbox_tmp_path(
     ws = Path(workspace_root).resolve()
     if host_root is not None:
         host = Path(host_root).resolve()
+        if ws != host and not ws.is_relative_to(host):
+            return ws.parent / ".sandbox_tmp" / ws.name
     else:
         parent = ws.parent
         if parent.name == "sandboxes" and parent.parent.name == ".olympus":

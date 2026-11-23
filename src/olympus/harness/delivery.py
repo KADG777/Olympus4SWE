@@ -47,7 +47,12 @@ def _delivery_version(workspace: Path, base_commit: str | None) -> str:
 
 
 def run_delivery_checks(
-    plan: TaskPlan, *, workspace_root: Path, overlay_dir: Path, run_dir: Path
+    plan: TaskPlan,
+    *,
+    workspace_root: Path,
+    overlay_dir: Path,
+    run_dir: Path,
+    sandbox_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return a receipt tied to the checked inputs and saved per-check logs."""
     receipt_id = new_id("delivery")
@@ -62,7 +67,11 @@ def run_delivery_checks(
         sandbox = None
         failure_reason = "无法建立隔离验收环境"
         try:
-            sandbox = create_sandbox(workspace_root, label=f"{receipt_id}-{position}")
+            sandbox = create_sandbox(
+                workspace_root,
+                label=f"{receipt_id}-{position}",
+                sandbox_root=sandbox_root,
+            )
             workspace = sandbox.workspace_path
             failure_reason = "无法核验交付快照"
             if overlay_dir.is_dir():

@@ -33,6 +33,9 @@ from olympus.stages.orchestrate import OrchestrateStage
 
 WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
 
+# A gate decider returns "auto_approve", "await_human", or "block" for one artifact gate.
+GateDecider = Callable[[str, Any, "WorkflowRuntime", str], str]
+
 _NODE_TYPES: tuple[str, ...] = (
     "intake_triage",
     "align_goal",
@@ -96,6 +99,8 @@ class WorkflowRuntime:
     apply_to_workspace: bool = False
     topology: str = "modular_product"
     extra: dict[str, Any] = field(default_factory=dict)
+    gate_policy: GateDecider | None = None
+    sandbox_root: Path | None = None
     execution_drivers: ExecutionDriversConfig = field(
         default_factory=ExecutionDriversConfig.resolve
     )
@@ -145,6 +150,7 @@ def _orchestrate_stage(runtime: WorkflowRuntime) -> OrchestrateStage:
         provider=runtime.provider,
         workspace_root=runtime.workspace_root,
         artifacts_root=runtime.artifacts_root,
+        sandbox_root=runtime.sandbox_root,
         execution_drivers=runtime.execution_drivers,
         driver_registry=runtime.driver_registry,
         model_provider=runtime.model_provider,
@@ -230,7 +236,11 @@ def _node_design(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
             max_steps=runtime.max_steps,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as a clean graph pause
-        raise GraphPaused("design_spec", str(exc)) from exc
+        raise GraphPaused(
+            "design_spec",
+            str(exc),
+            {"route": "blocked", "pause_kind": "blocked"},
+        ) from exc
     return {"design": design.model_dump(mode="json"), "route": "ready"}
 
 
@@ -242,10 +252,18 @@ def _node_validate_design(state: dict[str, Any], params: Mapping[str, Any]) -> d
     design: DesignSpec | None = snap["design"]
     spec: GoalSpec | None = snap["spec"]
     if design is None:
-        raise GraphPaused("validate_design", "Run has no DesignSpec to validate")
+        raise GraphPaused(
+            "validate_design",
+            "Run has no DesignSpec to validate",
+            {"route": "blocked", "pause_kind": "blocked"},
+        )
     violations = validate_design_spec(design, spec)
     if violations:
-        raise GraphPaused("validate_design", "; ".join(violations))
+        raise GraphPaused(
+            "validate_design",
+            "; ".join(violations),
+            {"route": "blocked", "pause_kind": "blocked"},
+        )
     return {"route": "ok"}
 
 
@@ -265,7 +283,11 @@ def _node_pm_decompose(state: dict[str, Any], params: Mapping[str, Any]) -> dict
             use_design=use_design,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as a clean graph pause
-        raise GraphPaused("pm_decompose", str(exc)) from exc
+        raise GraphPaused(
+            "pm_decompose",
+            str(exc),
+            {"route": "blocked", "pause_kind": "blocked"},
+        ) from exc
     return {"plan": plan.model_dump(mode="json"), "route": "ready"}
 
 
@@ -276,7 +298,11 @@ def _node_validate_plan(state: dict[str, Any], params: Mapping[str, Any]) -> dic
     snap = runtime.store.get_run(run_id)
     plan = snap["plan"]
     if plan is None:
-        raise GraphPaused("validate_plan", "Run has no TaskPlan to validate")
+        raise GraphPaused(
+            "validate_plan",
+            "Run has no TaskPlan to validate",
+            {"route": "blocked", "pause_kind": "blocked"},
+        )
     violations = validate_plan(
         plan,
         snap["spec"],
@@ -285,7 +311,11 @@ def _node_validate_plan(state: dict[str, Any], params: Mapping[str, Any]) -> dic
         topology=topology,
     )
     if violations:
-        raise GraphPaused("validate_plan", "; ".join(violations))
+        raise GraphPaused(
+            "validate_plan",
+            "; ".join(violations),
+            {"route": "blocked", "pause_kind": "blocked"},
+        )
     return {"route": "ok"}
 
 
@@ -344,6 +374,7 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
         raise GraphPaused(gate_spec["node"], f"Run has no {gate_spec['label']} to approve")
 
     approved = is_artifact_approved(runtime.store, run_id, gate, snap)
+    policy = runtime.gate_policy
     if not approved and auto:
         _auto_approve_gate(
             runtime,
@@ -353,6 +384,30 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
             expected_revision=int(snap["state_revision"]),
         )
         approved = True
+    elif not approved and policy is not None:
+        decision = policy(gate, artifact, runtime, run_id)
+        if decision == "auto_approve":
+            _auto_approve_gate(
+                runtime,
+                gate,
+                run_id,
+                artifact,
+                expected_revision=int(snap["state_revision"]),
+            )
+            approved = True
+        elif decision == "block":
+            raise GraphPaused(
+                gate_spec["node"],
+                f"{gate_spec['label']} failed deterministic validation",
+                {"route": "blocked", "pause_kind": "blocked"},
+            )
+        else:
+            pause_kind = "clarify" if gate == "spec" and _has_blockers(artifact) else "approval"
+            raise GraphPaused(
+                gate_spec["node"],
+                f"{gate_spec['label']} is awaiting human approval",
+                {"route": "awaiting", "pause_kind": pause_kind},
+            )
     if not approved:
         target_id = getattr(artifact, gate_spec["id_attr"])
         raise GraphPaused(
@@ -361,6 +416,13 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
             {"route": "awaiting"},
         )
     return {"route": "approved"}
+
+
+def _has_blockers(artifact: Any) -> bool:
+    resolver = getattr(artifact, "unresolved_blockers", None)
+    if callable(resolver):
+        return bool(resolver())
+    return False
 
 
 def _node_execute(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:

@@ -1013,6 +1013,92 @@ class RunControl:
 
     # ------------------------------------------------------------- workflow promotion
 
+    def request_revision(
+        self,
+        run_id: str,
+        *,
+        feedback: str,
+        actor: str = "human",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Record a human revision request and reopen the workflow for re-alignment."""
+        clean = feedback.strip()
+        if not clean:
+            raise ValueError("request_revision requires non-empty feedback")
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
+        status: RunStatus = snap["status"]
+        if status in _ACTIVE_STATUSES:
+            raise ValueError(f"Run {run_id} is currently active ({status.value})")
+        if status not in (
+            RunStatus.AWAITING_HUMAN,
+            RunStatus.PAUSED,
+            RunStatus.FAILED,
+            RunStatus.COMPLETED,
+        ):
+            raise ValueError(f"Run {run_id} cannot be revised from status {status.value}")
+        cas_revision = int(snap["state_revision"])
+        new_rev = self.store.set_run_status(
+            run_id,
+            RunStatus.RUNNING,
+            expected_revision=cas_revision,
+            actor=actor,
+            stage="align",
+            detail={"action": "revision_requested", "feedback": clean},
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="align",
+            event_type="run.revision_requested",
+            actor=actor,
+            payload={"feedback": clean, "from_status": status.value},
+        )
+        return {
+            "run_id": run_id,
+            "status": RunStatus.RUNNING.value,
+            "state_revision": new_rev,
+            "feedback": clean,
+        }
+
+    def reopen_run(
+        self,
+        run_id: str,
+        *,
+        feedback: str,
+        actor: str = "human",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Record post-completion follow-up work and re-enter the workflow incrementally."""
+        clean = feedback.strip()
+        if not clean:
+            raise ValueError("reopen_run requires non-empty feedback")
+        snap = self.store.get_run(run_id, expected_revision=expected_revision)
+        if snap["status"] != RunStatus.COMPLETED:
+            raise ValueError(
+                f"Run {run_id} is {snap['status'].value}; incremental reopen requires completed"
+            )
+        cas_revision = int(snap["state_revision"])
+        new_rev = self.store.set_run_status(
+            run_id,
+            RunStatus.RUNNING,
+            expected_revision=cas_revision,
+            actor=actor,
+            stage="align",
+            detail={"action": "reopened", "feedback": clean},
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="align",
+            event_type="run.reopened",
+            actor=actor,
+            payload={"feedback": clean},
+        )
+        return {
+            "run_id": run_id,
+            "status": RunStatus.RUNNING.value,
+            "state_revision": new_rev,
+            "feedback": clean,
+        }
+
     def promote_to_execute(
         self,
         run_id: str,

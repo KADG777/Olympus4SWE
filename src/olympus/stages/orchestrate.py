@@ -289,12 +289,18 @@ def _bounded_inline_diff(
 
 
 def _reopen_or_recreate_sandbox(
-    workspace_root: Path, *, label: str, reuse: bool
+    workspace_root: Path,
+    *,
+    label: str,
+    reuse: bool,
+    sandbox_root: Path | str | None = None,
 ) -> SandboxHandle:
-    sandbox = create_sandbox(workspace_root, label=label, reuse=reuse)
+    sandbox = create_sandbox(
+        workspace_root, label=label, reuse=reuse, sandbox_root=sandbox_root
+    )
     if sandbox.reused and load_sandbox_baseline(sandbox) is None:
         remove_sandbox(sandbox)
-        return create_sandbox(workspace_root, label=label)
+        return create_sandbox(workspace_root, label=label, sandbox_root=sandbox_root)
     return sandbox
 
 
@@ -486,6 +492,7 @@ class OrchestrateStage:
         provider: LLMProvider,
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
+        sandbox_root: Path | str | None = None,
         execution_drivers: ExecutionDriversConfig | None = None,
         driver_registry: DriverRegistry | None = None,
         model_provider: Callable[[str], LLMProvider] | None = None,
@@ -511,6 +518,7 @@ class OrchestrateStage:
             if artifacts_root is not None
             else self.workspace_root / ".olympus" / "runs"
         )
+        self.sandbox_root = Path(sandbox_root).resolve() if sandbox_root is not None else None
 
     def _native_driver(
         self, run_id: str, model: str | None, *, review: bool = False
@@ -1007,7 +1015,10 @@ class OrchestrateStage:
         overlay_dir = self._run_dir(run_id) / "accepted_overlay"
         label = f"{run_id}-{leased.task_id}"
         sandbox = _reopen_or_recreate_sandbox(
-            self.workspace_root, label=label, reuse=leased.attempt > 1
+            self.workspace_root,
+            label=label,
+            reuse=leased.attempt > 1,
+            sandbox_root=self.sandbox_root,
         )
 
         retain_sandbox = False
@@ -1525,7 +1536,9 @@ class OrchestrateStage:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 if snap["status"] == RunStatus.CANCELLED:
-                    remove_run_sandboxes(self.workspace_root, run_id)
+                    remove_run_sandboxes(
+                        self.workspace_root, run_id, sandbox_root=self.sandbox_root
+                    )
                 return snap
             design: DesignSpec | None = snap.get("design")
             plan: TaskPlan | None = snap["plan"]
@@ -1720,6 +1733,7 @@ class OrchestrateStage:
                             workspace_root=self.workspace_root,
                             overlay_dir=run_dir / "accepted_overlay",
                             run_dir=run_dir,
+                            sandbox_root=self.sandbox_root,
                         )
                         try:
                             self.store.append_event(
@@ -1752,7 +1766,9 @@ class OrchestrateStage:
                     except ConcurrencyConflictError:
                         continue
                     if target_status == RunStatus.COMPLETED:
-                        remove_run_sandboxes(self.workspace_root, run_id)
+                        remove_run_sandboxes(
+                            self.workspace_root, run_id, sandbox_root=self.sandbox_root
+                        )
                     return self.store.get_run(run_id)
 
                 if not snap["budget_ledger"].can_reserve(policy):
