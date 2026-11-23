@@ -15,10 +15,17 @@ from olympus.harness.loop import (
 from olympus.tools.aci import WorkspaceToolkit
 
 
+def _normalize_rel_path(raw: str) -> str:
+    cleaned = raw.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.strip("/")
+
+
 def _matches_scope(rel_path: str, scope_paths: Sequence[str]) -> bool:
-    normalized = rel_path.lstrip("./")
+    normalized = _normalize_rel_path(rel_path)
     for raw in scope_paths:
-        target = raw.strip().strip("/")
+        target = _normalize_rel_path(raw)
         if not target:
             continue
         if normalized == target or normalized.startswith(f"{target}/"):
@@ -33,7 +40,11 @@ def format_workspace_inventory(
     scope_paths: Sequence[str] | None = None,
 ) -> str:
     """Format a bounded deterministic inventory of existing workspace paths."""
-    cleaned_scopes = [item.strip().strip("/") for item in (scope_paths or ()) if item.strip()]
+    cleaned_scopes = [
+        cleaned
+        for item in (scope_paths or ())
+        if (cleaned := _normalize_rel_path(item))
+    ]
     if cleaned_scopes:
         all_files, _ = toolkit.list_relative_files(max_files=5000)
         matched = [path for path in all_files if _matches_scope(path, cleaned_scopes)]

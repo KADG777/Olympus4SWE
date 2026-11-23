@@ -36,7 +36,6 @@ from olympus.web.server import AriadneApp, create_fastapi_app
 
 playwright = pytest.importorskip("playwright.sync_api")
 
-# Valid minimal 1x1 PNG data URIs (offline, zero network calls) for testing custom portrait slots.
 IDLE_PORTRAIT_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -255,7 +254,6 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
         json={"name": "voice-cli", "root_path": str(second_repo)},
     ).json()["workspace"]
 
-    # Primary workspace: Prometheus waiting, Athena waiting, Hephaestus working, Argus delivered.
     prom_wait = _seed_oracle(
         store,
         run_id="run-prom-wait",
@@ -318,7 +316,6 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
         approve=("spec", "design", "plan"),
     )
 
-    # Second workspace: Prometheus actively aligning (working).
     prom_work_ws2 = _seed_oracle(
         store,
         run_id="run-voice-align",
@@ -335,13 +332,11 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
     dock = page.locator("#pantheon-dock")
     expect(dock).to_be_visible()
 
-    # Exact canonical pipeline order of the 5 seats.
     seat_gods = dock.locator(".pantheon-seat").evaluate_all(
         "nodes => nodes.map(node => node.dataset.god)"
     )
     assert seat_gods == ["prometheus", "athena", "hephaestus", "momus", "argus"]
 
-    # Verify live states, dual counts on Prometheus, and Oracle chips under All Projects.
     prom_seat = dock.locator(".pantheon-seat[data-god='prometheus']")
     expect(prom_seat).to_have_attribute("data-state", "waiting_on_human")
     expect(prom_seat.locator("[data-count-kind='waiting']")).to_have_text("1")
@@ -366,7 +361,6 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
     argus_seat = dock.locator(".pantheon-seat[data-god='argus']")
     expect(argus_seat).to_have_attribute("data-state", "idle")
 
-    # Built-in Warm Editorial Stone SVG emblems render in both Dock (lg) and OracleCards (sm).
     expect(
         dock.locator(".god-avatar[data-size='lg'][data-avatar-mode='fallback-svg']")
     ).to_have_count(5)
@@ -375,7 +369,6 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
         page.locator(".oracle-card .god-avatar[data-size='sm'] .god-avatar-svg")
     ).to_have_count(5)
 
-    # Switching Workspace filter synchronizes both Board cards and Pantheon Dock aggregates.
     page.locator("#workspace-switcher").select_option(ws2["workspace_id"])
     expect(prom_seat).to_have_attribute("data-state", "working")
     expect(prom_seat.locator("[data-count-kind='waiting']")).to_have_count(0)
@@ -385,7 +378,6 @@ def test_pantheon_dock_renders_five_seats_in_order_with_live_states_and_workspac
     expect(athena_seat).to_have_attribute("data-state", "idle")
     expect(heph_seat).to_have_attribute("data-state", "idle")
 
-    # Switching back to All Projects restores multi-workspace seats.
     page.locator("#workspace-switcher").select_option("")
     expect(prom_seat).to_have_attribute("data-state", "waiting_on_human")
     expect(heph_seat).to_have_attribute("data-state", "working")
@@ -396,7 +388,6 @@ def test_pantheon_dock_click_and_hover_cross_column_highlight_and_clear(pantheon
     store, primary_repo, _, url = pantheon_server
     default_ws = httpx.get(f"{url}/api/workspaces").json()["workspaces"][0]
 
-    # Seed Prometheus across TWO columns (human + agent), Hephaestus in agent, Argus in done.
     prom_human = _seed_oracle(
         store,
         run_id="run-p-human",
@@ -467,7 +458,6 @@ def test_pantheon_dock_click_and_hover_cross_column_highlight_and_clear(pantheon
     card_ha = page.locator(f".oracle-card[data-run-id='{heph_agent}']")
     card_ad = page.locator(f".oracle-card[data-run-id='{arg_done}']")
 
-    # 1. Hovering a seat previews cross-column highlight without locking filter.
     heph_seat.hover()
     expect(card_ha).to_have_attribute("data-highlight", "true")
     expect(card_ph).to_have_attribute("data-dimmed", "true")
@@ -475,12 +465,10 @@ def test_pantheon_dock_click_and_hover_cross_column_highlight_and_clear(pantheon
     expect(card_ad).to_have_attribute("data-dimmed", "true")
     expect(heph_seat).to_have_attribute("aria-pressed", "false")
 
-    # Moving pointer away clears hover preview.
     page.locator(".board-title").hover()
     expect(page.locator(".oracle-card[data-highlight='true']")).to_have_count(0)
     expect(page.locator(".oracle-card[data-dimmed='true']")).to_have_count(0)
 
-    # 2. Clicking Prometheus locks cross-column highlight across both human and agent columns.
     prom_seat.click()
     expect(prom_seat).to_have_attribute("aria-pressed", "true")
     expect(prom_seat).to_have_attribute("data-selected", "true")
@@ -489,7 +477,6 @@ def test_pantheon_dock_click_and_hover_cross_column_highlight_and_clear(pantheon
     expect(card_ha).to_have_attribute("data-dimmed", "true")
     expect(card_ad).to_have_attribute("data-dimmed", "true")
 
-    # Clicking the Clear filter button restores full Board visibility.
     clear_btn = page.get_by_role("button", name="Clear filter")
     expect(clear_btn).to_be_visible()
     clear_btn.click()
@@ -497,7 +484,6 @@ def test_pantheon_dock_click_and_hover_cross_column_highlight_and_clear(pantheon
     expect(page.locator(".oracle-card[data-highlight='true']")).to_have_count(0)
     expect(page.locator(".oracle-card[data-dimmed='true']")).to_have_count(0)
 
-    # 3. Clicking Argus highlights delivered column card, and clicking again toggles off cleanly.
     arg_seat.click()
     expect(arg_seat).to_have_attribute("aria-pressed", "true")
     expect(card_ad).to_have_attribute("data-highlight", "true")
@@ -517,7 +503,6 @@ def test_god_avatar_asset_slot_working_animation_reduced_motion_and_fallback(
     store, primary_repo, _, url = pantheon_server
     default_ws = httpx.get(f"{url}/api/workspaces").json()["workspaces"][0]
 
-    # Prometheus: waiting_on_human; Hephaestus: working; Athena: idle.
     _seed_oracle(
         store,
         run_id="run-av-prom",
@@ -552,7 +537,6 @@ def test_god_avatar_asset_slot_working_animation_reduced_motion_and_fallback(
 
     expect = playwright.expect
 
-    # Part 1: Animated workingSrc vs static idleSrc + sprite-sheet + prefers-reduced-motion.
     page = browser.new_page(viewport={"width": 1440, "height": 900})
     manifest = {
         "prometheus": {
@@ -579,12 +563,10 @@ def test_god_avatar_asset_slot_working_animation_reduced_motion_and_fallback(
     heph_avatar = page.locator("#pantheon-dock .pantheon-seat[data-god='hephaestus'] .god-avatar")
     athena_avatar = page.locator("#pantheon-dock .pantheon-seat[data-god='athena'] .god-avatar")
 
-    # waiting_on_human renders static idleSrc, NOT workingSrc.
     expect(prom_avatar).to_have_attribute("data-state", "waiting_on_human")
     expect(prom_avatar).to_have_attribute("data-avatar-mode", "idle-image")
     expect(prom_avatar.locator("img")).to_have_attribute("src", IDLE_PORTRAIT_DATA_URI)
 
-    # working with frames > 1 renders horizontal sprite-sheet strip animation.
     expect(heph_avatar).to_have_attribute("data-state", "working")
     expect(heph_avatar).to_have_attribute("data-avatar-mode", "working-sprite")
     expect(heph_avatar).to_have_attribute("data-reduced-motion", "false")
@@ -593,19 +575,16 @@ def test_god_avatar_asset_slot_working_animation_reduced_motion_and_fallback(
     )
     assert anim_name == "pantheon-sprite-play"
 
-    # Broken idleSrc on Athena triggers onError and gracefully renders built-in SVG fallback.
     expect(athena_avatar).to_have_attribute("data-avatar-mode", "fallback-svg")
     expect(athena_avatar).to_have_attribute("data-asset-fallback", "true")
     expect(athena_avatar.locator(".god-avatar-svg")).to_be_visible()
     expect(athena_avatar.locator("img")).to_have_count(0)
 
-    # Emulating prefers-reduced-motion: reduce switches Hephaestus to static idleSrc immediately.
     page.emulate_media(reduced_motion="reduce")
     expect(heph_avatar).to_have_attribute("data-reduced-motion", "true")
     expect(heph_avatar).to_have_attribute("data-avatar-mode", "idle-image")
     expect(heph_avatar.locator("img")).to_have_attribute("src", IDLE_PORTRAIT_DATA_URI)
 
-    # Switch to non-sprite workingSrc (animated webp image mode) and restore motion.
     page.emulate_media(reduced_motion="no-preference")
     page.evaluate(
         """(uri) => {
@@ -619,7 +598,6 @@ def test_god_avatar_asset_slot_working_animation_reduced_motion_and_fallback(
     expect(heph_avatar).to_have_attribute("data-avatar-mode", "working-image")
     expect(heph_avatar.locator("img")).to_have_attribute("src", WORKING_ANIM_DATA_URI)
 
-    # Under reduced motion with no idleSrc, working-only asset falls back cleanly to built-in SVG.
     page.emulate_media(reduced_motion="reduce")
     expect(heph_avatar).to_have_attribute("data-avatar-mode", "fallback-svg")
     expect(heph_avatar.locator(".god-avatar-svg")).to_be_visible()
@@ -648,11 +626,9 @@ def test_pantheon_dock_updates_live_via_board_sse(pantheon_server, browser):
     expect(prom_seat.locator("[data-count-kind='active']")).to_have_text("1")
     expect(prom_seat.locator("[data-count-kind='waiting']")).to_have_count(0)
 
-    # Backend transitions the Oracle to awaiting_human with a blocking ambiguity.
     store.save_spec(live_run, _make_spec("spec-sse-wait", blocking_question="Approve base ref?"))
     store.set_run_status(live_run, RunStatus.AWAITING_HUMAN)
 
-    # Pantheon Dock updates live over /api/board/stream without page reload.
     expect(prom_seat).to_have_attribute("data-state", "waiting_on_human")
     expect(prom_seat.locator("[data-count-kind='waiting']")).to_have_text("1")
     expect(prom_seat.locator("[data-count-kind='active']")).to_have_count(0)

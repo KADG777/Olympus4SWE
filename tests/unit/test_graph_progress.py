@@ -831,8 +831,6 @@ def test_human_gate_unknown_gate_keeps_legacy_pause(store: RunStore, tmp_path: P
     assert excinfo.value.reason == "Unknown human gate 'release'"
     assert excinfo.value.state_updates == {}
 
-# ---------------------------------------------------------------- Oracle Board
-
 
 def _classify(store: RunStore, run_id: str) -> BoardClassification:
     return classify_run_board(

@@ -2842,7 +2842,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
                 if ws["root_path"] == str(root.resolve())
             )
 
-            # A1: workspace-less spec_only cannot directly invoke or promote to execute workflow.
             reject_direct = client.post(
                 "/api/runs",
                 json={
@@ -2867,7 +2866,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             )
             assert reject_promote.status_code == 400
 
-            # A2: greenfield validates scope_paths BEFORE mkdir/register, and supports init_git.
             bad_target = tmp_path / "reject-greenfield"
             bad_resp = client.post(
                 "/api/runs",
@@ -2898,8 +2896,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             assert git_resp.status_code == 200
             assert (git_target / ".git").exists()
 
-            # A3: triage receives scope kwargs, brownfield inventory respects scope_paths,
-            # and workspace_id-only issuance defaults to full_sdlc_tdd.
             with patch.object(
                 graph_loader, "triage_input", wraps=graph_loader.triage_input
             ) as spy_triage:
@@ -2936,7 +2932,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             assert ws_only.status_code == 200
             assert store.get_run(ws_only.json()["run_id"])["workflow_name"] == "full_sdlc_tdd"
 
-            # A4: paused run agrees between Board (resolve_blocker) and L2 hitl_banner (run_paused).
             paused_id = store.create_run(title="Paused spec parity")
             store.save_spec(
                 paused_id,
@@ -2956,7 +2951,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             assert paused_l2["kind"] == "run_paused"
             assert paused_l2["actions"] == ["resume"]
 
-            # A8: legacy run with workspace_root matching a registered workspace appears in filter.
             legacy_id = store.create_run(title="Legacy root match", workspace_root=root)
             filtered_ids = {
                 r["run_id"]
@@ -2964,7 +2958,6 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             }
             assert legacy_id in filtered_ids
 
-            # S4: atomic duplicate registration rejection inside SQLite tx.
             with pytest.raises(ValueError, match="Workspace already registered"):
                 store.register_workspace(
                     name="dup",
@@ -2973,10 +2966,116 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
                     exist_ok=False,
                 )
 
-            # Workflow defaults matrix exposed via /api/workflows.
             wf_payload = client.get("/api/workflows").json()
             assert wf_payload["default_workflows"]["brownfield:fix"] == "repo_fast_patch"
             assert wf_payload["default_workflows"]["spec_only:feature"] == "product_blueprint"
             assert wf_payload["default_workflows"]["greenfield:feature"] == "full_sdlc_tdd"
+
+            blank_greenfield = tmp_path / "blank-intent-greenfield"
+            blank_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "   ",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(blank_greenfield),
+                    "init_git": True,
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert blank_resp.status_code == 400
+            assert not blank_greenfield.exists()
+            assert store.get_workspace_by_root(blank_greenfield) is None
+
+            (root / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / "github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / ".github" / "workflows" / "ci.yml").write_text("name: dot\n", encoding="utf-8")
+            (root / "github" / "workflows" / "ci.yml").write_text("name: plain\n", encoding="utf-8")
+
+            dot_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Audit dot github workflow",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "scope_paths": [".github/workflows/ci.yml"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert dot_resp.status_code == 200
+            dot_inventory = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert ".github/workflows/ci.yml" in dot_inventory
+            assert "github/workflows/ci.yml" not in dot_inventory.replace(
+                ".github/workflows/ci.yml", ""
+            )
+
+            plain_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Audit plain github workflow",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "scope_paths": ["github/workflows/ci.yml"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert plain_resp.status_code == 200
+            plain_inventory = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert "github/workflows/ci.yml" in plain_inventory
+            assert ".github/workflows/ci.yml" not in plain_inventory
+
+            wt_dir = tmp_path / "sse-head-wt"
+            wt_dir.mkdir()
+            for git_args in (
+                ["git", "init", "-b", "probe-branch"],
+                ["git", "config", "user.email", "t@example.com"],
+                ["git", "config", "user.name", "Test"],
+            ):
+                subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+            (wt_dir / "a.txt").write_text("ok\n", encoding="utf-8")
+            for git_args in (["git", "add", "a.txt"], ["git", "commit", "-m", "init"]):
+                subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+
+            wt_run_id = store.create_run(
+                title="SSE Head Probe", workflow_name="full_sdlc_tdd"
+            )
+            wt_spec = _board_spec("spec-sse-wt")
+            wt_design = _board_design(wt_spec, "design-sse-wt")
+            wt_plan = _board_plan(
+                wt_spec,
+                "plan-sse-wt",
+                task_status=TaskStatus.RUNNING,
+                attempt=1,
+                worktree_path=str(wt_dir),
+            )
+            store.save_spec(wt_run_id, wt_spec)
+            store.save_design(wt_run_id, wt_design)
+            store.save_plan(wt_run_id, wt_plan)
+            store.set_run_status(wt_run_id, RunStatus.RUNNING)
+
+            token_before = app.board_change_token()
+            assert (
+                next(
+                    r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == wt_run_id
+                )["worktree_branch"]
+                == "probe-branch"
+            )
+            subprocess.run(
+                ["git", "checkout", "--detach", "HEAD"],
+                cwd=wt_dir,
+                check=True,
+                capture_output=True,
+            )
+            token_after = app.board_change_token()
+            assert token_after != token_before
+            assert (
+                next(
+                    r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == wt_run_id
+                )["worktree_branch"]
+                is None
+            )
     finally:
         sup.shutdown()

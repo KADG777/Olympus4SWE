@@ -106,23 +106,19 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
     expect = playwright.expect
     page.goto(f"{url}/")
 
-    # Select the default workspace on the board so + Issue Oracle pre-fills it.
     page.locator("#workspace-switcher").select_option(default_ws["workspace_id"])
     page.locator("#btn-issue-oracle").click()
     dialog = page.locator("#new-run-dialog")
     expect(dialog).to_be_visible()
 
-    # Step 1: Brownfield is default and workspace is pre-filled from selectedWorkspaceId.
     expect(dialog.locator("[data-scope-mode='brownfield']")).to_have_attribute(
         "aria-pressed", "true"
     )
     expect(dialog.locator("#new-run-workspace")).to_have_value(default_ws["workspace_id"])
 
-    # Step 2: Selecting Fix shows auto-selected repo_fast_patch workflow summary.
     dialog.locator("[data-task-type='fix']").click()
     expect(dialog.locator("#new-run-workflow-meta")).to_contain_text("repo_fast_patch")
 
-    # Fill optional base_ref, scope_paths, title, and intent, then submit.
     dialog.locator("#new-run-base-ref").fill("main")
     dialog.locator("#new-run-scope-paths").fill("src/app.py")
     dialog.locator("#new-run-title").fill("Fix write_scope guard")
@@ -135,7 +131,6 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
     brownfield_run_id = resp_info.value.json()["run_id"]
     expect(dialog).to_be_hidden()
 
-    # Card appears on Oracle Board with Brownfield / Fix metadata; backend captured scope fields.
     card = page.locator(f".oracle-card[data-run-id='{brownfield_run_id}']")
     expect(card).to_be_visible()
     expect(card).to_have_attribute("data-mode", "brownfield")
@@ -147,7 +142,6 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
     assert snap["scope_paths"] == ["src/app.py"]
     assert snap["workflow_name"] == "repo_fast_patch"
 
-    # Re-open modal and verify error resilience on invalid brownfield custom path (400).
     page.locator("#btn-issue-oracle").click()
     expect(dialog).to_be_visible()
     dialog.locator("#new-run-workspace").select_option("__custom__")
@@ -168,7 +162,6 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
         "Preserve this exact prompt across 400 validation errors."
     )
 
-    # Switch to Greenfield with a populated directory -> 400 inline error, draft still preserved.
     dialog.locator("[data-scope-mode='greenfield']").click()
     dialog.locator("[data-task-type='feature']").click()
     expect(dialog.locator("#new-run-workflow-meta")).to_contain_text("full_sdlc_tdd")
@@ -185,7 +178,6 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
         "Preserve this exact prompt across 400 validation errors."
     )
 
-    # Fix target path to a brand-new empty directory -> succeeds, auto-registers workspace.
     dialog.locator("#new-run-greenfield-path").fill(str(fresh_greenfield))
     with page.expect_response(
         lambda res: res.url.endswith("/api/runs") and res.request.method == "POST"
@@ -202,7 +194,6 @@ def test_issue_oracle_modal_scoped_creation_and_error_resilience(
     ws_names = [ws["name"] for ws in httpx.get(f"{url}/api/workspaces").json()["workspaces"]]
     assert "voice-cli-new" in ws_names
 
-    # Spec-Only + Blueprint -> defaults to product_blueprint without mutating workspace.
     page.locator("#workspace-switcher").select_option("")
     page.locator("#btn-issue-oracle").click()
     expect(dialog).to_be_visible()
@@ -235,13 +226,11 @@ def test_issue_oracle_benchmark_sample_disclosure_and_advanced_overrides(board_s
     dialog = page.locator("#new-run-dialog")
     expect(dialog).to_be_visible()
 
-    # Both disclosures start collapsed so Scope -> Task Type -> Intent stay primary.
     advanced = dialog.locator("#new-run-advanced")
     benchmark = dialog.locator("#new-run-benchmark-disclosure")
     expect(advanced).to_have_js_property("open", False)
     expect(benchmark).to_have_js_property("open", False)
 
-    # Expand Benchmark disclosure and load B-001 preset cleanly.
     benchmark.locator("summary").click()
     expect(benchmark).to_have_js_property("open", True)
     dialog.locator("#new-run-demo").select_option("B-001")
@@ -250,12 +239,10 @@ def test_issue_oracle_benchmark_sample_disclosure_and_advanced_overrides(board_s
     assert dialog.locator("#new-run-title").input_value().strip() != ""
     assert dialog.locator("#new-run-input").input_value().strip() != ""
 
-    # Clear sample returns cleanly to scoped mode.
     dialog.locator("#btn-clear-demo").click()
     expect(dialog.locator("#new-run-demo-banner")).to_have_count(0)
     expect(dialog.locator("#new-run-workspace")).to_be_visible()
 
-    # Expand Advanced Runtime Overrides to verify power-user controls remain accessible.
     advanced.locator("summary").click()
     expect(advanced).to_have_js_property("open", True)
     for control_id in (
@@ -278,7 +265,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
     store = RunStore(tmp_path / "ruling.db")
     seed_demo_runs(store, workspace)
 
-    # Gate the mock design stage so we can deterministically observe In Flight -> Approve Design.
     allow_design = threading.Event()
     design_started = threading.Event()
     sample_design = DesignSpec.model_validate(
@@ -326,11 +312,9 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
     url = f"http://127.0.0.1:{port}"
 
     try:
-        # Seed an existing run that the user already opened as an L2 Ariadne tab.
         existing_tab_id = store.create_run(title="Pre-Opened Inspection Tab")
         store.set_run_status(existing_tab_id, RunStatus.RUNNING)
 
-        # 1. Oracle awaiting clarification (Prometheus -> You).
         clarify_id = store.create_run(title="Clarify Rate Limiter")
         store.save_spec(
             clarify_id,
@@ -356,7 +340,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         )
         store.set_run_status(clarify_id, RunStatus.AWAITING_HUMAN)
 
-        # 2. Supervised blueprint run paused at gate_spec (Prometheus -> You).
         spec_id = store.create_run(
             title="Approve Billing GoalSpec",
             workflow_name="product_blueprint",
@@ -385,7 +368,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         )
         store.set_run_status(spec_id, RunStatus.AWAITING_HUMAN)
 
-        # 3. Supervised blueprint run paused at gate_plan (Athena -> You) for 409 conflict resync.
         plan_id = store.create_run(title="Approve Export Plan", workflow_name="product_blueprint")
         store.append_event(
             run_id=plan_id,
@@ -464,13 +446,11 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         expect = playwright.expect
         page.goto(f"{url}/")
 
-        # Open existing_tab_id as an L2 tab, then return to Oracle Board.
         page.locator(f".oracle-card[data-run-id='{existing_tab_id}'] .oracle-card-trigger").click()
         expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(1)
         page.locator("#nav-oracle-board").click()
         expect(page.locator("body")).to_have_attribute("data-surface", "board")
 
-        # --- A. Clarify inside Quick Ruling Drawer ---
         clarify_cta = page.locator(f"[data-quick-rule='{clarify_id}']")
         expect(clarify_cta).to_contain_text("Answer in Drawer")
         clarify_cta.click()
@@ -490,7 +470,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         expect(page.locator(f"[data-quick-rule='{clarify_id}']")).to_contain_text("Review Spec")
         expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(1)
 
-        # --- B. Approve GoalSpec inside Quick Ruling Drawer -> moves live to In Flight ---
         spec_cta = page.locator(f"[data-quick-rule='{spec_id}']")
         expect(spec_cta).to_contain_text("Review Spec")
         spec_cta.click()
@@ -501,7 +480,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         assert spec_res.value.status == 200
         expect(drawer).to_be_hidden()
         assert design_started.wait(timeout=5.0)
-        # Card moved out of Awaiting Your Ruling into In Flight; OPEN ARIADNE TABS untouched!
         expect(
             page.locator(f"[data-column='agent'] .oracle-card[data-run-id='{spec_id}']")
         ).to_be_visible()
@@ -514,7 +492,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         ).to_be_visible()
         allow_design.set()
 
-        # --- C. Approve Plan with 409 optimistic-lock conflict resync inside Drawer ---
         plan_cta = page.locator(f"[data-quick-rule='{plan_id}']")
         expect(plan_cta).to_contain_text("Approve Plan")
         plan_cta.click()
@@ -540,7 +517,6 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         expect(drawer.locator("#quick-drawer-notice")).to_contain_text("请确认后重试")
         expect(drawer.get_by_role("heading", name="任务计划 · v2")).to_be_visible()
 
-        # Re-confirm on v2 -> 200 succeeds, drawer closes, card moves to Delivered & Verified!
         with page.expect_response(f"{url}/api/runs/{plan_id}/command") as fresh_res:
             drawer.locator("[data-approve='approve_plan']").click()
         assert fresh_res.value.status == 200
@@ -566,7 +542,6 @@ def test_quick_ruling_drawer_blocker_resolution_and_open_cockpit_escape_hatch(
     store, _, url = board_server
     blocked_id = "run-campus-waitlist"
 
-    # Seed an extra human-held Oracle to test the "Open Full Ariadne Cockpit ↗" button.
     escape_id = store.create_run(title="Inspect Full Spec In Cockpit")
     store.save_spec(
         escape_id,
@@ -583,7 +558,6 @@ def test_quick_ruling_drawer_blocker_resolution_and_open_cockpit_escape_hatch(
     expect = playwright.expect
     page.goto(f"{url}/")
 
-    # Resolve blocker directly from Quick Ruling Drawer without opening an Ariadne tab.
     blocker_cta = page.locator(f"[data-quick-rule='{blocked_id}']")
     expect(blocker_cta).to_contain_text("Resolve Blocker")
     blocker_cta.click()
@@ -597,7 +571,6 @@ def test_quick_ruling_drawer_blocker_resolution_and_open_cockpit_escape_hatch(
     expect(drawer).to_be_hidden()
     expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(0)
 
-    # Open Quick Ruling Drawer on escape_id and click "Open Full Ariadne Cockpit ↗".
     page.locator(f"[data-quick-rule='{escape_id}']").click()
     expect(drawer).to_be_visible()
     drawer.locator("#btn-drawer-open-cockpit").click()
@@ -649,7 +622,6 @@ def test_stale_drawer_response_keeps_other_drawer_open_and_preserves_tabs_past_l
     expect(drawer).to_have_attribute("data-run-id", other_id)
     page.close()
 
-    # Pending ruling stays visible past 50 runs; open tabs survive 200+ runs on reload.
     p2 = browser.new_page(viewport={"width": 1440, "height": 900})
     p2.goto(f"{url}/")
     keep_id = store.create_run(run_id="keep-older-tab", title="Older Open Tab")

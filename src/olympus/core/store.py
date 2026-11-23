@@ -1400,6 +1400,30 @@ class RunStore:
         finally:
             conn.close()
 
+    def active_worktree_paths(self) -> list[str]:
+        """Return distinct non-empty task worktree paths on non-archived runs."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT plan_json FROM runs WHERE status != ? AND plan_json IS NOT NULL",
+                (RunStatus.CANCELLED.value,),
+            ).fetchall()
+        finally:
+            conn.close()
+        paths: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                data = json.loads(row["plan_json"])
+            except json.JSONDecodeError:
+                continue
+            for task in data.get("tasks") or ():
+                raw = task.get("worktree_path")
+                if isinstance(raw, str) and raw.strip() and raw not in seen:
+                    seen.add(raw)
+                    paths.append(raw)
+        return paths
+
     def board_fingerprint(self, *, workspace_id: str | None = None) -> tuple[Any, ...]:
         """Lightweight SQLite change token for board SSE polling without full replay."""
         conn = self._connect()

@@ -108,6 +108,27 @@ def _detect_git_repo(root: Path) -> tuple[bool, str | None]:
     return True, None
 
 
+def _read_git_head_state(worktree_path: str) -> str | None:
+    root = Path(worktree_path)
+    dot_git = root / ".git"
+    head_file: Path | None = None
+    try:
+        if dot_git.is_dir():
+            head_file = dot_git / "HEAD"
+        elif dot_git.is_file():
+            pointer = dot_git.read_text(encoding="utf-8", errors="ignore").strip()
+            if pointer.startswith("gitdir:"):
+                git_dir = Path(pointer.removeprefix("gitdir:").strip())
+                if not git_dir.is_absolute():
+                    git_dir = (root / git_dir).resolve()
+                head_file = git_dir / "HEAD"
+        if head_file is not None and head_file.is_file():
+            return head_file.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+    return None
+
+
 def _default_workflow_for(workspace_mode: str, task_type: str) -> str:
     if workspace_mode == "spec_only" or task_type == "blueprint":
         return "product_blueprint"
@@ -387,6 +408,13 @@ class AriadneApp:
         """Validate one board snapshot against RunListResponse before SSE emission."""
         payload = self.list_runs_payload(workspace_id=workspace_id)
         return RunListResponse.model_validate(payload).model_dump(mode="json")
+
+    def board_change_token(self, *, workspace_id: str | None = None) -> tuple[Any, ...]:
+        """Combine SQLite board state with active worktree Git HEAD states for SSE polling."""
+        head_states = tuple(
+            (wt, _read_git_head_state(wt)) for wt in self.store.active_worktree_paths()
+        )
+        return (self.store.board_fingerprint(workspace_id=workspace_id), head_states)
 
     def _workspace_for(self, run_id: str) -> Path:
         return self.supervisor.resolve_workspace(run_id)
@@ -972,16 +1000,6 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             if not requested_root:
                 requested_root = str(demo_ws)
 
-        scope = service.prepare_run_scope(
-            workspace_id=payload.workspace_id,
-            workspace_root=requested_root,
-            workspace_mode=payload.workspace_mode,
-            task_type=payload.task_type,
-            base_ref=payload.base_ref,
-            scope_paths=payload.scope_paths,
-            init_git=payload.init_git,
-        )
-
         default_goal = str(preset["raw_input"]) if preset else ""
         raw_input = str(payload.raw_input or payload.goal or default_goal).strip()
         if not raw_input:
@@ -993,6 +1011,8 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         else:
             constraints = []
         default_title = str(preset["title"]) if preset else raw_input[:60]
+        resolved_mode = payload.workspace_mode or "brownfield"
+        resolved_type = payload.task_type or "feature"
         if payload.workflow_name:
             resolved_workflow = payload.workflow_name
         elif (
@@ -1000,22 +1020,32 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             or payload.task_type is not None
             or payload.workspace_id is not None
         ):
-            resolved_workflow = _default_workflow_for(
-                scope.workspace_mode, scope.task_type
-            )
+            resolved_workflow = _default_workflow_for(resolved_mode, resolved_type)
         elif preset:
             resolved_workflow = str(preset["default_workflow"])
         else:
             resolved_workflow = "product_blueprint"
+        workflow_def = load_workflow(resolved_workflow)
         if (
-            scope.workspace_mode == "spec_only"
-            and scope.workspace_root is None
-            and load_workflow(resolved_workflow).stop_after == "execute"
+            resolved_mode == "spec_only"
+            and payload.workspace_id is None
+            and not requested_root
+            and workflow_def.stop_after == "execute"
         ):
             raise ValueError(
                 "spec_only runs cannot enter an execution workflow "
                 "without binding an explicit target workspace"
             )
+
+        scope = service.prepare_run_scope(
+            workspace_id=payload.workspace_id,
+            workspace_root=requested_root,
+            workspace_mode=payload.workspace_mode,
+            task_type=payload.task_type,
+            base_ref=payload.base_ref,
+            scope_paths=payload.scope_paths,
+            init_git=payload.init_git,
+        )
         started = service.supervisor.start_run(
             title=str(payload.title or default_title),
             raw_input=raw_input,
@@ -1192,8 +1222,8 @@ async def _board_sse_stream(
     once: bool,
 ) -> AsyncIterator[str]:
     """Board snapshot stream: 0.5s SQLite polls, aggregate-change emissions, 5s heartbeats."""
-    last_fingerprint = await asyncio.to_thread(
-        service.store.board_fingerprint, workspace_id=workspace_id
+    last_token = await asyncio.to_thread(
+        service.board_change_token, workspace_id=workspace_id
     )
     initial = await asyncio.to_thread(
         service.validated_board_payload, workspace_id=workspace_id
@@ -1209,14 +1239,14 @@ async def _board_sse_stream(
         if await request.is_disconnected():
             return
         ticks += 1
-        fingerprint = await asyncio.to_thread(
-            service.store.board_fingerprint, workspace_id=workspace_id
+        token = await asyncio.to_thread(
+            service.board_change_token, workspace_id=workspace_id
         )
-        if fingerprint == last_fingerprint:
+        if token == last_token:
             if ticks % 10 == 0:
                 yield ": heartbeat\n\n"
             continue
-        last_fingerprint = fingerprint
+        last_token = token
         nxt = await asyncio.to_thread(
             service.validated_board_payload, workspace_id=workspace_id
         )
