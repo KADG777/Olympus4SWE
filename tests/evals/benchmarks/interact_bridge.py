@@ -31,8 +31,10 @@ from typing import Any
 
 try:  # Imported as ``tests.evals.benchmarks.interact_bridge`` (host tests).
     from .fastmcp_client import McpError, McpHttpClient
+    from .token_usage import merge_token_usage, normalize_token_usage
 except ImportError:  # Executed as a standalone script inside the task container.
     from fastmcp_client import McpError, McpHttpClient
+    from token_usage import merge_token_usage, normalize_token_usage
 
 EXIT_OK = 0
 EXIT_SESSION_FAILED = 1
@@ -249,6 +251,9 @@ class BridgeConfig:
     infra_retry_backoff: float
     pi_bin: str | None
     base_commit_file: Path
+    pi_provider: str | None = None
+    thinking_level: str | None = None
+    context_window: int | None = None
 
 
 class InteractBridge:
@@ -266,6 +271,7 @@ class InteractBridge:
         self.turns = 0
         self.dialogue: list[dict[str, str]] = []
         self.run_id = ""
+        self.token_usage: dict[str, Any] | None = None
 
     def run(self) -> None:
         if self.config.phase == "plan":
@@ -652,8 +658,43 @@ class InteractBridge:
         if run_id:
             self.run_id = run_id
             self._save_run_id()
+        self._record_token_usage(envelope)
         self.log("session.envelope", envelope=envelope)
         return envelope
+
+    def _record_token_usage(self, envelope: dict[str, Any]) -> None:
+        usage = normalize_token_usage(envelope.get("token_usage"))
+        if usage is None:
+            return
+        self.token_usage = merge_token_usage(self.token_usage, usage)
+        self.log("session.token_usage", token_usage=self.token_usage)
+        self._write_token_usage()
+
+    def _token_usage_dir(self) -> Path | None:
+        trajectory = self.config.trajectory
+        return trajectory.parent if trajectory is not None else None
+
+    def _write_token_usage(self) -> None:
+        """Persist per-step and cumulative usage beside the step JSONL log."""
+        usage = self.token_usage
+        if usage is None:
+            return
+        directory = self._token_usage_dir()
+        if directory is None:
+            return
+        trajectory = self.config.trajectory
+        step_tag = "step"
+        if trajectory is not None and trajectory.stem.startswith("olympus-interact-"):
+            step_tag = trajectory.stem[len("olympus-interact-") :]
+        payload = json.dumps(usage, indent=2, ensure_ascii=False) + "\n"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "token_usage.json").write_text(payload, encoding="utf-8")
+            (directory / f"token_usage-{step_tag}.json").write_text(
+                payload, encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     def session_argv(self, subcommand: str, message: str, step_mode: str) -> list[str]:
         argv = [self.config.olympus_bin, "session", subcommand]
@@ -676,6 +717,14 @@ class InteractBridge:
             ("--provider", self.config.provider),
             ("--model", self.config.model),
             ("--base-url", self.config.base_url),
+            ("--pi-provider", self.config.pi_provider),
+            ("--thinking", self.config.thinking_level),
+            (
+                "--context-window",
+                None
+                if self.config.context_window is None
+                else str(self.config.context_window),
+            ),
             ("--stage-driver", self.config.stage_driver),
             ("--worker-driver", self.config.worker_driver),
             ("--reviewer-driver", self.config.reviewer_driver),
@@ -818,6 +867,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--pi-provider", default=None)
+    parser.add_argument("--thinking", default=None)
+    parser.add_argument("--context-window", type=int, default=None)
     parser.add_argument("--stage-driver", default=None)
     parser.add_argument("--worker-driver", default=None)
     parser.add_argument("--reviewer-driver", default=None)
@@ -878,6 +930,9 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         infra_retry_backoff=max(0.0, args.infra_retry_backoff),
         pi_bin=args.pi_bin,
         base_commit_file=Path(args.base_commit_file).expanduser(),
+        pi_provider=args.pi_provider,
+        thinking_level=args.thinking,
+        context_window=args.context_window,
     )
 
 
@@ -911,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
             "turns": bridge.turns,
             "exit_code": exit_code,
             "error": redact_text(error, bridge.environ) if error else None,
+            "token_usage": bridge.token_usage,
         }
         print(json.dumps(summary))
         if error:

@@ -45,6 +45,38 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+try:  # Imported as ``tests.evals.benchmarks.harbor_together``.
+    from .token_usage import (
+        build_budget_settled_command,
+        merge_token_usage,
+        normalize_token_usage,
+        parse_budget_settled_stdout,
+        token_usage_context_fields,
+        usage_from_context_fields,
+        zero_token_usage,
+    )
+except ImportError:  # Loaded as a bare top-level module by standalone tooling.
+    try:
+        from tests.evals.benchmarks.token_usage import (
+            build_budget_settled_command,
+            merge_token_usage,
+            normalize_token_usage,
+            parse_budget_settled_stdout,
+            token_usage_context_fields,
+            usage_from_context_fields,
+            zero_token_usage,
+        )
+    except ImportError:  # Executed directly from the benchmarks directory.
+        from token_usage import (  # type: ignore[no-redef]
+            build_budget_settled_command,
+            merge_token_usage,
+            normalize_token_usage,
+            parse_budget_settled_stdout,
+            token_usage_context_fields,
+            usage_from_context_fields,
+            zero_token_usage,
+        )
+
 _HarborBaseAgent: Any = None
 _HarborAgentContext: Any = None
 _HarborCapabilities: Any = None
@@ -603,6 +635,43 @@ def _driver_uses_pi(value: str | None) -> bool:
     return name in {"auto", "pi"}
 
 
+def _coerce_context_window(value: Any) -> int | None:
+    """Coerce a JSON/CLI context-window value into a positive token cap."""
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"context_window={value!r}; expected a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"context_window={value!r}; expected a positive integer")
+    return parsed
+
+
+def split_pi_model_name(
+    model_name: str | None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    pi_provider: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve Harbor's ``provider/model`` string without mangling Pi model ids.
+
+    Known API providers keep splitting into ``--provider``; an explicit
+    ``--pi-provider`` instead owns any matching ``<pi-provider>/<model>`` prefix
+    so the bare model id reaches Pi unchanged.
+    """
+    derived_provider, derived_model = _split_model_name(model_name)
+    resolved_pi = pi_provider.strip() if pi_provider else None
+    resolved_provider = (provider or derived_provider or "").strip() or None
+    resolved_model = (model or derived_model or "").strip() or None
+    if resolved_model and resolved_pi and "/" in resolved_model:
+        head, tail = resolved_model.split("/", 1)
+        if head.strip().casefold() == resolved_pi.casefold() and tail.strip():
+            resolved_model = tail.strip()
+    return resolved_provider, resolved_pi, resolved_model
+
+
 def default_project_root() -> Path:
     """Repository root of this checkout (``pyproject.toml`` + ``src/olympus``)."""
     return Path(__file__).resolve().parents[3]
@@ -833,6 +902,8 @@ class UserEnabledOlympusAgent(BaseAgent):
     if _HarborCapabilities is None:
         SUPPORTS_ATIF: bool = True
 
+    DEFAULT_SETUP_TIMEOUT_SEC: float = 900.0
+
     def __init__(
         self,
         logs_dir: Path,
@@ -848,6 +919,9 @@ class UserEnabledOlympusAgent(BaseAgent):
         provider: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
+        pi_provider: str | None = None,
+        thinking_level: str | None = None,
+        context_window: int | None = None,
         max_turns: int = 15,
         state_dir: str = "/tmp/olympus-session",
         workspace: str | None = None,
@@ -886,15 +960,20 @@ class UserEnabledOlympusAgent(BaseAgent):
         self.logs_dir = Path(logs_dir)
         self.logger = (getattr(self, "logger", log) or log).getChild(__name__)
 
-        derived_provider, derived_model = _split_model_name(model_name)
+        derived_provider, derived_pi, derived_model = split_pi_model_name(
+            model_name, provider=provider, model=model, pi_provider=pi_provider
+        )
         self._workflow = str(workflow or "full_sdlc_tdd")
         self._gate_policy = str(gate_policy or "interactive_minimal")
         self._stage_driver = stage_driver.strip() if stage_driver else None
         self._worker_driver = worker_driver.strip() if worker_driver else None
         self._reviewer_driver = reviewer_driver.strip() if reviewer_driver else None
         self._monitor_model = monitor_model.strip() if monitor_model else None
-        self._provider = (provider or derived_provider or "auto").strip()
-        self._model = (model or derived_model or "").strip() or None
+        self._provider = (derived_provider or "auto").strip()
+        self._pi_provider = derived_pi
+        self._model = derived_model
+        self._thinking_level = thinking_level.strip() if thinking_level else None
+        self._context_window = _coerce_context_window(context_window)
         self._base_url = base_url.strip() if base_url else None
         self._max_turns = max(1, int(max_turns))
         self._state_dir = (state_dir or "/tmp/olympus-session").rstrip("/") or "/"
@@ -990,6 +1069,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._last_cumulative_diff = ""
         self._conversation: list[dict[str, Any]] = []
         self._sim_user: Any | None = None
+        self._token_usage: dict[str, Any] | None = None
 
     @staticmethod
     def name() -> str:
@@ -1264,6 +1344,8 @@ class UserEnabledOlympusAgent(BaseAgent):
                 await self._capture_git_diff(environment, turn=999)
             if envelope is not None:
                 self._run_id = envelope.run_id or self._run_id
+            with suppress(Exception):
+                await self._finalize_token_usage(environment, envelope)
             self._write_atif(final_status=final_status, turns=turns)
             self._populate_context(context, final_status=final_status, turns=turns)
 
@@ -1280,6 +1362,12 @@ class UserEnabledOlympusAgent(BaseAgent):
             ("--provider", self._provider),
             ("--model", self._model),
             ("--base-url", self._base_url),
+            ("--pi-provider", self._pi_provider),
+            ("--thinking", self._thinking_level),
+            (
+                "--context-window",
+                None if self._context_window is None else str(self._context_window),
+            ),
             ("--stage-driver", self._stage_driver),
             ("--worker-driver", self._worker_driver),
             ("--reviewer-driver", self._reviewer_driver),
@@ -1314,6 +1402,7 @@ class UserEnabledOlympusAgent(BaseAgent):
                 detail[:2000] or "olympus session produced no JSON envelope"
             )
         self._run_id = envelope.run_id or self._run_id
+        self._record_token_usage(envelope)
         await self._capture_git_diff(environment, turn=turn)
         self._record_message(
             role="agent",
@@ -1332,6 +1421,44 @@ class UserEnabledOlympusAgent(BaseAgent):
             encoding="utf-8",
         )
         return envelope
+
+    def _record_token_usage(self, envelope: SessionEnvelopeView) -> None:
+        usage = normalize_token_usage(envelope.raw.get("token_usage"))
+        if usage is not None:
+            self._token_usage = merge_token_usage(self._token_usage, usage)
+
+    async def _finalize_token_usage(
+        self, environment: Any, envelope: SessionEnvelopeView | None
+    ) -> None:
+        """Attach usage from the last envelope, else recover it from the event store."""
+        try:
+            if envelope is not None:
+                self._record_token_usage(envelope)
+            if self._token_usage is None:
+                recovered = await self._recover_token_usage(environment)
+                self._token_usage = merge_token_usage(self._token_usage, recovered)
+        finally:
+            self._write_token_usage()
+
+    async def _recover_token_usage(self, environment: Any) -> dict[str, Any] | None:
+        """Fallback: sum cumulative ``budget.settled`` events from the container DB."""
+        db_path = posixpath.join(self._state_dir.rstrip("/") or "/", "olympus.db")
+        command = build_budget_settled_command(db_path, self._run_id or None)
+        try:
+            outcome = await self._exec(environment, command, cwd="/", timeout_sec=60)
+        except Exception:  # noqa: BLE001 - recovery must never fail a trial
+            log.debug("budget.settled recovery exec failed", exc_info=True)
+            return None
+        if outcome.return_code != 0:
+            return None
+        return parse_budget_settled_stdout(outcome.stdout)
+
+    def _write_token_usage(self) -> None:
+        usage = self._token_usage or zero_token_usage()
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        (self.logs_dir / "token_usage.json").write_text(
+            json.dumps(usage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
 
     async def _exec(
         self,
@@ -1569,13 +1696,18 @@ class UserEnabledOlympusAgent(BaseAgent):
                 "model_name": self._model or self.model_name,
             },
             "steps": steps,
+            "token_usage": self._token_usage or zero_token_usage(),
             "notes": (
                 "Olympus headless-session adapter: simulated users see only the "
                 "assistant's natural-language message and the per-turn git diff."
             ),
             "final_metrics": {
                 "total_steps": len(steps),
-                "extra": {"turns": turns, "final_status": final_status},
+                "extra": {
+                    "turns": turns,
+                    "final_status": final_status,
+                    "token_usage": self._token_usage or zero_token_usage(),
+                },
             },
         }
         (self.logs_dir / "trajectory.json").write_text(
@@ -1598,6 +1730,11 @@ class UserEnabledOlympusAgent(BaseAgent):
                 if line.startswith("diff --git ")
             ],
         }
+        if self._token_usage is not None:
+            metadata["token_usage"] = self._token_usage
+            for name, value in token_usage_context_fields(self._token_usage).items():
+                with suppress(Exception):
+                    setattr(context, name, value)
         try:
             context.metadata = metadata
         except Exception:  # pragma: no cover - defensive around foreign contexts
@@ -1634,6 +1771,7 @@ class _FallbackAgentConfig:
     model_name: str | None = None
     base_url: str | None = None
     override_timeout_sec: float | None = None
+    override_setup_timeout_sec: float | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
@@ -1763,6 +1901,7 @@ def build_olympus_trial_config(
     swe_together_root: Path | str | None = None,
     environment: str | None = None,
     agent_timeout: float | None = None,
+    setup_timeout: float | None = None,
     user_context_chars: int = 3000,
     call_user_on_completion: bool = True,
     user_temperature: float | None = 0.5,
@@ -1828,6 +1967,7 @@ def build_olympus_trial_config(
         model_name=model,
         base_url=base_url,
         override_timeout_sec=agent_timeout,
+        override_setup_timeout_sec=setup_timeout,
         kwargs=sim_kwargs,
         env=safe_agent_env,
     )
@@ -1922,6 +2062,23 @@ def _trial_error(result: Any) -> str | None:
     return getattr(info, "exception_type", None) if info is not None else None
 
 
+def _trial_token_usage(result: Any) -> dict[str, Any] | None:
+    """Read canonical usage from Harbor's recorded ``AgentContext``, if any."""
+    context = getattr(result, "agent_result", None)
+    if context is None:
+        return None
+    metadata = getattr(context, "metadata", None)
+    if isinstance(metadata, dict):
+        usage = normalize_token_usage(metadata.get("token_usage"))
+        if usage is not None:
+            return usage
+    return usage_from_context_fields(
+        n_input_tokens=getattr(context, "n_input_tokens", None),
+        n_output_tokens=getattr(context, "n_output_tokens", None),
+        n_cache_tokens=getattr(context, "n_cache_tokens", None),
+    )
+
+
 def build_launcher_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1963,6 +2120,30 @@ def build_launcher_parser() -> argparse.ArgumentParser:
         help="Harbor environment type (default: $SWT_SANDBOX, else docker).",
     )
     parser.add_argument("--agent-timeout", type=float, default=None)
+    parser.add_argument(
+        "--override-setup-timeout-sec",
+        "--agent-setup-timeout",
+        dest="override_setup_timeout_sec",
+        type=float,
+        default=None,
+        help="Harbor AgentConfig.override_setup_timeout_sec (slow container venv builds).",
+    )
+    parser.add_argument(
+        "--pi-provider",
+        default=None,
+        help="Pi built-in provider name forwarded as --pi-provider.",
+    )
+    parser.add_argument(
+        "--thinking",
+        default=None,
+        help="Pi thinking level forwarded as --thinking (off..max).",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=None,
+        help="Context window token cap forwarded as --context-window.",
+    )
     parser.add_argument("--user-context-chars", type=int, default=3000)
     parser.add_argument("--user-temperature", type=float, default=0.5)
     parser.add_argument(
@@ -2012,6 +2193,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     agent_env = json.loads(args.agent_env) if args.agent_env else {}
     if not isinstance(agent_env, dict):
         raise SystemExit("--agent-env must be a JSON object")
+    # Explicit CLI flags win over --agent-kwargs for the Pi/context controls.
+    for flag, value in (
+        ("pi_provider", args.pi_provider),
+        ("thinking_level", args.thinking),
+        ("context_window", args.context_window),
+    ):
+        if value is not None:
+            extra_kwargs[flag] = value
     configs = [
         build_olympus_trial_config(
             task,
@@ -2024,6 +2213,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             swe_together_root=root,
             environment=args.environment,
             agent_timeout=args.agent_timeout,
+            setup_timeout=args.override_setup_timeout_sec,
             user_context_chars=args.user_context_chars,
             call_user_on_completion=not args.no_call_user_on_completion,
             user_temperature=args.user_temperature,
@@ -2054,6 +2244,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "trial": getattr(result, "trial_name", None),
             "reward": _trial_reward(result),
             "error": _trial_error(result),
+            "token_usage": _trial_token_usage(result),
         }
         for result in results
     ]
@@ -2107,6 +2298,7 @@ __all__ = [
     "redact_base_url",
     "redact_text",
     "split_diff_output",
+    "split_pi_model_name",
     "stage_source_archive",
     "strip_junk",
     "tag_harbor_base",

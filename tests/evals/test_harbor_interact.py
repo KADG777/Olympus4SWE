@@ -526,7 +526,7 @@ def save(state):
 
 
 def emit(status, *, pause_kind=None, message="", changed_files=None, error=None):
-    print(json.dumps({
+    payload = {
         "run_id": load().get("run_id", ""),
         "status": status,
         "pause_kind": pause_kind,
@@ -536,7 +536,14 @@ def emit(status, *, pause_kind=None, message="", changed_files=None, error=None)
         "unresolved_blockers": [],
         "changed_files": changed_files or [],
         "error": error,
-    }))
+    }
+    usage = os.environ.get("FAKE_OLYMPUS_TOKEN_USAGE")
+    if usage:
+        try:
+            payload["token_usage"] = json.loads(usage)
+        except ValueError:
+            pass
+    print(json.dumps(payload))
     raise SystemExit(0)
 
 
@@ -1815,6 +1822,7 @@ def test_setup_bundles_olympus_bridge_and_pi(tmp_path: Path) -> None:
     targets = [target for _, target, _ in environment.uploads]
     assert "/tmp/olympus-bridge/interact_bridge.py" in targets
     assert "/tmp/olympus-bridge/fastmcp_client.py" in targets
+    assert "/tmp/olympus-bridge/token_usage.py" in targets
     assert "/tmp/olympus-src/pyproject.toml" in targets
     assert (package, "/tmp/olympus-src/src/olympus") in environment.uploaded_dirs
     assert agent._installed_pi_bin == "/tmp/pi-cli/bin/pi"
@@ -2047,6 +2055,193 @@ def test_populate_context_post_run_reads_trajectories(tmp_path: Path) -> None:
     summary = context.metadata["olympus_interact"]
     assert summary["steps"][0]["turns"] == 1
     assert summary["steps"][0]["status"] == "needs_input"
+
+
+# --------------------------------------------------------------------------- Pi + usage passthrough
+
+
+_PI_USAGE_PAYLOAD = {
+    "llm_calls": 2,
+    "input_tokens": 800,
+    "output_tokens": 100,
+    "reasoning_tokens": 40,
+    "cache_read_tokens": 300,
+    "cache_write_tokens": 0,
+}
+
+
+def test_interact_options_parse_pi_controls_and_strip_pi_prefix(tmp_path: Path) -> None:
+    agent = _agent(
+        tmp_path,
+        model_name="qwen-token-plan-cn/qwen3-max",
+        pi_provider="qwen-token-plan-cn",
+        thinking_level=" high ",
+        context_window="262144",
+    )
+    options = agent.interact_options
+    assert options.pi_provider == "qwen-token-plan-cn"
+    assert options.thinking_level == "high"
+    assert options.context_window == 262144
+    assert options.model == "qwen3-max"
+
+    default = _agent(tmp_path, model_name="openai/gpt-test").interact_options
+    assert default.pi_provider is None
+    assert default.thinking_level is None
+    assert default.context_window is None
+
+
+def test_bridge_argv_forwards_pi_controls(tmp_path: Path) -> None:
+    agent = _agent(
+        tmp_path,
+        pi_provider="qwen-token-plan-cn",
+        thinking_level="max",
+        context_window=262144,
+    )
+    argv = agent._bridge_argv(
+        "plan", "/tmp/instruction.md", "/logs/agent/olympus-interact-step-01.jsonl"
+    )
+    assert argv[argv.index("--pi-provider") + 1] == "qwen-token-plan-cn"
+    assert argv[argv.index("--thinking") + 1] == "max"
+    assert argv[argv.index("--context-window") + 1] == "262144"
+
+
+def test_bridge_forwards_pi_controls_and_writes_token_usage(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    logs = tmp_path / "agent-logs"
+    logs.mkdir()
+    trajectory = logs / "olympus-interact-step-01.jsonl"
+    fake = _write_fake_olympus(tmp_path)
+    server = FakeMcpServer(
+        replies=["AMB-1: raise ValueError('zero').", "Looks good, ship it."]
+    )
+    try:
+        args = _bridge_common(
+            "plan", fake, repo, state, server, trajectory, tmp_path / "plan.md"
+        ) + [
+            "--goal",
+            "Build a calculator library",
+            "--pi-provider",
+            "qwen-token-plan-cn",
+            "--thinking",
+            "high",
+            "--context-window",
+            "262144",
+        ]
+        process, summary = _run_bridge(
+            args, env={"FAKE_OLYMPUS_TOKEN_USAGE": json.dumps(_PI_USAGE_PAYLOAD)}
+        )
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert summary["status"] == "ok", summary
+
+        expected = {
+            "llm_calls": 2,
+            "input_tokens": 800,
+            "output_tokens": 100,
+            "reasoning_tokens": 40,
+            "cache_read_tokens": 300,
+            "cache_write_tokens": 0,
+            "total_tokens": 800 + 100 + 300,
+            "cache_hit_rate": round(300 / (800 + 300), 4),
+            "by_actor": {},
+        }
+        assert summary["token_usage"] == expected
+        assert json.loads((logs / "token_usage.json").read_text()) == expected
+        assert json.loads((logs / "token_usage-step-01.json").read_text()) == expected
+
+        events = _jsonl_events(trajectory)
+        assert any(event.get("event") == "session.token_usage" for event in events)
+        envelope_events = [
+            event for event in events if event.get("event") == "session.envelope"
+        ]
+        assert envelope_events[-1]["envelope"]["token_usage"] == _PI_USAGE_PAYLOAD
+
+        invocations = [
+            json.loads(line)
+            for line in (state / "fake-invocations.jsonl").read_text().splitlines()
+        ]
+        session_argv = next(
+            invocation["argv"]
+            for invocation in invocations
+            if invocation["argv"][0] == "session"
+        )
+        assert session_argv[session_argv.index("--pi-provider") + 1] == (
+            "qwen-token-plan-cn"
+        )
+        assert session_argv[session_argv.index("--thinking") + 1] == "high"
+        assert session_argv[session_argv.index("--context-window") + 1] == "262144"
+    finally:
+        server.close()
+
+
+def test_populate_context_reads_token_usage_from_step_log(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "olympus-interact-step-01.jsonl").write_text(
+        json.dumps({"event": "ask_user", "turn": 1})
+        + "\n"
+        + json.dumps(
+            {
+                "event": "session.envelope",
+                "envelope": {
+                    "status": "completed",
+                    "run_id": "run-7",
+                    "token_usage": _PI_USAGE_PAYLOAD,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    agent = _agent(tmp_path)
+    context = _context()
+    agent.populate_context_post_run(context)
+    usage = context.metadata["token_usage"]
+    assert usage["total_tokens"] == 1200
+    assert context.n_input_tokens == 1100
+    assert context.n_output_tokens == 100
+    assert context.n_cache_tokens == 300
+
+
+def test_populate_context_reads_token_usage_artifact_without_step_logs(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "token_usage.json").write_text(json.dumps(_PI_USAGE_PAYLOAD), encoding="utf-8")
+    agent = _agent(tmp_path)
+    context = _context()
+    agent.populate_context_post_run(context)
+    assert context.metadata["token_usage"]["total_tokens"] == 1200
+    assert context.n_cache_tokens == 300
+
+
+def test_run_bridge_step_captures_summary_token_usage(tmp_path: Path) -> None:
+    payload = json.dumps(
+        {
+            "status": "ok",
+            "phase": "plan",
+            "run_id": "run-9",
+            "turns": 0,
+            "token_usage": _PI_USAGE_PAYLOAD,
+        }
+    )
+    environment = FakeEnvironment(
+        handler=lambda command, cwd, env, timeout_sec: ExecResult(
+            return_code=0, stdout=payload + "\n"
+        )
+    )
+    agent = _agent(tmp_path)
+    asyncio.run(agent.run(PLAN_INSTRUCTION, environment, _context()))
+    assert agent._token_usage is not None
+    assert agent._token_usage["total_tokens"] == 1200
+
+    context = _context()
+    agent.populate_context_post_run(context)
+    assert context.metadata["token_usage"]["total_tokens"] == 1200
+    assert context.n_input_tokens == 1100
+    assert context.n_output_tokens == 100
+    assert context.n_cache_tokens == 300
 
 
 # --------------------------------------------------------------------------- invariants

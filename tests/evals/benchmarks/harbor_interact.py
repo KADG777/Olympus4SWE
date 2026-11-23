@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shlex
+from contextlib import suppress
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
@@ -44,7 +45,20 @@ except Exception:  # pragma: no cover - old Harbor releases resolve natively
 try:
     from .interact_bridge import DEFAULT_INITIAL_QUESTION, redact_text
 except ImportError:  # Imported as a top-level module by standalone tooling.
-    from interact_bridge import DEFAULT_INITIAL_QUESTION, redact_text
+    from interact_bridge import DEFAULT_INITIAL_QUESTION, redact_text  # type: ignore[no-redef]
+
+try:
+    from .token_usage import (
+        merge_token_usage,
+        normalize_token_usage,
+        token_usage_context_fields,
+    )
+except ImportError:  # Imported as a top-level module by standalone tooling.
+    from token_usage import (  # type: ignore[no-redef]
+        merge_token_usage,
+        normalize_token_usage,
+        token_usage_context_fields,
+    )
 
 VERSION = "0.1.0"
 BRIDGE_DIR = "/tmp/olympus-bridge"
@@ -57,7 +71,7 @@ _VALID_ROLES = frozenset({_PLAN_ONLY_ROLE, _EXECUTE_ROLE, _HANDOFF_ROLE})
 _HANDOFF_MARKERS = ("handoff step", "do not make intentional implementation changes")
 _PLAN_MARKERS = ("agreeing on the plan", "do not make implementation edits")
 _FENCED_BLOCK = re.compile(r"```(?:bash|sh|shell)?[ \t]*\n(.*?)```", re.DOTALL)
-_BRIDGE_SCRIPTS = ("fastmcp_client.py", "interact_bridge.py")
+_BRIDGE_SCRIPTS = ("fastmcp_client.py", "interact_bridge.py", "token_usage.py")
 
 
 @dataclass
@@ -139,6 +153,12 @@ def _as_optional_bool(value: Any) -> bool | None:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _as_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def _driver_uses_pi(value: str | None) -> bool:
     """Return True when a driver setting resolves to Pi after ``auto`` probing."""
     name = (value or "").split("@", 1)[0].strip().lower()
@@ -154,6 +174,9 @@ class InteractOptions:
     provider: str | None = None
     model: str | None = None
     base_url: str | None = None
+    pi_provider: str | None = None
+    thinking_level: str | None = None
+    context_window: int | None = None
     stage_driver: str | None = "auto"
     worker_driver: str | None = "auto"
     reviewer_driver: str | None = "auto"
@@ -190,6 +213,7 @@ class InteractOptions:
             "mcp_timeout_sec",
             "install_pi",
             "olympus_editable",
+            "context_window",
         }
         options = cls(**{key: value for key, value in raw.items() if key not in coerced})
         options = replace(
@@ -199,6 +223,9 @@ class InteractOptions:
             mcp_timeout_sec=_as_float(raw.get("mcp_timeout_sec"), 120.0),
             install_pi=_as_optional_bool(raw.get("install_pi")),
             olympus_editable=bool(_as_optional_bool(raw.get("olympus_editable"))),
+            context_window=_as_optional_int(raw.get("context_window")),
+            pi_provider=(options.pi_provider or "").strip() or None,
+            thinking_level=(options.thinking_level or "").strip() or None,
         )
         provider = options.provider
         model = options.model or model_name
@@ -206,6 +233,10 @@ class InteractOptions:
             head, tail = model.split("/", 1)
             if head in {"openai", "anthropic", "mock"}:
                 provider, model = head, tail
+        if options.pi_provider and model and "/" in model:
+            head, tail = model.split("/", 1)
+            if head.strip().casefold() == options.pi_provider.casefold() and tail.strip():
+                model = tail.strip()
         return replace(options, provider=provider, model=model)
 
 
@@ -301,6 +332,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         self._run_id: str | None = None
         self._installed_olympus_bin: str | None = None
         self._installed_pi_bin: str | None = None
+        self._token_usage: dict[str, Any] | None = None
         super().__init__(
             logs_dir=logs_dir if logs_dir is not None else Path.cwd() / "logs",
             model_name=model_name,
@@ -398,6 +430,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
 
     def populate_context_post_run(self, context: Any) -> None:
         summaries: list[dict[str, Any]] = []
+        usage = self._token_usage
         for path in sorted(Path(self.logs_dir).glob("olympus-interact-step-*.jsonl")):
             turns, status, run_id = 0, None, None
             try:
@@ -416,17 +449,41 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                     envelope = record.get("envelope") or {}
                     status = envelope.get("status") or status
                     run_id = envelope.get("run_id") or run_id
+                    usage = merge_token_usage(usage, envelope.get("token_usage"))
             summaries.append(
                 {"step": path.stem, "turns": turns, "status": status, "run_id": run_id}
             )
-        if not summaries:
+        usage = merge_token_usage(usage, self._read_token_usage_artifact())
+        if not summaries and usage is None:
             return
         metadata = dict(getattr(context, "metadata", None) or {})
         metadata["olympus_interact"] = {
             "steps": summaries,
             "run_id": self._run_id,
         }
+        if usage is not None:
+            metadata["token_usage"] = usage
+            for name, value in token_usage_context_fields(usage).items():
+                with suppress(Exception):
+                    setattr(context, name, value)
         context.metadata = metadata
+
+    def _read_token_usage_artifact(self) -> dict[str, Any] | None:
+        """Merge ``token_usage.json`` exported by the in-container bridge, if any."""
+        logs = Path(self.logs_dir)
+        candidates = [logs / "token_usage.json"]
+        candidates.extend(sorted(logs.glob("token_usage-step-*.json")))
+        usage: dict[str, Any] | None = None
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                usage = merge_token_usage(usage, payload)
+        return usage
 
     def _pi_install_requested(self) -> bool:
         options = self._interact
@@ -762,6 +819,9 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         run_id = (summary or {}).get("run_id")
         if run_id:
             self._run_id = str(run_id)
+        usage = normalize_token_usage((summary or {}).get("token_usage"))
+        if usage is not None:
+            self._token_usage = merge_token_usage(self._token_usage, usage)
 
     def _bridge_argv(
         self, role: str, remote_instruction: str, trajectory: str
@@ -808,6 +868,12 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             ("--provider", options.provider),
             ("--model", options.model),
             ("--base-url", options.base_url),
+            ("--pi-provider", options.pi_provider),
+            ("--thinking", options.thinking_level),
+            (
+                "--context-window",
+                None if options.context_window is None else str(options.context_window),
+            ),
             ("--stage-driver", options.stage_driver),
             ("--worker-driver", options.worker_driver),
             ("--reviewer-driver", options.reviewer_driver),
