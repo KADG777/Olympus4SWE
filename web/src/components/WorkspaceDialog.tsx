@@ -1,7 +1,17 @@
 import { useState, type FormEvent } from "react";
 
+import { deriveCloneFolderName, joinDirPath } from "../lib/paths";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { NativeDialog } from "./Dialogs";
+import { DirectoryPicker } from "./DirectoryPicker";
+
+type AddWorkspaceMode = "open" | "new" | "clone";
+
+const MODE_TABS: { id: AddWorkspaceMode; label: string; hint: string }[] = [
+  { id: "open", label: "Open Folder", hint: "Register existing directory" },
+  { id: "new", label: "New Project", hint: "Create empty folder" },
+  { id: "clone", label: "Clone Git URL", hint: "Clone remote repo" },
+];
 
 export function WorkspaceDialog({
   workbench,
@@ -10,23 +20,45 @@ export function WorkspaceDialog({
   workbench: Workbench;
   state: WorkbenchState;
 }) {
+  const [mode, setMode] = useState<AddWorkspaceMode>("open");
   const [rootPath, setRootPath] = useState("");
   const [name, setName] = useState("");
-  const [createIfMissing, setCreateIfMissing] = useState(false);
-  const [initGit, setInitGit] = useState(false);
+
+  const [newParentDir, setNewParentDir] = useState("");
+  const [newParentTouched, setNewParentTouched] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [newDisplayName, setNewDisplayName] = useState("");
+  const [newInitGit, setNewInitGit] = useState(true);
+
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneParentDir, setCloneParentDir] = useState("");
+  const [cloneParentTouched, setCloneParentTouched] = useState(false);
+  const [cloneFolder, setCloneFolder] = useState("");
+  const [cloneFolderEdited, setCloneFolderEdited] = useState(false);
+
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [localRefreshSeq, setLocalRefreshSeq] = useState(0);
+
+  const pickerRefreshKey = `${state.workspaceDialogOpenSeq}:${localRefreshSeq}:${state.workspaces
+    .map((ws) => ws.workspace_id)
+    .join(",")}`;
 
   const closeDialog = () => {
     const dialog = document.getElementById("workspace-manager-dialog") as HTMLDialogElement | null;
     if (dialog?.open) dialog.close();
   };
 
-  const handleRegister = async (event: FormEvent) => {
+  const switchMode = (nextMode: AddWorkspaceMode) => {
+    setMode(nextMode);
+    setError(null);
+  };
+
+  const handleOpenFolder = async (event: FormEvent) => {
     event.preventDefault();
     const trimmedPath = rootPath.trim();
     if (!trimmedPath) {
-      setError("请填写本地仓库或工作目录路径");
+      setError("请填写或选择本地仓库目录路径");
       return;
     }
     setBusy(true);
@@ -34,8 +66,8 @@ export function WorkspaceDialog({
     const result = await workbench.registerWorkspace({
       root_path: trimmedPath,
       name: name.trim() || null,
-      create_if_missing: createIfMissing,
-      init_git: initGit,
+      create_if_missing: false,
+      init_git: false,
     });
     setBusy(false);
     if (!result.ok) {
@@ -44,8 +76,77 @@ export function WorkspaceDialog({
     }
     setRootPath("");
     setName("");
-    setCreateIfMissing(false);
-    setInitGit(false);
+    setLocalRefreshSeq((seq) => seq + 1);
+  };
+
+  const composedNewPath = joinDirPath(newParentDir, newFolderName);
+
+  const handleCreateProject = async (event: FormEvent) => {
+    event.preventDefault();
+    const parent = newParentDir.trim();
+    const folder = newFolderName.trim();
+    if (!parent) {
+      setError("请选择新建项目的父目录");
+      return;
+    }
+    if (!folder) {
+      setError("请填写新项目文件夹名称");
+      return;
+    }
+    if (folder === "." || folder === ".." || folder.includes("/") || folder.includes("\\")) {
+      setError("项目文件夹名称不能包含路径分隔符或相对路径片段");
+      return;
+    }
+    const targetPath = joinDirPath(parent, folder);
+    setBusy(true);
+    setError(null);
+    const result = await workbench.registerWorkspace({
+      root_path: targetPath,
+      name: newDisplayName.trim() || folder,
+      create_if_missing: true,
+      init_git: newInitGit,
+    });
+    setBusy(false);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setNewFolderName("");
+    setNewDisplayName("");
+    setLocalRefreshSeq((seq) => seq + 1);
+  };
+
+  const effectiveCloneFolder = cloneFolder.trim() || deriveCloneFolderName(cloneUrl);
+  const composedClonePath = joinDirPath(cloneParentDir, effectiveCloneFolder);
+
+  const handleClone = async (event: FormEvent) => {
+    event.preventDefault();
+    const trimmedUrl = cloneUrl.trim();
+    const trimmedParent = cloneParentDir.trim();
+    if (!trimmedUrl) {
+      setError("请填写 Git 仓库地址或 owner/repo 简写");
+      return;
+    }
+    if (!trimmedParent) {
+      setError("请选择克隆目标父目录");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const result = await workbench.cloneWorkspace({
+      remote_url: trimmedUrl,
+      parent_dir: trimmedParent,
+      folder_name: cloneFolder.trim() || null,
+    });
+    setBusy(false);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setCloneUrl("");
+    setCloneFolder("");
+    setCloneFolderEdited(false);
+    setLocalRefreshSeq((seq) => seq + 1);
   };
 
   const handleUnregister = async (workspaceId: string) => {
@@ -53,6 +154,7 @@ export function WorkspaceDialog({
     setError(null);
     await workbench.unregisterWorkspace(workspaceId);
     setBusy(false);
+    setLocalRefreshSeq((seq) => seq + 1);
   };
 
   return (
@@ -149,75 +251,287 @@ export function WorkspaceDialog({
           </ul>
         </section>
 
-        <form className="workspace-register-form" id="workspace-register-form" onSubmit={(e) => void handleRegister(e)}>
-          <p className="dialog-label">Register Local Workspace</p>
-          <div className="form-grid">
-            <div className="form-field">
-              <label className="dialog-label" htmlFor="workspace-root-input">
-                Directory Path
-              </label>
-              <input
-                id="workspace-root-input"
-                className="field"
-                type="text"
-                placeholder="/path/to/repository"
-                value={rootPath}
-                onChange={(event) => setRootPath(event.target.value)}
-              />
-            </div>
-            <div className="form-field">
-              <label className="dialog-label" htmlFor="workspace-name-input">
-                Display Name (optional)
-              </label>
-              <input
-                id="workspace-name-input"
-                className="field"
-                type="text"
-                placeholder="Defaults to folder name"
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-              />
-            </div>
+        <section className="workspace-add-section" aria-label="Add Workspace">
+          <p className="dialog-label">Add Workspace</p>
+          <div className="seg-group workspace-mode-tabs" role="group" aria-label="Add Workspace Mode">
+            {MODE_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                className="seg-option"
+                data-workspace-tab={tab.id}
+                aria-pressed={mode === tab.id ? "true" : "false"}
+                disabled={busy}
+                onClick={() => switchMode(tab.id)}
+              >
+                <span>{tab.label}</span>
+                <span className="seg-option-sub">{tab.hint}</span>
+              </button>
+            ))}
           </div>
-          <div className="workspace-checkbox-row">
-            <label className="workspace-check">
-              <input
-                id="workspace-create-missing"
-                type="checkbox"
-                checked={createIfMissing}
-                onChange={(event) => setCreateIfMissing(event.target.checked)}
-              />
-              <span>Create directory if missing</span>
-            </label>
-            <label className="workspace-check">
-              <input
-                id="workspace-init-git"
-                type="checkbox"
-                checked={initGit}
-                onChange={(event) => setInitGit(event.target.checked)}
-              />
-              <span>Initialize Git repo</span>
-            </label>
-          </div>
-          {error ? (
-            <p className="notice" data-level="bad" id="workspace-dialog-error" role="alert">
-              {error}
-            </p>
-          ) : null}
-          <div className="dialog-actions">
-            <button type="button" className="btn btn-quiet" onClick={closeDialog}>
-              Done
-            </button>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              id="btn-register-workspace"
-              disabled={busy}
+
+          {mode === "open" ? (
+            <form
+              className="workspace-register-form"
+              id="workspace-register-form"
+              onSubmit={(e) => void handleOpenFolder(e)}
             >
-              {busy ? "Registering…" : "Register Workspace"}
-            </button>
-          </div>
-        </form>
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="workspace-root-input">
+                  Directory Path
+                </label>
+                <DirectoryPicker
+                  idPrefix="workspace-open"
+                  inputId="workspace-root-input"
+                  value={rootPath}
+                  onChange={(next) => {
+                    setRootPath(next);
+                    setError(null);
+                  }}
+                  placeholder="/path/to/repository"
+                  disabled={busy}
+                  mode="select_folder"
+                  refreshKey={pickerRefreshKey}
+                />
+              </div>
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="workspace-name-input">
+                  Display Name (optional)
+                </label>
+                <input
+                  id="workspace-name-input"
+                  className="field"
+                  type="text"
+                  placeholder="Defaults to folder name"
+                  value={name}
+                  disabled={busy}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              </div>
+              {error ? (
+                <p className="notice" data-level="bad" id="workspace-dialog-error" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <div className="dialog-actions">
+                <button type="button" className="btn btn-quiet" onClick={closeDialog}>
+                  Done
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  id="btn-register-workspace"
+                  disabled={busy}
+                >
+                  {busy ? "Registering…" : "Register Workspace"}
+                </button>
+              </div>
+            </form>
+          ) : null}
+
+          {mode === "new" ? (
+            <form
+              className="workspace-register-form"
+              id="workspace-new-form"
+              onSubmit={(e) => void handleCreateProject(e)}
+            >
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="workspace-new-parent-input">
+                  Parent Directory
+                </label>
+                <DirectoryPicker
+                  idPrefix="workspace-new-parent"
+                  inputId="workspace-new-parent-input"
+                  value={newParentDir}
+                  onChange={(next) => {
+                    setNewParentTouched(true);
+                    setNewParentDir(next);
+                    setError(null);
+                  }}
+                  onDefaultRoot={(root) => {
+                    if (!newParentTouched) setNewParentDir(root);
+                  }}
+                  placeholder="/path/to/projects"
+                  disabled={busy}
+                  mode="select_parent"
+                  refreshKey={pickerRefreshKey}
+                />
+              </div>
+              <div className="form-grid">
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="workspace-new-folder">
+                    Short Project Name
+                  </label>
+                  <input
+                    id="workspace-new-folder"
+                    className="field mono"
+                    type="text"
+                    placeholder="e.g. voice-cli"
+                    value={newFolderName}
+                    disabled={busy}
+                    onChange={(event) => {
+                      setNewFolderName(event.target.value);
+                      setError(null);
+                    }}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="workspace-new-display-name">
+                    Display Name (optional)
+                  </label>
+                  <input
+                    id="workspace-new-display-name"
+                    className="field"
+                    type="text"
+                    placeholder="Defaults to folder name"
+                    value={newDisplayName}
+                    disabled={busy}
+                    onChange={(event) => setNewDisplayName(event.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="workspace-checkbox-row">
+                <label className="workspace-check">
+                  <input
+                    id="workspace-new-init-git"
+                    type="checkbox"
+                    checked={newInitGit}
+                    disabled={busy}
+                    onChange={(event) => setNewInitGit(event.target.checked)}
+                  />
+                  <span>Initialize Git repo (git init)</span>
+                </label>
+              </div>
+              <p className="workspace-path-preview mono" id="workspace-new-preview">
+                {composedNewPath ? (
+                  <>
+                    Creates <strong>{composedNewPath}</strong>
+                  </>
+                ) : (
+                  "Select a parent directory and enter a short project name"
+                )}
+              </p>
+              {error ? (
+                <p className="notice" data-level="bad" id="workspace-dialog-error" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <div className="dialog-actions">
+                <button type="button" className="btn btn-quiet" onClick={closeDialog}>
+                  Done
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  id="btn-create-workspace"
+                  disabled={busy}
+                >
+                  {busy ? "Creating…" : "Create Project"}
+                </button>
+              </div>
+            </form>
+          ) : null}
+
+          {mode === "clone" ? (
+            <form
+              className="workspace-register-form"
+              id="workspace-clone-form"
+              onSubmit={(e) => void handleClone(e)}
+            >
+              <div className="form-grid">
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="workspace-clone-url">
+                    Git Remote URL or owner/repo
+                  </label>
+                  <input
+                    id="workspace-clone-url"
+                    className="field mono"
+                    type="text"
+                    placeholder="https://github.com/owner/repo.git or owner/repo"
+                    value={cloneUrl}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const nextUrl = event.target.value;
+                      setCloneUrl(nextUrl);
+                      setError(null);
+                      if (!cloneFolderEdited) {
+                        setCloneFolder(deriveCloneFolderName(nextUrl));
+                      }
+                    }}
+                  />
+                </div>
+                <div className="form-field">
+                  <label className="dialog-label" htmlFor="workspace-clone-folder">
+                    Target Folder Name
+                  </label>
+                  <input
+                    id="workspace-clone-folder"
+                    className="field mono"
+                    type="text"
+                    placeholder="Auto-derived from URL"
+                    value={cloneFolder}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const nextFolder = event.target.value;
+                      setCloneFolder(nextFolder);
+                      setCloneFolderEdited(nextFolder.trim().length > 0);
+                      setError(null);
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="form-field">
+                <label className="dialog-label" htmlFor="workspace-clone-parent-input">
+                  Clone Into Parent Directory
+                </label>
+                <DirectoryPicker
+                  idPrefix="workspace-clone-parent"
+                  inputId="workspace-clone-parent-input"
+                  value={cloneParentDir}
+                  onChange={(next) => {
+                    setCloneParentTouched(true);
+                    setCloneParentDir(next);
+                    setError(null);
+                  }}
+                  onDefaultRoot={(root) => {
+                    if (!cloneParentTouched) setCloneParentDir(root);
+                  }}
+                  placeholder="/path/to/projects"
+                  disabled={busy}
+                  mode="select_parent"
+                  refreshKey={pickerRefreshKey}
+                />
+              </div>
+              <p className="workspace-path-preview mono" id="workspace-clone-preview">
+                {composedClonePath ? (
+                  <>
+                    Clones into <strong>{composedClonePath}</strong>
+                  </>
+                ) : (
+                  "Enter a remote Git URL or owner/repo and select a parent directory"
+                )}
+              </p>
+              {error ? (
+                <p className="notice" data-level="bad" id="workspace-dialog-error" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <div className="dialog-actions">
+                <button type="button" className="btn btn-quiet" onClick={closeDialog}>
+                  Done
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  id="btn-clone-workspace"
+                  disabled={busy}
+                >
+                  {busy ? "Cloning…" : "Clone & Register"}
+                </button>
+              </div>
+            </form>
+          ) : null}
+        </section>
       </div>
     </NativeDialog>
   );

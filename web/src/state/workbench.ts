@@ -2,6 +2,7 @@ import { flushSync } from "react-dom";
 import { useSyncExternalStore } from "react";
 
 import {
+  cloneWorkspace,
   createRun,
   createWorkspace,
   deleteWorkspace,
@@ -18,6 +19,7 @@ import type { StreamPhase } from "../api/useRunStream";
 import type {
   ActivityPreviews,
   ApprovalAction,
+  CloneWorkspaceBody,
   CommandBody,
   CreateRunBody,
   CreateWorkspaceBody,
@@ -142,6 +144,7 @@ export interface NewRunForm {
   workspaceId: string;
   customWorkspaceRoot: string;
   greenfieldPath: string;
+  initGit: boolean;
   contextWorkspaceId: string;
   baseRef: string;
   scopePaths: string;
@@ -172,6 +175,7 @@ export interface WorkbenchState {
   openTabs: string[];
   quickDrawerRunId: string | null;
   newRunOpenSeq: number;
+  workspaceDialogOpenSeq: number;
   allRuns: RunSummary[];
   runs: RunSummary[];
   pantheon: PantheonSeatSummary[];
@@ -348,6 +352,7 @@ export class Workbench {
       openTabs: initialTabs,
       quickDrawerRunId: null,
       newRunOpenSeq: 0,
+      workspaceDialogOpenSeq: 0,
       allRuns: [],
       runs: [],
       pantheon: [],
@@ -693,6 +698,8 @@ export class Workbench {
   }
 
   async openWorkspaceManager(): Promise<void> {
+    this.state.workspaceDialogOpenSeq += 1;
+    this.commit();
     byId<HTMLDialogElement>("workspace-manager-dialog")?.showModal();
     try {
       await this.refreshWorkspaces();
@@ -711,6 +718,20 @@ export class Workbench {
       return { ok: true, workspace: response.workspace };
     } catch (error) {
       return { ok: false, error: (error as Error).message || "注册工作区失败" };
+    }
+  }
+
+  async cloneWorkspace(
+    body: CloneWorkspaceBody,
+  ): Promise<{ ok: true; workspace: WorkspaceSummary } | { ok: false; error: string }> {
+    try {
+      const response = await cloneWorkspace(body);
+      await this.refreshWorkspaces();
+      await this.refreshRuns().catch(() => undefined);
+      this.toast(`已克隆并注册工作区 ${response.workspace.name}`);
+      return { ok: true, workspace: response.workspace };
+    } catch (error) {
+      return { ok: false, error: (error as Error).message || "克隆工作区失败" };
     }
   }
 
@@ -1413,6 +1434,9 @@ export class Workbench {
       if (scopePaths.length) payload.scope_paths = scopePaths;
     } else if (mode === "greenfield") {
       payload.workspace_root = form.greenfieldPath.trim();
+      if (form.initGit) {
+        payload.init_git = true;
+      }
     } else if (mode === "spec_only") {
       if (form.contextWorkspaceId.trim()) {
         payload.workspace_id = form.contextWorkspaceId.trim();

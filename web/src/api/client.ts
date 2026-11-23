@@ -1,6 +1,7 @@
 import type {
   AttemptArtifactsResponse,
   BallHolder,
+  CloneWorkspaceBody,
   CommandBody,
   CommandResponse,
   ConflictResponse,
@@ -10,6 +11,7 @@ import type {
   DeleteWorkspaceResponse,
   DemosResponse,
   ErrorResponse,
+  FilesystemBrowseResponse,
   ProvidersResponse,
   RecordedAttemptArtifacts,
   RunListResponse,
@@ -85,6 +87,37 @@ export async function createWorkspace(body: CreateWorkspaceBody): Promise<Worksp
   const data = await json<WorkspaceResponse | ErrorResponse>(response);
   if (!response.ok || !data.ok) {
     throw new ApiError((!data.ok && data.error) || "注册工作区失败", response.status);
+  }
+  return data;
+}
+
+export async function cloneWorkspace(body: CloneWorkspaceBody): Promise<WorkspaceResponse> {
+  const response = await fetch("/api/workspaces/clone", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await json<WorkspaceResponse | ErrorResponse>(response);
+  if (!response.ok || !data.ok) {
+    throw new ApiError((!data.ok && data.error) || "克隆工作区失败", response.status);
+  }
+  return data;
+}
+
+export async function browseFilesystem(
+  partialPath?: string,
+  showHidden?: boolean,
+): Promise<FilesystemBrowseResponse> {
+  const query = new URLSearchParams();
+  if (partialPath && partialPath.trim()) query.set("partial_path", partialPath);
+  if (showHidden) query.set("show_hidden", "true");
+  const qs = query.toString();
+  const response = await fetch(qs ? `/api/filesystem/browse?${qs}` : "/api/filesystem/browse", {
+    cache: "no-store",
+  });
+  const data = await json<FilesystemBrowseResponse | ErrorResponse>(response);
+  if (!response.ok || !data.ok) {
+    throw new ApiError((!data.ok && data.error) || "浏览目录失败", response.status);
   }
   return data;
 }
