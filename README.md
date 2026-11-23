@@ -1,5 +1,7 @@
 # Olympus4SWE
 
+English | [简体中文](README.zh-CN.md)
+
 **A first-principles, Agent-Native full-lifecycle software engineering system.**
 
 Olympus4SWE pairs a **deterministic SDLC control plane** (Python 3.13 + SQLite WAL + FastAPI) with a **pluggable execution meta-harness** (built-in `native` loop + external `Pi` coding agent driver) and a two-layer **Oracle Board + Ariadne** web workbench.
