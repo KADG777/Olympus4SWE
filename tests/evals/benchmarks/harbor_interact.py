@@ -586,7 +586,6 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
 
     async def _install_pi(self, environment: Any) -> None:
         options = self._interact
-        prefix = shlex.quote(PI_PREFIX)
         pkg = shlex.quote(options.pi_package)
         command = "\n".join(
             [
@@ -600,26 +599,43 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                 f'elif [ -x {shlex.quote(PI_PREFIX + "/bin/pi")} ] && '
                 f'{shlex.quote(PI_PREFIX + "/bin/pi")} --version >/dev/null 2>&1; then',
                 f"  PI_BIN={shlex.quote(PI_PREFIX + '/bin/pi')}",
-                "elif command -v curl >/dev/null 2>&1 && "
-                f'[ {pkg} = "@earendil-works/pi-coding-agent" ]; then',
-                "  curl -fsSL https://pi.dev/install.sh | sh >/dev/null 2>&1",
-                '  PI_BIN="$HOME/.local/bin/pi"',
                 "else",
-                "  if ! command -v npm >/dev/null 2>&1; then",
-                "    if command -v apt-get >/dev/null 2>&1; then",
-                "      apt-get update -qq && apt-get install -y -qq nodejs npm",
-                "    else",
-                "      echo 'npm is required to install the pi CLI' >&2; exit 1",
-                "    fi",
+                f'  PI_DIR={shlex.quote(PI_PREFIX)}',
+                '  if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                '  NODE_BIN=""',
+                '  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && '
+                'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); '
+                'process.exit(a>22||(a===22&&b>=19)?0:1)" >/dev/null 2>&1; then',
+                '    NODE_BIN=$(dirname "$(command -v node)")',
+                "  elif command -v curl >/dev/null 2>&1; then",
+                '    ARCH=$(uname -m)',
+                '    case "$ARCH" in x86_64|amd64) NARCH=x64;; '
+                'aarch64|arm64) NARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac',
+                '    NODE_DIR="$PI_DIR/node"',
+                '    mkdir -p "$NODE_DIR"',
+                '    curl -fsSL '
+                '"https://nodejs.org/dist/v22.21.1/node-v22.21.1-linux-${NARCH}.tar.gz" '
+                '| tar -xz -C "$NODE_DIR" --strip-components=1',
+                '    NODE_BIN="$NODE_DIR/bin"',
+                "  elif command -v npm >/dev/null 2>&1; then",
+                '    NODE_BIN=$(dirname "$(command -v npm)")',
+                "  else",
+                "    echo 'curl or Node.js >= 22.19 with npm is required' >&2; exit 1",
                 "  fi",
-                f"  npm install -g --ignore-scripts --prefix {prefix} {pkg}",
-                f"  PI_BIN={shlex.quote(PI_PREFIX + '/bin/pi')}",
+                '  PATH="$NODE_BIN:$PATH" "$NODE_BIN/npm" install -g --ignore-scripts '
+                f'--prefix "$PI_DIR" {pkg} >/dev/null',
+                '  WRAP="$PI_DIR/bin/pi-olympus"',
+                '  printf \'#!/bin/sh\\nexport PATH="%s:$PATH"\\nexec "%s/bin/pi" "$@"\\n\' '
+                '"$NODE_BIN" "$PI_DIR" > "$WRAP"',
+                '  chmod 755 "$WRAP"',
+                '  PI_BIN="$WRAP"',
                 "fi",
                 'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
                 '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
                 '  ln -sf "$PI_BIN" /usr/local/bin/pi',
                 "fi",
-                '"$PI_BIN" --version >/dev/null 2>&1',
+                '"$PI_BIN" --version >/dev/null',
                 'echo "$PI_BIN"',
             ]
         )

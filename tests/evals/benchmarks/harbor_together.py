@@ -1025,22 +1025,44 @@ class UserEnabledOlympusAgent(BaseAgent):
                 'elif [ -x "$HOME/.local/bin/pi" ] && '
                 '"$HOME/.local/bin/pi" --version >/dev/null 2>&1; then',
                 '  PI_BIN="$HOME/.local/bin/pi"',
-                "elif command -v curl >/dev/null 2>&1 && "
-                f'[ {pkg} = "@earendil-works/pi-coding-agent" ]; then',
-                "  curl -fsSL https://pi.dev/install.sh | sh >/dev/null 2>&1",
-                '  PI_BIN="$HOME/.local/bin/pi"',
-                "elif command -v npm >/dev/null 2>&1; then",
-                f"  npm install -g --ignore-scripts {pkg}",
-                "  PI_BIN=$(command -v pi)",
                 "else",
-                '  echo "curl and npm unavailable; Pi CLI not installed" >&2',
-                "  exit 0",
+                "  PI_DIR=/opt/olympus-pi",
+                '  if ! mkdir -p "$PI_DIR" 2>/dev/null || [ ! -w "$PI_DIR" ]; then '
+                'PI_DIR=/tmp/olympus-pi; mkdir -p "$PI_DIR"; fi',
+                '  NODE_BIN=""',
+                '  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && '
+                'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); '
+                'process.exit(a>22||(a===22&&b>=19)?0:1)" >/dev/null 2>&1; then',
+                '    NODE_BIN=$(dirname "$(command -v node)")',
+                "  elif command -v curl >/dev/null 2>&1; then",
+                '    ARCH=$(uname -m)',
+                '    case "$ARCH" in x86_64|amd64) NARCH=x64;; '
+                'aarch64|arm64) NARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac',
+                '    NODE_DIR="$PI_DIR/node"',
+                '    mkdir -p "$NODE_DIR"',
+                '    curl -fsSL '
+                '"https://nodejs.org/dist/v22.21.1/node-v22.21.1-linux-${NARCH}.tar.gz" '
+                '| tar -xz -C "$NODE_DIR" --strip-components=1',
+                '    NODE_BIN="$NODE_DIR/bin"',
+                "  elif command -v npm >/dev/null 2>&1; then",
+                '    NODE_BIN=$(dirname "$(command -v npm)")',
+                "  else",
+                '    echo "curl and npm unavailable; Pi CLI not installed" >&2',
+                "    exit 0",
+                "  fi",
+                '  PATH="$NODE_BIN:$PATH" "$NODE_BIN/npm" install -g --ignore-scripts '
+                f'--prefix "$PI_DIR" {pkg} >/dev/null',
+                '  WRAP="$PI_DIR/bin/pi-olympus"',
+                '  printf \'#!/bin/sh\\nexport PATH="%s:$PATH"\\nexec "%s/bin/pi" "$@"\\n\' '
+                '"$NODE_BIN" "$PI_DIR" > "$WRAP"',
+                '  chmod 755 "$WRAP"',
+                '  PI_BIN="$WRAP"',
                 "fi",
                 'if [ -w /usr/local/bin ] && [ -x "$PI_BIN" ] && '
                 '[ "$PI_BIN" != "/usr/local/bin/pi" ]; then',
                 '  ln -sf "$PI_BIN" /usr/local/bin/pi',
                 "fi",
-                '"$PI_BIN" --version >/dev/null 2>&1',
+                '"$PI_BIN" --version >/dev/null',
                 'echo "$PI_BIN"',
             ]
         )
