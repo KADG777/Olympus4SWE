@@ -2347,3 +2347,31 @@ def test_session_reopen_completed_custom_align_workflow(
     assert code2 == 0, reopened
     assert reopened["workflow"] == "custom_blueprint"
     assert reopened["error"] is None
+
+
+def test_explicit_revise_prefix_while_execution_blocked_triggers_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    revision = "revise: remove the division feature from the requirements"
+    script = SessionScript()
+    script.align.extend([json.dumps(_goal_spec()), json.dumps(_goal_spec(version=2))])
+    script.design.extend([json.dumps(_design()), json.dumps(_design())])
+    script.plan.extend([json.dumps(_plan(command=_FAILING_CHECK)), json.dumps(_plan())])
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 6)
+    script.router.append(json.dumps({"action": "revise", "feedback": revision}))
+    _patch_provider(monkeypatch, script)
+
+    code, blocked = _invoke(["start", "Build a calculator library", *_base(repo, state)])
+    assert code == 0 and blocked["pause_kind"] == "blocked", blocked
+    run_id = str(blocked["run_id"])
+
+    code2, reply = _invoke(["reply", run_id, revision, *_base(repo, state)])
+    assert code2 == 0, reply
+    store = RunStore(state / "olympus.db")
+    events = store.list_events(run_id)
+    assert any(e.event_type == "run.revision_requested" for e in events)
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("recovery_mode") != "in_place"

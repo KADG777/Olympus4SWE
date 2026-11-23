@@ -4644,6 +4644,481 @@ def test_human_in_place_retry_still_rechecks_verified_repro_before_argus(
     assert "NOW PASS" in state["prompts"][1]
 
 
+def test_probe_isolated_preserves_exec_mode_and_hides_parent_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit implementation",
+                }
+            ],
+        ),
+    )
+
+    def write_exec(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        target = ws / "feature.py"
+        target.write_text("#!/usr/bin/env python3\nFLAG = True\n", encoding="utf-8")
+        target.chmod(0o755)
+
+    monkeypatch.setenv("OLYMPUS_REVIEW_FIXTURE_TOKEN", "synthetic-fixture")
+    provider, _ = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Mutating mode probe and env leak probe",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": "chmod a-x feature.py",
+                        "message": "Mode-mutating exit-0 probe",
+                    },
+                    {
+                        "id": "F2",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": (
+                            'if [ "${OLYMPUS_REVIEW_FIXTURE_TOKEN:-}" = synthetic-fixture ]; '
+                            "then exit 1; fi"
+                        ),
+                        "message": "Env secret should not be visible to probe",
+                    },
+                ],
+            }
+        ]
+    )
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_exec]), provider=provider
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    mode = stat.S_IMODE((tmp_path / "feature.py").stat().st_mode)
+    assert mode == 0o755
+
+
+def test_accepted_rename_deletion_persists_into_downstream_dag_and_recreation_clears_tombstone(
+    tmp_path: Path,
+) -> None:
+    from olympus.core.contracts import AcceptanceCheck
+
+    _init_repo(tmp_path)
+    (tmp_path / "old.py").write_text("OLD = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "old.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add old.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    base_plan = _parallel_plan(spec, scopes={"T1": ["old.py", "new.py"], "T2": ["second.py"]})
+    t2_check = AcceptanceCheck(
+        id="C2",
+        kind=CheckKind.COMMAND,
+        description="Old module stays gone in T2 sandbox",
+        command="test ! -e old.py && test -f new.py",
+    )
+    t3_task = base_plan.tasks[1].model_copy(
+        update={
+            "task_id": "T3",
+            "title": "Recreate old.py",
+            "depends_on": ["T2"],
+            "write_scope": ["old.py"],
+            "acceptance_checks": [
+                AcceptanceCheck(
+                    id="C3",
+                    kind=CheckKind.COMMAND,
+                    description="Recreated old.py exists",
+                    command="python3 -c 'import old; assert old.RECREATED'",
+                )
+            ],
+            "max_cycles": 1,
+        }
+    )
+    plan = base_plan.model_copy(
+        update={
+            "tasks": [
+                base_plan.tasks[0],
+                base_plan.tasks[1].model_copy(
+                    update={"depends_on": ["T1"], "acceptance_checks": [t2_check], "max_cycles": 1}
+                ),
+                t3_task,
+            ]
+        }
+    )
+    _approve_plan(store, run_id, plan)
+
+    seen_in_t2: list[tuple[bool, bool]] = []
+
+    class _RenameDagWorker(_DirectWriteWorker):
+        def run_turn(self, request: DriverTurnRequest, **kw: Any) -> TurnOutcome:
+            ws = request.workspace_path
+            if request.task_id == "T1":
+                (ws / "old.py").rename(ws / "new.py")
+            elif request.task_id == "T2":
+                seen_in_t2.append(((ws / "old.py").exists(), (ws / "new.py").exists()))
+            return super().run_turn(request, **kw)
+
+    worker = _RenameDagWorker(
+        {
+            "T1": {},
+            "T2": {"second.py": "OK = True\n"},
+            "T3": {"old.py": "RECREATED = True\n"},
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry({"direct": worker}),
+    )
+    snap = stage.run_execution(run_id=run_id, apply_to_workspace=True)
+    assert snap["status"] == RunStatus.COMPLETED
+    assert seen_in_t2 == [(False, True)]
+    assert (tmp_path / "new.py").exists()
+    assert (tmp_path / "old.py").read_text(encoding="utf-8") == "RECREATED = True\n"
+    tombstones = tmp_path / ".olympus" / "runs" / run_id / "accepted_deletions.json"
+    assert not tombstones.exists()
+
+
+def test_serial_task_blocks_edits_to_spec_out_of_scope_and_frozen_test_paths(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    frozen = tmp_path / "tests" / "test_frozen.py"
+    frozen.parent.mkdir(parents=True, exist_ok=True)
+    frozen.write_text("def test_frozen(): assert False\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "tests/test_frozen.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add frozen test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    original = store.get_run(run_id)["spec"]
+    assert original is not None
+    spec = original.model_copy(
+        update={
+            "out_of_scope": ["tests/test_frozen.py"],
+            "constraints": ["Test freeze: do not modify tests/test_frozen.py"],
+        }
+    )
+    store.save_spec(run_id, spec)
+    AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path).confirm_spec(
+        run_id=run_id, approver="zeus"
+    )
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def tamper_frozen(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "tests" / "test_frozen.py").write_text(
+            "def test_frozen(): assert True\n", encoding="utf-8"
+        )
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([tamper_frozen]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+    assert "assert False" in frozen.read_text(encoding="utf-8")
+    rejections = [
+        e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"
+    ]
+    assert rejections
+    assert "tests/test_frozen.py" in rejections[0].payload["violating_paths"]
+
+
+def test_propose_plan_strips_planner_populated_execution_state_fields(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    raw = _single_task_plan(
+        spec=spec,
+        write_scope=["feature.py"],
+        max_cycles=1,
+        checks=[
+            {
+                "id": "CHK-REV",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Review",
+            }
+        ],
+    ).model_dump(mode="json")
+    raw["tasks"][0].update(
+        verified_repro_commands=["test -f planner-injected.fixture"],
+        in_place_recoveries=2,
+        attempt=4,
+        review_cycle=1,
+    )
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        if "Independent Verifier" in messages[0].content:
+            return _passing_reviewer(messages, tools)
+        return LLMResponse(content=json.dumps(raw))
+
+    def write_feature(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    stage = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([write_feature]),
+        provider=MockLLMProvider(responder=responder),
+    )
+    proposed = stage.propose_plan(run_id=run_id, auto_approve=True)
+    task = proposed.tasks[0]
+    assert task.verified_repro_commands == []
+    assert task.in_place_recoveries == 0
+    assert task.attempt == 0
+    assert task.review_cycle == 0
+
+    snap = stage.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+
+
+def test_recheck_drops_broken_prior_repro_and_reinvokes_argus(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+    command = "if grep -q OLD feature.py; then exit 1; else exit 127; fi"
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "OLD marker present",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": command,
+                        "message": "OLD marker fails",
+                    }
+                ],
+            },
+            {
+                "task_id": "T1",
+                "attempt": 2,
+                "passed": True,
+                "summary": "Now fixed",
+                "findings": [],
+            },
+        ]
+    )
+
+    def worker(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        (ws / "feature.py").write_text(
+            "OLD = True\n" if attempt == 1 else "FIXED = True\n", encoding="utf-8"
+        )
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([worker]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert state["calls"] == 2
+    recheck = next(
+        e.payload for e in store.list_events(run_id) if e.event_type == "review.repro_rechecked"
+    )
+    assert recheck["short_circuited"] is False
+    assert recheck["results"][0]["broken"] is True
+
+
+def test_missing_or_unknown_requirement_ref_cannot_block_acceptance(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+    provider, _ = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Unanchored findings",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": None,
+                        "repro_command": "exit 1",
+                        "message": "Missing requirement_ref",
+                    },
+                    {
+                        "id": "F2",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R999",
+                        "repro_command": "exit 1",
+                        "message": "Unknown requirement_ref",
+                    },
+                ],
+            }
+        ]
+    )
+
+    def write_feature(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_feature]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    event = next(
+        e.payload for e in store.list_events(run_id) if e.event_type == "review.verdict_verified"
+    )
+    assert event["verified_important"] == 0
+    assert event["dropped_unverified"] == 2
+
+
+def test_tracked_ephemeral_suffix_deletion_is_promoted_to_workspace(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "legacy.bak").write_text("tracked file\n", encoding="utf-8")
+    subprocess.run(["git", "add", "legacy.bak"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add tracked bak"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["legacy.bak"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def delete_bak(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "legacy.bak").unlink()
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([delete_bak]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert not (tmp_path / "legacy.bak").exists()
+
+
 
 
 

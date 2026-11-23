@@ -1039,3 +1039,42 @@ def test_tools_aci_has_no_harness_imports_and_worktree_reexports_env_builder() -
 
     assert worktree_env is build_sandbox_env
     assert ".olympus" in IGNORED_DIR_NAMES
+
+
+def test_clean_ephemeral_artifacts_preserves_preexisting_gitignored_files(tmp_path: Path) -> None:
+    from olympus.harness.worktree import (
+        clean_ephemeral_artifacts,
+        create_sandbox,
+        remove_sandbox,
+        snapshot_sandbox_state,
+    )
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True
+    )
+    sandbox = create_sandbox(tmp_path, label="gitignored-ephemeral")
+    try:
+        (sandbox.workspace_path / "existing.tmp").write_text("preexisting", encoding="utf-8")
+        baseline = snapshot_sandbox_state(sandbox)
+        (sandbox.workspace_path / "fresh.tmp").write_text("fresh", encoding="utf-8")
+        removed = clean_ephemeral_artifacts(sandbox, baseline)
+        assert removed == ["fresh.tmp"]
+        assert (sandbox.workspace_path / "existing.tmp").exists()
+        assert not (sandbox.workspace_path / "fresh.tmp").exists()
+    finally:
+        remove_sandbox(sandbox)

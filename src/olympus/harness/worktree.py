@@ -65,6 +65,7 @@ class SandboxBaseline:
     is_git: bool
     entries: tuple[tuple[str, str | None], ...]
     base_commit: str | None = None
+    preexisting_ephemeral: tuple[str, ...] = ()
 
     def mapping(self) -> dict[str, str | None]:
         return dict(self.entries)
@@ -182,6 +183,7 @@ def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> N
                 "is_git": baseline.is_git,
                 "base_commit": baseline.base_commit,
                 "entries": [list(e) for e in baseline.entries],
+                "preexisting_ephemeral": list(baseline.preexisting_ephemeral),
             },
         ),
         encoding="utf-8",
@@ -198,10 +200,17 @@ def load_sandbox_baseline(handle: SandboxHandle) -> SandboxBaseline | None:
         )
         raw_commit = payload.get("base_commit")
         base_commit = str(raw_commit) if isinstance(raw_commit, str) and raw_commit else None
+        raw_ephemeral = payload.get("preexisting_ephemeral", [])
+        preexisting_ephemeral = (
+            tuple(str(rel) for rel in raw_ephemeral if isinstance(rel, str) and rel)
+            if isinstance(raw_ephemeral, list)
+            else ()
+        )
         return SandboxBaseline(
             is_git=bool(payload["is_git"]),
             entries=entries,
             base_commit=base_commit,
+            preexisting_ephemeral=preexisting_ephemeral,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -496,14 +505,51 @@ def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
             entries = _git_changed_fingerprints(ws, handle.base_commit)
         except RuntimeError:
             entries = _workspace_fingerprints(ws)
-            return SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
-        return SandboxBaseline(
+            base = SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
+            ephemeral = tuple(
+                sorted(
+                    rel.replace("\\", "/")
+                    for rel in _untracked_paths(handle, base)
+                    if is_ephemeral_artifact(rel)
+                )
+            )
+            return SandboxBaseline(
+                is_git=False,
+                entries=base.entries,
+                preexisting_ephemeral=ephemeral,
+            )
+        base = SandboxBaseline(
             is_git=True,
             entries=tuple(sorted(entries.items())),
             base_commit=handle.base_commit,
         )
-    return SandboxBaseline(
+        ephemeral = tuple(
+            sorted(
+                rel.replace("\\", "/")
+                for rel in _untracked_paths(handle, base)
+                if is_ephemeral_artifact(rel)
+            )
+        )
+        return SandboxBaseline(
+            is_git=True,
+            entries=base.entries,
+            base_commit=handle.base_commit,
+            preexisting_ephemeral=ephemeral,
+        )
+    base = SandboxBaseline(
         is_git=False, entries=tuple(sorted(_workspace_fingerprints(ws).items()))
+    )
+    ephemeral = tuple(
+        sorted(
+            rel.replace("\\", "/")
+            for rel in _untracked_paths(handle, base)
+            if is_ephemeral_artifact(rel)
+        )
+    )
+    return SandboxBaseline(
+        is_git=False,
+        entries=base.entries,
+        preexisting_ephemeral=ephemeral,
     )
 
 
@@ -579,16 +625,18 @@ def clean_ephemeral_artifacts(
 ) -> list[str]:
     """Delete newly created untracked junk files and return their sorted relative paths.
 
-    Only files absent from both the pre-worker ``baseline`` and the git ``base_commit`` are
-    considered, so tracked files and pre-existing sandbox files are never removed.
+    Only files absent from the pre-worker ``baseline`` (including gitignored pre-existing
+    ephemeral candidates) and the git ``base_commit`` are considered, so tracked files and
+    pre-existing sandbox files are never removed.
     """
     before = baseline.mapping()
+    preexisting_ephemeral = set(baseline.preexisting_ephemeral)
     base_commit = baseline.base_commit or handle.base_commit
     ws = handle.workspace_path
     removed: list[str] = []
     for raw_rel in sorted(_untracked_paths(handle, baseline)):
         rel = raw_rel.replace("\\", "/")
-        if rel in before:
+        if rel in before or rel in preexisting_ephemeral:
             continue
         if _is_tracked_at_base(ws, base_commit, rel):
             continue
@@ -612,14 +660,15 @@ def sync_upstream_files(
     baseline: SandboxBaseline,
     *,
     write_scope: Sequence[str],
+    deleted_paths: Sequence[str] = (),
 ) -> SandboxBaseline:
-    """Refresh newly accepted upstream files without clobbering the task's in-progress work.
+    """Refresh newly accepted upstream files/deletions without clobbering in-progress work.
 
     Only paths the worker left exactly at their baseline content are synced. Worker
     mutations outside ``write_scope`` stay untouched so the Diff Gate still audits them,
     and the returned baseline records fingerprints for the synced upstream paths only.
     """
-    if not overlay_dir.is_dir():
+    if not overlay_dir.is_dir() and not deleted_paths:
         return baseline
     policy = WorkspacePolicy(allowed_write_scope=list(write_scope))
     merged = baseline.mapping()
@@ -627,10 +676,33 @@ def sync_upstream_files(
     base_commit = baseline.base_commit or handle.base_commit
     ws = handle.workspace_path
     synced_rels: list[str] = []
-    for src in sorted(overlay_dir.rglob("*")):
-        if not src.is_file():
-            continue
-        rel = src.relative_to(overlay_dir).as_posix()
+    if overlay_dir.is_dir():
+        for src in sorted(overlay_dir.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(overlay_dir).as_posix()
+            if any(
+                part in IGNORED_DIR_NAMES or part == ".olympus"
+                for part in PurePosixPath(rel).parts
+            ):
+                continue
+            if policy.allows_relative_path(rel):
+                continue
+            if rel in current_map and current_map[rel] != merged.get(rel):
+                continue
+            if rel in merged and rel not in current_map:
+                continue
+            current = _file_fingerprint(ws / rel)
+            if rel in merged:
+                if current != merged[rel]:
+                    continue
+            elif (current is not None) != _is_tracked_at_base(ws, base_commit, rel):
+                continue
+            dst = ws / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            synced_rels.append(rel)
+    for rel in sorted(set(deleted_paths)):
         if any(
             part in IGNORED_DIR_NAMES or part == ".olympus"
             for part in PurePosixPath(rel).parts
@@ -643,15 +715,17 @@ def sync_upstream_files(
         if rel in merged and rel not in current_map:
             continue
         current = _file_fingerprint(ws / rel)
+        if current is None:
+            continue
         if rel in merged:
             if current != merged[rel]:
                 continue
-        elif (current is not None) != _is_tracked_at_base(ws, base_commit, rel):
+        elif not _is_tracked_at_base(ws, base_commit, rel):
             continue
-        dst = ws / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        synced_rels.append(rel)
+        target = ws / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+            synced_rels.append(rel)
     if synced_rels:
         updated_map = _current_fingerprints(handle, baseline)
         for rel in synced_rels:
@@ -663,6 +737,7 @@ def sync_upstream_files(
         is_git=baseline.is_git,
         entries=tuple(sorted(merged.items())),
         base_commit=baseline.base_commit,
+        preexisting_ephemeral=baseline.preexisting_ephemeral,
     )
 
 
@@ -693,6 +768,7 @@ def absorb_verification_artifacts(
         is_git=baseline.is_git,
         entries=tuple(sorted(merged.items())),
         base_commit=baseline.base_commit,
+        preexisting_ephemeral=baseline.preexisting_ephemeral,
     )
 
 

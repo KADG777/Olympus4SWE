@@ -67,6 +67,12 @@ _EXECUTE_TYPES = frozenset({"execute_task_dag"})
 _PLAN_ONLY_STOP = "plan"
 _MAX_IN_PLACE_RECOVERIES = 2
 _MAX_PLAN_RECOVERIES = 3
+_EXPLICIT_REVISION_RE = re.compile(r"^\s*(?:revise|reopen)\s*[:：]\s*\S", re.IGNORECASE)
+
+
+def _is_explicit_revision_directive(text: str) -> bool:
+    """Return True when the human explicitly issued a ``revise:`` or ``reopen:`` directive."""
+    return _EXPLICIT_REVISION_RE.match(text) is not None
 
 
 @dataclass(frozen=True)
@@ -424,7 +430,11 @@ class SessionRunner:
 
         if intent.action in ("revise", "reopen"):
             feedback = intent.feedback or text
-            if pause_kind == PauseKind.BLOCKED and intent.action == "revise":
+            if (
+                pause_kind == PauseKind.BLOCKED
+                and intent.action == "revise"
+                and not _is_explicit_revision_directive(text)
+            ):
                 return self._recover_blocked(run_id, definition, snap, feedback)
             return self._revise(run_id, definition, snap, feedback)
 
