@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import re
+import shutil
 import subprocess
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -34,6 +38,7 @@ from olympus.web.projection import (
 from olympus.web.schemas import (
     AttemptArtifactsResponse,
     BallHolder,
+    CloneWorkspaceRequest,
     CommandRequest,
     CommandResponse,
     ConflictResponse,
@@ -44,6 +49,7 @@ from olympus.web.schemas import (
     DemosResponse,
     ErrorResponse,
     EventsResponse,
+    FilesystemBrowseResponse,
     HealthResponse,
     ProvidersResponse,
     RunListResponse,
@@ -127,6 +133,106 @@ def _read_git_head_state(worktree_path: str) -> str | None:
     except OSError:
         return None
     return None
+
+
+_MAX_BROWSE_PATH_LENGTH = 512
+_MAX_BROWSE_ENTRIES = 200
+_MAX_CLONE_URL_LENGTH = 512
+_MAX_FOLDER_NAME_LENGTH = 120
+_CLONE_URL_SCHEMES = frozenset({"https", "http", "ssh", "git"})
+_LOCAL_PATH_PREFIXES = ("/", "~", "./", "../", ".\\", "..\\", "\\\\")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+)
+_SCP_GIT_URL = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:\s]+)$")
+_SHORTHAND_GIT_URL = re.compile(r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)$")
+_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _branch_name_from_git_head(head_state: str | None) -> str | None:
+    if head_state is None or not head_state.startswith("ref: refs/heads/"):
+        return None
+    return head_state.removeprefix("ref: refs/heads/").strip() or None
+
+
+def _clone_repo_name(path: str) -> str:
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if len(segments) < 2:
+        raise ValueError("remote_url must include a repository owner and name")
+    if any(segment in {".", ".."} for segment in segments):
+        raise ValueError("remote_url must not contain path traversal segments")
+    repo = segments[-1]
+    name = repo[:-4] if repo.endswith(".git") else repo
+    if not name:
+        raise ValueError("remote_url is missing a repository name")
+    return name
+
+
+def normalize_clone_url(raw: str) -> tuple[str, str]:
+    """Validate a Git remote and return ``(normalized_url, inferred_repo_name)``."""
+    value = raw.strip()
+    if not value:
+        raise ValueError("remote_url is required")
+    if len(value) > _MAX_CLONE_URL_LENGTH:
+        raise ValueError(f"remote_url exceeds {_MAX_CLONE_URL_LENGTH} characters")
+    if value.startswith("-"):
+        raise ValueError("remote_url must not start with '-'")
+    if "\x00" in value or any(
+        ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value
+    ):
+        raise ValueError("remote_url contains whitespace or control characters")
+    if value in {".", ".."} or value.startswith(_LOCAL_PATH_PREFIXES) or _DRIVE_PATH.match(value):
+        raise ValueError("remote_url must be a Git remote, not a local filesystem path")
+    if "://" in value:
+        parts = urlsplit(value)
+        scheme = parts.scheme.lower()
+        if scheme not in _CLONE_URL_SCHEMES:
+            raise ValueError(f"Unsupported clone URL scheme: {parts.scheme or 'unknown'}")
+        if not parts.hostname:
+            raise ValueError("remote_url is missing a host")
+        repo_name = _clone_repo_name(parts.path)
+        return urlunsplit((scheme, parts.netloc, parts.path, parts.query, "")), repo_name
+    scp = _SCP_GIT_URL.match(value)
+    if scp is not None:
+        return value.rstrip("/"), _clone_repo_name(scp.group("path"))
+    shorthand = _SHORTHAND_GIT_URL.match(value)
+    if shorthand is not None:
+        repo = shorthand.group("repo")
+        repo_slug = repo[:-4] if repo.endswith(".git") else repo
+        if not repo_slug:
+            raise ValueError("remote_url is missing a repository name")
+        return f"https://github.com/{shorthand.group('owner')}/{repo_slug}.git", repo_slug
+    raise ValueError(
+        "remote_url must be an https/ssh Git URL, an SCP-style remote, or owner/repo shorthand"
+    )
+
+
+def _validate_clone_folder_name(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("Clone folder name is required")
+    if value in {".", ".."}:
+        raise ValueError("Clone folder name must not be '.' or '..'")
+    if "/" in value or "\\" in value:
+        raise ValueError("Clone folder name must not contain path separators")
+    if value.startswith("-"):
+        raise ValueError("Clone folder name must not start with '-'")
+    if value != value.rstrip(" ."):
+        raise ValueError("Clone folder name must not end with a space or dot")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("Clone folder name contains control characters")
+    if len(value) > _MAX_FOLDER_NAME_LENGTH:
+        raise ValueError(f"Clone folder name exceeds {_MAX_FOLDER_NAME_LENGTH} characters")
+    if value.split(".", 1)[0].lower() in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(f"Clone folder name '{value}' is reserved on Windows")
+    return value
 
 
 def _default_workflow_for(workspace_mode: str, task_type: str) -> str:
@@ -237,6 +343,176 @@ class AriadneApp:
             exist_ok=False,
         )
         return {"ok": True, "workspace": workspace}
+
+    def clone_workspace(self, payload: CloneWorkspaceRequest) -> dict[str, Any]:
+        """Clone a validated Git remote into an empty directory and register it."""
+        remote_url, inferred_name = normalize_clone_url(payload.remote_url)
+        folder_name = _validate_clone_folder_name(payload.folder_name or inferred_name)
+        parent = Path(payload.parent_dir).expanduser()
+        if not parent.is_dir():
+            raise ValueError(f"Clone parent directory does not exist: {payload.parent_dir}")
+        parent_dir = parent.resolve()
+        destination = (parent_dir / folder_name).resolve()
+        if destination.parent != parent_dir:
+            raise ValueError("Clone destination escapes the selected parent directory")
+        existed = destination.exists()
+        if existed:
+            if not destination.is_dir():
+                raise ValueError(f"Clone destination is not a directory: {destination}")
+            try:
+                populated = next(destination.iterdir(), None) is not None
+            except OSError as exc:
+                raise ValueError(
+                    f"Cannot inspect clone destination {destination}: {exc}"
+                ) from exc
+            if populated:
+                raise ValueError(f"Clone destination is not empty: {destination}")
+        if self.store.get_workspace_by_root(destination) is not None:
+            raise ValueError(f"Workspace already registered: {destination}")
+        try:
+            self._run_git_clone(remote_url, destination)
+        except ValueError:
+            if not existed:
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+        is_git_repo, default_branch = _detect_git_repo(destination)
+        workspace = self.store.register_workspace(
+            name=(payload.name or "").strip() or folder_name,
+            root_path=destination,
+            is_git_repo=is_git_repo,
+            default_branch=default_branch,
+            exist_ok=False,
+        )
+        return {"ok": True, "workspace": workspace}
+
+    def _run_git_clone(self, remote_url: str, destination: Path) -> None:
+        """Run a non-interactive ``git clone --``; tests may override this seam."""
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            completed = subprocess.run(
+                ["git", "clone", "--", remote_url, str(destination)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"git clone failed: {exc}") from exc
+        if completed.returncode != 0:
+            lines = (completed.stderr or completed.stdout or "").strip().splitlines()
+            summary = lines[-1].strip() if lines else f"exit code {completed.returncode}"
+            raise ValueError(f"git clone failed: {summary}")
+
+    def browse_filesystem(
+        self, *, partial_path: str | None = None, show_hidden: bool = False
+    ) -> dict[str, Any]:
+        """List child directories for the T3-style ``partial_path`` picker."""
+        raw = (partial_path or "").strip()
+        if "\x00" in raw:
+            raise ValueError("partial_path must not contain NUL bytes")
+        if len(raw) > _MAX_BROWSE_PATH_LENGTH:
+            raise ValueError(f"partial_path exceeds {_MAX_BROWSE_PATH_LENGTH} characters")
+        if raw:
+            try:
+                resolved = Path(os.path.expanduser(raw)).resolve()
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"Cannot resolve partial_path: {exc}") from exc
+            if raw.endswith("/") or resolved.is_dir():
+                browse_dir, prefix = resolved, ""
+            else:
+                browse_dir, prefix = resolved.parent, resolved.name
+        else:
+            browse_dir, prefix = self._default_browse_root(), ""
+
+        parent_path = str(browse_dir.parent) if browse_dir.parent != browse_dir else None
+        if not browse_dir.is_dir():
+            return {
+                "ok": True,
+                "current_path": str(browse_dir),
+                "parent_path": parent_path,
+                "prefix": prefix,
+                "path_missing": True,
+                "quick_roots": self._quick_roots(),
+                "entries": [],
+            }
+
+        registered = {str(workspace["root_path"]) for workspace in self.store.list_workspaces()}
+        prefix_lower = prefix.lower()
+        ranked: list[tuple[tuple[int, int, str], dict[str, Any]]] = []
+        try:
+            children = sorted(browse_dir.iterdir(), key=lambda child: child.name.lower())
+        except OSError:
+            children = []
+        for child in children:
+            name = child.name
+            if not show_hidden and not prefix.startswith(".") and name.startswith("."):
+                continue
+            if prefix_lower and prefix_lower not in name.lower():
+                continue
+            try:
+                if not child.is_dir():
+                    continue
+                canonical = str(child.resolve())
+                is_git_repo = (child / ".git").exists()
+            except (OSError, RuntimeError):
+                continue
+            default_branch = (
+                _branch_name_from_git_head(_read_git_head_state(canonical))
+                if is_git_repo
+                else None
+            )
+            prefix_rank = 0
+            if prefix_lower:
+                prefix_rank = 0 if name.lower().startswith(prefix_lower) else 1
+            key = (prefix_rank, 0 if is_git_repo else 1, name.lower())
+            ranked.append(
+                (
+                    key,
+                    {
+                        "name": name,
+                        "path": canonical,
+                        "is_git_repo": is_git_repo,
+                        "default_branch": default_branch,
+                        "already_registered": canonical in registered,
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: item[0])
+        return {
+            "ok": True,
+            "current_path": str(browse_dir),
+            "parent_path": parent_path,
+            "prefix": prefix,
+            "path_missing": False,
+            "quick_roots": self._quick_roots(),
+            "entries": [entry for _, entry in ranked[:_MAX_BROWSE_ENTRIES]],
+        }
+
+    def _default_browse_root(self) -> Path:
+        parent = self.workspace_root.parent
+        if parent.is_dir() and os.access(parent, os.R_OK | os.X_OK):
+            return parent
+        return Path.home().resolve()
+
+    def _quick_roots(self) -> list[dict[str, str]]:
+        home = Path.home().resolve()
+        roots: list[dict[str, str]] = []
+        seen: set[str] = set()
+        candidates = (
+            ("Projects", self.workspace_root.parent),
+            ("Home", home),
+            ("Workspace", self.workspace_root),
+        )
+        for label, path in candidates:
+            if label == "Projects" and path == home:
+                continue
+            canonical = str(path)
+            if canonical in seen or not path.is_dir():
+                continue
+            seen.add(canonical)
+            roots.append({"label": label, "path": canonical})
+        return roots
 
     @staticmethod
     def _init_git_repo(root: Path) -> None:
@@ -974,6 +1250,22 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
     @api.post("/api/workspaces", response_model=WorkspaceResponse, responses=error_responses)
     def create_workspace(payload: CreateWorkspaceRequest) -> dict[str, Any]:
         return service.create_workspace(payload)
+
+    @api.post(
+        "/api/workspaces/clone", response_model=WorkspaceResponse, responses=error_responses
+    )
+    def clone_workspace(payload: CloneWorkspaceRequest) -> dict[str, Any]:
+        return service.clone_workspace(payload)
+
+    @api.get(
+        "/api/filesystem/browse",
+        response_model=FilesystemBrowseResponse,
+        responses=error_responses,
+    )
+    def browse_filesystem(
+        partial_path: str | None = None, show_hidden: bool = False
+    ) -> dict[str, Any]:
+        return service.browse_filesystem(partial_path=partial_path, show_hidden=show_hidden)
 
     @api.delete(
         "/api/workspaces/{workspace_id}",

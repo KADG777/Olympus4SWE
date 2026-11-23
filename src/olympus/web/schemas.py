@@ -160,6 +160,41 @@ class WorkspaceResponse(StrictModel):
     workspace: WorkspaceSummary
 
 
+class QuickRoot(StrictModel):
+    label: str
+    path: str
+
+
+class FilesystemBrowseEntry(StrictModel):
+    name: str
+    path: str
+    is_git_repo: bool
+    default_branch: str | None = None
+    already_registered: bool = False
+
+
+class FilesystemBrowseResponse(StrictModel):
+    ok: Literal[True] = True
+    current_path: str
+    parent_path: str | None = None
+    prefix: str = ""
+    path_missing: bool = False
+    quick_roots: list[QuickRoot]
+    entries: list[FilesystemBrowseEntry]
+
+
+class CloneWorkspaceRequest(StrictModel):
+    remote_url: str = Field(min_length=1)
+    parent_dir: str = Field(min_length=1)
+    folder_name: str | None = None
+    name: str | None = None
+
+    @field_validator("remote_url", "parent_dir")
+    @classmethod
+    def _validate_required_text(cls, value: str) -> str:
+        return _strip_non_empty(value)
+
+
 class DeleteWorkspaceResponse(StrictModel):
     ok: Literal[True] = True
     workspace_id: str

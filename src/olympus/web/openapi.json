@@ -712,6 +712,49 @@
         "title": "ClarifyCommand",
         "type": "object"
       },
+      "CloneWorkspaceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "folder_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Name"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "parent_dir": {
+            "minLength": 1,
+            "title": "Parent Dir",
+            "type": "string"
+          },
+          "remote_url": {
+            "minLength": 1,
+            "title": "Remote Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "remote_url",
+          "parent_dir"
+        ],
+        "title": "CloneWorkspaceRequest",
+        "type": "object"
+      },
       "CommandResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2147,6 +2190,103 @@
         "title": "ExecutionStrategy",
         "type": "string"
       },
+      "FilesystemBrowseEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "already_registered": {
+            "default": false,
+            "title": "Already Registered",
+            "type": "boolean"
+          },
+          "default_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "is_git_repo": {
+            "title": "Is Git Repo",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "is_git_repo"
+        ],
+        "title": "FilesystemBrowseEntry",
+        "type": "object"
+      },
+      "FilesystemBrowseResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "current_path": {
+            "title": "Current Path",
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/FilesystemBrowseEntry"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "parent_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Path"
+          },
+          "path_missing": {
+            "default": false,
+            "title": "Path Missing",
+            "type": "boolean"
+          },
+          "prefix": {
+            "default": "",
+            "title": "Prefix",
+            "type": "string"
+          },
+          "quick_roots": {
+            "items": {
+              "$ref": "#/components/schemas/QuickRoot"
+            },
+            "title": "Quick Roots",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_path",
+          "quick_roots",
+          "entries"
+        ],
+        "title": "FilesystemBrowseResponse",
+        "type": "object"
+      },
       "GlobalInvariant": {
         "additionalProperties": false,
         "description": "Cross-cutting rule locked before parallel or sequential module implementation.",
@@ -3166,6 +3306,25 @@
           "providers"
         ],
         "title": "ProvidersResponse",
+        "type": "object"
+      },
+      "QuickRoot": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "path"
+        ],
+        "title": "QuickRoot",
         "type": "object"
       },
       "ReassignHumanCommand": {
@@ -6092,6 +6251,62 @@
         "summary": "List Demos"
       }
     },
+    "/api/filesystem/browse": {
+      "get": {
+        "operationId": "browse_filesystem_api_filesystem_browse_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "partial_path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Partial Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "show_hidden",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Show Hidden",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilesystemBrowseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "Browse Filesystem"
+      }
+    },
     "/api/providers": {
       "get": {
         "operationId": "list_providers_api_providers_get",
@@ -6875,6 +7090,44 @@
           }
         },
         "summary": "Create Workspace"
+      }
+    },
+    "/api/workspaces/clone": {
+      "post": {
+        "operationId": "clone_workspace_api_workspaces_clone_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "Clone Workspace"
       }
     },
     "/api/workspaces/{workspace_id}": {
