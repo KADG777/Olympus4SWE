@@ -1,8 +1,22 @@
 name: Feature request
-description: Propose a new capability or enhancement.
+description: Propose a new capability, track deliverable, or enhancement.
 title: "feat: "
 labels: ["enhancement"]
 body:
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track / Subsystem
+      description: Which area of the repository does this work belong to?
+      options:
+        - "Evaluation & Benchmarking (tests/evals)"
+        - "Ariadne Web UX & Visualization (web/src)"
+        - "Workflows, Providers & CLI DX"
+        - "Platform Core (align contract before implementation)"
+        - "Docs / Governance"
+    validations:
+      required: true
+
   - type: textarea
     id: goal
     attributes:
@@ -12,10 +26,19 @@ body:
       required: true
 
   - type: textarea
+    id: write_scope
+    attributes:
+      label: Expected write_scope
+      description: Which directories or files do you expect to create or modify?
+      placeholder: "e.g. web/src/components/OracleCard.tsx, tests/unit/test_web_oracle_board.py"
+    validations:
+      required: true
+
+  - type: textarea
     id: non_goals
     attributes:
       label: Non-goals
-      description: What is explicitly out of scope for this change?
+      description: What is explicitly out of scope (including core modules this change will NOT touch)?
     validations:
       required: true
 
@@ -23,6 +46,6 @@ body:
     id: acceptance_criteria
     attributes:
       label: Acceptance criteria
-      description: Concrete, verifiable conditions that mark this feature as done.
+      description: Concrete, verifiable conditions (tests, commands, or UI behavior) that mark this task as done.
     validations:
       required: true

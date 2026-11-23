@@ -1,0 +1,31 @@
+# Code ownership routing for Olympus4SWE.
+# See CONTRIBUTING.md for track responsibilities and the Platform Core contract protocol.
+
+# Default fallback reviewer
+* @kyrie21z
+
+# Platform Core — Tech Lead approval required to preserve architectural invariants
+/src/olympus/core/             @kyrie21z
+/src/olympus/harness/          @kyrie21z
+/src/olympus/stages/           @kyrie21z
+/src/olympus/graph/engine.py   @kyrie21z
+/src/olympus/graph/loader.py   @kyrie21z
+/src/olympus/graph/progress.py @kyrie21z
+/src/olympus/session/          @kyrie21z
+/src/olympus/web/              @kyrie21z
+
+# Repository architecture, packaging, governance, and CI gates
+/AGENTS.md                     @kyrie21z
+/CONTRIBUTING.md               @kyrie21z
+/GLOSSARY.md                   @kyrie21z
+/docs/ARCHITECTURE.md          @kyrie21z
+/pyproject.toml                @kyrie21z
+/uv.lock                       @kyrie21z
+/.github/                      @kyrie21z
+
+# Track areas — add teammate GitHub handles as tracks are assigned:
+# /tests/evals/                     @eval-lead @kyrie21z
+# /web/src/                         @web-lead @kyrie21z
+# /src/olympus/providers/dialects/  @dx-lead @kyrie21z
+# /src/olympus/graph/workflows/     @dx-lead @kyrie21z
+# /src/olympus/cli/                 @dx-lead @kyrie21z

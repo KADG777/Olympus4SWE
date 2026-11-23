@@ -1,26 +1,53 @@
 # AGENTS.md — Olympus4SWE
 
-Olympus4SWE 是一个以第一性原理驱动的 Agent-Native 全生命周期软件工程系统（Python 3.13 + `uv`）。
+Olympus4SWE is a first-principles, Agent-Native full-lifecycle software engineering system (Python 3.13 + `uv` backend, React + TypeScript + `pnpm` frontend).
 
-## 仓库地图
+This file is the canonical technical guide for both human contributors and AI coding agents working in this repository. For team roles, onboarding, and PR workflow, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- 架构与设计原则：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- 本地工程参考资料（未入库）：`docs/references/oiloil-curated/INDEX.md`
-- 核心源码：`src/olympus/`
-  - `core/` — 强类型契约、SHA-256 内容指纹、DAG 与 `write_scope` 校验、SQLite 事件与状态存储
-  - `providers/` — 轻量 LLM 接口（OpenAI-Compatible / Anthropic / Mock）
-  - `tools/` — 绝对路径防呆 ACI 原语与输出截断引导
-  - `harness/` — 透明 Append-Only Loop、`git worktree` 沙盒、Trace 落盘
-  - `stages/` — Stage 1 `Align`（需求对齐冻结）与 Stage 2 `Orchestrate & Verify`（调度与独立验收）
-  - `web/` — 双层 `Oracle Board` + `Ariadne` 事件溯源 Web 工作台（Workspace / Scope / 5-God Pantheon Dock / SSE 实时流 / 幂等人工控制）
-  - `cli/` — CLI 交互入口
-- 测试与评测：`tests/unit/`、`tests/evals/`
+## Repository Map
 
-## 开发与验证约定
+- Architecture & principles: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Canonical domain glossary: [GLOSSARY.md](GLOSSARY.md)
+- Team workflow & track ownership: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Backend source (`src/olympus/`):
+  - `core/` — Strict Pydantic contracts, SHA-256 content fingerprints, DAG & `write_scope` validation, SQLite event/state store, deterministic control primitives
+  - `providers/` — Pluggable LLM provider layer (`dialects/`, `registry.py`, `factory.py`, `base.py`, `types.py`) isolating official vendor SDKs (`openai`, `anthropic`)
+  - `tools/` — Safe ACI file/shell primitives with absolute-path enforcement and bounded output
+  - `harness/` — Transparent append-only loop, `AgentDriver` abstraction (`native`, `pi`), `DiffGate`, `Watchdog`, `git worktree` sandbox, `TurnReceipt`
+  - `stages/` — Stage 1 `Align` (`align.py`), Stage 2a `Design` (`design.py`), Stage 2 `Orchestrate & Verify` (`orchestrate.py`)
+  - `graph/` — Declarative workflow loader/engine (`engine.py`, `loader.py`, `progress.py`) and YAML workflow templates (`workflows/*.yaml`)
+  - `session/` — Headless session routing, policy, and runner (`contracts.py`, `policy.py`, `router.py`, `runner.py`)
+  - `web/` — FastAPI server, OpenAPI schema export (`openapi.json`), read-only event projection, supervisor, and built static assets
+  - `cli/` — Typer CLI entrypoints (`olympus`)
+- Frontend source (`web/src/`): React + TypeScript Ariadne & Oracle Board workbench, consuming typed OpenAPI contracts (`web/src/api/schema.d.ts`)
+- Tests & benchmarks: `tests/unit/` (unit, contract, architecture, and browser tests), `tests/evals/` (isolated evaluation suites, datasets, scorers, and reports)
 
-- 依赖与命令统一通过 `uv run` 执行（`uv run pytest`、`uv run ruff check .`）。
-- 确定性控制面（状态迁移、DAG 校验、预算、锁、审批绑定）严禁交由 LLM 直接改写。
-- `providers/` 为独立可插拔的模型兼容层（参考 Pi Agent `pi-ai` 等架构），核心调度与 Stage 严禁绑定/强耦合特定厂商（如百炼）。
-- 模块解耦：`core/`、`tools/`、`stages/` 保持轻耦合与无 Web/第三方重编排框架依赖，由 `Olympus4SWE` 按第一性原理独立演进。
-- 开发分工：新增模块/功能动手前，先派 Paseo `CDS`/`QDS` subagent 在 GitHub 检索同类实现以借鉴或复用；确定性编码与信息检索优先由 `CDS`/`QDS` 执行，高级模型专注方案交流与细化。
-- Git 交付工作流：除仓库初始化与微不足道的单行拼写微调外，新需求、功能增强与缺陷修复统一遵循 `GitHub Issue → Branch / git worktree → PR（Closes #<id>）` 闭环合入 `main`，严禁直接向 `main` 堆叠未跟踪的新特性改动。
+## Architecture Invariants (Enforced by CI)
+
+These boundaries are mechanically checked by `tests/unit/test_architecture_invariants.py` and `.github/workflows/ci.yml`:
+
+1. **Deterministic control plane vs. probabilistic LLM plane**: State transitions, DAG validation, `write_scope` / `DiffGate` enforcement, monotonic budget ledgers, and hash-bound approvals belong exclusively to deterministic code. Never let LLM output mutate them directly.
+2. **Pure foundation (`core/`)**: `src/olympus/core/` must not import any sibling `olympus.*` package, vendor LLM SDKs, web/CLI frameworks, or `tests`.
+3. **Vendor SDK isolation**: Only `src/olympus/providers/` may import `openai` or `anthropic`. All upper layers (`stages/`, `graph/`, `session/`, `web/`, `cli/`) must depend on `olympus.providers` abstractions.
+4. **Presentation isolation**: Core and runtime layers (`core/`, `providers/`, `tools/`, `harness/`, `stages/`, `graph/`, `session/`) must not import `olympus.web`, `olympus.cli`, `fastapi`, `uvicorn`, or `typer`.
+5. **Evaluation independence**: Dependency is strictly one-way (`tests/evals/ → src/olympus/`). Production code under `src/olympus/` must never import `tests`, and benchmark schemas stay separate in `tests/evals/schemas.py`.
+6. **Frontend contract discipline**: No untyped `.js`/`.jsx` files under `web/src/`. Any backend API schema change must keep `web/src/api/schema.d.ts` and built assets under `src/olympus/web/static` in sync.
+
+## Platform Core Change Protocol
+
+Before modifying Platform Core (`core/`, `harness/`, `stages/`, `graph/engine.py|loader.py|progress.py`, `session/`, `web/server.py|schemas.py|projection.py|supervisor.py|openapi.py`, `pyproject.toml`, or `.github/`):
+
+- Open or reference a GitHub Issue that aligns the interface contract and `write_scope` first.
+- Prefer exposing clean, read-only fields or typed protocols over adding feature-specific conditionals inside core modules.
+
+## Verification & Git Delivery
+
+- Run all Python commands via `uv run`:
+  - `uv run ruff check .`
+  - `uv run mypy src`
+  - `uv run pytest -q`
+- When touching `web/` or backend API schemas, also run:
+  - `pnpm --dir web generate:api`
+  - `pnpm --dir web typecheck`
+  - `pnpm --dir web build`
+- Follow `GitHub Issue → Branch → PR (Closes #<id>)` for all non-trivial changes. Never push directly to `main`.

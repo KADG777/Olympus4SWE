@@ -1,0 +1,49 @@
+name: Eval diagnostic & telemetry feedback
+description: Report benchmark results, failure taxonomy, or request a read-only telemetry field to drive Core iteration.
+title: "eval: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: baseline
+    attributes:
+      label: Baseline snapshot
+      description: Commit SHA (or tag), dataset name, and model configuration evaluated.
+      placeholder: "e.g. main@fb5fc52 | clarifycodebench_30.jsonl | gpt-4o-mini"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scorecard
+    attributes:
+      label: Quantitative scorecard
+      description: Key metrics (Pass@1, Recall, Token Cost, Latency) and delta vs. previous baseline.
+    validations:
+      required: true
+
+  - type: textarea
+    id: failure_taxonomy
+    attributes:
+      label: Top failure modes (Taxonomy)
+      description: Categorized failure patterns with counts and specific case IDs.
+      placeholder: |
+        - F1 (6/30): Stage 1 missed blocking constraint (case_04, case_11, ...)
+        - F2 (3/30): DiffGate rejected valid generated file (case_19, ...)
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction command
+      description: Exact command to reproduce one representative failing case.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: telemetry_request
+    attributes:
+      label: Optional Core telemetry / contract request
+      description: If evaluation needs a new read-only field (e.g. on TurnReceipt or RunStore), describe the desired schema here so Platform Core can expose it cleanly.
+    validations:
+      required: false
