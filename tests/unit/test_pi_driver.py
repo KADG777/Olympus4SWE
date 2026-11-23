@@ -2605,12 +2605,42 @@ print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
     doc = json.loads(captured["models_json"])
     override = doc["providers"]["openrouter"]
     assert "baseUrl" not in override
-    assert "apiKey" not in override
+    # Finding #2: Ambient ~/.pi/agent/auth.json is read in memory via $OLYMPUS_PI_GATEWAY_KEY
+    # without symlinking or serializing the credential to disk, so Pi cannot mutate ~/.pi/agent.
+    assert override["apiKey"] == "$OLYMPUS_PI_GATEWAY_KEY"
+    assert "saved-key" not in captured["models_json"]
+    assert captured["auth_link"] is None
     assert override["modelOverrides"] == {"openai/gpt-4.1": {"contextWindow": 262144}}
-    # Finding #2: Ambient ~/.pi/agent/auth.json is symlinked (not copied), and still intact.
-    assert captured["auth_link"] == str(ambient_auth)
     assert ambient_auth.is_file()
     assert not Path(captured["cfg_dir"]).exists()
+
+    # Finding #1 regression: providers.json overriding built-in 'openai' with a custom base_url
+    # MUST still be treated as a custom endpoint and passed into Pi's provider override.
+    providers_cfg = tmp_path / "providers.json"
+    providers_cfg.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai": {
+                        "dialect": "openai-chat",
+                        "default_model": "qwen3.8-flash",
+                        "base_url": "https://custom-proxy.example/v1",
+                        "api_key_env": "OPENAI_API_KEY",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom_from_file = build_provider(
+        provider="openai",
+        model="qwen3.8-flash",
+        providers_file=providers_cfg,
+    )
+    binding = custom_from_file.external_gateway_binding("qwen3.8-flash")
+    assert binding is not None
+    assert binding.is_custom_endpoint is True
+    assert binding.base_url == "https://custom-proxy.example/v1"
 
 
 def test_pi_driver_redacts_short_and_custom_env_binding_secrets(
@@ -2679,3 +2709,30 @@ print(json.dumps({"type": "message_end", "message": msg}), flush=True)
     assert outcome.completed is False
     assert short_secret not in outcome.stop_reason
     assert short_secret not in trace.read_text(encoding="utf-8")
+
+    # Finding #3 regression: even a literal secret value equal to 'keyless' must be redacted.
+    monkeypatch.setenv("MY_CUSTOM_CRED_VAR", "keyless")
+    trace2 = tmp_path / "trace-keyless.jsonl"
+    _reset_pi_availability_cache()
+    try:
+        outcome2 = PiDriver(
+            binary=str(fake),
+            provider=_CustomBindingProvider(),
+            pi_provider="custom-prov",
+        ).run_turn(
+            DriverTurnRequest(
+                workspace_path=tmp_path,
+                env_root=tmp_path,
+                actor="worker",
+                system_prompt="",
+                user_prompt="hi",
+                read_only=True,
+                model="demo-model",
+                trace_path=trace2,
+            )
+        )
+    finally:
+        _reset_pi_availability_cache()
+    assert outcome2.completed is False
+    assert "keyless" not in outcome2.stop_reason
+    assert "keyless" not in trace2.read_text(encoding="utf-8")

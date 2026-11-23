@@ -2298,3 +2298,66 @@ def test_token_usage_recovers_from_db_when_later_turn_drops_envelope(
     assert artifact["output_tokens"] == 60
     assert artifact["cache_read_tokens"] == 150
     assert context.n_input_tokens == 450
+
+
+def test_token_usage_recovers_from_db_when_later_turn_raises_or_returns_empty_by_actor(
+    tmp_path: Path,
+) -> None:
+    turn0 = _envelope(
+        "needs_input",
+        "Proceed?",
+        pause_kind="clarify",
+        token_usage={
+            "llm_calls": 1,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+    )
+    empty_actor_turn1 = _envelope(
+        "completed",
+        "Done.",
+        token_usage={"by_actor": {"align:proposer": {}}},
+    )
+    budget_rows = [
+        ["align:proposer", {"used": 1, "input_tokens": 100, "output_tokens": 20}],
+        ["build:worker", {"used": 2, "input_tokens": 200, "output_tokens": 40}],
+    ]
+
+    # Case A: later turn returns empty-count by_actor payload -> must recover 300 from DB.
+    handler_a = _SessionHandler([turn0, empty_actor_turn1], budget_rows=budget_rows)
+    agent_a, env_a = _make_agent(
+        tmp_path / "case_a", handler_a, _StubUser(["Go ahead"]), call_user_on_completion=False
+    )
+    ctx_a = SimpleNamespace(metadata=None)
+    asyncio.run(agent_a.setup(env_a))
+    asyncio.run(agent_a.run("Do the thing", env_a, ctx_a))
+    art_a = json.loads((tmp_path / "case_a" / "logs" / "token_usage.json").read_text())
+    assert art_a["input_tokens"] == 300
+
+    # Case B: later turn raises ConnectionError -> finally must recover 300 from DB.
+    handler_b = _SessionHandler([turn0], budget_rows=budget_rows)
+    orig_call = handler_b.__call__
+    turn_calls = 0
+
+    def _raising_handler(command: str) -> Any:
+        nonlocal turn_calls
+        if "olympus session" in command:
+            turn_calls += 1
+            if turn_calls == 2:
+                raise ConnectionError("container dropped")
+        return orig_call(command)
+
+    agent_b, env_b = _make_agent(
+        tmp_path / "case_b",
+        _raising_handler,
+        _StubUser(["Go ahead"]),
+        call_user_on_completion=False,
+    )
+    ctx_b = SimpleNamespace(metadata=None)
+    asyncio.run(agent_b.setup(env_b))
+    with pytest.raises(ConnectionError):
+        asyncio.run(agent_b.run("Do the thing", env_b, ctx_b))
+    art_b = json.loads((tmp_path / "case_b" / "logs" / "token_usage.json").read_text())
+    assert art_b["input_tokens"] == 300

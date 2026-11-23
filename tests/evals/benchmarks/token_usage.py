@@ -85,10 +85,14 @@ def normalize_token_usage(payload: Any) -> dict[str, Any] | None:
             raw_calls = entry.get("calls")
             if raw_calls is None:
                 raw_calls = entry.get("llm_calls")
+            actor_calls = _as_non_negative_int(raw_calls)
+            actor_total = _total(actor_counters)
+            if actor_calls == 0 and actor_total == 0:
+                continue
             by_actor[str(actor)] = {
-                "calls": _as_non_negative_int(raw_calls),
+                "calls": actor_calls,
                 **actor_counters,
-                "total_tokens": _total(actor_counters),
+                "total_tokens": actor_total,
             }
     llm_calls = _as_non_negative_int(payload.get("llm_calls"))
     if not llm_calls and by_actor:

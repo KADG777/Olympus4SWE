@@ -1386,6 +1386,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         action: str,
         message: str,
     ) -> SessionEnvelopeView:
+        self._last_turn_had_usage = False
         command = self._session_command(action, message=message)
         outcome = await self._exec(
             environment,
@@ -1435,7 +1436,11 @@ class UserEnabledOlympusAgent(BaseAgent):
     ) -> None:
         """Attach usage from the last envelope, else recover it from the event store."""
         try:
-            if envelope is not None and self._record_token_usage(envelope):
+            if (
+                envelope is not None
+                and self._token_usage is None
+                and self._record_token_usage(envelope)
+            ):
                 self._last_turn_had_usage = True
             if self._token_usage is None or not self._last_turn_had_usage:
                 recovered = await self._recover_token_usage(environment)

@@ -95,9 +95,7 @@ def _binary_cache_key(resolved: str) -> _BinaryCacheKey:
 def _collect_redaction_secrets(
     env: Mapping[str, str], extra_secrets: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
-    values: set[str] = {
-        s.strip() for s in extra_secrets if s and s.strip() and s.strip() != "keyless"
-    }
+    values: set[str] = {s.strip() for s in extra_secrets if s and s.strip()}
     for key, val in env.items():
         if val and len(val) >= 8 and _SECRET_ENV_RE.search(key):
             values.add(val)
@@ -313,24 +311,44 @@ def _strip_provider_prefix(model: str | None, pi_provider: str | None) -> str:
     return cleaned
 
 
-def _link_ambient_pi_state(cfg_dir: Path, env: Mapping[str, str]) -> None:
-    """Expose the user's ambient Pi auth/settings via read-only symlinks.
+def _resolve_ambient_pi_auth(
+    pi_provider: str, env: Mapping[str, str]
+) -> tuple[str | None, str | None, list[str]]:
+    """Read a saved Pi credential for ``pi_provider`` from ``~/.pi/agent/auth.json`` read-only.
 
-    When Olympus synthesizes an ephemeral ``PI_CODING_AGENT_DIR`` solely for a
-    ``models.json`` override (e.g. ``--context-window`` without a gateway key),
-    Pi would otherwise miss saved credentials in ``~/.pi/agent/auth.json``.
-    Symlinking avoids copying or serializing any credential material.
+    Returns ``(api_key_ref, literal_secret, redaction_secrets)`` without ever
+    copying, serializing, or symlinking ``auth.json`` into the ephemeral config dir.
     """
     home_raw = (env.get("HOME") or "").strip()
-    ambient_dir = (Path(home_raw) if home_raw else Path.home()) / ".pi" / "agent"
-    if not ambient_dir.is_dir():
-        return
-    for name in ("auth.json", "settings.json"):
-        source = ambient_dir / name
-        target = cfg_dir / name
-        if source.is_file() and not target.exists():
-            with suppress(OSError):
-                os.symlink(source, target)
+    auth_path = (Path(home_raw) if home_raw else Path.home()) / ".pi" / "agent" / "auth.json"
+    if not auth_path.is_file():
+        return None, None, []
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None, []
+    if not isinstance(raw, dict):
+        return None, None, []
+    entry = raw.get(pi_provider)
+    if not isinstance(entry, dict):
+        return None, None, []
+    credential = ""
+    for field in ("key", "apiKey", "access"):
+        candidate = entry.get(field)
+        if isinstance(candidate, str) and candidate.strip():
+            credential = candidate.strip()
+            break
+    if not credential:
+        return None, None, []
+    if credential.startswith(("!", "$")):
+        secrets: list[str] = []
+        if credential.startswith("$"):
+            var_name = credential[1:].strip("{}")
+            env_val = (env.get(var_name) or "").strip()
+            if env_val:
+                secrets.append(env_val)
+        return credential, None, secrets
+    return None, credential, [credential]
 
 
 def _binding_secrets(binding: ExternalGatewayBinding, env: Mapping[str, str]) -> list[str]:
@@ -410,10 +428,18 @@ def _prepare_gateway_config(
             override["modelOverrides"] = {
                 model_id: {"contextWindow": effective_context_window}
             }
+        if binding is None:
+            ambient_ref, ambient_secret, ambient_secrets = _resolve_ambient_pi_auth(
+                effective_pi_provider, env
+            )
+            extra_secrets.extend(ambient_secrets)
+            if ambient_ref is not None:
+                override["apiKey"] = ambient_ref
+            elif ambient_secret is not None:
+                env["OLYMPUS_PI_GATEWAY_KEY"] = ambient_secret
+                override["apiKey"] = "$OLYMPUS_PI_GATEWAY_KEY"
         cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
         os.chmod(cfg_dir, 0o700)
-        if binding is None:
-            _link_ambient_pi_state(cfg_dir, env)
         models_doc = {"providers": {effective_pi_provider: override}}
         models_file = cfg_dir / "models.json"
         models_file.write_text(

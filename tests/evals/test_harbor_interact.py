@@ -2519,11 +2519,11 @@ def test_interact_populate_context_reports_step_deltas_and_sums_distinct_runs(
     agent.populate_context_post_run(ctx2)
     assert (ctx2.n_input_tokens, ctx2.n_output_tokens, ctx2.n_cache_tokens) == (120, 15, 60)
 
-    # Step 3 (handoff): no LLM calls -> must NOT report token deltas to Harbor context
+    # Step 3 (handoff): no LLM calls -> Harbor context token fields must be explicitly 0
     agent._last_step_role = "handoff"
     ctx3 = SimpleNamespace(metadata=None)
     agent.populate_context_post_run(ctx3)
-    assert not hasattr(ctx3, "n_input_tokens")
+    assert (ctx3.n_input_tokens, ctx3.n_output_tokens, ctx3.n_cache_tokens) == (0, 0, 0)
 
     # Step 4 (second distinct run-2): 50 in / 10 out -> delta 50/10, trial total sums run-1 + run-2
     (logs / "olympus-interact-step-04.jsonl").write_text(

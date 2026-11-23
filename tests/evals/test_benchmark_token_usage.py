@@ -230,3 +230,6 @@ def test_normalize_accepts_session_envelope_llm_calls_and_context_includes_cache
         "n_output_tokens": 200,
         "n_cache_tokens": 500,
     }
+    # Empty/zero-count by_actor entries must not make an otherwise empty payload look valid.
+    assert normalize_token_usage({"by_actor": {"align:proposer": {}}}) is None
+    assert normalize_token_usage({"by_actor": {"align:proposer": {"llm_calls": 0}}}) is None

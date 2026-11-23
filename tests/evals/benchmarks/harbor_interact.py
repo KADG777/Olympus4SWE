@@ -479,6 +479,10 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         total_usage = sum_token_usage(self._run_token_usage.values())
         self._token_usage = total_usage
         if not summaries and total_usage is None:
+            if self._last_step_role == _HANDOFF_ROLE:
+                for name in ("n_input_tokens", "n_output_tokens", "n_cache_tokens"):
+                    with suppress(Exception):
+                        setattr(context, name, 0)
             return
         metadata = dict(getattr(context, "metadata", None) or {})
         metadata["olympus_interact"] = {
@@ -487,7 +491,11 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         }
         if total_usage is not None:
             metadata["token_usage"] = total_usage
-            if self._last_step_role != _HANDOFF_ROLE:
+            if self._last_step_role == _HANDOFF_ROLE:
+                for name in ("n_input_tokens", "n_output_tokens", "n_cache_tokens"):
+                    with suppress(Exception):
+                        setattr(context, name, 0)
+            else:
                 deltas: list[dict[str, Any] | None] = []
                 for key, current in self._run_token_usage.items():
                     previous = self._reported_run_usage.get(key)
@@ -496,10 +504,22 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
                         deltas.append(delta)
                     self._reported_run_usage[key] = current
                 step_delta = sum_token_usage(deltas)
-                if step_delta is not None:
-                    for name, value in token_usage_context_fields(step_delta).items():
-                        with suppress(Exception):
-                            setattr(context, name, value)
+                fields_to_set = (
+                    token_usage_context_fields(step_delta)
+                    if step_delta is not None
+                    else {
+                        "n_input_tokens": 0,
+                        "n_output_tokens": 0,
+                        "n_cache_tokens": 0,
+                    }
+                )
+                for name, value in fields_to_set.items():
+                    with suppress(Exception):
+                        setattr(context, name, value)
+        elif self._last_step_role == _HANDOFF_ROLE:
+            for name in ("n_input_tokens", "n_output_tokens", "n_cache_tokens"):
+                with suppress(Exception):
+                    setattr(context, name, 0)
         context.metadata = metadata
 
     def _read_token_usage_artifact(
