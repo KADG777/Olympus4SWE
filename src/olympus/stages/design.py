@@ -273,12 +273,18 @@ def triage_input(
     store: RunStore | None = None,
     run_id: str | None = None,
     workspace_root: Path | str | None = None,
+    workspace_mode: str | None = None,
+    task_type: str | None = None,
+    base_ref: str | None = None,
+    scope_paths: list[str] | None = None,
 ) -> TriageResult:
     """Classify an input as raw intent, a frozen GoalSpec, or a frozen DesignSpec.
 
     Filenames and UI labels are never trusted: only deterministic schema validation of the
-    actual content decides maturity.
+    actual content decides maturity. Explicit scope bindings are accepted so intake and
+    downstream stages receive identical deterministic context.
     """
+    del workspace_mode, task_type, base_ref, scope_paths
     result = _classify(raw_input, provider=provider, workspace_root=workspace_root)
     if store is not None and run_id is not None:
         store.append_event(

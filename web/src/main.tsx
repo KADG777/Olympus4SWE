@@ -12,7 +12,10 @@ import "./styles/table.css";
 import "./styles/waterfall.css";
 import "./styles/dock.css";
 import "./styles/dialog.css";
+import "./styles/drawer.css";
 import "./styles/workbench.css";
+import "./styles/board.css";
+import "./styles/pantheon.css";
 import "./styles/responsive.css";
 
 import { StrictMode } from "react";

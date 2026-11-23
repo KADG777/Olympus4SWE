@@ -71,6 +71,178 @@ dialog::backdrop {
   margin-block-start: var(--space-4);
 }
 
+#new-run-dialog {
+  max-inline-size: min(640px, calc(100vw - 2 * var(--space-4)));
+  inline-size: min(640px, calc(100vw - 2 * var(--space-4)));
+}
+
+.oracle-modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.oracle-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.oracle-modal-head .dialog-desc {
+  margin-block: var(--space-1) 0;
+}
+
+.oracle-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-block-start: var(--space-3);
+  border-block-start: 1px solid var(--rule);
+}
+
+.oracle-step-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.oracle-step-title {
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.oracle-step-hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.seg-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-sunk);
+}
+
+.seg-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--face-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  transition: background-color var(--motion-fast), border-color var(--motion-fast),
+    color var(--motion-fast);
+}
+
+.seg-option:hover {
+  background: var(--surface-paper);
+  color: var(--text-ink);
+}
+
+.seg-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.seg-option[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+  color: var(--text-ink);
+}
+
+.seg-option-sub {
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-normal);
+  color: var(--text-muted);
+}
+
+.oracle-workflow-summary {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-sunk);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.oracle-workflow-summary strong {
+  font-family: var(--face-mono);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-ink);
+}
+
+.oracle-demo-active {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  font-size: var(--text-xs);
+  color: var(--accent-fg);
+}
+
+.dialog-disclosures {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-block-start: var(--space-2);
+  border-block-start: 1px solid var(--rule);
+}
+
+.dialog-disclosure {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  padding: var(--space-2) var(--space-3);
+}
+
+.dialog-disclosure > summary {
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.dialog-disclosure-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-block-start: var(--space-3);
+}
+
+.dialog-error {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--bad);
+  border-radius: var(--radius);
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
 .toast {
   position: fixed;
   inset-block-end: var(--space-4);

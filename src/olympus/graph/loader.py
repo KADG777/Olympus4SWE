@@ -165,11 +165,34 @@ def _node_intake(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
     del params
     runtime = _runtime(state)
     run_id = _run_id(state)
+    workspace_mode = str(state.get("workspace_mode") or "brownfield")
+    task_type = str(state.get("task_type") or "feature")
+    raw_base_ref = state.get("base_ref")
+    base_ref = str(raw_base_ref) if isinstance(raw_base_ref, str) else None
+    scope_paths = [str(item) for item in (state.get("scope_paths") or [])]
+    scope_payload: dict[str, Any] = {
+        "workspace_id": state.get("workspace_id"),
+        "workspace_mode": workspace_mode,
+        "task_type": task_type,
+        "base_ref": base_ref,
+        "scope_paths": scope_paths,
+    }
+    runtime.store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.scope_bound",
+        actor="intake",
+        payload=scope_payload,
+    )
     result = triage_input(
         state.get("raw_input", ""),
         provider=runtime.provider,
         store=runtime.store,
         run_id=run_id,
+        workspace_mode=workspace_mode,
+        task_type=task_type,
+        base_ref=base_ref,
+        scope_paths=scope_paths,
     )
     updates: dict[str, Any] = {"triage": result.model_dump(mode="json")}
 
@@ -202,6 +225,10 @@ def _node_align(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, A
         enable_critique=False,
         max_steps=runtime.max_steps,
         strict_canonical=bool(params.get("strict_canonical", True)),
+        workspace_mode=state.get("workspace_mode"),
+        task_type=state.get("task_type"),
+        base_ref=state.get("base_ref"),
+        scope_paths=list(state.get("scope_paths") or []),
     )
     if bool(params.get("auto_approve", False)) and not spec.unresolved_blockers():
         spec = stage.confirm_spec(run_id=run_id, approver=runtime.approver)

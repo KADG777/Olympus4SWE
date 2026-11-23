@@ -36,7 +36,10 @@ from olympus.graph.loader import (
 )
 from olympus.graph.progress import (
     GATE_SPECS,
+    PANTHEON_SEATS,
+    BoardClassification,
     build_workflow_view,
+    classify_run_board,
     is_artifact_approved,
     is_blueprint_completed,
     resolve_resume_node,
@@ -827,3 +830,304 @@ def test_human_gate_unknown_gate_keeps_legacy_pause(store: RunStore, tmp_path: P
     assert excinfo.value.node_name == "gate_release"
     assert excinfo.value.reason == "Unknown human gate 'release'"
     assert excinfo.value.state_updates == {}
+
+
+def _classify(store: RunStore, run_id: str) -> BoardClassification:
+    return classify_run_board(
+        store.get_run(run_id, include_approval_baselines=True),
+        store.list_events(run_id),
+    )
+
+
+def _approved_spec(store: RunStore, run_id: str, *, blocking: bool = False) -> GoalSpec:
+    spec = _make_spec(blocking=blocking)
+    store.save_spec(run_id, spec)
+    _approve(store, run_id, "spec", spec)
+    return spec
+
+
+def _approved_design(store: RunStore, run_id: str, spec: GoalSpec) -> DesignSpec:
+    design = _make_design(spec)
+    store.save_design(run_id, design)
+    _approve(store, run_id, "design", design)
+    return design
+
+
+def _approved_plan(
+    store: RunStore,
+    run_id: str,
+    spec: GoalSpec,
+    *,
+    status: TaskStatus = TaskStatus.WAITING,
+) -> TaskPlan:
+    plan = _make_plan(spec, status=status)
+    store.save_plan(run_id, plan)
+    _approve(store, run_id, "plan", plan)
+    return plan
+
+
+def test_pantheon_seats_have_canonical_pipeline_order() -> None:
+    assert PANTHEON_SEATS == (
+        ("prometheus", "Align"),
+        ("athena", "Design/Plan"),
+        ("hephaestus", "Build"),
+        ("momus", "Review"),
+        ("argus", "Verify"),
+    )
+
+
+def test_classify_board_clarify_then_spec_approval(store: RunStore) -> None:
+    run_id = _new_run(store)
+    spec = _make_spec(blocking=True)
+    store.save_spec(run_id, spec)
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN)
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "prometheus",
+        "clarify",
+    )
+    assert state.status_badge == "clarify"
+    assert state.is_archived is False
+    assert state.worktree_branch is None
+
+    resolved = spec.model_copy(
+        update={
+            "open_ambiguities": [
+                spec.open_ambiguities[0].model_copy(update={"answer": "approved artifact wins"})
+            ]
+        }
+    )
+    store.save_spec(run_id, resolved)
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "prometheus",
+        "approve_spec",
+    )
+
+
+def test_classify_board_design_and_plan_gates(store: RunStore) -> None:
+    run_id = _new_run(store)
+    spec = _approved_spec(store, run_id)
+    design = _make_design(spec)
+    store.save_design(run_id, design)
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN)
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "athena",
+        "approve_design",
+    )
+
+    _approve(store, run_id, "design", design)
+    plan = _make_plan(spec)
+    store.save_plan(run_id, plan)
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "athena",
+        "approve_plan",
+    )
+
+
+def test_classify_board_executing_worktree_task(store: RunStore, tmp_path: Path) -> None:
+    import subprocess
+
+    wt_dir = tmp_path / "wt-branch"
+    wt_dir.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "feat/wt-task-1"],
+        cwd=wt_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    run_id = _new_run(store, workflow_name="full_sdlc_tdd")
+    spec = _approved_spec(store, run_id)
+    _approved_design(store, run_id, spec)
+    plan = _approved_plan(store, run_id, spec, status=TaskStatus.RUNNING)
+    running = plan.tasks[0].model_copy(
+        update={
+            "status": TaskStatus.RUNNING,
+            "attempt": 1,
+            "worktree_path": str(wt_dir),
+        }
+    )
+    store.save_plan(run_id, plan.model_copy(update={"tasks": [running]}))
+    store.set_run_status(run_id, RunStatus.RUNNING)
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "agent",
+        "hephaestus",
+        None,
+    )
+    assert state.status_badge == "running"
+    assert state.worktree_branch == "feat/wt-task-1"
+
+    for git_args in (
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+    (wt_dir / "f.txt").write_text("hi\n", encoding="utf-8")
+    for git_args in (
+        ["git", "add", "f.txt"],
+        ["git", "commit", "-m", "init"],
+        ["git", "checkout", "--detach", "HEAD"],
+    ):
+        subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+    assert _classify(store, run_id).worktree_branch is None
+
+
+def test_pantheon_stage_binding_matches_canonical_pipeline() -> None:
+    from olympus.graph.progress import PANTHEON_SEATS, PANTHEON_STAGE_BINDING
+
+    assert [stage for _god, stage, _label in PANTHEON_STAGE_BINDING] == [
+        "align",
+        "design",
+        "execute",
+        "review",
+        "verify",
+    ]
+    assert [god for god, _label in PANTHEON_SEATS] == [
+        god for god, _stage, _label in PANTHEON_STAGE_BINDING
+    ]
+
+
+def test_classify_board_review_and_verification_phases(store: RunStore) -> None:
+    run_id = _new_run(store, workflow_name="full_sdlc_tdd")
+    spec = _approved_spec(store, run_id)
+    _approved_design(store, run_id, spec)
+    plan = _approved_plan(store, run_id, spec, status=TaskStatus.VERIFYING)
+    verifying = plan.tasks[0].model_copy(
+        update={"status": TaskStatus.VERIFYING, "attempt": 1}
+    )
+    store.save_plan(run_id, plan.model_copy(update={"tasks": [verifying]}))
+    store.set_run_status(run_id, RunStatus.RUNNING)
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.status_badge) == (
+        "agent",
+        "argus",
+        "verifying",
+    )
+
+    store.append_event(
+        run_id=run_id,
+        stage="verify",
+        event_type="review.verdict_recorded",
+        actor="argus",
+        payload={"task_id": "T1", "attempt": 1, "passed": True},
+    )
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.status_badge) == (
+        "agent",
+        "momus",
+        "reviewing",
+    )
+
+
+def test_classify_board_blocked_failed_and_paused(store: RunStore) -> None:
+    run_id = _new_run(store, workflow_name="full_sdlc_tdd")
+    spec = _approved_spec(store, run_id)
+    _approved_design(store, run_id, spec)
+    _approved_plan(store, run_id, spec, status=TaskStatus.BLOCKED)
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN)
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "argus",
+        "resolve_blocker",
+    )
+    assert state.status_badge == "blocked"
+
+    store.set_run_status(run_id, RunStatus.PAUSED)
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.pending_action, state.status_badge) == (
+        "human",
+        "resolve_blocker",
+        "paused",
+    )
+
+    failed_run = store.create_run(
+        title="Failed align", workflow_name="full_sdlc_tdd", run_id="run-failed-align"
+    )
+    store.append_event(
+        run_id=failed_run,
+        stage="graph",
+        event_type="graph.failed",
+        actor="supervisor",
+        payload={"node": "align", "error": "model timed out"},
+    )
+    store.set_run_status(failed_run, RunStatus.FAILED)
+    state = _classify(store, failed_run)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "human",
+        "prometheus",
+        "resolve_blocker",
+    )
+    assert state.status_badge == "failed"
+
+
+def test_classify_board_completed_blueprint_and_execution(store: RunStore) -> None:
+    blueprint_run = _new_run(store)
+    blueprint_spec = _approved_spec(store, blueprint_run)
+    _approved_design(store, blueprint_run, blueprint_spec)
+    _approved_plan(store, blueprint_run, blueprint_spec)
+    store.set_run_status(blueprint_run, RunStatus.COMPLETED)
+
+    state = _classify(store, blueprint_run)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "done",
+        "athena",
+        None,
+    )
+    assert state.status_badge == "blueprint"
+    assert state.is_archived is False
+
+    delivered_run = store.create_run(
+        title="Delivered build", workflow_name="full_sdlc_tdd", run_id="run-delivered"
+    )
+    delivered_spec = _approved_spec(store, delivered_run)
+    _approved_design(store, delivered_run, delivered_spec)
+    _approved_plan(store, delivered_run, delivered_spec, status=TaskStatus.ACCEPTED)
+    store.set_run_status(delivered_run, RunStatus.COMPLETED)
+    state = _classify(store, delivered_run)
+    assert (state.ball_holder, state.active_god, state.pending_action) == (
+        "done",
+        "argus",
+        None,
+    )
+    assert state.status_badge == "delivered"
+
+
+def test_classify_board_cancelled_is_archived_done(store: RunStore) -> None:
+    run_id = _new_run(store)
+    store.set_run_status(run_id, RunStatus.CANCELLED)
+
+    state = _classify(store, run_id)
+    assert (state.ball_holder, state.pending_action, state.status_badge) == (
+        "done",
+        None,
+        "cancelled",
+    )
+    assert state.is_archived is True

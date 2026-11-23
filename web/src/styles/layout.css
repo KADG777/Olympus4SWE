@@ -16,6 +16,7 @@ body[data-rail="collapsed"] .cockpit {
 
 body[data-dock="closed"] .cockpit {
   --dock-width: 0px;
+  --resizer-width: 0px;
 }
 
 body[data-dock="closed"] #dock-resizer,

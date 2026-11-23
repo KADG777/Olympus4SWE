@@ -67,12 +67,34 @@ class RunSummary(StrictModel):
     workflow_name: str
     created_at: str
     updated_at: str
+    workspace_id: str | None = None
+    workspace_name: str
+    workspace_mode: WorkspaceMode
+    task_type: TaskType
+    ball_holder: BallHolder
+    active_god: PantheonGod
+    pending_action: PendingAction | None = None
+    worktree_branch: str | None = None
+    status_badge: str
+    is_archived: bool
+
+
+class PantheonSeatSummary(StrictModel):
+    god: PantheonGod
+    role_label: str
+    state: SeatState
+    active_count: int
+    waiting_count: int
+    oracle_ids: list[str]
 
 
 class RunListResponse(StrictModel):
     ok: Literal[True] = True
     runs: list[RunSummary]
     default_run_id: str | None = None
+    pantheon: list[PantheonSeatSummary]
+    pending_ruling_total: int
+    active_workspace_id: str | None = None
 
 
 class PauseInfo(StrictModel):
@@ -89,6 +111,61 @@ class ProviderConfig(StrictModel):
     providers_file: str | None = None
 
 
+WorkspaceMode = Literal["brownfield", "greenfield", "spec_only"]
+TaskType = Literal["feature", "fix", "refactor", "blueprint"]
+BallHolder = Literal["human", "agent", "done"]
+PantheonGod = Literal["prometheus", "athena", "hephaestus", "momus", "argus"]
+PendingAction = Literal[
+    "clarify",
+    "approve_spec",
+    "approve_design",
+    "approve_plan",
+    "resolve_blocker",
+    "review_delivery",
+]
+SeatState = Literal["idle", "working", "waiting_on_human"]
+
+
+class WorkspaceSummary(StrictModel):
+    workspace_id: str
+    name: str
+    root_path: str
+    is_git_repo: bool
+    default_branch: str | None = None
+    created_at: str
+    updated_at: str
+    active_oracle_count: int = 0
+    pending_ruling_count: int = 0
+
+
+class WorkspaceListResponse(StrictModel):
+    ok: Literal[True] = True
+    workspaces: list[WorkspaceSummary]
+
+
+class CreateWorkspaceRequest(StrictModel):
+    name: str | None = None
+    root_path: str = Field(min_length=1)
+    create_if_missing: bool = False
+    init_git: bool = False
+
+    @field_validator("root_path")
+    @classmethod
+    def _validate_root_path(cls, value: str) -> str:
+        return _strip_non_empty(value)
+
+
+class WorkspaceResponse(StrictModel):
+    ok: Literal[True] = True
+    workspace: WorkspaceSummary
+
+
+class DeleteWorkspaceResponse(StrictModel):
+    ok: Literal[True] = True
+    workspace_id: str
+    deleted: bool = True
+
+
 class CreateRunRequest(StrictModel):
     raw_input: str | None = None
     goal: str | None = None
@@ -103,6 +180,12 @@ class CreateRunRequest(StrictModel):
     sync: bool = False
     constraints: list[str] | None = None
     workspace_root: str | None = None
+    workspace_id: str | None = None
+    workspace_mode: WorkspaceMode | None = None
+    task_type: TaskType | None = None
+    base_ref: str | None = None
+    scope_paths: list[str] | None = None
+    init_git: bool = False
 
 
 class WorkflowRunResult(StrictModel):
@@ -138,6 +221,9 @@ class SeedDemoResponse(StrictModel):
     seeded: list[str]
     runs: list[RunSummary]
     default_run_id: str | None = None
+    pantheon: list[PantheonSeatSummary]
+    pending_ruling_total: int
+    active_workspace_id: str | None = None
 
 
 class EventsResponse(StrictModel):
@@ -762,6 +848,7 @@ class WorkflowSummary(StrictModel):
 class WorkflowsResponse(StrictModel):
     ok: Literal[True] = True
     workflows: list[WorkflowSummary]
+    default_workflows: dict[str, str] = Field(default_factory=dict)
 
 
 class DemoPreset(StrictModel):
@@ -806,6 +893,7 @@ __all__ = [
     "ApprovePlanCommand",
     "ApproveSpecCommand",
     "AttemptArtifactsResponse",
+    "BallHolder",
     "BudgetSummary",
     "ClarifyCommand",
     "CommandRequest",
@@ -814,10 +902,12 @@ __all__ = [
     "ConflictResponse",
     "CreateRunRequest",
     "CreateRunResponse",
+    "CreateWorkspaceRequest",
     "DagEdge",
     "DagNode",
     "DagView",
     "DeliveryAcceptance",
+    "DeleteWorkspaceResponse",
     "DemoPreset",
     "DemosResponse",
     "ErrorResponse",
@@ -826,8 +916,11 @@ __all__ = [
     "HitlBanner",
     "KeyOutputItem",
     "LiveProgress",
+    "PantheonGod",
+    "PantheonSeatSummary",
     "PauseCommand",
     "PauseInfo",
+    "PendingAction",
     "PromoteToExecuteCommand",
     "ProviderConfig",
     "ProviderStatus",
@@ -841,12 +934,18 @@ __all__ = [
     "RunProjectionResponse",
     "RunProgressItem",
     "RunSummary",
+    "SeatState",
     "SeedDemoResponse",
     "StageActivityItem",
     "StagePipelineItem",
     "SwimlaneRow",
+    "TaskType",
     "TraceabilityMatrix",
     "WaterfallTurn",
+    "WorkspaceListResponse",
+    "WorkspaceMode",
+    "WorkspaceResponse",
+    "WorkspaceSummary",
     "WorkflowSummary",
     "WorkflowView",
     "WorkflowsResponse",

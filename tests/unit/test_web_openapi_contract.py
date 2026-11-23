@@ -95,6 +95,7 @@ def test_openapi_covers_every_ariadne_route() -> None:
         "/api/runs/{run_id}/events",
         "/api/runs/{run_id}/command",
         "/api/runs/{run_id}/stream",
+        "/api/board/stream",
         "/api/runs/{run_id}/task-artifacts/{task_id}/{attempt}",
         "/api/runs/{run_id}/delivery-log/{event_seq}/{position}",
         "/api/providers",
@@ -102,6 +103,101 @@ def test_openapi_covers_every_ariadne_route() -> None:
         "/api/demos",
         "/api/seed-demo",
     } <= paths
+
+
+def test_openapi_board_projection_contract_is_concrete() -> None:
+    schema = build_openapi_schema()
+    components = schema["components"]["schemas"]
+
+    summary = components["RunSummary"]
+    assert summary["additionalProperties"] is False
+    assert {
+        "workspace_id",
+        "workspace_name",
+        "workspace_mode",
+        "task_type",
+        "ball_holder",
+        "active_god",
+        "pending_action",
+        "worktree_branch",
+        "status_badge",
+        "is_archived",
+    } <= set(summary["properties"])
+    assert set(summary["properties"]["ball_holder"]["enum"]) == {"human", "agent", "done"}
+    assert set(summary["properties"]["active_god"]["enum"]) == {
+        "prometheus",
+        "athena",
+        "hephaestus",
+        "momus",
+        "argus",
+    }
+    pending = summary["properties"]["pending_action"]["anyOf"]
+    assert {"clarify", "approve_spec", "approve_design", "approve_plan",
+            "resolve_blocker", "review_delivery"} <= set(pending[0]["enum"])
+    assert set(summary["properties"]["workspace_mode"]["enum"]) == {
+        "brownfield",
+        "greenfield",
+        "spec_only",
+    }
+    assert set(summary["properties"]["task_type"]["enum"]) == {
+        "feature",
+        "fix",
+        "refactor",
+        "blueprint",
+    }
+
+    seat = components["PantheonSeatSummary"]
+    assert seat["additionalProperties"] is False
+    assert {
+        "god",
+        "role_label",
+        "state",
+        "active_count",
+        "waiting_count",
+        "oracle_ids",
+    } == set(seat["properties"])
+    assert set(seat["properties"]["state"]["enum"]) == {
+        "idle",
+        "working",
+        "waiting_on_human",
+    }
+
+    listing = components["RunListResponse"]
+    assert {
+        "pantheon",
+        "pending_ruling_total",
+        "active_workspace_id",
+    } <= set(listing["properties"])
+    assert listing["properties"]["pantheon"]["items"]["$ref"].endswith(
+        "PantheonSeatSummary"
+    )
+    assert {"pantheon", "pending_ruling_total"} <= set(listing["required"])
+
+    workspace = components["WorkspaceSummary"]
+    assert {"active_oracle_count", "pending_ruling_count"} <= set(workspace["properties"])
+
+    parameters = {
+        parameter["name"]
+        for parameter in schema["paths"]["/api/runs"]["get"]["parameters"]
+    }
+    assert {
+        "workspace_id",
+        "workspace_mode",
+        "task_type",
+        "ball_holder",
+        "include_archived",
+    } <= parameters
+
+    board = schema["paths"]["/api/board/stream"]["get"]
+    assert set(board["responses"]) == {"200", "400"}
+    assert set(board["responses"]["200"]["content"]) == {"text/event-stream"}
+    assert board["responses"]["400"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("ErrorResponse")
+    assert {parameter["name"] for parameter in board["parameters"]} == {
+        "workspace_id",
+        "once",
+    }
 
 
 def test_budget_summary_accepts_legacy_wire_payload_without_cache_fields() -> None:

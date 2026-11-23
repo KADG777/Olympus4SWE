@@ -6,7 +6,9 @@ import json
 import re
 import sqlite3
 import subprocess
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1167,8 +1169,10 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
             assert 'src="/static/assets/ariadne.js"' in html
             bundle = client.get("/static/assets/ariadne.js").text
             for marker in (
-                "btn-new-run",
-                "thread-list",
+                "btn-issue-oracle",
+                "oracle-board",
+                "open-tabs",
+                "workspace-switcher",
                 "new-run-dialog",
                 "new-run-workflow",
                 "new-run-provider",
@@ -1843,3 +1847,1235 @@ def test_run_snapshot_exposes_recorded_output_versions_with_task_graph(tmp_path:
         (1, original.content_hash, False),
     ]
     assert versions[0]["summary"] == "任务计划 v2 已就绪，包含 1 个任务"
+
+
+def _minimal_goal_responder(
+    messages: Sequence[object], tools: Sequence[object]
+) -> LLMResponse:
+    del messages, tools
+    return LLMResponse(
+        content=json.dumps(
+            {
+                "goal": "Deliver the requested outcome",
+                "requirements": [
+                    {
+                        "id": "R1",
+                        "description": "Deliver the requested outcome",
+                        "acceptance_criteria": ["Passes the stated acceptance check"],
+                    }
+                ],
+            }
+        )
+    )
+
+
+def _mock_scope_supervisor(store: RunStore, workspace_root: Path) -> RunSupervisor:
+    return RunSupervisor(
+        store=store,
+        workspace_root=workspace_root,
+        provider_builder=lambda **_: MockLLMProvider(responder=_minimal_goal_responder),
+    )
+
+
+def _create_run_and_settle(
+    client: TestClient, app: AriadneApp, payload: dict[str, object]
+) -> tuple[str, dict[str, object]]:
+    response = client.post("/api/runs", json=payload)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    app.supervisor.wait(str(body["run_id"]), timeout=60.0)
+    return str(body["run_id"]), body
+
+
+def test_workspace_registry_http_lifecycle_and_disk_is_untouched(tmp_path: Path) -> None:
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            listed = client.get("/api/workspaces")
+            assert listed.status_code == 200
+            workspaces = listed.json()["workspaces"]
+            assert len(workspaces) == 1
+            assert workspaces[0]["root_path"] == str(root.resolve())
+            assert workspaces[0]["name"] == root.name
+            assert workspaces[0]["is_git_repo"] is False
+
+            # Startup auto-registration is idempotent, not a duplicate row.
+            rebuilt = AriadneApp(store=store, workspace_root=root)
+            assert rebuilt.default_workspace_id == workspaces[0]["workspace_id"]
+            assert len(client.get("/api/workspaces").json()["workspaces"]) == 1
+
+            missing = client.post(
+                "/api/workspaces", json={"root_path": str(tmp_path / "missing")}
+            )
+            assert missing.status_code == 400
+            assert "not found" in missing.json()["error"]
+
+            project = tmp_path / "project-a"
+            created = client.post(
+                "/api/workspaces",
+                json={
+                    "name": "Project A",
+                    "root_path": str(project),
+                    "create_if_missing": True,
+                },
+            )
+            assert created.status_code == 200, created.text
+            workspace = created.json()["workspace"]
+            assert workspace["name"] == "Project A"
+            assert Path(workspace["root_path"]) == project.resolve()
+            assert workspace["is_git_repo"] is False
+
+            duplicate = client.post(
+                "/api/workspaces", json={"root_path": str(project)}
+            )
+            assert duplicate.status_code == 400
+            assert "already registered" in duplicate.json()["error"]
+
+            git_project = tmp_path / "project-git"
+            git_project.mkdir()
+            git_created = client.post(
+                "/api/workspaces",
+                json={"root_path": str(git_project), "init_git": True},
+            )
+            assert git_created.status_code == 200, git_created.text
+            assert git_created.json()["workspace"]["is_git_repo"] is True
+
+            marker = project / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            deleted = client.delete(f"/api/workspaces/{workspace['workspace_id']}")
+            assert deleted.status_code == 200
+            assert deleted.json() == {
+                "ok": True,
+                "workspace_id": workspace["workspace_id"],
+                "deleted": True,
+            }
+            assert marker.read_text(encoding="utf-8") == "keep\n"
+            assert client.delete(
+                f"/api/workspaces/{workspace['workspace_id']}"
+            ).status_code == 404
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_brownfield_run_validates_scope_before_any_llm_call(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(repo / ".olympus" / "olympus.db")
+    supervisor = _mock_scope_supervisor(store, repo)
+    app = AriadneApp(store=store, workspace_root=repo, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            missing_root = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "workspace_root": str(tmp_path / "nope"),
+                },
+            )
+            assert missing_root.status_code == 400
+            assert "workspace_root not found" in missing_root.json()["error"]
+
+            escaped = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "scope_paths": ["../outside.txt"],
+                },
+            )
+            assert escaped.status_code == 400
+            assert "strictly inside" in escaped.json()["error"]
+
+            root_itself = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "scope_paths": ["."],
+                },
+            )
+            assert root_itself.status_code == 400
+            assert store.list_runs() == []
+
+            run_id, body = _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "fix the export bug",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "base_ref": "main",
+                    "scope_paths": ["src/mod.py", "./src/../src"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert body["workflow"] == "product_blueprint"
+            snapshot = store.get_run(run_id)
+            assert snapshot["workspace_mode"] == "brownfield"
+            assert snapshot["task_type"] == "fix"
+            assert snapshot["base_ref"] == "main"
+            assert snapshot["scope_paths"] == ["src/mod.py", "src"]
+            assert snapshot["workspace_id"] == app.default_workspace_id
+            assert snapshot["workspace_root"] == str(repo.resolve())
+
+            events = store.list_events(run_id)
+            recorded = next(
+                event for event in events if event.event_type == "graph.input_recorded"
+            )
+            assert recorded.payload["workspace_mode"] == "brownfield"
+            assert recorded.payload["task_type"] == "fix"
+            assert recorded.payload["base_ref"] == "main"
+            assert recorded.payload["scope_paths"] == ["src/mod.py", "src"]
+            assert recorded.payload["workspace_id"] == app.default_workspace_id
+            bound = next(
+                event for event in events if event.event_type == "graph.scope_bound"
+            )
+            assert bound.payload["workspace_mode"] == "brownfield"
+            assert bound.payload["task_type"] == "fix"
+            assert bound.payload["scope_paths"] == ["src/mod.py", "src"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_greenfield_run_creates_empty_workspace_and_rejects_populated_dirs(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "host"
+    (host / "src").mkdir(parents=True)
+    (host / "src" / "host_only.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(host / ".olympus" / "olympus.db")
+    supervisor = _mock_scope_supervisor(store, host)
+    app = AriadneApp(store=store, workspace_root=host, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            target = tmp_path / "brand-new"
+            run_id, _ = _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "task_type": "feature",
+                    "workspace_root": str(target),
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert target.is_dir()
+            assert list(target.iterdir()) == []
+            snapshot = store.get_run(run_id)
+            assert snapshot["workspace_mode"] == "greenfield"
+            assert snapshot["task_type"] == "feature"
+            assert snapshot["workspace_id"] is not None
+            registered = store.get_workspace(str(snapshot["workspace_id"]))
+            assert registered is not None
+            assert registered["root_path"] == str(target.resolve())
+            assert store.get_workspace_by_root(target) is not None
+
+            populated = tmp_path / "populated"
+            populated.mkdir()
+            (populated / "existing.txt").write_text("keep\n", encoding="utf-8")
+            rejected = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(populated),
+                },
+            )
+            assert rejected.status_code == 400
+            assert "must be empty" in rejected.json()["error"]
+            assert (populated / "existing.txt").read_text(encoding="utf-8") == "keep\n"
+
+            unbound = client.post(
+                "/api/runs",
+                json={"raw_input": "Build a standalone todo app", "workspace_mode": "greenfield"},
+            )
+            assert unbound.status_code == 400
+            assert "greenfield requires" in unbound.json()["error"]
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_greenfield_align_skips_host_inventory_over_http(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    (host / "src").mkdir(parents=True)
+    (host / "src" / "host_only.py").write_text("x = 1\n", encoding="utf-8")
+    store = RunStore(host / ".olympus" / "olympus.db")
+    captured_prompts: list[str] = []
+
+    def responder(messages: Sequence[object], tools: Sequence[object]) -> LLMResponse:
+        del tools
+        captured_prompts.append(str(getattr(messages[1], "content", "")))
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "goal": "Build a standalone todo app",
+                    "requirements": [
+                        {
+                            "id": "R1",
+                            "description": "Create and list todos",
+                            "acceptance_criteria": ["Todos persist across restarts"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=host,
+        provider_builder=lambda **_: MockLLMProvider(responder=responder),
+    )
+    app = AriadneApp(store=store, workspace_root=host, supervisor=supervisor)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            target = tmp_path / "oracle-board"
+            _create_run_and_settle(
+                client,
+                app,
+                {
+                    "raw_input": "Build a standalone todo app",
+                    "workspace_mode": "greenfield",
+                    "task_type": "feature",
+                    "workspace_root": str(target),
+                    "workflow_name": "product_blueprint",
+                    "sync": True,
+                },
+            )
+        assert captured_prompts, "AlignStage never received a prompt"
+        prompt = captured_prompts[0]
+        assert "GREENFIELD contract" in prompt
+        assert "skipped: greenfield" in prompt
+        assert "host_only.py" not in prompt
+    finally:
+        supervisor.shutdown()
+
+
+def test_default_workflow_resolution_and_explicit_override(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunStore(repo / ".olympus" / "olympus.db")
+    supervisor = RunSupervisor(store=store, workspace_root=repo)
+    app = AriadneApp(store=store, workspace_root=repo, supervisor=supervisor)
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"workspace_mode": "spec_only", "task_type": "feature"}, "product_blueprint"),
+        ({"workspace_mode": "brownfield", "task_type": "blueprint"}, "product_blueprint"),
+        ({"workspace_mode": "brownfield", "task_type": "fix"}, "repo_fast_patch"),
+        ({"workspace_mode": "brownfield", "task_type": "feature"}, "full_sdlc_tdd"),
+        ({}, "product_blueprint"),
+        (
+            {
+                "workspace_mode": "spec_only",
+                "workspace_root": str(repo),
+                "task_type": "feature",
+                "workflow_name": "repo_fast_patch",
+            },
+            "repo_fast_patch",
+        ),
+    ]
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            for fields, expected in cases:
+                response = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": f"Deliver the {expected} outcome",
+                        "provider_config": {"provider": "mock"},
+                        **fields,
+                    },
+                )
+                assert response.status_code == 200, response.text
+                run_id = str(response.json()["run_id"])
+                assert store.get_run(run_id)["workflow_name"] == expected
+                supervisor.wait(run_id, timeout=60.0)
+    finally:
+        supervisor.shutdown()
+
+
+def _board_spec(spec_id: str, *, blocking: bool = False) -> GoalSpec:
+    return GoalSpec(
+        spec_id=spec_id,
+        goal=f"Board projection fixture {spec_id}",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Board cards classify deterministically",
+                acceptance_criteria=["One classifier backs every surface"],
+            )
+        ],
+        open_ambiguities=(
+            [
+                AmbiguityItem(
+                    id="A1",
+                    question="Which surface owns the decision?",
+                    impact="Board routing",
+                    options=["classifier", "projection"],
+                    blocking=True,
+                )
+            ]
+            if blocking
+            else []
+        ),
+    )
+
+
+def _board_design(spec: GoalSpec, design_id: str) -> DesignSpec:
+    return DesignSpec(
+        design_id=design_id,
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        architecture_summary="A single deterministic projection owns board state.",
+        modules=[
+            DesignModule(
+                id="M1",
+                name="Projection",
+                responsibility="Classify every Oracle exactly once",
+                requirement_refs=["R1"],
+                target_paths=["src/olympus/web/projection.py"],
+            )
+        ],
+    )
+
+
+def _board_plan(
+    spec: GoalSpec,
+    plan_id: str,
+    *,
+    task_status: TaskStatus = TaskStatus.WAITING,
+    attempt: int = 0,
+    review_cycle: int = 0,
+    worktree_path: str | None = None,
+) -> TaskPlan:
+    return TaskPlan(
+        plan_id=plan_id,
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1",
+                title="Project the board",
+                objective="Classify the Oracle",
+                requirement_refs=["R1"],
+                write_scope=["src/olympus/web/projection.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="T1-C1",
+                        kind=CheckKind.COMMAND,
+                        description="pytest board projection",
+                        command="pytest -q",
+                    )
+                ],
+                status=task_status,
+                attempt=attempt,
+                review_cycle=review_cycle,
+                worktree_path=worktree_path,
+            )
+        ],
+    )
+
+
+def _board_approve(store: RunStore, run_id: str, gate: str, artifact: object) -> None:
+    from olympus.graph.progress import GATE_SPECS
+
+    gate_spec = GATE_SPECS[gate]
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=gate_spec["target"],
+            target_id=getattr(artifact, gate_spec["id_attr"]),
+            target_hash=artifact.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+
+def _seed_board_run(
+    store: RunStore,
+    run_id: str,
+    *,
+    workspace_id: str | None,
+    workspace_mode: str = "brownfield",
+    task_type: str = "feature",
+    workflow_name: str = "product_blueprint",
+    status: RunStatus = RunStatus.AWAITING_HUMAN,
+    spec: GoalSpec | None = None,
+    design: DesignSpec | None = None,
+    plan: TaskPlan | None = None,
+    approve: tuple[str, ...] = (),
+) -> str:
+    store.create_run(
+        title=f"Oracle {run_id}",
+        workflow_name=workflow_name,
+        run_id=run_id,
+        workspace_id=workspace_id,
+        workspace_mode=workspace_mode,
+        task_type=task_type,
+        workspace_root=store.get_workspace(workspace_id)["root_path"] if workspace_id else None,
+    )
+    if spec is not None:
+        store.save_spec(run_id, spec)
+        if "spec" in approve:
+            _board_approve(store, run_id, "spec", spec)
+    if design is not None:
+        store.save_design(run_id, design)
+        if "design" in approve:
+            _board_approve(store, run_id, "design", design)
+    if plan is not None:
+        store.save_plan(run_id, plan)
+        if "plan" in approve:
+            _board_approve(store, run_id, "plan", plan)
+    store.set_run_status(run_id, status, actor="test")
+    return run_id
+
+
+def test_oracle_board_projection_filters_pantheon_and_sse(tmp_path: Path) -> None:
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    ws_a = store.register_workspace(
+        name="Alpha", root_path=tmp_path / "alpha", is_git_repo=False
+    )
+    ws_b = store.register_workspace(
+        name="Beta", root_path=tmp_path / "beta", is_git_repo=False
+    )
+    a = str(ws_a["workspace_id"])
+    b = str(ws_b["workspace_id"])
+
+    clarify_spec = _board_spec("spec-clarify", blocking=True)
+    _seed_board_run(
+        store, "run-board-clarify", workspace_id=a, spec=clarify_spec
+    )
+
+    specc_spec = _board_spec("spec-specc")
+    _seed_board_run(
+        store,
+        "run-board-specc",
+        workspace_id=a,
+        task_type="fix",
+        spec=specc_spec,
+    )
+
+    design_spec = _board_spec("spec-design")
+    design = _board_design(design_spec, "design-board")
+    _seed_board_run(
+        store,
+        "run-board-design",
+        workspace_id=b,
+        spec=design_spec,
+        design=design,
+        approve=("spec",),
+    )
+
+    plan_spec = _board_spec("spec-plan")
+    plan_design = _board_design(plan_spec, "design-plan")
+    plan = _board_plan(plan_spec, "plan-board")
+    _seed_board_run(
+        store,
+        "run-board-plan",
+        workspace_id=b,
+        workspace_mode="greenfield",
+        spec=plan_spec,
+        design=plan_design,
+        plan=plan,
+        approve=("spec", "design"),
+    )
+
+    exec_spec = _board_spec("spec-exec")
+    exec_design = _board_design(exec_spec, "design-exec")
+    exec_wt = root / ".olympus" / "sandboxes" / "run-board-exec-T1"
+    exec_wt.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "olympus/run-board-exec-T1"],
+        cwd=exec_wt,
+        check=True,
+        capture_output=True,
+    )
+    exec_plan = _board_plan(
+        exec_spec,
+        "plan-exec",
+        task_status=TaskStatus.RUNNING,
+        attempt=1,
+        worktree_path=str(exec_wt),
+    )
+    _seed_board_run(
+        store,
+        "run-board-exec",
+        workspace_id=a,
+        workspace_mode="greenfield",
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=exec_spec,
+        design=exec_design,
+        plan=exec_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-exec",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    review_spec = _board_spec("spec-review")
+    review_design = _board_design(review_spec, "design-review")
+    review_plan = _board_plan(
+        review_spec, "plan-review", task_status=TaskStatus.VERIFYING, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-review",
+        workspace_id=a,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=review_spec,
+        design=review_design,
+        plan=review_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-review",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+    store.append_event(
+        run_id="run-board-review",
+        stage="verify",
+        event_type="review.verdict_recorded",
+        actor="argus",
+        payload={"task_id": "T1", "attempt": 1, "passed": True},
+    )
+
+    verify_spec = _board_spec("spec-verify")
+    verify_design = _board_design(verify_spec, "design-verify")
+    verify_plan = _board_plan(
+        verify_spec, "plan-verify", task_status=TaskStatus.VERIFYING, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-verify",
+        workspace_id=b,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.RUNNING,
+        spec=verify_spec,
+        design=verify_design,
+        plan=verify_plan,
+        approve=("spec", "design", "plan"),
+    )
+    store.append_event(
+        run_id="run-board-verify",
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "execute"},
+    )
+
+    blocked_spec = _board_spec("spec-blocked")
+    blocked_design = _board_design(blocked_spec, "design-blocked")
+    blocked_plan = _board_plan(
+        blocked_spec, "plan-blocked", task_status=TaskStatus.BLOCKED, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-blocked",
+        workspace_id=b,
+        workflow_name="full_sdlc_tdd",
+        spec=blocked_spec,
+        design=blocked_design,
+        plan=blocked_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    blueprint_spec = _board_spec("spec-blueprint")
+    blueprint_design = _board_design(blueprint_spec, "design-blueprint")
+    blueprint_plan = _board_plan(blueprint_spec, "plan-blueprint")
+    _seed_board_run(
+        store,
+        "run-board-blueprint",
+        workspace_id=a,
+        status=RunStatus.COMPLETED,
+        spec=blueprint_spec,
+        design=blueprint_design,
+        plan=blueprint_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    delivered_spec = _board_spec("spec-delivered")
+    delivered_design = _board_design(delivered_spec, "design-delivered")
+    delivered_plan = _board_plan(
+        delivered_spec, "plan-delivered", task_status=TaskStatus.ACCEPTED, attempt=1
+    )
+    _seed_board_run(
+        store,
+        "run-board-delivered",
+        workspace_id=a,
+        workflow_name="full_sdlc_tdd",
+        status=RunStatus.COMPLETED,
+        spec=delivered_spec,
+        design=delivered_design,
+        plan=delivered_plan,
+        approve=("spec", "design", "plan"),
+    )
+
+    _seed_board_run(
+        store, "run-board-cancelled", workspace_id=a, status=RunStatus.CANCELLED
+    )
+
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            board = client.get("/api/runs")
+            assert board.status_code == 200, board.text
+            payload = board.json()
+            runs = {run["run_id"]: run for run in payload["runs"]}
+            assert len(payload["runs"]) == 10
+            assert "run-board-cancelled" not in runs
+            assert payload["pending_ruling_total"] == 5
+            assert payload["active_workspace_id"] is None
+            assert [seat["god"] for seat in payload["pantheon"]] == [
+                "prometheus",
+                "athena",
+                "hephaestus",
+                "momus",
+                "argus",
+            ]
+            seats = {seat["god"]: seat for seat in payload["pantheon"]}
+            assert seats["prometheus"] == {
+                "god": "prometheus",
+                "role_label": "Align",
+                "state": "waiting_on_human",
+                "active_count": 0,
+                "waiting_count": 2,
+                "oracle_ids": ["run-board-specc", "run-board-clarify"],
+            }
+            assert (
+                seats["athena"]["state"],
+                seats["athena"]["waiting_count"],
+                seats["athena"]["oracle_ids"],
+            ) == ("waiting_on_human", 2, ["run-board-plan", "run-board-design"])
+            assert (seats["hephaestus"]["state"], seats["hephaestus"]["active_count"]) == (
+                "working",
+                1,
+            )
+            assert (seats["momus"]["state"], seats["momus"]["oracle_ids"]) == (
+                "working",
+                ["run-board-review"],
+            )
+            assert (
+                seats["argus"]["state"],
+                seats["argus"]["active_count"],
+                seats["argus"]["waiting_count"],
+            ) == ("waiting_on_human", 1, 1)
+
+            expected = {
+                "run-board-clarify": ("human", "prometheus", "clarify", "clarify"),
+                "run-board-specc": ("human", "prometheus", "approve_spec", "approve_spec"),
+                "run-board-design": ("human", "athena", "approve_design", "approve_design"),
+                "run-board-plan": ("human", "athena", "approve_plan", "approve_plan"),
+                "run-board-exec": ("agent", "hephaestus", None, "running"),
+                "run-board-review": ("agent", "momus", None, "reviewing"),
+                "run-board-verify": ("agent", "argus", None, "verifying"),
+                "run-board-blocked": ("human", "argus", "resolve_blocker", "blocked"),
+                "run-board-blueprint": ("done", "athena", None, "blueprint"),
+                "run-board-delivered": ("done", "argus", None, "delivered"),
+            }
+            for run_id, (ball, god, action, badge) in expected.items():
+                run = runs[run_id]
+                assert (run["ball_holder"], run["active_god"]) == (ball, god), run_id
+                assert (run["pending_action"], run["status_badge"]) == (action, badge), run_id
+                assert run["is_archived"] is False
+            assert runs["run-board-exec"]["worktree_branch"] == "olympus/run-board-exec-T1"
+            assert runs["run-board-exec"]["workspace_name"] == "Alpha"
+            assert runs["run-board-exec"]["workspace_mode"] == "greenfield"
+            assert runs["run-board-exec"]["task_type"] == "feature"
+            assert runs["run-board-delivered"]["workspace_id"] == a
+            assert runs["run-board-plan"]["workspace_name"] == "Beta"
+
+            archived = client.get("/api/runs", params={"include_archived": "true"}).json()
+            archived_runs = {run["run_id"]: run for run in archived["runs"]}
+            assert archived_runs["run-board-cancelled"]["is_archived"] is True
+            assert archived_runs["run-board-cancelled"]["ball_holder"] == "done"
+            assert len(archived["runs"]) == 11
+
+            alpha = client.get(
+                "/api/runs", params={"workspace_id": a}
+            ).json()
+            assert {run["run_id"] for run in alpha["runs"]} == {
+                "run-board-clarify",
+                "run-board-specc",
+                "run-board-exec",
+                "run-board-review",
+                "run-board-blueprint",
+                "run-board-delivered",
+            }
+            assert alpha["active_workspace_id"] == a
+            assert alpha["pending_ruling_total"] == 2
+
+            greenfield = client.get(
+                "/api/runs", params={"workspace_mode": "greenfield"}
+            ).json()
+            assert {run["run_id"] for run in greenfield["runs"]} == {
+                "run-board-plan",
+                "run-board-exec",
+            }
+
+            fixes = client.get("/api/runs", params={"task_type": "fix"}).json()
+            assert [run["run_id"] for run in fixes["runs"]] == ["run-board-specc"]
+
+            agents = client.get("/api/runs", params={"ball_holder": "agent"}).json()
+            assert {run["run_id"] for run in agents["runs"]} == {
+                "run-board-exec",
+                "run-board-review",
+                "run-board-verify",
+            }
+            assert agents["pending_ruling_total"] == 5
+
+            humans = client.get("/api/runs", params={"ball_holder": "human"}).json()
+            assert {run["run_id"] for run in humans["runs"]} == {
+                "run-board-clarify",
+                "run-board-specc",
+                "run-board-design",
+                "run-board-plan",
+                "run-board-blocked",
+            }
+
+            combined = client.get(
+                "/api/runs",
+                params={"workspace_id": a, "task_type": "feature"},
+            ).json()
+            assert {run["run_id"] for run in combined["runs"]} == {
+                "run-board-clarify",
+                "run-board-exec",
+                "run-board-review",
+                "run-board-blueprint",
+                "run-board-delivered",
+            }
+
+            assert client.get(
+                "/api/runs", params={"workspace_mode": "desktop"}
+            ).status_code == 400
+            assert client.get(
+                "/api/runs", params={"ball_holder": "nobody"}
+            ).status_code == 400
+
+            workspaces = client.get("/api/workspaces").json()["workspaces"]
+            by_id = {workspace["workspace_id"]: workspace for workspace in workspaces}
+            assert (
+                by_id[a]["active_oracle_count"],
+                by_id[a]["pending_ruling_count"],
+            ) == (2, 2)
+            assert (
+                by_id[b]["active_oracle_count"],
+                by_id[b]["pending_ruling_count"],
+            ) == (1, 3)
+
+            stream = client.get("/api/board/stream", params={"once": "1", "workspace_id": a})
+            assert stream.status_code == 200
+            assert stream.headers["content-type"].startswith("text/event-stream")
+            assert stream.text.startswith("event: board\n")
+            stream_payload = json.loads(
+                next(
+                    line[len("data: ") :]
+                    for line in stream.text.splitlines()
+                    if line.startswith("data: ")
+                )
+            )
+            assert stream_payload == client.get(
+                "/api/runs", params={"workspace_id": a}
+            ).json()
+            all_stream = client.get("/api/board/stream", params={"once": "1"})
+            all_payload = json.loads(
+                next(
+                    line[len("data: ") :]
+                    for line in all_stream.text.splitlines()
+                    if line.startswith("data: ")
+                )
+            )
+            assert all_payload == payload
+    finally:
+        app.supervisor.shutdown()
+
+
+def _next_board_frame(lines: Iterator[str]) -> dict[str, Any]:
+    data: str | None = None
+    for line in lines:
+        if line.startswith("data: "):
+            data = line[len("data: ") :]
+        elif line == "" and data is not None:
+            return json.loads(data)
+    raise AssertionError("board stream ended before a frame arrived")
+
+
+def test_board_stream_emits_on_change_and_exits_on_disconnect(tmp_path: Path) -> None:
+    import threading
+
+    root = tmp_path / "host"
+    root.mkdir()
+    store = RunStore(root / ".olympus" / "olympus.db")
+    app = AriadneApp(store=store, workspace_root=root)
+    _seed_board_run(
+        store,
+        "run-live",
+        workspace_id=None,
+        spec=_board_spec("spec-live", blocking=True),
+    )
+    try:
+        with (
+            TestClient(create_fastapi_app(app)) as client,
+            client.stream("GET", "/api/board/stream") as stream,
+        ):
+            assert stream.status_code == 200
+            lines = stream.iter_lines()
+            first = _next_board_frame(lines)
+            first_run = first["runs"][0]
+            assert first_run["ball_holder"] == "human"
+            assert first_run["pending_action"] == "clarify"
+
+            timer = threading.Timer(
+                0.75, lambda: store.set_run_status("run-live", RunStatus.PAUSED)
+            )
+            timer.start()
+            second = _next_board_frame(lines)
+            timer.join(timeout=5)
+            second_run = second["runs"][0]
+            assert second_run["status"] == "paused"
+            assert second_run["pending_action"] == "resolve_blocker"
+            assert second_run["status_badge"] == "paused"
+        # Exiting the stream context closes the connection; a clean exit means no hang.
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_static_mime_allowlist_serves_images_and_blocks_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import olympus.web.server as web_server
+
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (static_dir / "portrait.webp").write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
+    (static_dir / "emblem.svg").write_text("<svg/>", encoding="utf-8")
+    (static_dir / "payload.bin").write_bytes(b"bin")
+    monkeypatch.setattr(web_server, "_STATIC_DIR", static_dir)
+
+    root = tmp_path / "host"
+    root.mkdir()
+    app = AriadneApp(store=RunStore(root / "olympus.db"), workspace_root=root)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            png = client.get("/static/icon.png")
+            assert png.status_code == 200
+            assert png.headers["content-type"] == "image/png"
+            webp = client.get("/static/portrait.webp")
+            assert webp.status_code == 200
+            assert webp.headers["content-type"] == "image/webp"
+            svg = client.get("/static/emblem.svg")
+            assert svg.status_code == 200
+            assert svg.headers["content-type"] == "image/svg+xml"
+            assert client.get("/static/payload.bin").status_code == 404
+            assert client.get("/static/missing.png").status_code == 404
+            assert client.get("/static/..%2fhost%2folympus.db").status_code == 404
+    finally:
+        app.supervisor.shutdown()
+
+
+def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import patch
+
+    import olympus.graph.loader as graph_loader
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    (root / "src").mkdir()
+    (root / "src" / "inside.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "src" / "outside.py").write_text("y = 2\n", encoding="utf-8")
+
+    store = RunStore(tmp_path / "runs.db")
+    captured_prompts: list[str] = []
+
+    def _mock_responder(messages, _tools):
+        from olympus.providers.base import LLMResponse
+
+        if messages and "Requirements Alignment Architect" in messages[0].content:
+            captured_prompts.append(messages[1].content)
+        spec_json = GoalSpec(
+            goal="Verify scope hardening",
+            requirements=[
+                RequirementItem(
+                    id="R1",
+                    description="Scope contract holds",
+                    acceptance_criteria=["Tests pass"],
+                )
+            ],
+            out_of_scope=["Unrelated work"],
+        ).model_dump_json()
+        return LLMResponse(content=spec_json)
+
+    sup = RunSupervisor(
+        store=store,
+        workspace_root=root,
+        provider_builder=lambda **_: MockLLMProvider(responder=_mock_responder),
+    )
+    app = AriadneApp(store=store, workspace_root=root, supervisor=sup)
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            ws_id = next(
+                ws["workspace_id"]
+                for ws in client.get("/api/workspaces").json()["workspaces"]
+                if ws["root_path"] == str(root.resolve())
+            )
+
+            reject_direct = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Plan only",
+                    "workspace_mode": "spec_only",
+                    "workflow_name": "full_sdlc_tdd",
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert reject_direct.status_code == 400
+
+            spec_only_run = store.create_run(
+                title="Spec only run",
+                workflow_name="product_blueprint",
+                workspace_mode="spec_only",
+                task_type="blueprint",
+                workspace_root=None,
+            )
+            reject_promote = client.post(
+                f"/api/runs/{spec_only_run}/command",
+                json={"action": "promote_to_execute", "auto_advance": False},
+            )
+            assert reject_promote.status_code == 400
+
+            bad_target = tmp_path / "reject-greenfield"
+            bad_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Build new tool",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(bad_target),
+                    "scope_paths": ["."],
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert bad_resp.status_code == 400
+            assert not bad_target.exists()
+            assert store.get_workspace_by_root(bad_target) is None
+
+            git_target = tmp_path / "git-greenfield"
+            with patch.object(sup, "_launch", side_effect=lambda run_id, **_: {"run_id": run_id}):
+                git_resp = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Build git initialized tool",
+                        "workspace_mode": "greenfield",
+                        "workspace_root": str(git_target),
+                        "init_git": True,
+                        "provider_config": {"provider": "mock"},
+                    },
+                )
+            assert git_resp.status_code == 200
+            assert (git_target / ".git").exists()
+
+            with patch.object(
+                graph_loader, "triage_input", wraps=graph_loader.triage_input
+            ) as spy_triage:
+                scoped_resp = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Fix inside module only",
+                        "workspace_mode": "brownfield",
+                        "task_type": "fix",
+                        "base_ref": "main",
+                        "scope_paths": ["src/inside.py"],
+                        "workflow_name": "product_blueprint",
+                        "provider_config": {"provider": "mock"},
+                        "sync": True,
+                    },
+                )
+            assert scoped_resp.status_code == 200
+            assert spy_triage.call_args is not None
+            for key in ("workspace_mode", "task_type", "base_ref", "scope_paths"):
+                assert key in spy_triage.call_args.kwargs
+            inventory_section = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert "src/inside.py" in inventory_section
+            assert "src/outside.py" not in inventory_section
+
+            with patch.object(sup, "_launch", side_effect=lambda run_id, **_: {"run_id": run_id}):
+                ws_only = client.post(
+                    "/api/runs",
+                    json={
+                        "raw_input": "Add feature in workspace",
+                        "workspace_id": ws_id,
+                        "provider_config": {"provider": "mock"},
+                    },
+                )
+            assert ws_only.status_code == 200
+            assert store.get_run(ws_only.json()["run_id"])["workflow_name"] == "full_sdlc_tdd"
+
+            paused_id = store.create_run(title="Paused spec parity")
+            store.save_spec(
+                paused_id,
+                GoalSpec(
+                    goal="Paused review",
+                    requirements=[
+                        RequirementItem(id="R1", description="Pause", acceptance_criteria=["Ok"])
+                    ],
+                ),
+            )
+            store.set_run_status(paused_id, RunStatus.PAUSED)
+            paused_card = next(
+                r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == paused_id
+            )
+            paused_l2 = client.get(f"/api/runs/{paused_id}").json()["projection"]["hitl_banner"]
+            assert paused_card["pending_action"] == "resolve_blocker"
+            assert paused_l2["kind"] == "run_paused"
+            assert paused_l2["actions"] == ["resume"]
+
+            legacy_id = store.create_run(title="Legacy root match", workspace_root=root)
+            filtered_ids = {
+                r["run_id"]
+                for r in client.get("/api/runs", params={"workspace_id": ws_id}).json()["runs"]
+            }
+            assert legacy_id in filtered_ids
+
+            with pytest.raises(ValueError, match="Workspace already registered"):
+                store.register_workspace(
+                    name="dup",
+                    root_path=root,
+                    is_git_repo=True,
+                    exist_ok=False,
+                )
+
+            wf_payload = client.get("/api/workflows").json()
+            assert wf_payload["default_workflows"]["brownfield:fix"] == "repo_fast_patch"
+            assert wf_payload["default_workflows"]["spec_only:feature"] == "product_blueprint"
+            assert wf_payload["default_workflows"]["greenfield:feature"] == "full_sdlc_tdd"
+
+            blank_greenfield = tmp_path / "blank-intent-greenfield"
+            blank_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "   ",
+                    "workspace_mode": "greenfield",
+                    "workspace_root": str(blank_greenfield),
+                    "init_git": True,
+                    "provider_config": {"provider": "mock"},
+                },
+            )
+            assert blank_resp.status_code == 400
+            assert not blank_greenfield.exists()
+            assert store.get_workspace_by_root(blank_greenfield) is None
+
+            (root / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / "github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / ".github" / "workflows" / "ci.yml").write_text("name: dot\n", encoding="utf-8")
+            (root / "github" / "workflows" / "ci.yml").write_text("name: plain\n", encoding="utf-8")
+
+            dot_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Audit dot github workflow",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "scope_paths": [".github/workflows/ci.yml"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert dot_resp.status_code == 200
+            dot_inventory = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert ".github/workflows/ci.yml" in dot_inventory
+            assert "github/workflows/ci.yml" not in dot_inventory.replace(
+                ".github/workflows/ci.yml", ""
+            )
+
+            plain_resp = client.post(
+                "/api/runs",
+                json={
+                    "raw_input": "Audit plain github workflow",
+                    "workspace_mode": "brownfield",
+                    "task_type": "fix",
+                    "scope_paths": ["github/workflows/ci.yml"],
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert plain_resp.status_code == 200
+            plain_inventory = captured_prompts[-1].split("Brownfield binding:")[0]
+            assert "github/workflows/ci.yml" in plain_inventory
+            assert ".github/workflows/ci.yml" not in plain_inventory
+
+            wt_dir = tmp_path / "sse-head-wt"
+            wt_dir.mkdir()
+            for git_args in (
+                ["git", "init", "-b", "probe-branch"],
+                ["git", "config", "user.email", "t@example.com"],
+                ["git", "config", "user.name", "Test"],
+            ):
+                subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+            (wt_dir / "a.txt").write_text("ok\n", encoding="utf-8")
+            for git_args in (["git", "add", "a.txt"], ["git", "commit", "-m", "init"]):
+                subprocess.run(git_args, cwd=wt_dir, check=True, capture_output=True)
+
+            wt_run_id = store.create_run(
+                title="SSE Head Probe", workflow_name="full_sdlc_tdd"
+            )
+            wt_spec = _board_spec("spec-sse-wt")
+            wt_design = _board_design(wt_spec, "design-sse-wt")
+            wt_plan = _board_plan(
+                wt_spec,
+                "plan-sse-wt",
+                task_status=TaskStatus.RUNNING,
+                attempt=1,
+                worktree_path=str(wt_dir),
+            )
+            store.save_spec(wt_run_id, wt_spec)
+            store.save_design(wt_run_id, wt_design)
+            store.save_plan(wt_run_id, wt_plan)
+            store.set_run_status(wt_run_id, RunStatus.RUNNING)
+
+            token_before = app.board_change_token()
+            assert (
+                next(
+                    r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == wt_run_id
+                )["worktree_branch"]
+                == "probe-branch"
+            )
+            subprocess.run(
+                ["git", "checkout", "--detach", "HEAD"],
+                cwd=wt_dir,
+                check=True,
+                capture_output=True,
+            )
+            token_after = app.board_change_token()
+            assert token_after != token_before
+            assert (
+                next(
+                    r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == wt_run_id
+                )["worktree_branch"]
+                is None
+            )
+    finally:
+        sup.shutdown()

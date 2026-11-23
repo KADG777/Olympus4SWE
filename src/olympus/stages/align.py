@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,6 +28,51 @@ from olympus.tools.aci import WorkspaceToolkit
 
 class CritiqueOutput(StrictModel):
     notes: list[CritiqueNote] = Field(default_factory=list)
+
+
+def _scope_directive(
+    *,
+    workspace_mode: str | None,
+    task_type: str | None,
+    base_ref: str | None,
+    scope_paths: Sequence[str] | None,
+) -> str:
+    """Render the deterministic Scope x Type contract injected into the Stage 1 prompt."""
+    mode = (workspace_mode or "").strip().lower()
+    kind = (task_type or "").strip().lower()
+    blocks: list[str] = []
+    if mode == "greenfield":
+        blocks.append(
+            "GREENFIELD contract (explicit, authoritative):\n"
+            "- The workspace is a brand-new empty directory; there is NO existing codebase.\n"
+            "- Never scan, cite, or treat unrelated host repository files as context,\n"
+            "  contradictions, or constraints for this goal; synthesize the standalone\n"
+            "  GoalSpec directly from Raw user goal."
+        )
+    elif mode == "brownfield":
+        binding = ["Brownfield binding:"]
+        if base_ref:
+            binding.append(f"- Base git ref: {base_ref}")
+        if scope_paths:
+            binding.append(
+                "- Scoped paths (authoritative, workspace-relative): "
+                + ", ".join(scope_paths)
+            )
+        if len(binding) > 1:
+            blocks.append("\n".join(binding))
+    if kind == "fix":
+        blocks.append(
+            "Fix task directive: prioritize reproducible defect behavior, regression "
+            "constraints, and a minimal verified patch over broad architectural ceremony."
+        )
+    elif kind == "refactor":
+        blocks.append(
+            "Refactor task directive: preserve externally observable behavior and require "
+            "regression evidence for every refactored seam."
+        )
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks) + "\n\n"
 
 
 _ALIGN_SYSTEM_PROMPT = """You are the Stage 1 Requirements Alignment Architect of Olympus4SWE.
@@ -115,12 +161,19 @@ class AlignStage:
         enable_critique: bool = False,
         max_steps: int = 10,
         strict_canonical: bool = False,
+        workspace_mode: str | None = None,
+        task_type: str | None = None,
+        base_ref: str | None = None,
+        scope_paths: Sequence[str] | None = None,
     ) -> GoalSpec:
         """Probe repo context, draft GoalSpec, and optionally run cold-start critique.
 
         ``strict_canonical`` opts into the 5-element + EARS contract: the draft is checked
         with the zero-token gate and repaired once when it fails without blocking
         ambiguities. The default stays ``False`` for full backward compatibility.
+        ``workspace_mode``/``task_type``/``base_ref``/``scope_paths`` are explicit
+        deterministic inputs: a ``greenfield`` run skips host inventory scanning and a
+        ``brownfield`` run binds its scoped paths and git ref into the prompt.
         """
         self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
@@ -133,7 +186,18 @@ class AlignStage:
             max_steps=max_steps,
             trace_path=self._trace_file(run_id, "align-proposer"),
         )
-        inventory = format_workspace_inventory(toolkit)
+        greenfield = (workspace_mode or "").strip().lower() == "greenfield"
+        inventory = (
+            "Observed workspace files: (skipped: greenfield target has no existing repository)"
+            if greenfield
+            else format_workspace_inventory(toolkit, scope_paths=scope_paths)
+        )
+        scope_block = _scope_directive(
+            workspace_mode=workspace_mode,
+            task_type=task_type,
+            base_ref=base_ref,
+            scope_paths=scope_paths,
+        )
         schema_json = json.dumps(GoalSpec.model_json_schema(), ensure_ascii=False)
         strict_block = (
             "\nCanonical contract (required):\n"
@@ -152,6 +216,7 @@ class AlignStage:
         user_prompt = (
             f"Workspace root: {self.workspace_root}\n"
             f"{inventory}\n"
+            f"{scope_block}"
             f"Raw user goal:\n{raw_goal}\n\n"
             f"Explicit constraints: {json.dumps(constraints or [], ensure_ascii=False)}\n"
             f"{strict_block}\n"

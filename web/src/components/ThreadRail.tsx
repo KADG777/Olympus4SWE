@@ -1,19 +1,102 @@
+import type { BallHolder, RunSummary } from "../api/types";
 import type { Workbench, WorkbenchState } from "../state/workbench";
-import { statusMeta, WORKFLOW_LABELS } from "../lib/labels";
-import { Badge } from "./ui";
+
+const REGISTER_OPTION = "__register__";
+
+function BoardIcon() {
+  return (
+    <svg className="rail-nav-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M2 6h12" stroke="currentColor" strokeWidth="1.25" />
+    </svg>
+  );
+}
+
+function WorkspaceIcon() {
+  return (
+    <svg className="rail-nav-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M2.2 4.5A1.5 1.5 0 0 1 3.7 3h2.6l1.3 1.5h4.7a1.5 1.5 0 0 1 1.5 1.5v5.5A1.5 1.5 0 0 1 12.3 13H3.7a1.5 1.5 0 0 1-1.5-1.5v-7Z"
+        stroke="currentColor"
+        strokeWidth="1.25"
+      />
+    </svg>
+  );
+}
+
+function ArchiveIcon() {
+  return (
+    <svg className="rail-nav-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2.5" width="12" height="3" rx="1" stroke="currentColor" strokeWidth="1.25" />
+      <path
+        d="M3.2 5.5v6.8A1.2 1.2 0 0 0 4.4 13.5h7.2a1.2 1.2 0 0 0 1.2-1.2V5.5"
+        stroke="currentColor"
+        strokeWidth="1.25"
+      />
+      <path d="M6.4 8.5h3.2" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function resolveTabMeta(
+  runId: string,
+  state: WorkbenchState,
+): { title: string; ballHolder: BallHolder; workspaceId: string | null; workspaceName: string } {
+  const summary: RunSummary | undefined =
+    state.allRuns.find((item) => item.run_id === runId) ||
+    state.runs.find((item) => item.run_id === runId);
+  if (summary) {
+    return {
+      title: summary.title,
+      ballHolder: summary.ball_holder,
+      workspaceId: summary.workspace_id ?? null,
+      workspaceName: summary.workspace_name,
+    };
+  }
+  if (state.projection && state.projection.run_id === runId) {
+    const status = state.projection.status;
+    const ballHolder: BallHolder =
+      status === "completed" || status === "cancelled"
+        ? "done"
+        : status === "awaiting_human" || status === "paused" || status === "failed"
+          ? "human"
+          : "agent";
+    return {
+      title: state.projection.title,
+      ballHolder,
+      workspaceId: null,
+      workspaceName: "",
+    };
+  }
+  return {
+    title: runId,
+    ballHolder: "agent",
+    workspaceId: null,
+    workspaceName: "",
+  };
+}
 
 export function ThreadRail({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
   const collapsed = state.railCollapsed === true;
   const dark = state.theme === "dark";
+  const boardActive = state.activeSurface === "board" && !state.showArchived;
+  const archiveActive = state.activeSurface === "board" && state.showArchived;
+  const repoCount = state.workspaces.length;
+
   return (
-    <nav id="rail" className={collapsed ? "scroller collapsed" : "scroller"} aria-label="工作台线程栏">
+    <nav id="rail" className={collapsed ? "scroller collapsed" : "scroller"} aria-label="Olympus 导航栏">
       <div className="rail-head-row">
-        <div className="rail-brand">
+        <button
+          type="button"
+          className="rail-brand"
+          aria-label="返回 Oracle Board"
+          onClick={() => workbench.openBoard({ archived: false })}
+        >
           <span className="rail-mark" aria-hidden="true">
             ◈
           </span>
-          <span className="rail-wordmark">Ariadne</span>
-        </div>
+          <span className="rail-wordmark">OLYMPUS</span>
+        </button>
         <div className="rail-head-actions">
           <button
             type="button"
@@ -36,57 +119,142 @@ export function ThreadRail({ workbench, state }: { workbench: Workbench; state: 
           </button>
         </div>
       </div>
-      <button
-        type="button"
-        className="btn btn-primary rail-new-run"
-        id="btn-new-run"
-        onClick={() => void workbench.openNewRun()}
-      >
-        + 新建编排
-      </button>
-      <p className="rail-section-title">编排线程</p>
-      <div className="thread-list scroller" id="thread-list" aria-label="编排线程列表">
-        {state.runs.length ? (
-          state.runs.map((run) => {
-            const meta = statusMeta(run.status);
-            return (
-              <button
-                type="button"
-                className="thread-item"
-                key={run.run_id}
-                data-run-id={run.run_id}
-                aria-pressed={run.run_id === state.runId ? "true" : "false"}
-                onClick={() => workbench.selectRun(run.run_id)}
-              >
-                <span className="thread-item-title">{run.title}</span>
-                <span className="thread-item-meta">
-                  <Badge variant="muted">{WORKFLOW_LABELS[run.workflow_name] || run.workflow_name || "workflow"}</Badge>
-                  <Badge variant={meta.variant}>{`${meta.glyph} ${meta.label}`}</Badge>
-                </span>
-              </button>
-            );
-          })
-        ) : (
-          <p className="thread-empty">尚无编排线程</p>
-        )}
-      </div>
-      <div className="rail-foot" hidden>
-        <label className="rail-foot-label" htmlFor="run-selector">
-          运行实例
-        </label>
+
+      <div className="workspace-switcher-wrap">
         <select
-          id="run-selector"
-          className="run-select"
-          aria-label="切换运行实例"
-          value={state.runId || ""}
-          onChange={(event) => workbench.selectRun(event.target.value)}
+          id="workspace-switcher"
+          className="workspace-select"
+          aria-label="Workspace switcher"
+          value={state.selectedWorkspaceId || ""}
+          onChange={(event) => {
+            const value = event.target.value;
+            if (value === REGISTER_OPTION) {
+              void workbench.openWorkspaceManager();
+              return;
+            }
+            workbench.selectWorkspace(value || null);
+          }}
         >
-          {state.runs.map((run) => (
-            <option value={run.run_id} key={run.run_id}>
-              {`${run.title} (${run.run_id})`}
-            </option>
-          ))}
+          <option value="">
+            {`All Projects (${repoCount} ${repoCount === 1 ? "repo" : "repos"})`}
+          </option>
+          {state.workspaces.map((ws) => {
+            const total = ws.active_oracle_count + ws.pending_ruling_count;
+            return (
+              <option value={ws.workspace_id} key={ws.workspace_id}>
+                {total > 0 ? `${ws.name} (${total})` : ws.name}
+              </option>
+            );
+          })}
+          <option value={REGISTER_OPTION}>+ Register Workspace…</option>
         </select>
+      </div>
+
+      <div className="rail-nav" role="group" aria-label="Pinned navigation">
+        <button
+          type="button"
+          id="nav-oracle-board"
+          className="rail-nav-item"
+          aria-current={boardActive ? "page" : undefined}
+          onClick={() => workbench.openBoard({ archived: false })}
+        >
+          <BoardIcon />
+          <span className="rail-label">Oracle Board</span>
+          {state.pendingRulingTotal > 0 ? (
+            <span
+              className="nav-pending-badge"
+              id="nav-pending-badge"
+              aria-label={`${state.pendingRulingTotal} awaiting ruling`}
+            >
+              {state.pendingRulingTotal}
+            </span>
+          ) : null}
+        </button>
+
+        <button
+          type="button"
+          id="nav-workspaces"
+          className="rail-nav-item"
+          onClick={() => void workbench.openWorkspaceManager()}
+        >
+          <WorkspaceIcon />
+          <span className="rail-label">Workspaces</span>
+          <span className="nav-meta-count">{repoCount}</span>
+        </button>
+
+        <button
+          type="button"
+          id="nav-archive"
+          className="rail-nav-item"
+          aria-current={archiveActive ? "page" : undefined}
+          onClick={() => workbench.toggleArchive()}
+        >
+          <ArchiveIcon />
+          <span className="rail-label">Archive</span>
+        </button>
+      </div>
+
+      <hr className="rail-divider" />
+
+      <div className="rail-tabs-section">
+        <p className="rail-section-title">OPEN ARIADNE TABS</p>
+        <div
+          className="open-tabs-list scroller"
+          id="open-tabs"
+          role="list"
+          aria-label="Open Ariadne Tabs"
+        >
+          {state.openTabs.length ? (
+            state.openTabs.map((runId) => {
+              const meta = resolveTabMeta(runId, state);
+              const isCurrent = state.activeSurface === "oracle" && state.runId === runId;
+              const isCrossWorkspace =
+                Boolean(state.selectedWorkspaceId) &&
+                Boolean(meta.workspaceName) &&
+                meta.workspaceId !== state.selectedWorkspaceId;
+              return (
+                <div
+                  className="ariadne-tab"
+                  role="listitem"
+                  key={runId}
+                  data-run-id={runId}
+                  data-ball={meta.ballHolder}
+                  data-active={isCurrent ? "true" : "false"}
+                >
+                  <button
+                    type="button"
+                    className="ariadne-tab-trigger"
+                    aria-current={isCurrent ? "page" : undefined}
+                    onClick={() => workbench.openOracleTab(runId)}
+                  >
+                    <span
+                      className="tab-status-dot"
+                      data-ball={meta.ballHolder}
+                      aria-hidden="true"
+                    />
+                    <span className="ariadne-tab-text">
+                      <span className="ariadne-tab-title">{meta.title}</span>
+                      {isCrossWorkspace ? (
+                        <span className="ariadne-tab-workspace">{meta.workspaceName}</span>
+                      ) : null}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ariadne-tab-close"
+                    aria-label={`Close tab ${meta.title}`}
+                    data-close-tab={runId}
+                    onClick={() => workbench.closeOracleTab(runId)}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })
+          ) : (
+            <p className="thread-empty">Select an Oracle card to open an Ariadne cockpit tab.</p>
+          )}
+        </div>
       </div>
     </nav>
   );

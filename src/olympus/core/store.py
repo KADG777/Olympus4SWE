@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS commands (
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    root_path TEXT NOT NULL UNIQUE,
+    is_git_repo INTEGER NOT NULL,
+    default_branch TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -159,11 +169,138 @@ class RunStore:
             "provider_config_json": "provider_config_json TEXT",
             "execution_drivers_json": "execution_drivers_json TEXT",
             "workspace_root": "workspace_root TEXT",
+            "workspace_id": "workspace_id TEXT",
+            "workspace_mode": "workspace_mode TEXT NOT NULL DEFAULT 'brownfield'",
+            "task_type": "task_type TEXT NOT NULL DEFAULT 'feature'",
+            "base_ref": "base_ref TEXT",
+            "scope_paths_json": "scope_paths_json TEXT",
         }
         for column, ddl in additions.items():
             if column in existing:
                 continue
             conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+
+    @staticmethod
+    def canonical_root(root_path: Path | str) -> str:
+        """Canonical absolute workspace root used as the registry's unique key."""
+        return str(Path(root_path).expanduser().resolve())
+
+    @staticmethod
+    def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "workspace_id": row["workspace_id"],
+            "name": row["name"],
+            "root_path": row["root_path"],
+            "is_git_repo": bool(row["is_git_repo"]),
+            "default_branch": row["default_branch"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_workspaces(self) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces ORDER BY rowid ASC
+                """
+            ).fetchall()
+            return [self._workspace_from_row(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE workspace_id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()
+            return self._workspace_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def get_workspace_by_root(self, root_path: Path | str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE root_path = ?
+                """,
+                (self.canonical_root(root_path),),
+            ).fetchone()
+            return self._workspace_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def register_workspace(
+        self,
+        *,
+        name: str,
+        root_path: Path | str,
+        is_git_repo: bool,
+        default_branch: str | None = None,
+        exist_ok: bool = True,
+    ) -> dict[str, Any]:
+        """Register a workspace atomically; raises ValueError on duplicate when exist_ok=False."""
+        canonical = self.canonical_root(root_path)
+        with self._tx() as conn:
+            existing = conn.execute(
+                """
+                SELECT workspace_id, name, root_path, is_git_repo, default_branch,
+                       created_at, updated_at
+                FROM workspaces WHERE root_path = ?
+                """,
+                (canonical,),
+            ).fetchone()
+            if existing is not None:
+                if not exist_ok:
+                    raise ValueError(f"Workspace already registered: {canonical}")
+                return self._workspace_from_row(existing)
+            workspace_id = new_id("ws")
+            now = utc_now().isoformat()
+            conn.execute(
+                """
+                INSERT INTO workspaces (
+                    workspace_id, name, root_path, is_git_repo, default_branch,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    name,
+                    canonical,
+                    int(is_git_repo),
+                    default_branch,
+                    now,
+                    now,
+                ),
+            )
+            return {
+                "workspace_id": workspace_id,
+                "name": name,
+                "root_path": canonical,
+                "is_git_repo": bool(is_git_repo),
+                "default_branch": default_branch,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    def delete_workspace(self, workspace_id: str) -> bool:
+        """Remove a workspace registry row only; disk files and runs stay untouched."""
+        with self._tx() as conn:
+            cursor = conn.execute(
+                "DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            )
+            return cursor.rowcount > 0
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -407,6 +544,11 @@ class RunStore:
         provider_config: dict[str, Any] | None = None,
         execution_drivers: dict[str, Any] | None = None,
         workspace_root: Path | str | None = None,
+        workspace_id: str | None = None,
+        workspace_mode: str = "brownfield",
+        task_type: str = "feature",
+        base_ref: str | None = None,
+        scope_paths: Sequence[str] | None = None,
     ) -> str:
         rid = run_id or new_id("run")
         policy = budget_policy or BudgetPolicy()
@@ -418,6 +560,8 @@ class RunStore:
             else None
         )
         ws_root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
+        cleaned_scope = [str(item) for item in (scope_paths or [])]
+        scope_json = json.dumps(cleaned_scope, ensure_ascii=False) if cleaned_scope else None
         with self._tx() as conn:
             conn.execute(
                 """
@@ -426,8 +570,9 @@ class RunStore:
                     budget_policy_json, budget_ledger_json,
                     spec_json, plan_json, design_json,
                     workflow_name, provider_config_json, execution_drivers_json, workspace_root,
+                    workspace_id, workspace_mode, task_type, base_ref, scope_paths_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rid,
@@ -441,6 +586,11 @@ class RunStore:
                     provider_json,
                     json.dumps(execution_drivers) if execution_drivers is not None else None,
                     ws_root,
+                    workspace_id,
+                    workspace_mode,
+                    task_type,
+                    base_ref,
+                    scope_json,
                     now,
                     now,
                 ),
@@ -456,6 +606,11 @@ class RunStore:
                     "mode": mode.value,
                     "workflow_name": workflow_name,
                     "workspace_root": ws_root,
+                    "workspace_id": workspace_id,
+                    "workspace_mode": workspace_mode,
+                    "task_type": task_type,
+                    "base_ref": base_ref,
+                    "scope_paths": cleaned_scope,
                 },
                 state_revision=1,
             )
@@ -551,6 +706,13 @@ class RunStore:
                 json.loads(row["execution_drivers_json"]) if row["execution_drivers_json"] else None
             ),
             "workspace_root": row["workspace_root"],
+            "workspace_id": row["workspace_id"],
+            "workspace_mode": row["workspace_mode"] or "brownfield",
+            "task_type": row["task_type"] or "feature",
+            "base_ref": row["base_ref"],
+            "scope_paths": (
+                json.loads(row["scope_paths_json"]) if row["scope_paths_json"] else []
+            ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1187,18 +1349,122 @@ class RunStore:
         ).fetchone()
         return bool(row is not None and row["decision"] in _APPROVED_DECISIONS)
 
-    def list_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        *,
+        limit: int | None = 50,
+        workspace_id: str | None = None,
+        workspace_mode: str | None = None,
+        task_type: str | None = None,
+        include_archived: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List runs newest-first with optional Scope/Type/archive filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            clauses.append(
+                "(r.workspace_id = ? OR (r.workspace_id IS NULL AND r.workspace_root = "
+                "(SELECT root_path FROM workspaces WHERE workspace_id = ?)))"
+            )
+            params.extend((workspace_id, workspace_id))
+        if workspace_mode is not None:
+            clauses.append("r.workspace_mode = ?")
+            params.append(workspace_mode)
+        if task_type is not None:
+            clauses.append("r.task_type = ?")
+            params.append(task_type)
+        if not include_archived:
+            clauses.append("r.status != ?")
+            params.append(RunStatus.CANCELLED.value)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(limit)
         conn = self._connect()
         try:
             rows = conn.execute(
-                """
-                SELECT run_id, title, mode, status, state_revision, workflow_name,
-                       created_at, updated_at
-                FROM runs ORDER BY rowid DESC LIMIT ?
+                f"""
+                SELECT r.run_id, r.title, r.mode, r.status, r.state_revision, r.workflow_name,
+                       r.created_at, r.updated_at, r.workspace_id, r.workspace_mode,
+                       r.task_type, r.workspace_root,
+                       COALESCE(w.name, wr.name) AS workspace_name
+                FROM runs AS r
+                LEFT JOIN workspaces AS w ON w.workspace_id = r.workspace_id
+                LEFT JOIN workspaces AS wr
+                  ON r.workspace_id IS NULL AND wr.root_path = r.workspace_root
+                {where}ORDER BY r.rowid DESC {limit_sql}
                 """,
-                (limit,),
+                tuple(params),
             ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def active_worktree_paths(self) -> list[str]:
+        """Return distinct non-empty task worktree paths on non-archived runs."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT plan_json FROM runs WHERE status != ? AND plan_json IS NOT NULL",
+                (RunStatus.CANCELLED.value,),
+            ).fetchall()
+        finally:
+            conn.close()
+        paths: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                data = json.loads(row["plan_json"])
+            except json.JSONDecodeError:
+                continue
+            for task in data.get("tasks") or ():
+                raw = task.get("worktree_path")
+                if isinstance(raw, str) and raw.strip() and raw not in seen:
+                    seen.add(raw)
+                    paths.append(raw)
+        return paths
+
+    def board_fingerprint(self, *, workspace_id: str | None = None) -> tuple[Any, ...]:
+        """Lightweight SQLite change token for board SSE polling without full replay."""
+        conn = self._connect()
+        try:
+            run_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(MAX(rowid), 0) AS max_rowid,
+                       COALESCE(SUM(state_revision), 0) AS rev_sum,
+                       COALESCE(MAX(updated_at), '') AS max_updated
+                FROM runs
+                """
+            ).fetchone()
+            ev_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(MAX(rowid), 0) AS max_rowid FROM events"
+            ).fetchone()
+            ap_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(MAX(rowid), 0) AS max_rowid FROM approvals"
+            ).fetchone()
+            ws_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(MAX(rowid), 0) AS max_rowid,
+                       COALESCE(MAX(updated_at), '') AS max_updated
+                FROM workspaces
+                """
+            ).fetchone()
+            return (
+                workspace_id,
+                int(run_row["cnt"]),
+                int(run_row["max_rowid"]),
+                int(run_row["rev_sum"]),
+                str(run_row["max_updated"]),
+                int(ev_row["cnt"]),
+                int(ev_row["max_rowid"]),
+                int(ap_row["cnt"]),
+                int(ap_row["max_rowid"]),
+                int(ws_row["cnt"]),
+                int(ws_row["max_rowid"]),
+                str(ws_row["max_updated"]),
+            )
         finally:
             conn.close()
 

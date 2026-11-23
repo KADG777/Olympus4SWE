@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 
-import type { AmbiguityItem } from "../api/types";
+import type { AmbiguityItem, RunProjection } from "../api/types";
 import { localizeTriageReason, MATURITY_LABELS, pendingAmbiguities } from "../lib/labels";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { Badge } from "./ui";
@@ -88,13 +88,28 @@ function ClarifyItem({ amb }: { amb: AmbiguityItem }) {
   );
 }
 
-export function ClarifyPanel({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
+export function ClarifyPanel({
+  workbench,
+  state,
+  projection: projectionOverride,
+  generation: generationOverride,
+  onSubmit,
+  submitting = false,
+}: {
+  workbench?: Workbench;
+  state?: WorkbenchState;
+  projection?: RunProjection | null;
+  generation?: number;
+  onSubmit?: (answers: Record<string, string>) => Promise<void> | void;
+  submitting?: boolean;
+}) {
   const items = useRef<HTMLDivElement>(null);
-  const projection = state.projection;
+  const projection = projectionOverride !== undefined ? projectionOverride : state?.projection ?? null;
+  const generation = generationOverride ?? state?.clarifyGeneration ?? 0;
   const pending = projection ? pendingAmbiguities(projection) : [];
   // Answers in progress survive live updates until the question set itself changes.
   const signature = projection
-    ? `${projection.run_id}:${state.clarifyGeneration}:${pending.map((amb) => `${amb.id}:${amb.question || ""}`).join("|")}`
+    ? `${projection.run_id}:${generation}:${pending.map((amb) => `${amb.id}:${amb.question || ""}`).join("|")}`
     : "";
   const submit = () => {
     const answers: Record<string, string> = {};
@@ -102,7 +117,11 @@ export function ClarifyPanel({ workbench, state }: { workbench: Workbench; state
       const value = field.value.trim();
       if (value && field.dataset.ambInput) answers[field.dataset.ambInput] = value;
     });
-    void workbench.submitClarify(answers);
+    if (onSubmit) {
+      void onSubmit(answers);
+    } else if (workbench) {
+      void workbench.submitClarify(answers);
+    }
   };
   return (
     <section className="clarify-panel" id="clarify-panel" hidden={!pending.length} aria-labelledby="clarify-title">
@@ -118,8 +137,14 @@ export function ClarifyPanel({ workbench, state }: { workbench: Workbench; state
         ))}
       </div>
       <div className="clarify-actions">
-        <button type="button" className="btn btn-primary" id="btn-clarify-submit" onClick={submit}>
-          提交澄清并推进
+        <button
+          type="button"
+          className="btn btn-primary"
+          id="btn-clarify-submit"
+          disabled={submitting}
+          onClick={submit}
+        >
+          {submitting ? "提交中…" : "提交澄清并推进"}
         </button>
       </div>
     </section>

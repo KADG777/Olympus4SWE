@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -23,9 +24,14 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.dag import compute_dispatchable_tasks
-from olympus.core.store import RunStore
+from olympus.core.store import NotFoundError, RunStore
 from olympus.graph import load_workflow
-from olympus.graph.progress import build_workflow_view, is_blueprint_completed
+from olympus.graph.progress import (
+    PANTHEON_SEATS,
+    build_workflow_view,
+    classify_run_board,
+    is_blueprint_completed,
+)
 from olympus.harness.activity import tool_output_status
 from olympus.harness.receipt import build_turn_receipt
 from olympus.web.approval_review import (
@@ -1408,6 +1414,15 @@ def build_run_projection(
             "detail": err_msg,
             "actions": ["retry_workflow"],
         }
+    elif snap["status"] == RunStatus.PAUSED:
+        hitl_banner = {
+            "kind": "run_paused",
+            "tone": "info",
+            "task_id": None,
+            "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
+            "detail": "点击右上角「恢复运行」继续调度就绪任务",
+            "actions": ["resume"],
+        }
     elif spec is not None and not spec_approved:
         blockers = spec.unresolved_blockers()
         hitl_banner = {
@@ -1446,15 +1461,6 @@ def build_run_projection(
                 f"绑定需求指纹：{(plan.spec_hash or plan.design_hash or '')[:16]}…"
             ),
             "actions": ["approve_plan"],
-        }
-    elif snap["status"] == RunStatus.PAUSED:
-        hitl_banner = {
-            "kind": "run_paused",
-            "tone": "info",
-            "task_id": None,
-            "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
-            "detail": "点击右上角「恢复运行」继续调度就绪任务",
-            "actions": ["resume"],
         }
     elif blueprint_completed:
         hitl_banner = {
@@ -1607,6 +1613,185 @@ def build_run_projection(
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }
+
+def _resolve_workspace_meta(
+    store: RunStore,
+    snap: Mapping[str, Any],
+    workspaces: Mapping[str, Mapping[str, Any]] | None,
+    workspaces_by_root: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[str | None, str]:
+    workspace_id = snap.get("workspace_id")
+    if isinstance(workspace_id, str) and workspace_id:
+        workspace = workspaces.get(workspace_id) if workspaces is not None else None
+        if workspace is None:
+            workspace = store.get_workspace(workspace_id)
+        if workspace is not None:
+            return workspace_id, str(workspace["name"])
+    root = snap.get("workspace_root")
+    if isinstance(root, str) and root.strip():
+        canonical = store.canonical_root(root)
+        matched = (
+            workspaces_by_root.get(canonical)
+            if workspaces_by_root is not None
+            else store.get_workspace_by_root(canonical)
+        )
+        if matched is not None:
+            return str(matched["workspace_id"]), str(matched["name"])
+        return None, Path(root).name or "Workspace"
+    return None, "Unassigned"
+
+
+def build_run_summary(
+    store: RunStore,
+    run_id: str,
+    *,
+    workspaces: Mapping[str, Mapping[str, Any]] | None = None,
+    workspaces_by_root: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Derive one Oracle Board card from the canonical deterministic classifier."""
+    snap = store.get_run(run_id, include_approval_baselines=True)
+    events = store.list_events(run_id, after_seq=0)
+    approved = snap["artifact_approved"]
+    workflow_view = build_workflow_view(
+        str(snap.get("workflow_name") or "product_blueprint"),
+        events,
+        snap["status"],
+        spec_approved=approved[ApprovalTarget.GOAL_SPEC],
+        design_approved=approved[ApprovalTarget.DESIGN_SPEC],
+        plan_approved=approved[ApprovalTarget.TASK_PLAN],
+    )
+    state = classify_run_board(snap, events, workflow_view=workflow_view)
+    resolved_ws_id, resolved_ws_name = _resolve_workspace_meta(
+        store, snap, workspaces, workspaces_by_root
+    )
+    return {
+        "run_id": str(snap["run_id"]),
+        "title": str(snap["title"]),
+        "mode": snap["mode"].value,
+        "status": snap["status"].value,
+        "state_revision": int(snap["state_revision"]),
+        "workflow_name": str(snap.get("workflow_name") or "product_blueprint"),
+        "created_at": str(snap["created_at"]),
+        "updated_at": str(snap["updated_at"]),
+        "workspace_id": resolved_ws_id,
+        "workspace_name": resolved_ws_name,
+        "workspace_mode": str(snap.get("workspace_mode") or "brownfield"),
+        "task_type": str(snap.get("task_type") or "feature"),
+        "ball_holder": state.ball_holder,
+        "active_god": state.active_god,
+        "pending_action": state.pending_action,
+        "worktree_branch": state.worktree_branch,
+        "status_badge": state.status_badge,
+        "is_archived": state.is_archived,
+    }
+
+
+def aggregate_pantheon(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    seats: list[dict[str, Any]] = []
+    for god, role_label in PANTHEON_SEATS:
+        held = [
+            run
+            for run in runs
+            if run["active_god"] == god and run["ball_holder"] in ("agent", "human")
+        ]
+        active_count = sum(1 for run in held if run["ball_holder"] == "agent")
+        waiting_count = sum(1 for run in held if run["ball_holder"] == "human")
+        seats.append(
+            {
+                "god": god,
+                "role_label": role_label,
+                "state": (
+                    "waiting_on_human"
+                    if waiting_count > 0
+                    else ("working" if active_count > 0 else "idle")
+                ),
+                "active_count": active_count,
+                "waiting_count": waiting_count,
+                "oracle_ids": [str(run["run_id"]) for run in held],
+            }
+        )
+    return seats
+
+
+def build_board_payload(
+    store: RunStore,
+    *,
+    limit: int | None = 50,
+    workspace_id: str | None = None,
+    workspace_mode: str | None = None,
+    task_type: str | None = None,
+    ball_holder: str | None = None,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    workspace_list = store.list_workspaces()
+    workspaces = {str(item["workspace_id"]): item for item in workspace_list}
+    workspaces_by_root = {str(item["root_path"]): item for item in workspace_list}
+    rows = store.list_runs(
+        limit=None,
+        workspace_id=workspace_id,
+        workspace_mode=workspace_mode,
+        task_type=task_type,
+        include_archived=include_archived,
+    )
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            summaries.append(
+                build_run_summary(
+                    store,
+                    str(row["run_id"]),
+                    workspaces=workspaces,
+                    workspaces_by_root=workspaces_by_root,
+                )
+            )
+        except NotFoundError:
+            continue
+    pending_ruling_total = sum(
+        1 for summary in summaries if summary["ball_holder"] == "human"
+    )
+    runs = [
+        summary
+        for summary in summaries
+        if ball_holder is None or summary["ball_holder"] == ball_holder
+    ]
+    if limit is not None:
+        cap = max(limit, 0)
+        if ball_holder is None and cap > 0:
+            human_runs = [item for item in runs if item["ball_holder"] == "human"]
+            other_runs = [item for item in runs if item["ball_holder"] != "human"]
+            remaining = max(cap - len(human_runs), 0)
+            runs = [*human_runs, *other_runs[:remaining]]
+        else:
+            runs = runs[:cap]
+    return {
+        "ok": True,
+        "runs": runs,
+        "default_run_id": runs[0]["run_id"] if runs else None,
+        "pantheon": aggregate_pantheon(summaries),
+        "pending_ruling_total": pending_ruling_total,
+        "active_workspace_id": workspace_id,
+    }
+
+
+def build_workspace_counts(store: RunStore) -> dict[str, dict[str, int]]:
+    """Count active/waiting Oracles per registered workspace via the same classifier."""
+    counts = {
+        str(workspace["workspace_id"]): {
+            "active_oracle_count": 0,
+            "pending_ruling_count": 0,
+        }
+        for workspace in store.list_workspaces()
+    }
+    for run in build_board_payload(store, limit=None, include_archived=False)["runs"]:
+        workspace_id = run["workspace_id"]
+        if not isinstance(workspace_id, str) or workspace_id not in counts:
+            continue
+        if run["ball_holder"] == "agent":
+            counts[workspace_id]["active_oracle_count"] += 1
+        elif run["ball_holder"] == "human":
+            counts[workspace_id]["pending_ruling_count"] += 1
+    return counts
+
 
 # Backward-compatible re-export: demo seeding historically lived in this module.
 from olympus.web.demos import seed_demo_runs  # noqa: E402, F401 - lazy bottom re-export avoids circular import with demos.py

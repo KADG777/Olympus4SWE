@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/board/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Stream Board */
+        get: operations["stream_board_api_board_stream_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/demos": {
         parameters: {
             query?: never;
@@ -187,6 +204,41 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Workspaces */
+        get: operations["list_workspaces_api_workspaces_get"];
+        put?: never;
+        /** Create Workspace */
+        post: operations["create_workspace_api_workspaces_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{workspace_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Workspace */
+        delete: operations["delete_workspace_api_workspaces__workspace_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -531,12 +583,19 @@ export interface components {
              * @default false
              */
             auto_approve: boolean;
+            /** Base Ref */
+            base_ref?: string | null;
             /** Constraints */
             constraints?: string[] | null;
             /** Demo Id */
             demo_id?: string | null;
             /** Goal */
             goal?: string | null;
+            /**
+             * Init Git
+             * @default false
+             */
+            init_git: boolean;
             /** Monitor Model */
             monitor_model?: string | null;
             provider_config?: components["schemas"]["ProviderConfig"];
@@ -544,17 +603,25 @@ export interface components {
             raw_input?: string | null;
             /** Reviewer Driver */
             reviewer_driver?: string | null;
+            /** Scope Paths */
+            scope_paths?: string[] | null;
             /**
              * Sync
              * @default false
              */
             sync: boolean;
+            /** Task Type */
+            task_type?: ("feature" | "fix" | "refactor" | "blueprint") | null;
             /** Title */
             title?: string | null;
             /** Worker Driver */
             worker_driver?: string | null;
             /** Workflow Name */
             workflow_name?: string | null;
+            /** Workspace Id */
+            workspace_id?: string | null;
+            /** Workspace Mode */
+            workspace_mode?: ("brownfield" | "greenfield" | "spec_only") | null;
             /** Workspace Root */
             workspace_root?: string | null;
         };
@@ -585,6 +652,23 @@ export interface components {
             topology?: string | null;
             /** Workflow */
             workflow?: string | null;
+        };
+        /** CreateWorkspaceRequest */
+        CreateWorkspaceRequest: {
+            /**
+             * Create If Missing
+             * @default false
+             */
+            create_if_missing: boolean;
+            /**
+             * Init Git
+             * @default false
+             */
+            init_git: boolean;
+            /** Name */
+            name?: string | null;
+            /** Root Path */
+            root_path: string;
         };
         /** CritiqueNote */
         CritiqueNote: {
@@ -720,6 +804,22 @@ export interface components {
             notes: string;
             /** Owner Module Id */
             owner_module_id: string;
+        };
+        /** DeleteWorkspaceResponse */
+        DeleteWorkspaceResponse: {
+            /**
+             * Deleted
+             * @default true
+             */
+            deleted: boolean;
+            /**
+             * Ok
+             * @default true
+             * @constant
+             */
+            ok: true;
+            /** Workspace Id */
+            workspace_id: string;
         };
         /**
          * DeliverableKind
@@ -1125,6 +1225,27 @@ export interface components {
             watchdog_summary?: string | null;
             /** Watchdog Verdict */
             watchdog_verdict?: string | null;
+        };
+        /** PantheonSeatSummary */
+        PantheonSeatSummary: {
+            /** Active Count */
+            active_count: number;
+            /**
+             * God
+             * @enum {string}
+             */
+            god: "prometheus" | "athena" | "hephaestus" | "momus" | "argus";
+            /** Oracle Ids */
+            oracle_ids: string[];
+            /** Role Label */
+            role_label: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "idle" | "working" | "waiting_on_human";
+            /** Waiting Count */
+            waiting_count: number;
         };
         /** PauseCommand */
         PauseCommand: {
@@ -1553,6 +1674,8 @@ export interface components {
         };
         /** RunListResponse */
         RunListResponse: {
+            /** Active Workspace Id */
+            active_workspace_id?: string | null;
             /** Default Run Id */
             default_run_id?: string | null;
             /**
@@ -1561,6 +1684,10 @@ export interface components {
              * @constant
              */
             ok: true;
+            /** Pantheon */
+            pantheon: components["schemas"]["PantheonSeatSummary"][];
+            /** Pending Ruling Total */
+            pending_ruling_total: number;
             /** Runs */
             runs: components["schemas"]["RunSummary"][];
         };
@@ -1657,22 +1784,54 @@ export interface components {
         };
         /** RunSummary */
         RunSummary: {
+            /**
+             * Active God
+             * @enum {string}
+             */
+            active_god: "prometheus" | "athena" | "hephaestus" | "momus" | "argus";
+            /**
+             * Ball Holder
+             * @enum {string}
+             */
+            ball_holder: "human" | "agent" | "done";
             /** Created At */
             created_at: string;
+            /** Is Archived */
+            is_archived: boolean;
             /** Mode */
             mode: string;
+            /** Pending Action */
+            pending_action?: ("clarify" | "approve_spec" | "approve_design" | "approve_plan" | "resolve_blocker" | "review_delivery") | null;
             /** Run Id */
             run_id: string;
             /** State Revision */
             state_revision: number;
             /** Status */
             status: string;
+            /** Status Badge */
+            status_badge: string;
+            /**
+             * Task Type
+             * @enum {string}
+             */
+            task_type: "feature" | "fix" | "refactor" | "blueprint";
             /** Title */
             title: string;
             /** Updated At */
             updated_at: string;
             /** Workflow Name */
             workflow_name: string;
+            /** Workspace Id */
+            workspace_id?: string | null;
+            /**
+             * Workspace Mode
+             * @enum {string}
+             */
+            workspace_mode: "brownfield" | "greenfield" | "spec_only";
+            /** Workspace Name */
+            workspace_name: string;
+            /** Worktree Branch */
+            worktree_branch?: string | null;
         };
         /**
          * SchemaField
@@ -1696,6 +1855,8 @@ export interface components {
         };
         /** SeedDemoResponse */
         SeedDemoResponse: {
+            /** Active Workspace Id */
+            active_workspace_id?: string | null;
             /** Default Run Id */
             default_run_id?: string | null;
             /**
@@ -1704,6 +1865,10 @@ export interface components {
              * @constant
              */
             ok: true;
+            /** Pantheon */
+            pantheon: components["schemas"]["PantheonSeatSummary"][];
+            /** Pending Ruling Total */
+            pending_ruling_total: number;
             /** Runs */
             runs: components["schemas"]["RunSummary"][];
             /** Seeded */
@@ -2121,6 +2286,10 @@ export interface components {
         };
         /** WorkflowsResponse */
         WorkflowsResponse: {
+            /** Default Workflows */
+            default_workflows?: {
+                [key: string]: string;
+            };
             /**
              * Ok
              * @default true
@@ -2129,6 +2298,54 @@ export interface components {
             ok: true;
             /** Workflows */
             workflows: components["schemas"]["WorkflowSummary"][];
+        };
+        /** WorkspaceListResponse */
+        WorkspaceListResponse: {
+            /**
+             * Ok
+             * @default true
+             * @constant
+             */
+            ok: true;
+            /** Workspaces */
+            workspaces: components["schemas"]["WorkspaceSummary"][];
+        };
+        /** WorkspaceResponse */
+        WorkspaceResponse: {
+            /**
+             * Ok
+             * @default true
+             * @constant
+             */
+            ok: true;
+            workspace: components["schemas"]["WorkspaceSummary"];
+        };
+        /** WorkspaceSummary */
+        WorkspaceSummary: {
+            /**
+             * Active Oracle Count
+             * @default 0
+             */
+            active_oracle_count: number;
+            /** Created At */
+            created_at: string;
+            /** Default Branch */
+            default_branch?: string | null;
+            /** Is Git Repo */
+            is_git_repo: boolean;
+            /** Name */
+            name: string;
+            /**
+             * Pending Ruling Count
+             * @default 0
+             */
+            pending_ruling_count: number;
+            /** Root Path */
+            root_path: string;
+            /** Updated At */
+            updated_at: string;
+            /** Workspace Id */
+            workspace_id: string;
         };
     };
     responses: never;
@@ -2139,6 +2356,38 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    stream_board_api_board_stream_get: {
+        parameters: {
+            query?: {
+                workspace_id?: string | null;
+                once?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-Sent Events board stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     list_demos_api_demos_get: {
         parameters: {
             query?: never;
@@ -2201,6 +2450,11 @@ export interface operations {
         parameters: {
             query?: {
                 limit?: number;
+                workspace_id?: string | null;
+                workspace_mode?: ("brownfield" | "greenfield" | "spec_only") | null;
+                task_type?: ("feature" | "fix" | "refactor" | "blueprint") | null;
+                ball_holder?: ("human" | "agent" | "done") | null;
+                include_archived?: boolean;
             };
             header?: never;
             path?: never;
@@ -2608,6 +2862,108 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    list_workspaces_api_workspaces_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    create_workspace_api_workspaces_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWorkspaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    delete_workspace_api_workspaces__workspace_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteWorkspaceResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
