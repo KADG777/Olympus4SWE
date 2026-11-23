@@ -2170,7 +2170,7 @@ def test_normalize_clone_url_accepts_supported_remote_forms() -> None:
         "C:\\repos\\demo",
         "https://github.com/owner",
         "https://github.com/owner/../repo",
-        "git@github.com:owner",
+        "git@github.com:",
         "owner",
         "two words",
     ],
@@ -3514,3 +3514,116 @@ def test_review_hardening_scope_guards_paused_parity_and_legacy_workspace_filter
             )
     finally:
         sup.shutdown()
+
+
+def test_workspace_picker_and_clone_review_hardening(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from olympus.web.server import normalize_clone_url
+
+    assert normalize_clone_url("ssh://git@example.invalid:2222/repo.git") == (
+        "ssh://git@example.invalid:2222/repo.git",
+        "repo",
+    )
+    assert normalize_clone_url("git@example.invalid:repo.git") == (
+        "git@example.invalid:repo.git",
+        "repo",
+    )
+    for bad_scheme in ("http://example.invalid/o/r.git", "git://example.invalid/o/r.git"):
+        with pytest.raises(ValueError, match="Unsupported clone URL scheme"):
+            normalize_clone_url(bad_scheme)
+
+    root = tmp_path / "host"
+    root.mkdir()
+    bogus = root / "plain-dot-git"
+    bogus.mkdir()
+    (bogus / ".git").write_text("not a gitdir pointer\n", encoding="utf-8")
+
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    symlink_dest = root / "to-sibling"
+    symlink_dest.symlink_to(sibling)
+
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(bare), str(seed)], check=True, capture_output=True)
+    for args in (
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(args, cwd=seed, check=True, capture_output=True)
+    (seed / "README.md").write_text("hi\n", encoding="utf-8")
+    for args in (
+        ["git", "add", "README.md"],
+        ["git", "commit", "-m", "init"],
+        ["git", "push", "origin", "HEAD"],
+    ):
+        subprocess.run(args, cwd=seed, check=True, capture_output=True)
+
+    store = RunStore(tmp_path / "runs.db")
+    app = AriadneApp(store=store, workspace_root=root)
+
+    def _local_clone(_remote_url: str, destination: Path) -> None:
+        proc = subprocess.run(
+            ["git", "clone", str(bare), str(destination)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise ValueError(f"git clone failed: {proc.stderr.strip()}")
+
+    app._run_git_clone = _local_clone  # type: ignore[method-assign] -- local bare-repo seam
+    try:
+        with TestClient(create_fastapi_app(app)) as client:
+            assert (
+                client.get("/api/filesystem/browse", params={"wrong": "1"}).status_code == 400
+            )
+            entries = {
+                e["name"]: e
+                for e in client.get(
+                    "/api/filesystem/browse", params={"partial_path": f"{root}/"}
+                ).json()["entries"]
+            }
+            assert entries["plain-dot-git"]["is_git_repo"] is False
+
+            assert (
+                client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "owner/repo",
+                        "parent_dir": str(root),
+                        "folder_name": "to-sibling",
+                    },
+                ).status_code
+                == 400
+            )
+            assert (
+                client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "owner/repo",
+                        "parent_dir": "~olympus_missing_109_user",
+                    },
+                ).status_code
+                == 400
+            )
+
+            def _attempt(_idx: int) -> int:
+                return client.post(
+                    "/api/workspaces/clone",
+                    json={
+                        "remote_url": "https://example.invalid/org/raced.git",
+                        "parent_dir": str(root),
+                        "folder_name": "raced",
+                    },
+                ).status_code
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                codes = sorted(pool.map(_attempt, range(2)))
+            assert codes == [200, 400]
+            assert (root / "raced" / "README.md").is_file()
+            assert store.get_workspace_by_root(root / "raced") is not None
+    finally:
+        app.supervisor.shutdown()

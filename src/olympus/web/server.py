@@ -49,6 +49,7 @@ from olympus.web.schemas import (
     DemosResponse,
     ErrorResponse,
     EventsResponse,
+    FilesystemBrowseQuery,
     FilesystemBrowseResponse,
     HealthResponse,
     ProvidersResponse,
@@ -139,7 +140,7 @@ _MAX_BROWSE_PATH_LENGTH = 512
 _MAX_BROWSE_ENTRIES = 200
 _MAX_CLONE_URL_LENGTH = 512
 _MAX_FOLDER_NAME_LENGTH = 120
-_CLONE_URL_SCHEMES = frozenset({"https", "http", "ssh", "git"})
+_CLONE_URL_SCHEMES = frozenset({"https", "ssh"})
 _LOCAL_PATH_PREFIXES = ("/", "~", "./", "../", ".\\", "..\\", "\\\\")
 _WINDOWS_RESERVED_NAMES = frozenset(
     {
@@ -156,15 +157,24 @@ _SHORTHAND_GIT_URL = re.compile(r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 
 
+def _expand_user_path(raw: str) -> Path:
+    try:
+        return Path(raw).expanduser()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Cannot resolve path '{raw}': {exc}") from exc
+
+
 def _branch_name_from_git_head(head_state: str | None) -> str | None:
     if head_state is None or not head_state.startswith("ref: refs/heads/"):
         return None
     return head_state.removeprefix("ref: refs/heads/").strip() or None
 
 
-def _clone_repo_name(path: str) -> str:
+def _clone_repo_name(path: str, *, min_segments: int = 2) -> str:
     segments = [segment for segment in path.strip("/").split("/") if segment]
-    if len(segments) < 2:
+    if len(segments) < min_segments:
+        if min_segments == 1:
+            raise ValueError("remote_url is missing a repository name")
         raise ValueError("remote_url must include a repository owner and name")
     if any(segment in {".", ".."} for segment in segments):
         raise ValueError("remote_url must not contain path traversal segments")
@@ -197,11 +207,11 @@ def normalize_clone_url(raw: str) -> tuple[str, str]:
             raise ValueError(f"Unsupported clone URL scheme: {parts.scheme or 'unknown'}")
         if not parts.hostname:
             raise ValueError("remote_url is missing a host")
-        repo_name = _clone_repo_name(parts.path)
+        repo_name = _clone_repo_name(parts.path, min_segments=1 if scheme == "ssh" else 2)
         return urlunsplit((scheme, parts.netloc, parts.path, parts.query, "")), repo_name
     scp = _SCP_GIT_URL.match(value)
     if scp is not None:
-        return value.rstrip("/"), _clone_repo_name(scp.group("path"))
+        return value.rstrip("/"), _clone_repo_name(scp.group("path"), min_segments=1)
     shorthand = _SHORTHAND_GIT_URL.match(value)
     if shorthand is not None:
         repo = shorthand.group("repo")
@@ -287,8 +297,13 @@ class AriadneApp:
         )
         self._retry_guard = threading.Lock()
         self._retry_locks: dict[str, threading.Lock] = {}
+        self._clone_locks: dict[str, threading.Lock] = {}
         self.default_workspace_id: str | None = None
         self.ensure_default_workspace()
+
+    def _clone_lock_for(self, key: str) -> threading.Lock:
+        with self._retry_guard:
+            return self._clone_locks.setdefault(key, threading.Lock())
 
     def ensure_default_workspace(self) -> dict[str, Any] | None:
         """Idempotently register the server's default ``workspace_root`` on startup."""
@@ -316,7 +331,7 @@ class AriadneApp:
 
     def create_workspace(self, payload: CreateWorkspaceRequest) -> dict[str, Any]:
         """Register a local repository; never mutates an existing workspace tree."""
-        root = Path(payload.root_path).expanduser().resolve()
+        root = _expand_user_path(payload.root_path).resolve()
         if self.store.get_workspace_by_root(root) is not None:
             raise ValueError(f"Workspace already registered: {root}")
         if not root.exists():
@@ -348,45 +363,50 @@ class AriadneApp:
         """Clone a validated Git remote into an empty directory and register it."""
         remote_url, inferred_name = normalize_clone_url(payload.remote_url)
         folder_name = _validate_clone_folder_name(payload.folder_name or inferred_name)
-        parent = Path(payload.parent_dir).expanduser()
+        parent = _expand_user_path(payload.parent_dir)
         if not parent.is_dir():
             raise ValueError(f"Clone parent directory does not exist: {payload.parent_dir}")
         parent_dir = parent.resolve()
-        destination = (parent_dir / folder_name).resolve()
+        dest_entry = parent_dir / folder_name
+        if dest_entry.is_symlink():
+            raise ValueError(f"Clone destination must not be a symlink: {dest_entry}")
+        destination = dest_entry.resolve()
         if destination.parent != parent_dir:
             raise ValueError("Clone destination escapes the selected parent directory")
-        existed = destination.exists()
-        if existed:
-            if not destination.is_dir():
-                raise ValueError(f"Clone destination is not a directory: {destination}")
+        with self._clone_lock_for(str(destination)):
+            if dest_entry.is_symlink():
+                raise ValueError(f"Clone destination must not be a symlink: {dest_entry}")
+            existed = destination.exists()
+            if existed:
+                if not destination.is_dir():
+                    raise ValueError(f"Clone destination is not a directory: {destination}")
+                try:
+                    populated = next(destination.iterdir(), None) is not None
+                except OSError as exc:
+                    raise ValueError(
+                        f"Cannot inspect clone destination {destination}: {exc}"
+                    ) from exc
+                if populated:
+                    raise ValueError(f"Clone destination is not empty: {destination}")
+            if self.store.get_workspace_by_root(destination) is not None:
+                raise ValueError(f"Workspace already registered: {destination}")
             try:
-                populated = next(destination.iterdir(), None) is not None
-            except OSError as exc:
-                raise ValueError(
-                    f"Cannot inspect clone destination {destination}: {exc}"
-                ) from exc
-            if populated:
-                raise ValueError(f"Clone destination is not empty: {destination}")
-        if self.store.get_workspace_by_root(destination) is not None:
-            raise ValueError(f"Workspace already registered: {destination}")
-        try:
-            self._run_git_clone(remote_url, destination)
-        except ValueError:
-            if not existed:
-                shutil.rmtree(destination, ignore_errors=True)
-            raise
-        is_git_repo, default_branch = _detect_git_repo(destination)
-        workspace = self.store.register_workspace(
-            name=(payload.name or "").strip() or folder_name,
-            root_path=destination,
-            is_git_repo=is_git_repo,
-            default_branch=default_branch,
-            exist_ok=False,
-        )
-        return {"ok": True, "workspace": workspace}
+                self._run_git_clone(remote_url, destination)
+            except ValueError:
+                if not existed and self.store.get_workspace_by_root(destination) is None:
+                    shutil.rmtree(destination, ignore_errors=True)
+                raise
+            is_git_repo, default_branch = _detect_git_repo(destination)
+            workspace = self.store.register_workspace(
+                name=(payload.name or "").strip() or folder_name,
+                root_path=destination,
+                is_git_repo=is_git_repo,
+                default_branch=default_branch,
+                exist_ok=False,
+            )
+            return {"ok": True, "workspace": workspace}
 
     def _run_git_clone(self, remote_url: str, destination: Path) -> None:
-        """Run a non-interactive ``git clone --``; tests may override this seam."""
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         try:
             completed = subprocess.run(
@@ -414,10 +434,7 @@ class AriadneApp:
         if len(raw) > _MAX_BROWSE_PATH_LENGTH:
             raise ValueError(f"partial_path exceeds {_MAX_BROWSE_PATH_LENGTH} characters")
         if raw:
-            try:
-                resolved = Path(os.path.expanduser(raw)).resolve()
-            except (OSError, RuntimeError) as exc:
-                raise ValueError(f"Cannot resolve partial_path: {exc}") from exc
+            resolved = _expand_user_path(raw).resolve()
             if raw.endswith("/") or resolved.is_dir():
                 browse_dir, prefix = resolved, ""
             else:
@@ -454,14 +471,18 @@ class AriadneApp:
                 if not child.is_dir():
                     continue
                 canonical = str(child.resolve())
-                is_git_repo = (child / ".git").exists()
+                dot_git = child / ".git"
+                head_file = dot_git / "HEAD"
+                is_git_repo = dot_git.is_dir() and head_file.is_file()
             except (OSError, RuntimeError):
                 continue
-            default_branch = (
-                _branch_name_from_git_head(_read_git_head_state(canonical))
-                if is_git_repo
-                else None
-            )
+            default_branch: str | None = None
+            if is_git_repo:
+                try:
+                    head_text = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                except OSError:
+                    head_text = None
+                default_branch = _branch_name_from_git_head(head_text)
             prefix_rank = 0
             if prefix_lower:
                 prefix_rank = 0 if name.lower().startswith(prefix_lower) else 1
@@ -558,7 +579,7 @@ class AriadneApp:
             target = Path(str(workspace["root_path"]))
             workspace_source = "explicit"
         if workspace_root:
-            candidate = Path(workspace_root).expanduser().resolve()
+            candidate = _expand_user_path(workspace_root).resolve()
             if target is not None and target.resolve() != candidate:
                 raise ValueError(
                     f"workspace_id '{workspace_id}' does not match workspace_root {candidate}"
@@ -1263,9 +1284,21 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         responses=error_responses,
     )
     def browse_filesystem(
-        partial_path: str | None = None, show_hidden: bool = False
+        request: Request,
+        partial_path: str | None = None,
+        show_hidden: bool = False,
     ) -> dict[str, Any]:
-        return service.browse_filesystem(partial_path=partial_path, show_hidden=show_hidden)
+        del partial_path, show_hidden
+        try:
+            query = FilesystemBrowseQuery.model_validate(dict(request.query_params))
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            loc = ".".join(str(part) for part in first.get("loc", ()))
+            detail = f"{loc}: {first['msg']}" if loc else str(first["msg"])
+            raise ValueError(f"Invalid browse query ({detail})") from exc
+        return service.browse_filesystem(
+            partial_path=query.partial_path, show_hidden=query.show_hidden
+        )
 
     @api.delete(
         "/api/workspaces/{workspace_id}",

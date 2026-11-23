@@ -48,29 +48,47 @@ export function joinDirPath(parentDir: string, folderName: string): string {
   return `${normalized}${sep}${folder}`;
 }
 
+export function isValidSingleFolderSegment(raw: string): boolean {
+  const value = raw.trim();
+  if (!value || value === "." || value === "..") return false;
+  if (value.includes("/") || value.includes("\\")) return false;
+  if (value.startsWith("-") || value !== value.replace(/[ .]+$/, "")) return false;
+  return !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function splitDirPath(fullPath: string): { parent: string; name: string } {
+  const trimmed = fullPath.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return { parent: "", name: "" };
+  const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  if (idx < 0) return { parent: "", name: trimmed };
+  if (idx === 0) return { parent: "/", name: trimmed.slice(1) };
+  return { parent: trimmed.slice(0, idx), name: trimmed.slice(idx + 1) };
+}
+
 export function deriveCloneFolderName(rawUrl: string): string {
   const value = rawUrl.trim();
   if (!value || value.startsWith("-") || /\s/.test(value)) return "";
   if (value.startsWith("/") || value.startsWith("~") || value.startsWith(".")) return "";
 
   if (value.includes("://")) {
-    try {
-      const parsed = new URL(value);
-      const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
-      if (!["https", "http", "ssh", "git"].includes(scheme)) return "";
-      const segments = parsed.pathname.split("/").filter(Boolean);
-      if (segments.length < 2) return "";
-      if (segments.some((s) => s === "." || s === "..")) return "";
-      return stripGitSuffix(segments[segments.length - 1]);
-    } catch {
-      return "";
-    }
+    const schemeEnd = value.indexOf("://");
+    const scheme = value.slice(0, schemeEnd).toLowerCase();
+    if (scheme !== "https" && scheme !== "ssh") return "";
+    const afterScheme = value.slice(schemeEnd + 3);
+    const slashIdx = afterScheme.indexOf("/");
+    if (slashIdx < 0) return "";
+    const rawPath = afterScheme.slice(slashIdx + 1).split(/[?#]/, 1)[0];
+    const segments = rawPath.split("/").filter(Boolean);
+    const minSegments = scheme === "ssh" ? 1 : 2;
+    if (segments.length < minSegments) return "";
+    if (segments.some((s) => s === "." || s === "..")) return "";
+    return stripGitSuffix(segments[segments.length - 1]);
   }
 
   const scp = SCP_PATTERN.exec(value);
   if (scp) {
     const segments = scp[1].split("/").filter(Boolean);
-    if (segments.length < 2) return "";
+    if (segments.length < 1) return "";
     if (segments.some((s) => s === "." || s === "..")) return "";
     return stripGitSuffix(segments[segments.length - 1]);
   }

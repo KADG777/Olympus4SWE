@@ -136,7 +136,7 @@ export function WorkspaceDialog({
     const result = await workbench.cloneWorkspace({
       remote_url: trimmedUrl,
       parent_dir: trimmedParent,
-      folder_name: cloneFolder.trim() || null,
+      folder_name: cloneFolderEdited && cloneFolder.trim() ? cloneFolder.trim() : null,
     });
     setBusy(false);
     if (!result.ok) {

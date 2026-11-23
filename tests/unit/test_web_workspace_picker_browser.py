@@ -1,10 +1,3 @@
-"""Playwright E2E tests for Issue #109: DirectoryPicker, 3-mode Add Workspace, and Oracle picker.
-
-Run with:
-    TMPDIR=/tmp uv run --with playwright pytest \\
-        tests/unit/test_web_workspace_picker_browser.py -q
-"""
-
 from __future__ import annotations
 
 import os

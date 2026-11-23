@@ -7,7 +7,7 @@ import {
   WORKFLOW_SUMMARY,
   WORKSPACE_MODE_LABELS,
 } from "../lib/labels";
-import { joinDirPath } from "../lib/paths";
+import { isValidSingleFolderSegment, joinDirPath, splitDirPath } from "../lib/paths";
 import type { NewRunForm, Workbench, WorkbenchState } from "../state/workbench";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -220,6 +220,15 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
+    if (
+      form.workspaceMode === "greenfield" &&
+      !demo &&
+      greenfieldName.trim() &&
+      !isValidSingleFolderSegment(greenfieldName)
+    ) {
+      setError("短目录名必须是单个合法目录段，不能包含 '/'、'\\' 或 '..'");
+      return;
+    }
     const result = await workbench.submitNewRun(form);
     if (!result.ok) {
       setError(`创建请求失败：${result.error}`);
@@ -257,11 +266,28 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
 
   const handleGreenfieldNameChange = (nextName: string) => {
     setGreenfieldName(nextName);
-    if (nextName.trim() && greenfieldParent.trim()) {
-      set({ greenfieldPath: joinDirPath(greenfieldParent, nextName) });
-    } else if (!nextName.trim()) {
+    const trimmed = nextName.trim();
+    if (!trimmed) {
       set({ greenfieldPath: "" });
+      return;
     }
+    if (!isValidSingleFolderSegment(trimmed)) {
+      setError("短目录名必须是单个合法目录段，不能包含 '/'、'\\' 或 '..'");
+      return;
+    }
+    if (greenfieldParent.trim()) {
+      set({ greenfieldPath: joinDirPath(greenfieldParent, trimmed) });
+    }
+  };
+
+  const handleGreenfieldPathChange = (nextPath: string) => {
+    set({ greenfieldPath: nextPath });
+    const { parent, name } = splitDirPath(nextPath);
+    if (parent) {
+      setGreenfieldParentTouched(true);
+      setGreenfieldParent(parent);
+    }
+    setGreenfieldName(name);
   };
 
   const onFile = () => {
@@ -465,7 +491,7 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
                     placeholder="/path/to/new-project"
                     value={form.greenfieldPath}
                     disabled={state.submitting}
-                    onChange={(event) => set({ greenfieldPath: event.target.value })}
+                    onChange={(event) => handleGreenfieldPathChange(event.target.value)}
                   />
                 </div>
               </div>

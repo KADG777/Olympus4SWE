@@ -35,12 +35,14 @@ export function DirectoryPicker({
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
+  const [syncedKey, setSyncedKey] = useState<string | null>(null);
 
   const requestSeqRef = useRef(0);
   const changeSourceRef = useRef<"immediate" | "typing">("immediate");
   const onDefaultRootRef = useRef(onDefaultRoot);
   onDefaultRootRef.current = onDefaultRoot;
   const listRef = useRef<HTMLUListElement>(null);
+  const queryKey = `${value}\0${showHidden ? "1" : "0"}`;
 
   useEffect(() => {
     const delay = changeSourceRef.current === "typing" ? TYPING_DEBOUNCE_MS : 0;
@@ -54,6 +56,7 @@ export function DirectoryPicker({
         .then((response) => {
           if (cancelled || seq !== requestSeqRef.current) return;
           setData(response);
+          setSyncedKey(queryKey);
           setFetchError(null);
           setActiveIndex((prev) =>
             response.entries.length === 0 ? -1 : Math.min(prev, response.entries.length - 1),
@@ -77,7 +80,7 @@ export function DirectoryPicker({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [value, showHidden, refreshKey, manualRefreshSeq]);
+  }, [value, showHidden, refreshKey, manualRefreshSeq, queryKey]);
 
   useEffect(() => {
     if (activeIndex < 0) return;
@@ -102,12 +105,13 @@ export function DirectoryPicker({
   };
 
   const entries = data?.entries || [];
+  const entriesSynced = syncedKey === queryKey && !loading;
   const breadcrumbs = data?.current_path ? buildBreadcrumbs(data.current_path) : [];
   const quickRoots = data?.quick_roots || [];
   const resolvedInputId = inputId || `${idPrefix}-input`;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (disabled || !entries.length) return;
+    if (disabled || !entriesSynced || !entries.length) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setActiveIndex((prev) => (prev < entries.length - 1 ? prev + 1 : 0));

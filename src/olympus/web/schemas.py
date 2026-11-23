@@ -173,6 +173,11 @@ class FilesystemBrowseEntry(StrictModel):
     already_registered: bool = False
 
 
+class FilesystemBrowseQuery(StrictModel):
+    partial_path: str | None = None
+    show_hidden: bool = False
+
+
 class FilesystemBrowseResponse(StrictModel):
     ok: Literal[True] = True
     current_path: str
@@ -947,6 +952,9 @@ __all__ = [
     "DemosResponse",
     "ErrorResponse",
     "EventsResponse",
+    "FilesystemBrowseEntry",
+    "FilesystemBrowseQuery",
+    "FilesystemBrowseResponse",
     "HealthResponse",
     "HitlBanner",
     "KeyOutputItem",
