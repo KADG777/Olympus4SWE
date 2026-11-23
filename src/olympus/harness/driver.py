@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, field_validator
 
 from olympus.core.contracts import StrictModel
 from olympus.providers.base import LLMProvider, MockLLMProvider
@@ -19,6 +19,12 @@ if TYPE_CHECKING:
 DriverEvent = Callable[[str, dict[str, Any]], None]
 DriverFactory = Callable[[], "AgentDriver"]
 NonEmptySetting = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+# Pi ``--thinking`` levels per its documented thinkingLevelMap scale.
+VALID_THINKING_LEVELS = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+_VALID_THINKING_LEVELS = VALID_THINKING_LEVELS
 
 
 class DriverTurnRequest(StrictModel):
@@ -37,6 +43,9 @@ class DriverTurnRequest(StrictModel):
     max_steps: int | None = Field(default=None, ge=1)
     trace_path: Path | None = None
     model: str | None = None
+    pi_provider: str | None = None
+    thinking_level: str | None = None
+    context_window: int | None = Field(default=None, ge=1024)
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,9 @@ class TurnOutcome:
     steps_taken: int
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = 0
     receipt: dict[str, Any] = field(default_factory=dict)
     driver_name: str = ""
 
@@ -88,6 +100,26 @@ class ExecutionDriversConfig(StrictModel):
     worker_driver: NonEmptySetting = "auto"
     reviewer_driver: NonEmptySetting = "auto"
     monitor_model: NonEmptySetting | None = None
+    pi_provider: NonEmptySetting | None = None
+    thinking_level: NonEmptySetting | None = None
+    context_window: int | None = Field(default=None, ge=1024)
+
+    @field_validator("thinking_level", mode="before")
+    @classmethod
+    def _normalize_thinking_level(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"thinking_level must be a string, got {type(value).__name__}")
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in VALID_THINKING_LEVELS:
+            raise ValueError(
+                f"Invalid thinking_level {value!r}; expected one of "
+                f"{', '.join(sorted(VALID_THINKING_LEVELS))}"
+            )
+        return normalized
 
     @classmethod
     def resolve(
@@ -97,19 +129,34 @@ class ExecutionDriversConfig(StrictModel):
         worker_driver: str | None = None,
         reviewer_driver: str | None = None,
         monitor_model: str | None = None,
+        pi_provider: str | None = None,
+        thinking_level: str | None = None,
+        context_window: int | None = None,
     ) -> ExecutionDriversConfig:
         explicit = {
             "stage_driver": stage_driver,
             "worker_driver": worker_driver,
             "reviewer_driver": reviewer_driver,
             "monitor_model": monitor_model,
+            "pi_provider": pi_provider,
+            "thinking_level": thinking_level,
         }
-        values = {}
+        values: dict[str, Any] = {}
         for field_name, value in explicit.items():
             if value is not None:
                 values[field_name] = value
             elif setting := os.getenv(f"OLYMPUS_{field_name.upper()}", "").strip():
                 values[field_name] = setting
+        raw_window = os.getenv("OLYMPUS_CONTEXT_WINDOW", "").strip()
+        if context_window is not None:
+            values["context_window"] = context_window
+        elif raw_window:
+            try:
+                values["context_window"] = int(raw_window)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid OLYMPUS_CONTEXT_WINDOW {raw_window!r}: not an integer"
+                ) from exc
         return cls.model_validate(values)
 
 
@@ -210,8 +257,22 @@ def default_driver_factories(
     store: RunStore | None,
     run_id: str | None,
     provider: LLMProvider | None = None,
+    execution_drivers: ExecutionDriversConfig | None = None,
 ) -> dict[str, DriverFactory]:
     """Lazily build the external drivers shipped with Olympus (never at import time)."""
     from olympus.harness.pi import PiDriver
 
-    return {"pi": lambda: PiDriver(store=store, run_id=run_id, provider=provider)}
+    settings = execution_drivers or ExecutionDriversConfig()
+    pi_provider = settings.pi_provider
+    thinking_level = settings.thinking_level
+    context_window = settings.context_window
+    return {
+        "pi": lambda: PiDriver(
+            store=store,
+            run_id=run_id,
+            provider=provider,
+            pi_provider=pi_provider,
+            thinking_level=thinking_level,
+            context_window=context_window,
+        )
+    }

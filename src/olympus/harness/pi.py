@@ -27,7 +27,13 @@ from typing import Any
 from olympus.core.contracts import new_id, utc_now
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
-from olympus.harness.driver import ActiveTurnHandle, DriverEvent, DriverTurnRequest, TurnOutcome
+from olympus.harness.driver import (
+    VALID_THINKING_LEVELS,
+    ActiveTurnHandle,
+    DriverEvent,
+    DriverTurnRequest,
+    TurnOutcome,
+)
 from olympus.harness.receipt import build_turn_receipt
 from olympus.providers.auth import ExternalGatewayBinding
 from olympus.providers.base import LLMProvider
@@ -274,49 +280,149 @@ def _build_pi_env(request: DriverTurnRequest) -> dict[str, str]:
     )
 
 
+def _normalize_thinking_level(value: str | None) -> str | None:
+    """Validate and lowercase a ``--thinking`` level against Pi's documented scale."""
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized not in VALID_THINKING_LEVELS:
+        raise ValueError(
+            f"Invalid thinking_level {value!r}; expected one of "
+            f"{', '.join(sorted(VALID_THINKING_LEVELS))}"
+        )
+    return normalized
+
+
+def _strip_known_model_prefix(model: str | None, pi_provider: str | None) -> str:
+    """Drop a leading provider prefix only when it names a known provider.
+
+    ``gateway-x/gateway-model`` passed to native Pi provider ``gateway-x``
+    becomes ``gateway-model``; ``openai/gpt-4o`` / ``anthropic/claude-*`` are
+    stripped the same way. Any other prefix is preserved verbatim.
+    """
+    cleaned = (model or "").strip()
+    if not cleaned:
+        return cleaned
+    candidates: list[str] = []
+    if pi_provider and pi_provider.strip():
+        candidates.append(f"{pi_provider.strip().lower()}/")
+    candidates.extend(("openai/", "anthropic/"))
+    lowered = cleaned.lower()
+    for prefix in candidates:
+        if lowered.startswith(prefix) and cleaned[len(prefix) :].strip():
+            return cleaned[len(prefix) :]
+    return cleaned
+
+
 def _prepare_gateway_config(
     env: dict[str, str],
     model: str | None,
     *,
     provider: LLMProvider | None = None,
+    pi_provider: str | None = None,
+    context_window: int | None = None,
 ) -> tuple[str | None, str | None, Path | None, tuple[str, ...]]:
-    """Synthesize an ephemeral ``PI_CODING_AGENT_DIR/models.json`` for custom gateways.
+    """Resolve the provider wiring for one Pi turn.
 
-    Active provider gateway metadata wins over ambient environment variables so Pi
-    always targets the exact dialect and base URL selected by the session. Credentials
-    stay as ``$ENV_VAR`` references so no API keys are ever written to disk.
+    Returns ``(effective_provider, model_id, cfg_dir, extra_secrets)``:
+
+    * A caller-provided ``PI_CODING_AGENT_DIR`` is respected untouched.
+    * A configured ``pi_provider`` passes through natively (no ``models.json``)
+      unless a custom gateway binding or a context-window override needs an
+      ephemeral provider-override config.
+    * Without a ``pi_provider`` the legacy ``olympus-gateway`` provider is
+      synthesized as before.
+
+    Credentials stay as ``$ENV_VAR`` references so no API keys are ever written
+    to disk.
     """
+    effective_pi_provider = (pi_provider or "").strip() or None
+    effective_context_window = context_window
     if env.get("PI_CODING_AGENT_DIR"):
-        return None, model, None, ()
-    binding: ExternalGatewayBinding | None = None
+        # The caller owns the entire config dir: never overwrite it.
+        return effective_pi_provider, model, None, ()
+
+    if effective_pi_provider is not None:
+        binding: ExternalGatewayBinding | None = None
+        binder = getattr(provider, "external_gateway_binding", None)
+        if callable(binder):
+            maybe = binder(model)
+            if isinstance(maybe, ExternalGatewayBinding):
+                binding = maybe
+        if binding is None:
+            binding = resolve_external_gateway_from_env(env, model)
+        if binding is not None:
+            model_id = _strip_known_model_prefix(binding.model_id, effective_pi_provider)
+        else:
+            model_id = _strip_known_model_prefix(model, effective_pi_provider)
+        if binding is None and effective_context_window is None:
+            # Pure native Pi passthrough: Pi's built-in catalog for the provider
+            # already carries baseUrl, apiKey wiring, model metadata, and limits.
+            return effective_pi_provider, model_id, None, ()
+
+        extra_secrets: list[str] = []
+        override: dict[str, Any] = {}
+        if binding is not None:
+            if binding.api_key_env:
+                api_key_ref = f"${binding.api_key_env}"
+            else:
+                env["OLYMPUS_PI_GATEWAY_KEY"] = binding.api_key or "keyless"
+                api_key_ref = "$OLYMPUS_PI_GATEWAY_KEY"
+                if binding.api_key:
+                    extra_secrets.append(binding.api_key)
+            override["baseUrl"] = binding.base_url
+            override["apiKey"] = api_key_ref
+        if effective_context_window is not None and model_id:
+            override["modelOverrides"] = {
+                model_id: {"contextWindow": effective_context_window}
+            }
+        cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
+        os.chmod(cfg_dir, 0o700)
+        models_doc = {"providers": {effective_pi_provider: override}}
+        models_file = cfg_dir / "models.json"
+        models_file.write_text(
+            json.dumps(models_doc, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        os.chmod(models_file, 0o600)
+        env["PI_CODING_AGENT_DIR"] = str(cfg_dir)
+        env.setdefault("PI_OFFLINE", "1")
+        env.setdefault("PI_SKIP_VERSION_CHECK", "1")
+        return effective_pi_provider, model_id, cfg_dir, tuple(extra_secrets)
+
+    legacy_binding: ExternalGatewayBinding | None = None
     binder = getattr(provider, "external_gateway_binding", None)
     if callable(binder):
         maybe = binder(model)
         if isinstance(maybe, ExternalGatewayBinding):
-            binding = maybe
-    if binding is None:
-        binding = resolve_external_gateway_from_env(env, model)
-    if binding is None:
+            legacy_binding = maybe
+    if legacy_binding is None:
+        legacy_binding = resolve_external_gateway_from_env(env, model)
+    if legacy_binding is None:
         return None, model, None, ()
 
-    extra_secrets: list[str] = []
-    if binding.api_key_env:
-        api_key_ref = f"${binding.api_key_env}"
+    legacy_secrets: list[str] = []
+    if legacy_binding.api_key_env:
+        api_key_ref = f"${legacy_binding.api_key_env}"
     else:
-        env["OLYMPUS_PI_GATEWAY_KEY"] = binding.api_key or "keyless"
+        env["OLYMPUS_PI_GATEWAY_KEY"] = legacy_binding.api_key or "keyless"
         api_key_ref = "$OLYMPUS_PI_GATEWAY_KEY"
-        if binding.api_key:
-            extra_secrets.append(binding.api_key)
+        if legacy_binding.api_key:
+            legacy_secrets.append(legacy_binding.api_key)
 
+    model_entry: dict[str, Any] = {"id": legacy_binding.model_id}
+    if effective_context_window is not None:
+        model_entry["contextWindow"] = effective_context_window
     cfg_dir = Path(tempfile.mkdtemp(prefix="olympus-pi-cfg-"))
     os.chmod(cfg_dir, 0o700)
     models_doc = {
         "providers": {
             "olympus-gateway": {
-                "baseUrl": binding.base_url,
-                "api": binding.api,
+                "baseUrl": legacy_binding.base_url,
+                "api": legacy_binding.api,
                 "apiKey": api_key_ref,
-                "models": [{"id": binding.model_id}],
+                "models": [model_entry],
             }
         }
     }
@@ -326,7 +432,7 @@ def _prepare_gateway_config(
     env["PI_CODING_AGENT_DIR"] = str(cfg_dir)
     env.setdefault("PI_OFFLINE", "1")
     env.setdefault("PI_SKIP_VERSION_CHECK", "1")
-    return "olympus-gateway", binding.model_id, cfg_dir, tuple(extra_secrets)
+    return "olympus-gateway", legacy_binding.model_id, cfg_dir, tuple(legacy_secrets)
 
 
 def _safe_argv(command: list[str]) -> list[str]:
@@ -401,6 +507,9 @@ class _PiTurn:
         scope_guard_path: Path,
         emit: DriverEvent | None,
         provider: LLMProvider | None = None,
+        pi_provider: str | None = None,
+        thinking_level: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         self._request = request
         self._binary = binary
@@ -412,6 +521,14 @@ class _PiTurn:
         self._scope_guard_path = scope_guard_path
         self._emit_callback = emit
         self._provider = provider
+        # Request values override the driver defaults when explicitly set.
+        self._pi_provider = (request.pi_provider or pi_provider or "").strip() or None
+        self._thinking_level = _normalize_thinking_level(
+            request.thinking_level if request.thinking_level is not None else thinking_level
+        )
+        self._context_window = (
+            request.context_window if request.context_window is not None else context_window
+        )
         self._trace = _TraceWriter(request.trace_path)
         self._lock = threading.Lock()
         self._stdin_lock = threading.Lock()
@@ -429,6 +546,9 @@ class _PiTurn:
         self._step_by_tool: dict[str, int] = {}
         self._total_input_tokens = 0
         self._total_output_tokens = 0
+        self._total_cache_read_tokens = 0
+        self._total_cache_write_tokens = 0
+        self._total_reasoning_tokens = 0
         self._final_content = ""
         self._receipt_events: list[dict[str, Any]] = []
         self._aborted = False
@@ -534,6 +654,9 @@ class _PiTurn:
             steps_taken=self._steps,
             total_input_tokens=self._total_input_tokens,
             total_output_tokens=self._total_output_tokens,
+            total_cache_read_tokens=self._total_cache_read_tokens,
+            total_cache_write_tokens=self._total_cache_write_tokens,
+            total_reasoning_tokens=self._total_reasoning_tokens,
             receipt=receipt,
             driver_name="pi",
         )
@@ -544,7 +667,11 @@ class _PiTurn:
         env["OLYMPUS_PI_FORBIDDEN_GLOBS"] = json.dumps(self._request.forbidden_globs)
         env["OLYMPUS_PI_STRICT_SCOPE"] = "1" if self._request.strict_scope else "0"
         provider_name, model_id, cfg_dir, extra_secrets = _prepare_gateway_config(
-            env, self._request.model, provider=self._provider
+            env,
+            self._request.model,
+            provider=self._provider,
+            pi_provider=self._pi_provider,
+            context_window=self._context_window,
         )
         self._gateway_provider = provider_name
         self._gateway_model = model_id
@@ -595,6 +722,8 @@ class _PiTurn:
             command += ["--provider", self._gateway_provider]
         if self._gateway_model:
             command += ["--model", self._gateway_model]
+        if self._thinking_level:
+            command += ["--thinking", self._thinking_level]
         if request.disable_tools:
             command += ["--no-tools"]
         elif request.read_only:
@@ -895,11 +1024,15 @@ class _PiTurn:
         output_tokens = _non_negative_int(usage.get("output"))
         cache_read_tokens = _non_negative_int(usage.get("cacheRead"))
         cache_write_tokens = _non_negative_int(usage.get("cacheWrite"))
+        reasoning_tokens = _non_negative_int(usage.get("reasoning"))
         with self._lock:
             self._steps += 1
             step = self._steps
             self._total_input_tokens += input_tokens
             self._total_output_tokens += output_tokens
+            self._total_cache_read_tokens += cache_read_tokens
+            self._total_cache_write_tokens += cache_write_tokens
+            self._total_reasoning_tokens += reasoning_tokens
             # Track whether the *latest* assistant message errored so a transient
             # transport error that Pi retries and recovers from does not fail the turn.
             is_error_msg = message.get("stopReason") == "error"
@@ -924,6 +1057,7 @@ class _PiTurn:
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read_tokens,
                 "cache_write_tokens": cache_write_tokens,
+                "reasoning_tokens": reasoning_tokens,
             }
         )
         self._receipt_events.append(
@@ -934,10 +1068,18 @@ class _PiTurn:
                 "step": step,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "reasoning_tokens": reasoning_tokens,
             }
         )
         over_budget = self._settle_usage(
-            step, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+            step,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
         )
         self._emit(
             "llm",
@@ -949,6 +1091,7 @@ class _PiTurn:
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read_tokens,
                 "cache_write_tokens": cache_write_tokens,
+                "reasoning_tokens": reasoning_tokens,
             },
         )
         stop_reason = str(message.get("stopReason") or "")
@@ -1007,6 +1150,7 @@ class _PiTurn:
         output_tokens: int,
         cache_read_tokens: int,
         cache_write_tokens: int,
+        reasoning_tokens: int,
     ) -> bool:
         if self._store is None or self._run_id is None:
             return False
@@ -1019,6 +1163,7 @@ class _PiTurn:
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                reasoning_tokens=reasoning_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - usage accounting must not kill the turn
             self._trace.append(
@@ -1089,6 +1234,9 @@ class PiDriver:
         store: RunStore | None = None,
         run_id: str | None = None,
         provider: LLMProvider | None = None,
+        pi_provider: str | None = None,
+        thinking_level: str | None = None,
+        context_window: int | None = None,
         cancel_grace_seconds: float = 3.0,
         term_grace_seconds: float = 2.0,
         scope_guard_path: Path | None = None,
@@ -1097,6 +1245,9 @@ class PiDriver:
         self._store = store
         self._run_id = run_id
         self._provider = provider
+        self._pi_provider = (pi_provider or "").strip() or None
+        self._thinking_level = _normalize_thinking_level(thinking_level)
+        self._context_window = context_window
         self._cancel_grace_seconds = cancel_grace_seconds
         self._term_grace_seconds = term_grace_seconds
         self._scope_guard_path = scope_guard_path or _SCOPE_GUARD_PATH
@@ -1117,6 +1268,9 @@ class PiDriver:
             store=self._store,
             run_id=self._run_id,
             provider=self._provider,
+            pi_provider=self._pi_provider,
+            thinking_level=self._thinking_level,
+            context_window=self._context_window,
             cancel_grace_seconds=self._cancel_grace_seconds,
             term_grace_seconds=self._term_grace_seconds,
             scope_guard_path=self._scope_guard_path,

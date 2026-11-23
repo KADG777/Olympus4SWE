@@ -937,6 +937,9 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
             "worker_driver": "native@custom-worker",
             "reviewer_driver": "auto",
             "monitor_model": "environment-monitor",
+            "pi_provider": None,
+            "thinking_level": None,
+            "context_window": None,
         }
         invalid = client.post("/api/runs", json={"raw_input": "Goal", "reviewer_driver": 42})
         assert invalid.status_code == 400
@@ -953,6 +956,9 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
         "worker_driver": "environment-worker",
         "reviewer_driver": "native@custom-reviewer",
         "monitor_model": "custom-monitor",
+        "pi_provider": None,
+        "thinking_level": None,
+        "context_window": None,
     }
 
 

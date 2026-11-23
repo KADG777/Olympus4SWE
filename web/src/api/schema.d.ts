@@ -511,6 +511,11 @@ export interface components {
         /** BudgetSummary */
         BudgetSummary: {
             /**
+             * Cache Hit Rate
+             * @default 0
+             */
+            cache_hit_rate: number;
+            /**
              * Cache Read Tokens
              * @default 0
              */
@@ -532,6 +537,11 @@ export interface components {
             max_tokens?: number | null;
             /** Output Tokens */
             output_tokens: number;
+            /**
+             * Reasoning Tokens
+             * @default 0
+             */
+            reasoning_tokens: number;
             /** Total Tokens */
             total_tokens: number;
             /** Unknown Outcome Calls */
@@ -1533,12 +1543,32 @@ export interface components {
         };
         /** ReceiptLLM */
         ReceiptLLM: {
+            /**
+             * Cache Read Tokens
+             * @default 0
+             */
+            cache_read_tokens: number;
+            /**
+             * Cache Write Tokens
+             * @default 0
+             */
+            cache_write_tokens: number;
             /** Calls */
             calls: number;
             /** Input Tokens */
             input_tokens: number;
             /** Output Tokens */
             output_tokens: number;
+            /**
+             * Reasoning Tokens
+             * @default 0
+             */
+            reasoning_tokens: number;
+            /**
+             * Total Tokens
+             * @default 0
+             */
+            total_tokens: number;
         };
         /** ReceiptTool */
         ReceiptTool: {

@@ -675,16 +675,26 @@ class BudgetLedger(StrictModel):
     output_tokens: int = Field(default=0, ge=0)
     cache_read_tokens: int = Field(default=0, ge=0)
     cache_write_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
     unknown_outcome_calls: int = Field(default=0, ge=0)
 
     @property
     def total_tokens(self) -> int:
+        # reasoning_tokens is a non-additive breakdown subset of output_tokens on
+        # Pi/OpenAI-compatible usage, so it must never be added here.
         return (
             self.input_tokens
             + self.output_tokens
             + self.cache_read_tokens
             + self.cache_write_tokens
         )
+
+    @property
+    def cache_hit_rate(self) -> float:
+        denominator = self.input_tokens + self.cache_read_tokens
+        if denominator <= 0:
+            return 0.0
+        return round(self.cache_read_tokens / denominator, 4)
 
     def can_reserve(self, policy: BudgetPolicy) -> bool:
         calls_ok = (
@@ -707,6 +717,7 @@ class BudgetLedger(StrictModel):
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
         *,
         unknown: bool = False,
     ) -> BudgetLedger:
@@ -720,6 +731,7 @@ class BudgetLedger(StrictModel):
                 "output_tokens": self.output_tokens + max(0, output_tokens),
                 "cache_read_tokens": self.cache_read_tokens + max(0, cache_read_tokens),
                 "cache_write_tokens": self.cache_write_tokens + max(0, cache_write_tokens),
+                "reasoning_tokens": self.reasoning_tokens + max(0, reasoning_tokens),
                 "unknown_outcome_calls": self.unknown_outcome_calls + (1 if unknown else 0),
             }
         )

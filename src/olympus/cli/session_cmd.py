@@ -89,6 +89,27 @@ MonitorModelOpt = Annotated[
     str | None,
     typer.Option("--monitor-model", help="Watchdog monitor model."),
 ]
+PiProviderOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--pi-provider",
+        help=(
+            "Gateway provider ID for the native Pi driver "
+            "(e.g. the project's OpenAI-compatible gateway)."
+        ),
+    ),
+]
+ThinkingLevelOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--thinking",
+        help="Pi thinking effort: off|minimal|low|medium|high|xhigh|max.",
+    ),
+]
+ContextWindowOpt = Annotated[
+    int | None,
+    typer.Option("--context-window", min=1024, help="Pi model context window override."),
+]
 MessageOpt = Annotated[
     str | None,
     typer.Option("--message", help="Natural-language goal or reply text."),
@@ -128,6 +149,9 @@ def _build_runner(
     worker_driver: str | None,
     reviewer_driver: str | None,
     monitor_model: str | None,
+    pi_provider: str | None,
+    thinking_level: str | None,
+    context_window: int | None,
     run_id: str | None = None,
 ) -> SessionRunner:
     root = resolve_workspace_binding(
@@ -149,6 +173,9 @@ def _build_runner(
         worker_driver=worker_driver,
         reviewer_driver=reviewer_driver,
         monitor_model=monitor_model,
+        pi_provider=pi_provider,
+        thinking_level=thinking_level,
+        context_window=context_window,
         provider_builder=build_session_provider,
     )
     return SessionRunner(config)
@@ -176,6 +203,9 @@ def cmd_start(
     worker_driver: WorkerDriverOpt = None,
     reviewer_driver: ReviewerDriverOpt = None,
     monitor_model: MonitorModelOpt = None,
+    pi_provider: PiProviderOpt = None,
+    thinking: ThinkingLevelOpt = None,
+    context_window: ContextWindowOpt = None,
 ) -> None:
     """Create a run and drive it until a pause, completion, or failure."""
     raw_goal = (message or goal or "").strip()
@@ -193,6 +223,9 @@ def cmd_start(
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
+            pi_provider=pi_provider,
+            thinking_level=thinking,
+            context_window=context_window,
         )
     except (ProviderError, ValueError, OSError) as exc:
         _emit(
@@ -229,6 +262,9 @@ def cmd_reply(
     worker_driver: WorkerDriverOpt = None,
     reviewer_driver: ReviewerDriverOpt = None,
     monitor_model: MonitorModelOpt = None,
+    pi_provider: PiProviderOpt = None,
+    thinking: ThinkingLevelOpt = None,
+    context_window: ContextWindowOpt = None,
 ) -> None:
     """Route a free-form reply into clarification, approval, revision, or reopen."""
     text = (message or message_arg or "").strip()
@@ -246,6 +282,9 @@ def cmd_reply(
             worker_driver=worker_driver,
             reviewer_driver=reviewer_driver,
             monitor_model=monitor_model,
+            pi_provider=pi_provider,
+            thinking_level=thinking,
+            context_window=context_window,
             run_id=run_id,
         )
     except (ProviderError, ValueError, OSError) as exc:

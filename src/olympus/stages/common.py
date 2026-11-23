@@ -110,7 +110,9 @@ def resolve_stage_driver(
     if spec.partition("@")[0] == "native":
         return None, None
     resolved_registry = (registry or DriverRegistry()).with_factories(
-        default_driver_factories(store=store, run_id=run_id, provider=provider)
+        default_driver_factories(
+            store=store, run_id=run_id, provider=provider, execution_drivers=config
+        )
     )
     return resolved_registry.resolve_external(spec)
 

@@ -545,6 +545,11 @@
       "BudgetSummary": {
         "additionalProperties": false,
         "properties": {
+          "cache_hit_rate": {
+            "default": 0.0,
+            "title": "Cache Hit Rate",
+            "type": "number"
+          },
           "cache_read_tokens": {
             "default": 0,
             "title": "Cache Read Tokens",
@@ -591,6 +596,11 @@
           },
           "output_tokens": {
             "title": "Output Tokens",
+            "type": "integer"
+          },
+          "reasoning_tokens": {
+            "default": 0,
+            "title": "Reasoning Tokens",
             "type": "integer"
           },
           "total_tokens": {
@@ -3439,6 +3449,16 @@
       "ReceiptLLM": {
         "additionalProperties": false,
         "properties": {
+          "cache_read_tokens": {
+            "default": 0,
+            "title": "Cache Read Tokens",
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "default": 0,
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
           "calls": {
             "title": "Calls",
             "type": "integer"
@@ -3449,6 +3469,16 @@
           },
           "output_tokens": {
             "title": "Output Tokens",
+            "type": "integer"
+          },
+          "reasoning_tokens": {
+            "default": 0,
+            "title": "Reasoning Tokens",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "default": 0,
+            "title": "Total Tokens",
             "type": "integer"
           }
         },

@@ -457,6 +457,38 @@ def test_capture_sandbox_diff_handles_nongit_binary_and_reverted_overlay(
         remove_sandbox(handle)
 
 
+def test_agent_loop_receipt_and_ledger_carry_full_token_key_set(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state.db")
+    run_id = store.create_run(title="Ledger keys", budget_policy=BudgetPolicy(max_llm_calls=5))
+    provider = MockLLMProvider(
+        responses=[
+            LLMResponse(content="done", usage=UsageStats(input_tokens=100, output_tokens=40))
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider, store=store, run_id=run_id, actor="align:proposer", max_steps=2
+    )
+    res = loop.run(system_prompt="SYS", user_prompt="GO")
+
+    assert res.completed is True
+    llm = res.receipt["llm"]
+    # The native loop reports no cache/reasoning, but every key exists and the
+    # total is exactly input + output (+ cache when present) — never reasoning.
+    assert llm == {
+        "calls": 1,
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 140,
+    }
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert ledger.total_tokens == 140
+    assert ledger.reasoning_tokens == 0
+    assert ledger.cache_hit_rate == 0.0
+
+
 def test_agent_loop_preserves_prefix_and_errors_and_respects_budget(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()

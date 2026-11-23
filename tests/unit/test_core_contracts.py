@@ -234,3 +234,41 @@ def test_budget_ledger_accounts_cache_tokens_and_reads_legacy_json() -> None:
     # Cached tokens count against the true total even when input/output stay small.
     assert settled.can_reserve(BudgetPolicy(max_total_tokens=1050)) is False
     assert settled.can_reserve(BudgetPolicy(max_total_tokens=1051)) is True
+
+
+def test_budget_ledger_reasoning_tokens_are_non_additive_subset_of_output() -> None:
+    ledger = BudgetLedger().reserve(BudgetPolicy(max_total_tokens=10_000)).settle(
+        input_tokens=100,
+        output_tokens=400,
+        cache_read_tokens=300,
+        cache_write_tokens=200,
+        reasoning_tokens=350,
+    )
+    # Reasoning lives inside output tokens: it is reported but never added to totals.
+    assert ledger.reasoning_tokens == 350
+    assert ledger.total_tokens == 100 + 400 + 300 + 200
+    assert ledger.total_tokens == 1000
+    assert ledger.reasoning_tokens <= ledger.output_tokens
+
+    more = ledger.reserve(BudgetPolicy(max_total_tokens=10_000)).settle(
+        input_tokens=10, output_tokens=20, reasoning_tokens=15
+    )
+    assert more.reasoning_tokens == 365
+    assert more.total_tokens == 1030
+
+    legacy = BudgetLedger.model_validate_json('{"input_tokens": 5, "output_tokens": 6}')
+    assert legacy.reasoning_tokens == 0
+
+
+def test_budget_ledger_cache_hit_rate() -> None:
+    empty = BudgetLedger()
+    assert empty.cache_hit_rate == 0.0
+    assert empty.cache_hit_rate == 0
+
+    settled = (
+        BudgetLedger()
+        .reserve(BudgetPolicy(max_total_tokens=10_000))
+        .settle(input_tokens=60, output_tokens=10, cache_read_tokens=140)
+    )
+    assert settled.cache_hit_rate == round(140 / (60 + 140), 4)
+    assert settled.cache_hit_rate == pytest.approx(0.7, abs=0.001)

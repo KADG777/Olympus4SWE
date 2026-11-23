@@ -285,7 +285,15 @@ def test_build_turn_receipt_aggregates_sanitizes_and_collapses() -> None:
     )
 
     assert tuple(receipt) == RECEIPT_KEYS
-    assert receipt["llm"] == {"calls": 3, "input_tokens": 6000, "output_tokens": 150}
+    assert receipt["llm"] == {
+        "calls": 3,
+        "input_tokens": 6000,
+        "output_tokens": 150,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 6150,
+    }
     assert receipt["tools"][2] == {"tool": "unknown", "status": "denied", "duration_ms": 0}
     assert receipt["artifacts"] == {
         "diff_added": 12,
@@ -388,7 +396,15 @@ def test_loop_emits_events_and_persists_sanitized_receipt(tmp_path: Path) -> Non
     assert tuple(receipt) == RECEIPT_KEYS
     assert receipt["actor"] == "hephaestus:T1"
     assert receipt["task_id"] == "T1"
-    assert receipt["llm"] == {"calls": 2, "input_tokens": 4300, "output_tokens": 300}
+    assert receipt["llm"] == {
+        "calls": 2,
+        "input_tokens": 4300,
+        "output_tokens": 300,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 4600,
+    }
     assert len(receipt["tools"]) == 1
     assert receipt["tools"][0]["tool"] == "read_file"
     assert receipt["tools"][0]["status"] == "ok"
