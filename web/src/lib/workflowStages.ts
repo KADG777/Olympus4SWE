@@ -49,32 +49,33 @@ export interface WorkflowStagesModel {
 
 interface PhaseDefinition {
   id: string;
+  indexLabel: string;
   title: string;
   god: string;
 }
 
 const PHASE_DEFINITIONS: readonly PhaseDefinition[] = [
-  { id: "align", title: "需求对齐", god: "Prometheus" },
-  { id: "design", title: "白盒架构", god: "Athena" },
-  { id: "plan", title: "任务编排", god: "Athena" },
-  { id: "execute", title: "执行验收", god: "Hephaestus" },
-  { id: "other", title: "扩展步骤", god: "Olympus" },
+  { id: "align", indexLabel: "STAGE 01", title: "需求对齐", god: "Prometheus" },
+  { id: "design", indexLabel: "STAGE 02", title: "白盒架构", god: "Athena" },
+  { id: "plan", indexLabel: "STAGE 03", title: "任务编排", god: "Athena" },
+  { id: "execute", indexLabel: "STAGE 04", title: "执行验收", god: "Hephaestus" },
+  { id: "other", indexLabel: "STAGE 05", title: "扩展步骤", god: "Olympus" },
 ];
 
-const NODE_PHASE_BY_ID: Record<string, string> = {
-  intake: "align",
-  align: "align",
-  critic: "align",
-  gate_spec: "align",
-  design: "design",
-  validate_design: "design",
-  gate_design: "design",
-  plan: "plan",
-  validate_plan: "plan",
-  gate_plan: "plan",
-  execute: "execute",
-  verify: "execute",
-};
+const NODE_PHASE_BY_ID = new Map<string, string>([
+  ["intake", "align"],
+  ["align", "align"],
+  ["critic", "align"],
+  ["gate_spec", "align"],
+  ["design", "design"],
+  ["validate_design", "design"],
+  ["gate_design", "design"],
+  ["plan", "plan"],
+  ["validate_plan", "plan"],
+  ["gate_plan", "plan"],
+  ["execute", "execute"],
+  ["verify", "execute"],
+]);
 
 const KIND_LABELS: Record<WorkflowNodeKind, string> = {
   gate: "关口",
@@ -82,15 +83,24 @@ const KIND_LABELS: Record<WorkflowNodeKind, string> = {
   stage: "",
 };
 
-const STEP_GLYPHS: Record<string, string> = {
-  completed: "✓",
-  running: "▶",
-  paused: "◷",
-  failed: "✕",
-  error: "✕",
-  skipped: "—",
-  pending: "○",
-};
+const STEP_GLYPHS = new Map<string, string>([
+  ["completed", "✓"],
+  ["running", "▶"],
+  ["paused", "◷"],
+  ["failed", "✕"],
+  ["error", "✕"],
+  ["skipped", "—"],
+  ["pending", "○"],
+]);
+
+function ownValue<T>(record: Record<string, T> | null | undefined, key: string): T | undefined {
+  if (!record || !Object.hasOwn(record, key)) return undefined;
+  return record[key];
+}
+
+function nodeLabelFor(nodeId: string): string {
+  return ownValue(NODE_LABELS, nodeId) ?? nodeId;
+}
 
 export function classifyWorkflowNode(name: string, kind?: string | null): WorkflowNodeKind {
   const raw = String(kind || "").toLowerCase();
@@ -119,17 +129,24 @@ export function workflowStepTone(status: string): WorkflowStepTone {
 }
 
 function resolvePhaseId(node: WorkflowGraphNode): string {
-  const direct = NODE_PHASE_BY_ID[node.name];
+  const direct = NODE_PHASE_BY_ID.get(node.name);
   if (direct) return direct;
   const id = node.name.toLowerCase();
   const kind = String(node.kind || "").toLowerCase();
-  if (id.includes("spec") || id.includes("align") || id.includes("intake") || id.includes("critic") || kind.includes("align") || kind.includes("intake")) {
-    return "align";
-  }
   if (id.includes("design") || kind.includes("design")) return "design";
   if (id.includes("plan") || kind.includes("plan") || kind.includes("decompose")) return "plan";
   if (id.includes("exec") || id.includes("verify") || kind.includes("exec") || kind.includes("verify")) {
     return "execute";
+  }
+  if (
+    id.includes("intake") ||
+    id.includes("align") ||
+    id.includes("critic") ||
+    id.includes("spec") ||
+    kind.includes("align") ||
+    kind.includes("intake")
+  ) {
+    return "align";
   }
   return "other";
 }
@@ -138,41 +155,57 @@ function buildRouteBadge(
   nodeId: string,
   status: string,
   nodePhase: string,
-  order: Map<string, number>,
+  displayOrder: Map<string, number>,
   nodePhaseMap: Map<string, string>,
   kindMap: Map<string, WorkflowNodeKind>,
   edges: WorkflowGraphEdge[],
   traversedSet: Set<string>,
 ): RouteBadge | null {
-  const srcIndex = order.get(nodeId);
+  const srcIndex = displayOrder.get(nodeId);
   if (srcIndex === undefined) return null;
 
-  const outgoing = edges.filter((edge) => edge.source === nodeId && order.has(edge.target));
+  const outgoing = edges.filter((edge) => edge.source === nodeId && displayOrder.has(edge.target));
+
+  let bestTraversedBack: { target: string; index: number } | null = null;
+  let bestTraversedForward: { target: string; index: number } | null = null;
+  let bestDeclaredBack: { target: string; index: number } | null = null;
 
   for (const edge of outgoing) {
-    const key = `${edge.source}\u2192${edge.target}`;
-    if (!traversedSet.has(key)) continue;
-    const dstIndex = order.get(edge.target)!;
-    if (dstIndex <= srcIndex) {
-      return { text: `回退${NODE_LABELS[edge.target] || edge.target}`, tone: "warn" };
-    }
-    if (dstIndex > srcIndex + 1) {
-      const targetKind = kindMap.get(edge.target);
-      const samePhase = nodePhaseMap.get(edge.target) === nodePhase;
-      if (samePhase && targetKind === "gate") {
-        return { text: "直达关口", tone: "muted" };
+    const dstIndex = displayOrder.get(edge.target)!;
+    const isTraversed = traversedSet.has(`${edge.source}\u2192${edge.target}`);
+    if (isTraversed) {
+      if (dstIndex <= srcIndex) {
+        if (!bestTraversedBack || dstIndex < bestTraversedBack.index) {
+          bestTraversedBack = { target: edge.target, index: dstIndex };
+        }
+      } else if (dstIndex > srcIndex + 1) {
+        if (!bestTraversedForward || dstIndex > bestTraversedForward.index) {
+          bestTraversedForward = { target: edge.target, index: dstIndex };
+        }
       }
-      return { text: `直达${NODE_LABELS[edge.target] || edge.target}`, tone: "muted" };
+    } else if (dstIndex <= srcIndex) {
+      if (!bestDeclaredBack || dstIndex < bestDeclaredBack.index) {
+        bestDeclaredBack = { target: edge.target, index: dstIndex };
+      }
     }
   }
 
-  if (status === "failed" || status === "error") {
-    for (const edge of outgoing) {
-      const dstIndex = order.get(edge.target)!;
-      if (dstIndex <= srcIndex) {
-        return { text: `回退 ${NODE_LABELS[edge.target] || edge.target}`, tone: "bad" };
-      }
+  if (bestTraversedBack) {
+    return { text: `回退${nodeLabelFor(bestTraversedBack.target)}`, tone: "warn" };
+  }
+
+  if (bestTraversedForward) {
+    const target = bestTraversedForward.target;
+    const targetKind = kindMap.get(target);
+    const samePhase = nodePhaseMap.get(target) === nodePhase;
+    if (samePhase && targetKind === "gate") {
+      return { text: "直达关口", tone: "muted" };
     }
+    return { text: `直达${nodeLabelFor(target)}`, tone: "muted" };
+  }
+
+  if ((status === "failed" || status === "error") && bestDeclaredBack) {
+    return { text: `回退 ${nodeLabelFor(bestDeclaredBack.target)}`, tone: "bad" };
   }
 
   return null;
@@ -213,9 +246,8 @@ function connectorBetween(
   cur: WorkflowStageStep,
   traversedSet: Set<string>,
 ): ConnectorState {
-  if (prev.status === "skipped" || cur.status === "skipped") return "skipped";
   if (traversedSet.has(`${prev.id}\u2192${cur.id}`)) return "traversed";
-  if (prev.status === "completed" && cur.status !== "pending") return "traversed";
+  if (prev.status === "skipped" || cur.status === "skipped") return "skipped";
   return "pending";
 }
 
@@ -225,11 +257,11 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
   const rawEdges = workflow.graph?.edges || [];
   const statuses = workflow.node_statuses || {};
 
-  const order = new Map<string, number>();
+  const seenNodes = new Set<string>();
   const uniqueNodes: WorkflowGraphNode[] = [];
   for (const node of rawNodes) {
-    if (!node?.name || order.has(node.name)) continue;
-    order.set(node.name, uniqueNodes.length);
+    if (!node?.name || seenNodes.has(node.name)) continue;
+    seenNodes.add(node.name);
     uniqueNodes.push(node);
   }
 
@@ -254,23 +286,30 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
     else grouped.set(phaseId, [node]);
   }
 
+  const displayOrder = new Map<string, number>();
+  for (const def of PHASE_DEFINITIONS) {
+    for (const node of grouped.get(def.id) || []) {
+      displayOrder.set(node.name, displayOrder.size);
+    }
+  }
+
   const columns: WorkflowStageColumn[] = [];
   for (const def of PHASE_DEFINITIONS) {
     const nodesInPhase = grouped.get(def.id);
     if (!nodesInPhase?.length) continue;
 
     const steps: WorkflowStageStep[] = nodesInPhase.map((node) => {
-      const status = statuses[node.name] || "pending";
-      const label = NODE_LABELS[node.name] || node.name;
+      const status = ownValue(statuses, node.name) ?? "pending";
+      const label = nodeLabelFor(node.name);
       const kind = kindMap.get(node.name) || "stage";
       const kindLabel = KIND_LABELS[kind];
       const meta = statusMeta(status);
-      const statusText = WORKFLOW_STATUS_TEXT[status] || `${meta.glyph} ${meta.label}`;
+      const statusText = ownValue(WORKFLOW_STATUS_TEXT, status) ?? `${meta.glyph} ${meta.label}`;
       const routeBadge = buildRouteBadge(
         node.name,
         status,
         def.id,
-        order,
+        displayOrder,
         nodePhaseMap,
         kindMap,
         rawEdges,
@@ -284,7 +323,7 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
         kindLabel,
         status,
         tone: workflowStepTone(status),
-        glyph: STEP_GLYPHS[status] || "○",
+        glyph: STEP_GLYPHS.get(status) ?? "○",
         statusText,
         routeBadge,
         connectorBefore: null,
@@ -301,10 +340,9 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
     }
 
     const summary = summarizePhase(steps);
-    const indexNumber = String(columns.length + 1).padStart(2, "0");
     columns.push({
       id: def.id,
-      indexLabel: `STAGE ${indexNumber}`,
+      indexLabel: def.indexLabel,
       title: def.title,
       god: def.god,
       ...summary,

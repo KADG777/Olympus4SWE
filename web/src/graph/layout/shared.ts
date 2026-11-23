@@ -3,10 +3,7 @@ import type { ElkNode } from "elkjs/lib/elk-api";
 
 import type { Point } from "../geometry";
 
-/**
- * One physical card size for every Ariadne graph (task DAG and workflow alike), so both
- * Topology graphs read at the same 1:1 typography. CSS reads the same numbers via inline style.
- */
+/** Fixed 1:1 physical card size for the Task Dependency DAG. CSS reads the same numbers inline. */
 export const CARD_W = 184;
 export const CARD_H = 76;
 /** Minimum vertical port step (px) so fixed 7.2px arrowheads never overlap on high fan-in cards. */

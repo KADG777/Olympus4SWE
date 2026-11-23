@@ -391,7 +391,9 @@
 
 .wf-step-skip-pill,
 .wf-route-pill {
-  flex: none;
+  flex: 0 1 auto;
+  min-inline-size: 0;
+  max-inline-size: 100%;
   padding: 0 6px;
   border: 1px solid var(--rule);
   border-radius: var(--shape-pill);
@@ -399,6 +401,8 @@
   color: var(--text-muted);
   font-size: var(--text-xs);
   line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -450,6 +454,7 @@
 
 @container (max-width: 780px) {
   .wf-stages,
+  .wf-stages[data-cols="2"],
   .wf-stages[data-cols="3"],
   .wf-stages[data-cols="5"] {
     grid-template-columns: repeat(2, minmax(0, 1fr));

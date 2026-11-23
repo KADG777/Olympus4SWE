@@ -1168,12 +1168,10 @@ def test_staged_workflow_groups_phases_without_horizontal_overflow(workbench, br
     cards = {card["id"]: card for card in flow["cards"]}
     assert len(cards) == 10
 
-    # Task DAG stays at 1:1 physical card scale.
     assert _unscaled(dag["transform"]), dag["transform"]
     for card in dag["cards"]:
         assert abs(card["w"] - 184) <= 0.5 and abs(card["h"] - 76) <= 0.5, card
 
-    # product_blueprint groups 10 nodes into 3 phases with zero horizontal overflow.
     assert [stage["id"] for stage in flow["stages"]] == ["align", "design", "plan"]
     assert flow["stages"][0]["nodes"] == ["intake", "align", "critic", "gate_spec"]
     assert flow["stages"][1]["nodes"] == ["design", "validate_design", "gate_design"]
@@ -1184,7 +1182,6 @@ def test_staged_workflow_groups_phases_without_horizontal_overflow(workbench, br
         assert card["x"] >= flow["host"]["x"] - 1
         assert card["x"] + card["w"] <= flow["host"]["x"] + flow["host"]["w"] + 1
 
-    # Node kinds: human gates, deterministic validators and stages read differently.
     for name in ("gate_spec", "gate_design", "gate_plan"):
         assert cards[name]["kind"] == "gate" and cards[name]["badge"] == "关口"
     for name in ("validate_design", "validate_plan"):
@@ -1197,11 +1194,13 @@ def test_staged_workflow_groups_phases_without_horizontal_overflow(workbench, br
     assert cards["gate_spec"]["badgeBorder"] == accent
     assert cards["align"]["marker"] != accent
 
-    # repo_fast_patch omits unused design phase and adapts to 3 columns (align / plan / execute).
     fast_id = store.create_run(title="快速补丁阶段适配", workflow_name="repo_fast_patch")
     page.goto(f"{url}/?run={fast_id}")
     fast_flow = _wait_for_workflow(page)
     assert [stage["id"] for stage in fast_flow["stages"]] == ["align", "plan", "execute"]
+    assert "STAGE 01" in fast_flow["stages"][0]["text"]
+    assert "STAGE 03" in fast_flow["stages"][1]["text"]
+    assert "STAGE 04" in fast_flow["stages"][2]["text"]
     assert len(fast_flow["cards"]) == 6
     page.close()
 
@@ -1330,6 +1329,115 @@ def test_staged_workflow_empty_unmapped_and_failed_state(workbench, browser):
     page.close()
 
 
+def test_staged_workflow_custom_nodes_display_order_and_narrow_containers(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+
+    long_target = "very_long_custom_verification_target_node_name_for_narrow_overflow_guard"
+
+    def patch_custom_workflow(route):
+        resp = route.fetch()
+        data = resp.json()
+        proj = data.get("projection")
+        if isinstance(proj, dict) and proj.get("run_id") == run_id:
+            proj["workflow"] = {
+                **proj["workflow"],
+                "graph": {
+                    "nodes": [
+                        {"name": "plan", "kind": "pm_decompose"},
+                        {"name": "intake", "kind": "intake_triage"},
+                        {"name": "align", "kind": "align_goal"},
+                        {"name": "critic", "kind": "critic_parallel"},
+                        {"name": "design_spec_draft", "kind": "custom_step"},
+                        {"name": "toString", "kind": "custom_step"},
+                        {"name": long_target, "kind": "custom_step"},
+                    ],
+                    "edges": [
+                        {"source": "intake", "target": long_target, "conditional": True},
+                        {"source": "plan", "target": "intake", "conditional": True},
+                        {"source": "intake", "target": "plan", "conditional": True},
+                    ],
+                },
+                "node_statuses": {
+                    "intake": "completed",
+                    "align": "completed",
+                    "critic": "completed",
+                    "design_spec_draft": "pending",
+                    "plan": "completed",
+                    "toString": "pending",
+                    long_target: "pending",
+                },
+                "traversed_edges": [
+                    {"source": "intake", "target": long_target},
+                    {"source": "plan", "target": "intake"},
+                ],
+            }
+            route.fulfill(response=resp, json=data)
+            return
+        route.fulfill(response=resp)
+
+    page.route(f"**/api/runs/{run_id}*", patch_custom_workflow)
+    page.goto(f"{url}/?run={run_id}")
+    flow = _wait_for_workflow(page)
+    by_stage = {stage["id"]: stage for stage in flow["stages"]}
+    assert "design_spec_draft" in by_stage["design"]["nodes"]
+    assert "toString" in by_stage["other"]["nodes"]
+
+    cards = {card["id"]: card for card in flow["cards"]}
+    assert cards["plan"]["routePill"] == "回退输入分流"
+    assert cards["intake"]["routePill"] == f"直达{long_target}"
+
+    align_connectors = page.locator(
+        "#workflow-graph .wf-stage-col[data-stage-id='align'] .wf-step-connector"
+    ).evaluate_all("els => els.map(el => el.dataset.connector)")
+    assert align_connectors == ["pending", "pending"]
+
+    narrow = page.locator("#workflow-graph").evaluate("""(host) => {
+      host.style.width = '290px';
+      return { scrollWidth: host.scrollWidth, clientWidth: host.clientWidth };
+    }""")
+    assert narrow["scrollWidth"] <= narrow["clientWidth"] + 1
+    page.unroute(f"**/api/runs/{run_id}*")
+
+    def patch_two_stage(route):
+        resp = route.fetch()
+        data = resp.json()
+        proj = data.get("projection")
+        if isinstance(proj, dict) and proj.get("run_id") == run_id:
+            proj["workflow"] = {
+                **proj["workflow"],
+                "graph": {
+                    "nodes": [
+                        {"name": "intake", "kind": "intake_triage"},
+                        {"name": "execute", "kind": "execute_task_dag"},
+                    ],
+                    "edges": [{"source": "intake", "target": "execute"}],
+                },
+                "node_statuses": {"intake": "completed", "execute": "running"},
+                "traversed_edges": [{"source": "intake", "target": "execute"}],
+            }
+            route.fulfill(response=resp, json=data)
+            return
+        route.fulfill(response=resp)
+
+    page.route(f"**/api/runs/{run_id}*", patch_two_stage)
+    page.goto(f"{url}/?run={run_id}")
+    _wait_for_workflow(page)
+    two_col_widths = page.locator("#workflow-graph").evaluate("""(host) => {
+      host.style.width = '600px';
+      return Array.from(host.querySelectorAll('.wf-stage-col')).map(
+        (el) => el.getBoundingClientRect().width
+      );
+    }""")
+    assert len(two_col_widths) == 2
+    assert abs(two_col_widths[0] - two_col_widths[1]) <= 2.0
+    assert two_col_widths[0] > 240
+    assert not errors, errors
+    page.close()
+
+
 # ---------------------------------------------------------------------------
 # Graph interactions: scroll-safe controls, lineage highlight & SSE viewport
 # ---------------------------------------------------------------------------
@@ -1356,7 +1464,6 @@ def test_graph_islands_scroll_safe_controls_and_readonly_cards(workbench, browse
     wf_host = page.locator("#workflow-graph")
     dag_host = page.locator("#dag-graph")
 
-    # Unmodified wheel over the staged workflow board or DAG scrolls #stage vertically.
     wf_host.scroll_into_view_if_needed()
     wf_box = wf_host.bounding_box()
     scroll_before = stage.evaluate("el => el.scrollTop")

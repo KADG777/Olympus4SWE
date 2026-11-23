@@ -145,20 +145,14 @@
 }
 
 .ag-card-id,
-.ag-card-meta,
-.ag-card-title {
+.ag-card-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.ag-card-id,
-.ag-card-meta {
   font-family: var(--face-mono);
 }
 
-.ag-card-id,
-.ag-card-title {
+.ag-card-id {
   font-size: var(--text-sm);
   font-weight: var(--font-weight-medium);
 }
@@ -168,8 +162,7 @@
   font-size: var(--text-xs);
 }
 
-.ag-card-pill,
-.ag-card-kind {
+.ag-card-pill {
   flex: none;
   padding-inline: 6px;
   border: 1px solid var(--rule-hard);
