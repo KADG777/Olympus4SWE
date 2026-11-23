@@ -15,10 +15,12 @@ from olympus.core.contracts import (
     CheckKind,
     GoalSpec,
     RequirementItem,
+    ReviewAxis,
     ReviewFinding,
     ReviewSeverity,
     ReviewVerdict,
     SpecStatus,
+    TaskNode,
 )
 
 
@@ -121,6 +123,63 @@ def test_review_verdict_blocks_passing_with_important_finding() -> None:
         ],
     )
     assert ok.passed is True
+
+
+def test_review_contracts_expose_two_axis_and_run_proof_fields() -> None:
+    finding = ReviewFinding(
+        id="F1",
+        severity=ReviewSeverity.IMPORTANT,
+        file_path="src/app.py",
+        message="Broken requirement",
+        requirement_ref="R1",
+        repro_command="python3 -c 'raise SystemExit(1)'",
+        verified=True,
+        verification_output="SystemExit: 1",
+    )
+    assert finding.axis == ReviewAxis.SPEC
+    assert finding.verified is True
+    standards = ReviewFinding(
+        id="F2",
+        axis=ReviewAxis.STANDARDS,
+        severity=ReviewSeverity.NIT,
+        file_path="src/app.py",
+        line=3,
+        message="Prefer pathlib",
+    )
+    assert standards.repro_command is None and standards.verified is None
+
+    verdict = ReviewVerdict(
+        task_id="T1",
+        attempt=1,
+        passed=True,
+        summary="Only style nits remain",
+        findings=[standards],
+        dropped_unverified_count=2,
+    )
+    assert verdict.dropped_unverified_count == 2
+    with pytest.raises(ValidationError):
+        ReviewVerdict(
+            task_id="T1",
+            attempt=1,
+            passed=True,
+            summary="Negative counter",
+            dropped_unverified_count=-1,
+        )
+
+    task = TaskNode(
+        task_id="T1",
+        title="Implement feature",
+        objective="Add the guard",
+        write_scope=["feature.py"],
+        acceptance_checks=[
+            AcceptanceCheck(
+                id="C1", kind=CheckKind.INDEPENDENT_REVIEW, description="Audit"
+            )
+        ],
+        verified_repro_commands=["python3 -c 'raise SystemExit(1)'"],
+    )
+    assert task.verified_repro_commands == ["python3 -c 'raise SystemExit(1)'"]
+    assert "verified_repro_commands" not in task.definition()
 
 
 def test_acceptance_check_requires_command_when_kind_is_command() -> None:

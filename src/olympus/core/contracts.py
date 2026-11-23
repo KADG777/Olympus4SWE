@@ -512,11 +512,21 @@ class ReviewSeverity(StrEnum):
     PRE_EXISTING = "pre_existing"
 
 
+class ReviewAxis(StrEnum):
+    SPEC = "spec"
+    STANDARDS = "standards"
+
+
 class ReviewFinding(StrictModel):
     id: str
+    axis: ReviewAxis = ReviewAxis.SPEC
     severity: ReviewSeverity
     file_path: str
     line: int | None = Field(default=None, ge=1)
+    requirement_ref: str | None = None
+    repro_command: str | None = None
+    verified: bool | None = None
+    verification_output: str | None = None
     message: str = Field(min_length=1)
     suggestion: str | None = None
 
@@ -528,6 +538,7 @@ class ReviewVerdict(StrictModel):
     passed: bool
     summary: str = Field(min_length=1)
     findings: list[ReviewFinding] = Field(default_factory=list)
+    dropped_unverified_count: int = Field(default=0, ge=0)
     checked_commit: str | None = None
     incremental_only: bool = False
 
@@ -568,6 +579,7 @@ class TaskNode(StrictModel):
     role: str = "engineer"
     kind: TaskKind = TaskKind.IMPLEMENT
     deliverables: list[str] = Field(default_factory=list)
+    verified_repro_commands: list[str] = Field(default_factory=list)
 
     def definition(self) -> dict[str, Any]:
         """Return approval-bound task fields, excluding execution state."""

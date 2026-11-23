@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import olympus.stages.orchestrate as orchestrate_module
 from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
@@ -146,6 +147,9 @@ def _stage_responder(
             assert match is not None
             sandbox = Path(match.group(1).strip())
             if not any(msg.role == "tool" for msg in messages):
+                content = "FLAG = True\n"
+                if "[PRIOR REJECTION" in user_message:
+                    content += "GUARD = True\n"
                 return LLMResponse(
                     content=f"writing {file_name}",
                     tool_calls=(
@@ -154,7 +158,7 @@ def _stage_responder(
                             name="write_file",
                             arguments={
                                 "path": str(sandbox / file_name),
-                                "content": "FLAG = True\n",
+                                "content": content,
                             },
                         ),
                     ),
@@ -166,12 +170,18 @@ def _stage_responder(
             review_calls += 1
             findings: list[dict[str, Any]] = []
             if not passed:
+                module = Path(file_name).stem
                 findings.append(
                     {
                         "id": "F1",
+                        "axis": "spec",
                         "severity": "important",
                         "file_path": file_name,
                         "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": (
+                            f"python3 -c 'import {module}; assert {module}.GUARD'"
+                        ),
                         "message": "Missing overflow guard",
                     }
                 )
@@ -1583,6 +1593,23 @@ def _retained_stage(
     )
 
 
+def _review_script(
+    verdicts: Sequence[dict[str, Any]],
+) -> tuple[MockLLMProvider, dict[str, Any]]:
+    """Reviewer provider replaying scripted verdicts while counting LLM calls."""
+    state: dict[str, Any] = {"calls": 0, "prompts": []}
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        assert "Independent Verifier" in messages[0].content
+        state["calls"] += 1
+        state["prompts"].append(messages[1].content if len(messages) > 1 else "")
+        index = min(state["calls"] - 1, len(verdicts) - 1)
+        return LLMResponse(content=json.dumps(verdicts[index]))
+
+    return MockLLMProvider(responder=responder), state
+
+
 def _empty_dir(path: Path) -> bool:
     return not path.exists() or not any(path.iterdir())
 
@@ -1754,9 +1781,12 @@ def test_argus_rejection_reuses_retained_sandbox_for_targeted_repair(tmp_path: P
         passed = review_passes.pop(0)
         findings = [] if passed else [{
             "id": "F1",
+            "axis": "spec",
             "severity": "important",
             "file_path": "feature.py",
             "line": 1,
+            "requirement_ref": "R1",
+            "repro_command": "python3 -c 'import feature; assert feature.AUDIT'",
             "message": "Missing audit flag",
         }]
         return LLMResponse(content=json.dumps({
@@ -1788,6 +1818,368 @@ def test_argus_rejection_reuses_retained_sandbox_for_targeted_repair(tmp_path: P
     assert worker.sandboxes[0] == worker.sandboxes[1]
     reviews = [e for e in store.list_events(run_id) if e.event_type == "review.verdict_recorded"]
     assert [e.payload["attempt"] for e in reviews] == [1, 2]
+
+
+def test_unverified_exit_zero_and_standards_findings_never_block_acceptance(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Three unproven claims",
+                "findings": [
+                    {
+                        "id": "F-PROSE",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "message": "No overflow guard",
+                    },
+                    {
+                        "id": "F-EXIT0",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": "python3 -c 'pass'",
+                        "message": "Guard is missing",
+                    },
+                    {
+                        "id": "F-STYLE",
+                        "axis": "standards",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "message": "Prefer double quotes",
+                    },
+                ],
+            }
+        ]
+    )
+
+    def write_flag(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_flag]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 1
+    assert task.review_cycle == 0
+    assert state["calls"] == 1
+    events = store.list_events(run_id)
+    assert not [e for e in events if e.event_type == "task.requeued"]
+
+    verdict = json.loads(
+        (
+            tmp_path
+            / ".olympus"
+            / "runs"
+            / run_id
+            / "artifacts"
+            / "T1"
+            / "attempt-1"
+            / "verdict-cycle-1.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert verdict["passed"] is True
+    assert verdict["dropped_unverified_count"] == 2
+    assert {finding["severity"] for finding in verdict["findings"]} == {"nit"}
+    verified_events = [e for e in events if e.event_type == "review.verdict_verified"]
+    assert len(verified_events) == 1
+    payload = verified_events[0].payload
+    assert payload["passed"] is True
+    assert payload["verified_important"] == 0
+    assert payload["dropped_unverified"] == 2
+    assert payload["standards_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "timeout_seconds"),
+    [
+        ("python3 -c 'def ('", None),
+        ("olympus-missing-repro-binary-122", None),
+        ("python3 -c 'import time; time.sleep(30)'", 0.3),
+    ],
+    ids=["syntax-error", "exit-127", "timeout"],
+)
+def test_broken_reviewer_probes_never_block_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    timeout_seconds: float | None,
+) -> None:
+    if timeout_seconds is not None:
+        monkeypatch.setattr(
+            orchestrate_module, "_REPRO_TIMEOUT_SECONDS", timeout_seconds
+        )
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Broken probe",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": command,
+                        "message": "Claimed defect",
+                    }
+                ],
+            }
+        ]
+    )
+
+    def write_flag(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_flag]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 1
+    assert state["calls"] == 1
+    events = store.list_events(run_id)
+    assert not [e for e in events if e.event_type == "task.requeued"]
+    payload = next(
+        e.payload for e in events if e.event_type == "review.verdict_verified"
+    )
+    assert payload["verified_important"] == 0
+    assert payload["dropped_unverified"] == 1
+
+
+def test_proven_repro_blocks_persists_and_short_circuits_next_cycle(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    repro = "python3 -c 'import feature; assert feature.GUARD'"
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=4,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Missing guard",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 2,
+                        "requirement_ref": "R1",
+                        "repro_command": repro,
+                        "message": "GUARD is absent",
+                    }
+                ],
+            },
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": True,
+                "summary": "Guard added",
+                "findings": [],
+            },
+        ]
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        elif attempt == 2:
+            # Cycle 2 leaves the proven defect in place: Chronos must requeue with
+            # zero reviewer LLM calls instead of asking Argus again.
+            assert repro in prompt
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        else:
+            assert repro in prompt
+            (ws / "feature.py").write_text("FLAG = True\nGUARD = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([repair]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 3
+    assert task.review_cycle == 2
+    assert state["calls"] == 2
+    assert '"requirement_refs":["R1"]' in state["prompts"][0]
+    assert "NOW PASS" in state["prompts"][1]
+
+    events = store.list_events(run_id)
+    rechecks = [e for e in events if e.event_type == "review.repro_rechecked"]
+    assert [e.payload["passed"] for e in rechecks] == [False, True]
+    assert [row["command"] for row in rechecks[0].payload["results"]] == [repro]
+    assert rechecks[0].payload["short_circuited"] is True
+    assert rechecks[0].payload["llm_calls"] == 0
+    assert rechecks[1].payload["short_circuited"] is False
+    recorded = [e for e in events if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["attempt"] for e in recorded] == [1, 3]
+
+
+def test_verification_probe_side_effects_cannot_corrupt_worker_edits(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    repro = (
+        "python3 -c \"from pathlib import Path; "
+        "Path('helper.py').write_text('CORRUPTED = True\\n'); "
+        "Path('probe-junk.txt').write_text('junk')\" ; "
+        "python3 -c 'import feature; assert feature.GUARD'"
+    )
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py", "helper.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Missing guard",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 2,
+                        "requirement_ref": "R1",
+                        "repro_command": repro,
+                        "message": "GUARD is absent",
+                    }
+                ],
+            },
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": True,
+                "summary": "Guard added",
+                "findings": [],
+            },
+        ]
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "helper.py").write_text("HELPER = True\n", encoding="utf-8")
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        else:
+            # The probe corrupted helper.py during cycle 1; Chronos must have
+            # restored the worker's edit before this repair turn.
+            assert (ws / "helper.py").read_text(encoding="utf-8") == "HELPER = True\n"
+            (ws / "feature.py").write_text(
+                "FLAG = True\nGUARD = True\n", encoding="utf-8"
+            )
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([repair]), provider=provider
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert state["calls"] == 2
+    events = store.list_events(run_id)
+    assert not [e for e in events if e.event_type == "task.diff_gate_rejected"]
+    overlay_dir = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    feature = (overlay_dir / "feature.py").read_text(encoding="utf-8")
+    helper = (overlay_dir / "helper.py").read_text(encoding="utf-8")
+    assert "GUARD = True" in feature
+    assert "HELPER = True" in helper and "CORRUPTED" not in helper
 
 
 def test_resume_after_pause_reuses_retained_sandbox(tmp_path: Path) -> None:
