@@ -3,9 +3,12 @@ import { useSyncExternalStore } from "react";
 
 import {
   createRun,
+  createWorkspace,
+  deleteWorkspace,
   fetchAttemptArtifacts,
   fetchWorkbenchOptions,
   listRuns,
+  listWorkspaces,
   postCommand,
   seedDemo,
   type WorkbenchOptions,
@@ -16,13 +19,19 @@ import type {
   ApprovalAction,
   CommandBody,
   CreateRunBody,
+  CreateWorkspaceBody,
   DagNode,
   GoalSpec,
   KeyOutputItem,
+  PantheonGod,
+  PantheonSeatSummary,
   RecordedAttemptArtifacts,
   ReviewArtifact,
+  RunListResponse,
   RunProjection,
   RunSummary,
+  WorkspaceMode,
+  WorkspaceSummary,
 } from "../api/types";
 import {
   APPROVAL_LABELS,
@@ -38,6 +47,38 @@ import {
 import { captureReadingPosition, highlightProgress } from "../lib/readingPosition";
 
 export type Theme = "light" | "dark";
+export type ActiveSurface = "board" | "oracle";
+export type BoardModeFilter = "all" | WorkspaceMode;
+
+const OPEN_TABS_KEY = "olympus-open-tabs";
+
+function readStoredTabs(): string[] {
+  try {
+    const raw = localStorage.getItem(OPEN_TABS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const tabs: string[] = [];
+    for (const item of parsed) {
+      if (typeof item === "string" && item.trim() && !seen.has(item)) {
+        seen.add(item);
+        tabs.push(item);
+      }
+    }
+    return tabs;
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredTabs(tabs: string[]): void {
+  try {
+    localStorage.setItem(OPEN_TABS_KEY, JSON.stringify(tabs));
+  } catch {
+    // Storage may be unavailable (private mode); tabs still work in memory.
+  }
+}
 
 export interface DeliverySelection {
   index: number;
@@ -101,7 +142,18 @@ export interface NewRunForm {
 }
 
 export interface WorkbenchState {
+  activeSurface: ActiveSurface;
+  workspaces: WorkspaceSummary[];
+  selectedWorkspaceId: string | null;
+  boardModeFilter: BoardModeFilter;
+  selectedGodFilter: PantheonGod | null;
+  showArchived: boolean;
+  openTabs: string[];
+  quickDrawerRunId: string | null;
+  allRuns: RunSummary[];
   runs: RunSummary[];
+  pantheon: PantheonSeatSummary[];
+  pendingRulingTotal: number;
   runId: string | null;
   projection: RunProjection | null;
   view: View;
@@ -157,16 +209,35 @@ export class Workbench {
   private listeners = new Set<() => void>();
   private toastTimer: number | undefined;
   private pendingAction: DialogConfig | null = null;
+  private lastBoardWorkspaceRefreshKey = "";
+  private boardRequestSeq = 0;
+  private userNavigated = false;
+  private closedTabIds = new Set<string>();
 
   constructor(location: Location = window.location) {
     this.params = new URLSearchParams(location.search);
     const hashView = location.hash.replace(/^#/, "");
     const queryView = this.params.get("view");
     const queryTab = this.params.get("tab");
+    const queryRun = this.params.get("run")?.trim() || null;
     this.sse = this.params.get("nosse") !== "1";
+    const storedTabs = readStoredTabs();
+    const initialTabs =
+      queryRun && !storedTabs.includes(queryRun) ? [queryRun, ...storedTabs] : storedTabs;
     this.state = {
+      activeSurface: queryRun ? "oracle" : "board",
+      workspaces: [],
+      selectedWorkspaceId: null,
+      boardModeFilter: "all",
+      selectedGodFilter: null,
+      showArchived: false,
+      openTabs: initialTabs,
+      quickDrawerRunId: null,
+      allRuns: [],
       runs: [],
-      runId: null,
+      pantheon: [],
+      pendingRulingTotal: 0,
+      runId: queryRun,
       projection: null,
       view: isView(hashView) ? hashView : isView(queryView) ? queryView : "topology",
       selectedTaskId: this.params.get("task") || null,
@@ -207,28 +278,318 @@ export class Workbench {
     else notify();
   }
 
+  private persistTabs(tabs: string[]): void {
+    this.state.openTabs = tabs;
+    writeStoredTabs(tabs);
+  }
+
+  private mergeAllRuns(incoming: RunSummary[], replaceArchived: boolean): void {
+    if (replaceArchived) {
+      this.state.allRuns = incoming;
+      return;
+    }
+    const incomingIds = new Set(incoming.map((item) => item.run_id));
+    const retainedArchived = this.state.allRuns.filter(
+      (item) => item.is_archived && !incomingIds.has(item.run_id),
+    );
+    this.state.allRuns = [...incoming, ...retainedArchived];
+  }
+
   async start(): Promise<void> {
     window.addEventListener("hashchange", () => {
       const view = window.location.hash.replace(/^#/, "");
       if (isView(view) && view !== this.state.view) this.setView(view);
     });
-    this.setView(this.state.view);
     this.setTheme(this.state.theme);
-    let data = await this.refreshRuns();
-    if (!this.state.runs.length) {
+    const queryRun = this.params.get("run")?.trim() || null;
+
+    let [wsData, allData] = await Promise.all([
+      listWorkspaces().catch(() => ({ ok: true as const, workspaces: [] })),
+      listRuns({ includeArchived: true, limit: 200 }),
+    ]);
+    if (!allData.runs.length) {
       await seedDemo();
-      data = await this.refreshRuns();
+      [wsData, allData] = await Promise.all([
+        listWorkspaces().catch(() => ({ ok: true as const, workspaces: [] })),
+        listRuns({ includeArchived: true, limit: 200 }),
+      ]);
     }
-    const initialRun =
-      this.params.get("run") || data.default_run_id || this.state.runs[0]?.run_id || null;
-    if (initialRun) this.loadRun(initialRun);
+
+    const s = this.state;
+    s.workspaces = wsData.workspaces || [];
+    this.mergeAllRuns(allData.runs || [], true);
+    s.pantheon = allData.pantheon || [];
+    s.pendingRulingTotal = allData.pending_ruling_total ?? 0;
+    s.runs = s.showArchived
+      ? allData.runs || []
+      : (allData.runs || []).filter((run) => !run.is_archived);
+
+    const knownIds = new Set(s.allRuns.map((run) => run.run_id));
+    const validatedTabs = s.openTabs.filter(
+      (id) => (knownIds.has(id) || id === queryRun) && !this.closedTabIds.has(id),
+    );
+    if (queryRun && !this.closedTabIds.has(queryRun) && !validatedTabs.includes(queryRun)) {
+      validatedTabs.unshift(queryRun);
+    }
+    this.persistTabs(validatedTabs);
+
+    if (this.userNavigated) {
+      this.commit();
+      return;
+    }
+
+    if (queryRun) {
+      s.activeSurface = "oracle";
+      this.loadRun(queryRun);
+    } else {
+      s.activeSurface = "board";
+      s.runId = null;
+      this.syncUrl();
+      this.commit();
+    }
   }
 
-  async refreshRuns() {
-    const data = await listRuns();
-    this.state.runs = data.runs || [];
+  async refreshWorkspaces(): Promise<WorkspaceSummary[]> {
+    const data = await listWorkspaces();
+    this.state.workspaces = data.workspaces || [];
+    this.commit(false);
+    return this.state.workspaces;
+  }
+
+  async refreshBoardRuns(): Promise<RunListResponse> {
+    const seq = ++this.boardRequestSeq;
+    const s = this.state;
+    const data = await listRuns({
+      workspaceId: s.selectedWorkspaceId,
+      includeArchived: s.showArchived,
+    });
+    if (seq !== this.boardRequestSeq) return data;
+    s.runs = data.runs || [];
+    s.pantheon = data.pantheon || [];
+    if (!s.selectedWorkspaceId) {
+      s.pendingRulingTotal = data.pending_ruling_total ?? 0;
+      this.mergeAllRuns(data.runs || [], s.showArchived);
+    }
     this.commit();
     return data;
+  }
+
+  async refreshRuns(): Promise<RunListResponse> {
+    const [allData, wsData] = await Promise.all([
+      listRuns({ includeArchived: true, limit: 200 }),
+      listWorkspaces().catch(() => null),
+    ]);
+    const s = this.state;
+    if (wsData) s.workspaces = wsData.workspaces || [];
+    this.mergeAllRuns(allData.runs || [], true);
+    s.pendingRulingTotal = allData.pending_ruling_total ?? 0;
+    if (!s.selectedWorkspaceId) {
+      s.pantheon = allData.pantheon || [];
+      s.runs = s.showArchived
+        ? allData.runs || []
+        : (allData.runs || []).filter((run) => !run.is_archived);
+      this.commit();
+      return allData;
+    }
+    return this.refreshBoardRuns();
+  }
+
+  applyBoardSnapshot = (snapshot: RunListResponse): void => {
+    const s = this.state;
+    const restore = s.activeSurface === "oracle" && s.projection ? captureReadingPosition() : null;
+    this.mergeAllRuns(snapshot.runs || [], false);
+    s.pendingRulingTotal = snapshot.pending_ruling_total ?? 0;
+
+    if (!s.selectedWorkspaceId) {
+      s.pantheon = snapshot.pantheon || [];
+      if (!s.showArchived) {
+        s.runs = snapshot.runs || [];
+      } else {
+        s.runs = s.allRuns;
+        void this.refreshBoardRuns().catch(() => undefined);
+      }
+    } else {
+      const source = s.showArchived ? s.allRuns : snapshot.runs || [];
+      s.runs = source.filter((run) => run.workspace_id === s.selectedWorkspaceId);
+      void this.refreshBoardRuns().catch(() => undefined);
+    }
+
+    const wsKey = `${snapshot.pending_ruling_total}:${(snapshot.runs || [])
+      .map((run) => `${run.run_id}:${run.state_revision}:${run.ball_holder}:${run.workspace_id || ""}`)
+      .join(",")}`;
+    if (wsKey !== this.lastBoardWorkspaceRefreshKey) {
+      this.lastBoardWorkspaceRefreshKey = wsKey;
+      void this.refreshWorkspaces().catch(() => undefined);
+    }
+
+    this.commit();
+    restore?.();
+  };
+
+  openBoard(options: { archived?: boolean } = {}): void {
+    this.userNavigated = true;
+    const s = this.state;
+    const nextArchived = options.archived ?? false;
+    const archivedChanged = s.showArchived !== nextArchived;
+    s.activeSurface = "board";
+    s.showArchived = nextArchived;
+    s.dockOpen = false;
+    this.syncUrl();
+    if (archivedChanged || s.selectedWorkspaceId) {
+      if (!s.selectedWorkspaceId) {
+        s.runs = nextArchived
+          ? s.allRuns
+          : s.allRuns.filter((run) => !run.is_archived);
+      } else {
+        s.runs = s.allRuns.filter(
+          (run) =>
+            run.workspace_id === s.selectedWorkspaceId && (nextArchived || !run.is_archived),
+        );
+      }
+      this.commit();
+      void this.refreshBoardRuns().catch(() => undefined);
+      return;
+    }
+    this.commit();
+  }
+
+  toggleArchive(): void {
+    const s = this.state;
+    if (s.activeSurface === "board" && s.showArchived) {
+      this.openBoard({ archived: false });
+    } else {
+      this.openBoard({ archived: true });
+    }
+  }
+
+  openOracleTab(runId: string): void {
+    if (!runId) return;
+    this.userNavigated = true;
+    this.closedTabIds.delete(runId);
+    const s = this.state;
+    if (!s.openTabs.includes(runId)) {
+      this.persistTabs([...s.openTabs, runId]);
+    }
+    s.activeSurface = "oracle";
+    s.quickDrawerRunId = null;
+    if (s.runId !== runId || !s.projection || s.projection.run_id !== runId) {
+      s.selectedTaskId = null;
+      s.workflowNode = null;
+      this.loadRun(runId);
+    } else {
+      s.dockOpen = s.userOpenedDock || s.projection.hitl_banner?.kind === "task_blocked";
+      this.syncUrl();
+      this.commit();
+    }
+  }
+
+  closeOracleTab(runId: string): void {
+    this.userNavigated = true;
+    this.closedTabIds.add(runId);
+    const s = this.state;
+    const idx = s.openTabs.indexOf(runId);
+    if (idx === -1) return;
+    const nextTabs = s.openTabs.filter((id) => id !== runId);
+    this.persistTabs(nextTabs);
+
+    if (s.activeSurface === "oracle" && s.runId === runId) {
+      const nextRunId = nextTabs[Math.min(idx, nextTabs.length - 1)] || null;
+      if (nextRunId) {
+        s.selectedTaskId = null;
+        s.workflowNode = null;
+        this.loadRun(nextRunId);
+      } else {
+        s.runId = null;
+        s.projection = null;
+        s.dockOpen = false;
+        s.userOpenedDock = false;
+        s.activeSurface = "board";
+        this.syncUrl();
+        this.commit();
+      }
+      return;
+    }
+    if (s.runId === runId) {
+      s.runId = null;
+      s.projection = null;
+    }
+    this.commit();
+  }
+
+  selectWorkspace(workspaceId: string | null): void {
+    const next = workspaceId && workspaceId.trim() ? workspaceId : null;
+    const s = this.state;
+    if (s.selectedWorkspaceId === next) return;
+    s.selectedWorkspaceId = next;
+    s.runs = s.allRuns.filter(
+      (run) =>
+        (next === null || run.workspace_id === next) && (s.showArchived || !run.is_archived),
+    );
+    this.commit();
+    void this.refreshBoardRuns().catch(() => undefined);
+  }
+
+  setBoardModeFilter(mode: BoardModeFilter): void {
+    if (this.state.boardModeFilter === mode) return;
+    this.state.boardModeFilter = mode;
+    this.commit();
+  }
+
+  setSelectedGodFilter(god: PantheonGod | null): void {
+    this.state.selectedGodFilter = god && this.state.selectedGodFilter === god ? null : god;
+    this.commit();
+  }
+
+  openQuickDrawer(runId: string): void {
+    this.state.quickDrawerRunId = runId;
+    this.commit();
+  }
+
+  closeQuickDrawer(): void {
+    if (this.state.quickDrawerRunId === null) return;
+    this.state.quickDrawerRunId = null;
+    this.commit();
+  }
+
+  async openWorkspaceManager(): Promise<void> {
+    byId<HTMLDialogElement>("workspace-manager-dialog")?.showModal();
+    try {
+      await this.refreshWorkspaces();
+    } catch {
+      this.toast("加载工作区列表失败");
+    }
+  }
+
+  async registerWorkspace(
+    body: CreateWorkspaceBody,
+  ): Promise<{ ok: true; workspace: WorkspaceSummary } | { ok: false; error: string }> {
+    try {
+      const response = await createWorkspace(body);
+      await this.refreshWorkspaces();
+      this.toast(`已注册工作区 ${response.workspace.name}`);
+      return { ok: true, workspace: response.workspace };
+    } catch (error) {
+      return { ok: false, error: (error as Error).message || "注册工作区失败" };
+    }
+  }
+
+  async unregisterWorkspace(workspaceId: string): Promise<boolean> {
+    try {
+      await deleteWorkspace(workspaceId);
+      const resetFilter = this.state.selectedWorkspaceId === workspaceId;
+      if (resetFilter) {
+        this.state.selectedWorkspaceId = null;
+      }
+      await this.refreshWorkspaces();
+      if (resetFilter) {
+        await this.refreshBoardRuns();
+      }
+      this.toast("已移除工作区注册（本地文件与历史记录均保留）");
+      return true;
+    } catch (error) {
+      this.toast(`移除工作区失败：${(error as Error).message}`);
+      return false;
+    }
   }
 
   /** Switch the console to another run; the transport hook reconnects on `streamGeneration`. */
@@ -240,6 +601,10 @@ export class Workbench {
       const hitlDialog = byId<HTMLDialogElement>("hitl-dialog");
       if (hitlDialog?.open) hitlDialog.close();
     }
+    s.activeSurface = "oracle";
+    if (!s.openTabs.includes(runId)) {
+      this.persistTabs([...s.openTabs, runId]);
+    }
     s.runId = runId;
     s.userOpenedDock = false;
     s.activity = undefined;
@@ -250,10 +615,7 @@ export class Workbench {
   }
 
   selectRun(runId: string): void {
-    if (!runId || runId === this.state.runId) return;
-    this.state.selectedTaskId = null;
-    this.state.workflowNode = null;
-    this.loadRun(runId);
+    this.openOracleTab(runId);
   }
 
   connectionText(): string {
@@ -300,10 +662,12 @@ export class Workbench {
       const blocked = nodes.find((node) => node.status === "blocked" || node.status === "failed");
       s.selectedTaskId = (blocked || nodes[0])?.task_id || null;
     }
-    const runEntry = s.runs.find((run) => run.run_id === projection.run_id);
-    if (runEntry) {
-      runEntry.status = projection.status;
-      runEntry.workflow_name = projection.workflow_name || runEntry.workflow_name;
+    for (const list of [s.runs, s.allRuns]) {
+      const runEntry = list.find((run) => run.run_id === projection.run_id);
+      if (runEntry) {
+        runEntry.status = projection.status;
+        runEntry.workflow_name = projection.workflow_name || runEntry.workflow_name;
+      }
     }
     if (switchedRun && !s.userOpenedDock) {
       s.dockOpen = projection.hitl_banner?.kind === "task_blocked";
@@ -403,8 +767,13 @@ export class Workbench {
 
   private syncUrl(): void {
     const url = new URL(window.location.href);
-    if (this.state.runId) url.searchParams.set("run", this.state.runId);
-    url.hash = this.state.view;
+    if (this.state.activeSurface === "oracle" && this.state.runId) {
+      url.searchParams.set("run", this.state.runId);
+      url.hash = this.state.view;
+    } else {
+      url.searchParams.delete("run");
+      url.hash = "";
+    }
     if (url.href !== window.location.href) window.history.replaceState(window.history.state, "", url);
   }
 
@@ -898,6 +1267,8 @@ export class Workbench {
       if (selectedDemo && Array.isArray(selectedDemo.constraints)) {
         payload.constraints = selectedDemo.constraints;
       }
+    } else if (s.selectedWorkspaceId) {
+      payload.workspace_id = s.selectedWorkspaceId;
     }
     if (s.submitting) return false;
     s.submitting = true;

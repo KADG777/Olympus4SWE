@@ -1,4 +1,14 @@
-import type { DagNode, RunProgressItem, RunProjection, WorkflowView } from "../api/types";
+import type {
+  BallHolder,
+  DagNode,
+  PantheonGod,
+  PendingAction,
+  RunProgressItem,
+  RunProjection,
+  TaskType,
+  WorkflowView,
+  WorkspaceMode,
+} from "../api/types";
 
 export const VIEWS = ["topology", "design", "matrix", "waterfall"] as const;
 export type View = (typeof VIEWS)[number];
@@ -257,4 +267,68 @@ export function taskBlocker(projection: RunProjection | null, selectedTaskId: st
   if (!projection || banner?.kind !== "task_blocked") return null;
   const selected = projection.dag.nodes.find((node: DagNode) => node.task_id === selectedTaskId);
   return selected?.blocker || banner;
+}
+
+export const WORKSPACE_MODE_LABELS: Record<WorkspaceMode, string> = {
+  brownfield: "Brownfield",
+  greenfield: "Greenfield",
+  spec_only: "Spec-Only",
+};
+
+export const TASK_TYPE_LABELS: Record<TaskType, string> = {
+  feature: "Feature",
+  fix: "Fix",
+  refactor: "Refactor",
+  blueprint: "Blueprint",
+};
+
+export const GOD_META: Record<PantheonGod, { name: string; role: string; monogram: string }> = {
+  prometheus: { name: "Prometheus", role: "Align · Needs", monogram: "P" },
+  athena: { name: "Athena", role: "Design · Arch", monogram: "A" },
+  hephaestus: { name: "Hephaestus", role: "Build · Sandbox", monogram: "H" },
+  momus: { name: "Momus", role: "Review · Audit", monogram: "M" },
+  argus: { name: "Argus", role: "Verify · Gate", monogram: "G" },
+};
+
+export const STATUS_BADGE_LABELS: Record<string, string> = {
+  clarify: "Clarify",
+  approve_spec: "Approve Spec",
+  approve_design: "Approve Design",
+  approve_plan: "Approve Plan",
+  review_delivery: "Review Delivery",
+  blocked: "Blocked",
+  paused: "Paused",
+  failed: "Failed",
+  created: "Queued",
+  aligning: "Aligning",
+  designing: "Designing",
+  planning: "Planning",
+  building: "Building",
+  reviewing: "Reviewing",
+  verifying: "Verifying",
+  delivered: "Verified",
+  blueprint: "Blueprint Ready",
+  cancelled: "Cancelled",
+};
+
+export const PENDING_ACTION_CTA: Record<NonNullable<PendingAction>, string> = {
+  clarify: "Answer Clarifications",
+  approve_spec: "Review GoalSpec",
+  approve_design: "Review Design",
+  approve_plan: "Approve Plan",
+  resolve_blocker: "Resolve Blocker",
+  review_delivery: "Review Delivery",
+};
+
+export function boardBadgeVariant(ballHolder: BallHolder, statusBadge: string): Variant {
+  if (statusBadge === "failed" || statusBadge === "blocked") return "bad";
+  if (statusBadge === "cancelled") return "muted";
+  if (ballHolder === "human") return "warn";
+  if (ballHolder === "agent") return "live";
+  return "ok";
+}
+
+export function shortOracleCode(runId: string): string {
+  const cleaned = runId.replace(/^run[-_]?/i, "");
+  return cleaned.length > 12 ? cleaned.slice(0, 12) : cleaned || runId;
 }

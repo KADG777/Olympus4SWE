@@ -36,8 +36,35 @@
     inline-size: auto;
   }
 
-  .thread-list {
+  .thread-list,
+  .rail-divider,
+  .rail-tabs-section {
     display: none;
+  }
+
+  .rail-nav {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .rail-nav-item {
+    inline-size: auto;
+  }
+
+  .workspace-switcher-wrap {
+    flex: 0 1 200px;
+  }
+
+  .board-head {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .board-canvas {
+    padding: var(--space-4);
+  }
+
+  .board-columns {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .stage-inline {

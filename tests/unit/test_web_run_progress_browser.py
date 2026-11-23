@@ -14,6 +14,7 @@ import uvicorn
 
 from olympus.core.contracts import (
     AcceptanceCheck,
+    AmbiguityItem,
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
@@ -22,6 +23,7 @@ from olympus.core.contracts import (
     DesignSpec,
     GoalSpec,
     RequirementItem,
+    RunStatus,
     TaskNode,
     TaskPlan,
     TaskStatus,
@@ -553,7 +555,8 @@ def test_submit_feedback_precedes_http_response(workbench, browser):
     _, run_id, url = workbench
     page = browser.new_page()
     page.goto(f"{url}/?run={run_id}")
-    page.get_by_role("button", name="+ 新建编排").click()
+    page.locator("#nav-oracle-board").click()
+    page.locator("#btn-issue-oracle").click()
     page.get_by_label("需求原文").fill("检查提交反馈")
     held = []
     page.route(f"{url}/api/runs", lambda route: held.append(route))
@@ -990,7 +993,8 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(broken.locator("#workflow-badge")).to_contain_text("产品蓝图")
     expect(broken.locator("#run-current-stage")).to_contain_text("有任务受阻")
     broken.unroute("**/static/assets/ariadne-graph*.js")
-    broken.locator("#thread-list .thread-item").nth(1).click()
+    broken.locator("#nav-oracle-board").click()
+    broken.locator(f".oracle-card:not([data-run-id='{run_id}']) .oracle-card-trigger").first.click()
     expect(broken.locator("#dag-graph .ag-island")).to_be_visible()
     expect(broken.locator("#workflow-graph .ag-island")).to_be_visible()
     _assert_graph_stylesheet_applied(broken)
@@ -1007,7 +1011,10 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
         expect(css_broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
         assert css_broken.locator("#dag-graph .ag-island").count() == 0, label
         css_broken.unroute("**/static/assets/ariadne-graph*.css*")
-        css_broken.locator("#thread-list .thread-item").nth(1).click()
+        css_broken.locator("#nav-oracle-board").click()
+        css_broken.locator(
+            f".oracle-card:not([data-run-id='{run_id}']) .oracle-card-trigger"
+        ).first.click()
         expect(css_broken.locator("#dag-graph .ag-island")).to_be_visible()
         expect(css_broken.locator("#workflow-graph .ag-island")).to_be_visible()
         _assert_graph_stylesheet_applied(css_broken, allow_retry=True)
@@ -1022,7 +1029,10 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(stalled_css.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
     assert stalled_css.locator("#dag-graph .ag-island").count() == 0
     stalled_css.unroute("**/static/assets/ariadne-graph*.css*")
-    stalled_css.locator("#thread-list .thread-item").nth(1).click()
+    stalled_css.locator("#nav-oracle-board").click()
+    stalled_css.locator(
+        f".oracle-card:not([data-run-id='{run_id}']) .oracle-card-trigger"
+    ).first.click()
     expect(stalled_css.locator("#dag-graph .ag-island")).to_be_visible()
     expect(stalled_css.locator("#workflow-graph .ag-island")).to_be_visible()
     _assert_graph_stylesheet_applied(stalled_css, allow_retry=True)
@@ -1044,7 +1054,10 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(late_js.locator("#dag-graph")).to_contain_text(
         "任务依赖图组件未能加载", timeout=7000
     )
-    late_js.locator("#thread-list .thread-item").nth(1).click()
+    late_js.locator("#nav-oracle-board").click()
+    late_js.locator(
+        f".oracle-card:not([data-run-id='{run_id}']) .oracle-card-trigger"
+    ).first.click()
     late_js.wait_for_function(
         "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
         ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
@@ -1616,7 +1629,8 @@ def test_task_dag_live_sse_status_update_preserves_zoom_and_pan_and_resets_on_ru
     assert card_handle.evaluate("node => node.isConnected")
 
     # Switching runs changes topology signature -> triggers fresh ELK layout and 1:1 auto-fit.
-    page.locator(f"#thread-list [data-run-id='{second_id}']").click()
+    page.locator("#nav-oracle-board").click()
+    page.locator(f".oracle-card[data-run-id='{second_id}'] .oracle-card-trigger").click()
     expect(dag.locator("[data-task-id='SOLO-1']")).to_be_visible()
     assert abs(dag.evaluate(VIEWPORT_MATRIX)["zoom"] - 1.0) < 0.01
     page.close()
@@ -1734,4 +1748,284 @@ def test_watchdog_diagnosis_surfaces_live_and_after_refresh(workbench, browser):
     target.click()
     playwright.expect(dock.get_by_text("外部阻塞", exact=True)).to_be_visible()
     playwright.expect(dock.get_by_text("Credentials are missing.", exact=True)).to_be_visible()
+    page.close()
+
+
+# ---------------------------------------------------------------------------
+# Oracle Board (L1), Two-Tier Sidebar, Workspace Switcher & Open Ariadne Tabs
+# ---------------------------------------------------------------------------
+
+
+def test_oracle_board_landing_columns_mode_filters_and_deep_link(workbench, browser):
+    store, demo_id, url = workbench
+    human_id = store.create_run(
+        title="Clarify Auth Rate Limit",
+        workspace_mode="greenfield",
+        task_type="feature",
+    )
+    store.save_spec(
+        human_id,
+        GoalSpec(
+            goal="Rate limit API",
+            requirements=[
+                RequirementItem(
+                    id="R1", description="Limit requests", acceptance_criteria=["Returns 429"]
+                )
+            ],
+            open_ambiguities=[
+                AmbiguityItem(
+                    id="A1",
+                    question="Use SQLite or in-memory counters?",
+                    impact="Storage persistence",
+                    blocking=True,
+                )
+            ],
+        ),
+    )
+    store.set_run_status(human_id, RunStatus.AWAITING_HUMAN)
+
+    agent_id = store.create_run(
+        title="Refactor Router Adapters",
+        workspace_mode="brownfield",
+        task_type="refactor",
+    )
+    store.set_run_status(agent_id, RunStatus.RUNNING)
+
+    done_id = store.create_run(
+        title="API Spec Blueprint",
+        workspace_mode="spec_only",
+        task_type="blueprint",
+    )
+    store.set_run_status(done_id, RunStatus.COMPLETED)
+
+    archived_id = store.create_run(
+        title="Retired Legacy Migration",
+        workspace_mode="brownfield",
+        task_type="fix",
+    )
+    store.set_run_status(archived_id, RunStatus.CANCELLED)
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+    page.goto(f"{url}/")
+
+    # Lands on L1 Oracle Board with 3 Ball-in-Court columns and data-god attributes.
+    expect(page.locator("body")).to_have_attribute("data-surface", "board")
+    expect(page.get_by_role("heading", name="Oracle Board", exact=True)).to_be_visible()
+
+    human_col = page.locator("[data-column='human']")
+    agent_col = page.locator("[data-column='agent']")
+    done_col = page.locator("[data-column='done']")
+
+    expect(human_col.locator(f".oracle-card[data-run-id='{human_id}']")).to_have_attribute(
+        "data-god", "prometheus"
+    )
+    expect(agent_col.locator(f".oracle-card[data-run-id='{agent_id}']")).to_be_visible()
+    expect(done_col.locator(f".oracle-card[data-run-id='{done_id}']")).to_have_attribute(
+        "data-god", "athena"
+    )
+    expect(page.locator(f".oracle-card[data-run-id='{archived_id}']")).to_have_count(0)
+
+    # Sidebar pending-ruling badge reflects live human-held count.
+    pending_count = httpx.get(f"{url}/api/runs").json()["pending_ruling_total"]
+    assert pending_count >= 1
+    expect(page.locator("#nav-pending-badge")).to_have_text(str(pending_count))
+
+    # Mode filter pills filter across columns.
+    page.locator("[data-mode-filter='greenfield']").click()
+    expect(human_col.locator(f".oracle-card[data-run-id='{human_id}']")).to_be_visible()
+    expect(agent_col.locator(f".oracle-card[data-run-id='{agent_id}']")).to_have_count(0)
+    expect(done_col.locator(f".oracle-card[data-run-id='{done_id}']")).to_have_count(0)
+
+    page.locator("[data-mode-filter='spec_only']").click()
+    expect(done_col.locator(f".oracle-card[data-run-id='{done_id}']")).to_be_visible()
+    expect(human_col.locator(f".oracle-card[data-run-id='{human_id}']")).to_have_count(0)
+
+    page.locator("[data-mode-filter='all']").click()
+    expect(human_col.locator(f".oracle-card[data-run-id='{human_id}']")).to_be_visible()
+
+    # Archive toggle surfaces cancelled/completed history and returns cleanly to active board.
+    page.locator("#nav-archive").click()
+    expect(page.locator("#oracle-board-archive")).to_be_visible()
+    expect(page.locator(f".oracle-card[data-run-id='{archived_id}']")).to_be_visible()
+    page.locator("#nav-oracle-board").click()
+    expect(page.locator("#oracle-board-columns")).to_be_visible()
+
+    # Legacy deep link (?run=<id>#design) lands directly in L2 Ariadne Cockpit with tab open.
+    page.goto(f"{url}/?run={demo_id}#design")
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+    expect(page.locator("#view-design")).to_be_visible()
+    expect(page.locator(f"#open-tabs .ariadne-tab[data-run-id='{demo_id}']")).to_have_attribute(
+        "data-active", "true"
+    )
+    page.close()
+
+
+def test_workspace_register_unregister_and_switching_preserves_cross_project_tabs(
+    workbench, browser, tmp_path
+):
+    store, _, url = workbench
+    second_repo = tmp_path / "voice-cli"
+    second_repo.mkdir()
+    marker_file = second_repo / "README.md"
+    marker_file.write_text("# voice-cli\n", encoding="utf-8")
+
+    default_ws = httpx.get(f"{url}/api/workspaces").json()["workspaces"][0]
+    ws1_run = store.create_run(
+        title="Default Repo Task",
+        workspace_id=default_ws["workspace_id"],
+        workspace_root=default_ws["root_path"],
+        workspace_mode="brownfield",
+        task_type="fix",
+    )
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+    page.goto(f"{url}/")
+
+    # Open a Workspace 1 Oracle as an L2 Ariadne tab, then return to Oracle Board.
+    page.locator(f".oracle-card[data-run-id='{ws1_run}'] .oracle-card-trigger").click()
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+    expect(page.locator(f"#open-tabs .ariadne-tab[data-run-id='{ws1_run}']")).to_be_visible()
+    page.locator("#nav-oracle-board").click()
+    expect(page.locator("body")).to_have_attribute("data-surface", "board")
+
+    # Open Workspace Manager via sidebar and test invalid path rejection first.
+    page.locator("#nav-workspaces").click()
+    dialog = page.locator("#workspace-manager-dialog")
+    expect(dialog).to_be_visible()
+    dialog.locator("#workspace-root-input").fill(str(tmp_path / "does-not-exist"))
+    dialog.locator("#btn-register-workspace").click()
+    expect(dialog.locator("#workspace-dialog-error")).to_be_visible()
+
+    # Register the real second_repo directory.
+    dialog.locator("#workspace-root-input").fill(str(second_repo))
+    dialog.locator("#workspace-name-input").fill("voice-cli")
+    dialog.locator("#btn-register-workspace").click()
+    expect(dialog.locator("#workspace-list")).to_contain_text("voice-cli")
+    dialog.get_by_role("button", name="Done").click()
+    expect(dialog).to_be_hidden()
+
+    # Seed a run bound to voice-cli and switch workspace filter to voice-cli.
+    workspaces = httpx.get(f"{url}/api/workspaces").json()["workspaces"]
+    ws2 = next(item for item in workspaces if item["name"] == "voice-cli")
+    ws2_run = store.create_run(
+        title="Offline Voice Slicer",
+        workspace_id=ws2["workspace_id"],
+        workspace_root=ws2["root_path"],
+        workspace_mode="brownfield",
+        task_type="feature",
+    )
+
+    page.locator("#workspace-switcher").select_option(ws2["workspace_id"])
+    expect(page.locator(f".oracle-card[data-run-id='{ws2_run}']")).to_be_visible()
+    expect(page.locator(f".oracle-card[data-run-id='{ws1_run}']")).to_have_count(0)
+
+    # Invariant: switching Workspace NEVER closes already-open cross-project Ariadne tabs
+    # and surfaces the tab's workspace badge for disambiguation.
+    cross_tab = page.locator(f"#open-tabs .ariadne-tab[data-run-id='{ws1_run}']")
+    expect(cross_tab).to_be_visible()
+    expect(cross_tab.locator(".ariadne-tab-workspace")).to_have_text(default_ws["name"])
+
+    # Unregister voice-cli via Workspace Manager: resets filter to All Projects, keeps disk files.
+    page.locator("#nav-workspaces").click()
+    expect(dialog).to_be_visible()
+    dialog.locator(f"[data-workspace-remove='{ws2['workspace_id']}']").click()
+    expect(dialog.locator(f"[data-workspace-id='{ws2['workspace_id']}']")).to_have_count(0)
+    dialog.get_by_role("button", name="Done").click()
+
+    assert second_repo.is_dir() and marker_file.read_text(encoding="utf-8") == "# voice-cli\n"
+    expect(page.locator("#workspace-switcher")).to_have_value("")
+    expect(page.locator(f".oracle-card[data-run-id='{ws1_run}']")).to_be_visible()
+    page.close()
+
+
+def test_open_and_close_ariadne_tabs_persist_without_deleting_runs(workbench, browser):
+    store, demo_id, url = workbench
+    extra_id = store.create_run(title="Keep On Board After Close")
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+    page.goto(f"{url}/")
+
+    # Seed a stale ID in localStorage alongside opening a real card.
+    page.evaluate(
+        "() => localStorage.setItem('olympus-open-tabs', JSON.stringify(['run-stale-gone']))"
+    )
+    page.reload()
+    expect(page.locator("#open-tabs .ariadne-tab[data-run-id='run-stale-gone']")).to_have_count(0)
+
+    # Open card from Oracle Board -> appears in Open Ariadne Tabs and persists across reload.
+    page.locator(f".oracle-card[data-run-id='{extra_id}'] .oracle-card-trigger").click()
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+    expect(page.locator(f"#open-tabs .ariadne-tab[data-run-id='{extra_id}']")).to_be_visible()
+    stored = page.evaluate("() => JSON.parse(localStorage.getItem('olympus-open-tabs') || '[]')")
+    assert extra_id in stored
+
+    # Open a second tab, reload to verify persistence of both tabs.
+    page.locator("#nav-oracle-board").click()
+    page.locator(f".oracle-card[data-run-id='{demo_id}'] .oracle-card-trigger").click()
+    expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(2)
+    page.reload()
+    expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(2)
+
+    # Close both tabs with × -> returns to Oracle Board and never deletes backend runs.
+    page.locator(f"[data-close-tab='{demo_id}']").click()
+    expect(page.locator(f"#open-tabs .ariadne-tab[data-run-id='{demo_id}']")).to_have_count(0)
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+
+    page.locator(f"[data-close-tab='{extra_id}']").click()
+    expect(page.locator("#open-tabs .ariadne-tab")).to_have_count(0)
+    expect(page.locator("body")).to_have_attribute("data-surface", "board")
+    expect(page.locator(f".oracle-card[data-run-id='{extra_id}']")).to_be_visible()
+    expect(page.locator(f".oracle-card[data-run-id='{demo_id}']")).to_be_visible()
+    assert store.get_run(extra_id)["run_id"] == extra_id
+    page.close()
+
+
+def test_live_board_sse_updates_pending_ruling_badge_while_on_l2_tab(workbench, browser):
+    store, demo_id, url = workbench
+    watcher_id = store.create_run(title="Background In-Flight Oracle")
+    store.set_run_status(watcher_id, RunStatus.RUNNING)
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+    page.goto(f"{url}/?run={demo_id}")
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+
+    initial_pending = httpx.get(f"{url}/api/runs").json()["pending_ruling_total"]
+    if initial_pending > 0:
+        expect(page.locator("#nav-pending-badge")).to_have_text(str(initial_pending))
+    else:
+        expect(page.locator("#nav-pending-badge")).to_have_count(0)
+
+    # Transition the other Oracle to ball_holder="human" while staying on demo_id's L2 tab.
+    store.save_spec(
+        watcher_id,
+        GoalSpec(
+            goal="Need human ruling",
+            requirements=[
+                RequirementItem(id="R1", description="Clarify target", acceptance_criteria=["Done"])
+            ],
+            open_ambiguities=[
+                AmbiguityItem(
+                    id="AMB-1",
+                    question="Which branch is the base?",
+                    impact="Worktree target",
+                    blocking=True,
+                )
+            ],
+        ),
+    )
+    store.set_run_status(watcher_id, RunStatus.AWAITING_HUMAN)
+
+    # Sidebar Oracle Board pending badge updates live via /api/board/stream without leaving L2.
+    expect(page.locator("#nav-pending-badge")).to_have_text(str(initial_pending + 1))
+    expect(page.locator("body")).to_have_attribute("data-surface", "oracle")
+
+    # Switching back to Oracle Board immediately shows the Oracle in Awaiting Your Ruling.
+    page.locator("#nav-oracle-board").click()
+    card = page.locator(f"[data-column='human'] .oracle-card[data-run-id='{watcher_id}']")
+    expect(card).to_be_visible()
+    expect(card).to_have_attribute("data-god", "prometheus")
     page.close()

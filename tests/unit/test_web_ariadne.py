@@ -1169,8 +1169,10 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
             assert 'src="/static/assets/ariadne.js"' in html
             bundle = client.get("/static/assets/ariadne.js").text
             for marker in (
-                "btn-new-run",
-                "thread-list",
+                "btn-issue-oracle",
+                "oracle-board",
+                "open-tabs",
+                "workspace-switcher",
                 "new-run-dialog",
                 "new-run-workflow",
                 "new-run-provider",

@@ -1,10 +1,13 @@
 import type {
   AttemptArtifactsResponse,
+  BallHolder,
   CommandBody,
   CommandResponse,
   ConflictResponse,
   CreateRunBody,
   CreateRunResponse,
+  CreateWorkspaceBody,
+  DeleteWorkspaceResponse,
   DemosResponse,
   ErrorResponse,
   ProvidersResponse,
@@ -12,7 +15,11 @@ import type {
   RunListResponse,
   RunProjection,
   RunProjectionResponse,
+  TaskType,
   WorkflowsResponse,
+  WorkspaceListResponse,
+  WorkspaceMode,
+  WorkspaceResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -30,6 +37,11 @@ const runPath = (runId: string): string => `/api/runs/${encodeURIComponent(runId
 export const streamUrl = (runId: string, afterSeq: number): string =>
   `${runPath(runId)}/stream?after_seq=${afterSeq}`;
 
+export const boardStreamUrl = (workspaceId?: string | null): string =>
+  workspaceId
+    ? `/api/board/stream?workspace_id=${encodeURIComponent(workspaceId)}`
+    : "/api/board/stream";
+
 export const deliveryLogUrl = (runId: string, eventSeq: number, position: number): string =>
   `${runPath(runId)}/delivery-log/${eventSeq}/${position}`;
 
@@ -37,8 +49,55 @@ async function json<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function listRuns(): Promise<RunListResponse> {
-  return json<RunListResponse>(await fetch("/api/runs"));
+export interface ListRunsParams {
+  workspaceId?: string | null;
+  workspaceMode?: WorkspaceMode | null;
+  taskType?: TaskType | null;
+  ballHolder?: BallHolder | null;
+  includeArchived?: boolean;
+  limit?: number;
+}
+
+export async function listRuns(params: ListRunsParams = {}): Promise<RunListResponse> {
+  const query = new URLSearchParams();
+  if (params.workspaceId) query.set("workspace_id", params.workspaceId);
+  if (params.workspaceMode) query.set("workspace_mode", params.workspaceMode);
+  if (params.taskType) query.set("task_type", params.taskType);
+  if (params.ballHolder) query.set("ball_holder", params.ballHolder);
+  if (params.includeArchived) query.set("include_archived", "true");
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const qs = query.toString();
+  const response = await fetch(qs ? `/api/runs?${qs}` : "/api/runs", { cache: "no-store" });
+  return json<RunListResponse>(response);
+}
+
+export async function listWorkspaces(): Promise<WorkspaceListResponse> {
+  const response = await fetch("/api/workspaces", { cache: "no-store" });
+  return json<WorkspaceListResponse>(response);
+}
+
+export async function createWorkspace(body: CreateWorkspaceBody): Promise<WorkspaceResponse> {
+  const response = await fetch("/api/workspaces", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await json<WorkspaceResponse | ErrorResponse>(response);
+  if (!response.ok || !data.ok) {
+    throw new ApiError((!data.ok && data.error) || "注册工作区失败", response.status);
+  }
+  return data;
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<DeleteWorkspaceResponse> {
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "DELETE",
+  });
+  const data = await json<DeleteWorkspaceResponse | ErrorResponse>(response);
+  if (!response.ok || !data.ok) {
+    throw new ApiError((!data.ok && data.error) || "移除工作区失败", response.status);
+  }
+  return data;
 }
 
 export async function seedDemo(): Promise<void> {

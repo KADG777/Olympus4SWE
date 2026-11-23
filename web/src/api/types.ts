@@ -6,6 +6,17 @@ export type RunProjection = Schemas["RunProjection"];
 export type RunSummary = Schemas["RunSummary"];
 export type RunListResponse = Schemas["RunListResponse"];
 export type RunProjectionResponse = Schemas["RunProjectionResponse"];
+export type PantheonSeatSummary = Schemas["PantheonSeatSummary"];
+export type WorkspaceSummary = Schemas["WorkspaceSummary"];
+export type WorkspaceListResponse = Schemas["WorkspaceListResponse"];
+export type WorkspaceResponse = Schemas["WorkspaceResponse"];
+export type DeleteWorkspaceResponse = Schemas["DeleteWorkspaceResponse"];
+export type WorkspaceMode = RunSummary["workspace_mode"];
+export type TaskType = RunSummary["task_type"];
+export type BallHolder = RunSummary["ball_holder"];
+export type PantheonGod = RunSummary["active_god"];
+export type PendingAction = RunSummary["pending_action"];
+export type SeatState = PantheonSeatSummary["state"];
 export type RunEvent = Schemas["RunEvent"];
 export type RunProgressItem = Schemas["RunProgressItem"];
 export type DagNode = Schemas["DagNode"];
@@ -46,6 +57,7 @@ type Loose<T, K extends PropertyKey> = Omit<T, K & keyof T> & Partial<Pick<T, K 
 type Defaults = "auto_advance" | "sync";
 
 export type CreateRunBody = Loose<Schemas["CreateRunRequest"], Defaults | "auto_approve">;
+export type CreateWorkspaceBody = Loose<Schemas["CreateWorkspaceRequest"], "create_if_missing" | "init_git">;
 
 export type CommandBody =
   | Loose<Schemas["ApproveSpecCommand"], Defaults | "accept_risk" | "reason">
