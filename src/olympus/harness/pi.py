@@ -313,25 +313,34 @@ def _strip_provider_prefix(model: str | None, pi_provider: str | None) -> str:
 
 def _resolve_ambient_pi_auth(
     pi_provider: str, env: Mapping[str, str]
-) -> tuple[str | None, str | None, list[str]]:
+) -> tuple[str | None, str | None, dict[str, str], list[str]]:
     """Read a saved Pi credential for ``pi_provider`` from ``~/.pi/agent/auth.json`` read-only.
 
-    Returns ``(api_key_ref, literal_secret, redaction_secrets)`` without ever
+    Returns ``(api_key_ref, literal_secret, extra_env, redaction_secrets)`` without ever
     copying, serializing, or symlinking ``auth.json`` into the ephemeral config dir.
     """
     home_raw = (env.get("HOME") or "").strip()
     auth_path = (Path(home_raw) if home_raw else Path.home()) / ".pi" / "agent" / "auth.json"
     if not auth_path.is_file():
-        return None, None, []
+        return None, None, {}, []
     try:
         raw = json.loads(auth_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, None, []
+        return None, None, {}, []
     if not isinstance(raw, dict):
-        return None, None, []
+        return None, None, {}, []
     entry = raw.get(pi_provider)
     if not isinstance(entry, dict):
-        return None, None, []
+        return None, None, {}, []
+    extra_env: dict[str, str] = {}
+    secrets: list[str] = []
+    raw_entry_env = entry.get("env")
+    if isinstance(raw_entry_env, dict):
+        for env_key, env_val in raw_entry_env.items():
+            if isinstance(env_key, str) and env_key.strip() and isinstance(env_val, str):
+                extra_env[env_key.strip()] = env_val
+                if env_val.strip():
+                    secrets.append(env_val.strip())
     credential = ""
     for field in ("key", "apiKey", "access"):
         candidate = entry.get(field)
@@ -339,16 +348,16 @@ def _resolve_ambient_pi_auth(
             credential = candidate.strip()
             break
     if not credential:
-        return None, None, []
+        return None, None, extra_env, secrets
     if credential.startswith(("!", "$")):
-        secrets: list[str] = []
         if credential.startswith("$"):
             var_name = credential[1:].strip("{}")
-            env_val = (env.get(var_name) or "").strip()
+            env_val = (env.get(var_name) or extra_env.get(var_name) or "").strip()
             if env_val:
                 secrets.append(env_val)
-        return credential, None, secrets
-    return None, credential, [credential]
+        return credential, None, extra_env, secrets
+    secrets.append(credential)
+    return None, credential, extra_env, secrets
 
 
 def _binding_secrets(binding: ExternalGatewayBinding, env: Mapping[str, str]) -> list[str]:
@@ -429,9 +438,14 @@ def _prepare_gateway_config(
                 model_id: {"contextWindow": effective_context_window}
             }
         if binding is None:
-            ambient_ref, ambient_secret, ambient_secrets = _resolve_ambient_pi_auth(
-                effective_pi_provider, env
-            )
+            (
+                ambient_ref,
+                ambient_secret,
+                ambient_env,
+                ambient_secrets,
+            ) = _resolve_ambient_pi_auth(effective_pi_provider, env)
+            for env_key, env_val in ambient_env.items():
+                env.setdefault(env_key, env_val)
             extra_secrets.extend(ambient_secrets)
             if ambient_ref is not None:
                 override["apiKey"] = ambient_ref

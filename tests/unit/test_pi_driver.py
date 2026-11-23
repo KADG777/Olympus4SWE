@@ -2623,7 +2623,7 @@ print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
                 "providers": {
                     "openai": {
                         "dialect": "openai-chat",
-                        "default_model": "qwen3.8-flash",
+                        "default_model": "custom-model-v1",
                         "base_url": "https://custom-proxy.example/v1",
                         "api_key_env": "OPENAI_API_KEY",
                     }
@@ -2634,13 +2634,52 @@ print(json.dumps({{"type": "message_end", "message": msg}}), flush=True)
     )
     custom_from_file = build_provider(
         provider="openai",
-        model="qwen3.8-flash",
+        model="custom-model-v1",
         providers_file=providers_cfg,
     )
-    binding = custom_from_file.external_gateway_binding("qwen3.8-flash")
+    binding = custom_from_file.external_gateway_binding("custom-model-v1")
     assert binding is not None
     assert binding.is_custom_endpoint is True
     assert binding.base_url == "https://custom-proxy.example/v1"
+
+    # Finding #2 regression: provider-level env map in ~/.pi/agent/auth.json is forwarded
+    # into subprocess env (and redacted) when credential references $VAR.
+    ambient_auth.write_text(
+        json.dumps(
+            {
+                "openrouter": {
+                    "type": "api_key",
+                    "key": "$AMBIENT_PROV_KEY",
+                    "env": {"AMBIENT_PROV_KEY": "sk-ambient-env-secret"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    from olympus.harness.pi import _prepare_gateway_config
+
+    probe_env: dict[str, str] = {"HOME": str(fake_home)}
+    prov_name, mod_id, cfg_dir, extra_secrets = _prepare_gateway_config(
+        probe_env,
+        "openai/gpt-4.1",
+        provider=builtin_provider,
+        pi_provider="openrouter",
+        context_window=262144,
+    )
+    try:
+        assert prov_name == "openrouter"
+        assert mod_id == "openai/gpt-4.1"
+        assert probe_env["AMBIENT_PROV_KEY"] == "sk-ambient-env-secret"
+        assert "sk-ambient-env-secret" in extra_secrets
+        assert cfg_dir is not None
+        doc2 = json.loads((cfg_dir / "models.json").read_text(encoding="utf-8"))
+        assert doc2["providers"]["openrouter"]["apiKey"] == "$AMBIENT_PROV_KEY"
+        assert "sk-ambient-env-secret" not in (cfg_dir / "models.json").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        if cfg_dir is not None:
+            shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 def test_pi_driver_redacts_short_and_custom_env_binding_secrets(
