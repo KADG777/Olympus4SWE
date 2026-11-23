@@ -34,6 +34,7 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.control import RunControl
 from olympus.core.dag import PlanValidationError, validate_plan
 from olympus.core.store import RunStore
 from olympus.harness.driver import (
@@ -4397,6 +4398,250 @@ def test_vertical_three_slice_tracer_bullet_dag_completes_end_to_end(tmp_path: P
     assert {task.status for task in final["plan"].tasks} == {TaskStatus.ACCEPTED}
     assert set(driver.turns) == {"T1-skeleton", "T2-items", "T3-count"}
     assert driver.turns[0] == "T1-skeleton"
+
+
+def test_exit_zero_verification_probe_cannot_inject_or_mutate_delivered_files(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "clean.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add clean file"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    repro = (
+        "python3 -c \"from pathlib import Path; "
+        "Path('injected.py').write_text('LEAK = True\\n'); "
+        "Path('clean.py').write_text('VALUE = 999\\n')\""
+    )
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["*.py"],
+            max_cycles=2,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit implementation",
+                }
+            ],
+        ),
+    )
+    provider, _ = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Claimed defect with exit-0 mutating probe",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": repro,
+                        "message": "False positive probe that writes files and exits 0",
+                    }
+                ],
+            }
+        ]
+    )
+
+    def write_feature(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store, tmp_path, _AttemptWorker([write_feature]), provider=provider
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert (tmp_path / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+    assert (tmp_path / "clean.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not (tmp_path / "injected.py").exists()
+    assert not (overlay / "injected.py").exists()
+    assert not (overlay / "clean.py").exists() or (
+        (overlay / "clean.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    )
+
+
+def test_worker_rename_removes_old_path_from_overlay_and_workspace(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "pkg").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "pkg" / "old.py").write_text("OLD = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "pkg/old.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add pkg/old.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["pkg/old.py"],
+            max_cycles=2,
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Renamed module exists",
+                    "command": "python3 -c 'import pkg.new as m; assert m.NEW'",
+                }
+            ],
+        ),
+    )
+    overlay_old = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay" / "pkg" / "old.py"
+    overlay_old.parent.mkdir(parents=True, exist_ok=True)
+    overlay_old.write_text("OLD = True\n", encoding="utf-8")
+
+    def rename_module(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "pkg" / "old.py").unlink()
+        (ws / "pkg" / "new.py").write_text("NEW = True\n", encoding="utf-8")
+
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([rename_module]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert not (tmp_path / "pkg" / "old.py").exists()
+    assert not (overlay / "pkg" / "old.py").exists()
+    assert (tmp_path / "pkg" / "new.py").read_text(encoding="utf-8") == "NEW = True\n"
+    assert (overlay / "pkg" / "new.py").read_text(encoding="utf-8") == "NEW = True\n"
+
+
+def test_human_in_place_retry_still_rechecks_verified_repro_before_argus(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    repro = "python3 -c 'import feature; assert feature.GUARD'"
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the guard",
+                }
+            ],
+        ),
+    )
+    provider, state = _review_script(
+        [
+            {
+                "task_id": "T1",
+                "attempt": 1,
+                "passed": False,
+                "summary": "Missing GUARD",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "axis": "spec",
+                        "severity": "important",
+                        "file_path": "feature.py",
+                        "line": 1,
+                        "requirement_ref": "R1",
+                        "repro_command": repro,
+                        "message": "GUARD attribute missing",
+                    }
+                ],
+            },
+            {
+                "task_id": "T1",
+                "attempt": 3,
+                "passed": True,
+                "summary": "GUARD present",
+                "findings": [],
+            },
+        ]
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        elif attempt == 2:
+            assert "[Human hint]" in prompt
+            # Still fails the proven repro; Chronos must catch it with 0 Argus calls.
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        else:
+            (ws / "feature.py").write_text("FLAG = True\nGUARD = True\n", encoding="utf-8")
+
+    stage = _retained_stage(store, tmp_path, _AttemptWorker([repair]), provider=provider)
+    first = stage.run_execution(run_id=run_id)
+    assert first["status"] == RunStatus.AWAITING_HUMAN
+    assert first["plan"].tasks[0].status == TaskStatus.BLOCKED
+    assert first["plan"].tasks[0].verified_repro_commands == [repro]
+    assert state["calls"] == 1
+
+    # Human retries in place: review_cycle resets to 0, verified_repro_commands stays set.
+    RunControl(store).retry_task(
+        run_id,
+        "T1",
+        operation_id="op-retry-1",
+        expected_state_revision=first["state_revision"],
+        hint="Please define GUARD = True",
+        actor="human",
+    )
+    retried = store.get_run(run_id)["plan"].tasks[0]
+    assert retried.review_cycle == 0
+    assert retried.verified_repro_commands == [repro]
+
+    second = stage.run_execution(run_id=run_id)
+    assert second["status"] == RunStatus.AWAITING_HUMAN
+    assert second["plan"].tasks[0].status == TaskStatus.BLOCKED
+    assert state["calls"] == 1  # Short-circuited at 0 reviewer LLM tokens!
+    rechecks = [
+        e for e in store.list_events(run_id) if e.event_type == "review.repro_rechecked"
+    ]
+    assert len(rechecks) == 1
+    assert rechecks[0].payload["passed"] is False
+    assert rechecks[0].payload["short_circuited"] is True
+
+    RunControl(store).retry_task(
+        run_id,
+        "T1",
+        operation_id="op-retry-2",
+        expected_state_revision=second["state_revision"],
+        hint="Actually add GUARD = True now",
+        actor="human",
+    )
+    third = stage.run_execution(run_id=run_id)
+    assert third["status"] == RunStatus.COMPLETED
+    assert third["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert third["plan"].tasks[0].verified_repro_commands == []
+    assert state["calls"] == 2
+    assert "NOW PASS" in state["prompts"][1]
 
 
 

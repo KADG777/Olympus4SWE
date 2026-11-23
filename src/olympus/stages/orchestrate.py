@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
@@ -214,6 +216,27 @@ def _copy_matching_scope(
         dst = dst_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, dst)
+
+
+def _remove_deleted_paths(dst_root: Path, rel_paths: Sequence[str]) -> None:
+    """Propagate worker-deleted or renamed source paths to overlay/workspace roots."""
+    if not rel_paths or not dst_root.exists():
+        return
+    resolved_root = dst_root.resolve()
+    for rel in rel_paths:
+        target = dst_root / rel
+        with suppress(OSError):
+            if not target.resolve(strict=False).is_relative_to(resolved_root):
+                continue
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+                parent = target.parent
+                while parent != dst_root and parent.is_relative_to(dst_root):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
 
 
 def _format_spec_context(spec: GoalSpec) -> str:
@@ -559,8 +582,27 @@ def _probe_is_broken(*, command: str, returncode: int | None, output: str) -> bo
     return "SyntaxError" in output and _INLINE_PYTHON_C.search(command) is not None
 
 
-def _snapshot_probe_guard(sandbox: SandboxHandle) -> dict[str, bytes]:
-    """Save current bytes of worker-touched files so probes cannot corrupt them."""
+@dataclass(frozen=True)
+class _ProbeGuardSnapshot:
+    dirty_bytes: dict[str, bytes]
+    existing_paths: frozenset[str]
+
+
+def _walk_sandbox_files(workspace: Path) -> set[str]:
+    """List all non-ignored relative file/symlink paths currently in the sandbox."""
+    ignored = IGNORED_DIR_NAMES | {".olympus"}
+    found: set[str] = set()
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in ignored]
+        root_path = Path(root)
+        for name in files:
+            rel = (root_path / name).relative_to(workspace).as_posix()
+            found.add(rel)
+    return found
+
+
+def _snapshot_probe_guard(sandbox: SandboxHandle) -> _ProbeGuardSnapshot:
+    """Save current sandbox file inventory and dirty bytes so probes cannot alter delivery."""
     workspace = sandbox.workspace_path
     saved: dict[str, bytes] = {}
     total = 0
@@ -568,7 +610,7 @@ def _snapshot_probe_guard(sandbox: SandboxHandle) -> dict[str, bytes]:
         if fingerprint is None:
             continue
         path = workspace / rel
-        if not path.is_file():
+        if not path.is_file() or path.is_symlink():
             continue
         try:
             data = path.read_bytes()
@@ -578,17 +620,51 @@ def _snapshot_probe_guard(sandbox: SandboxHandle) -> dict[str, bytes]:
             break
         saved[rel] = data
         total += len(data)
-    return saved
+    return _ProbeGuardSnapshot(
+        dirty_bytes=saved,
+        existing_paths=frozenset(_walk_sandbox_files(workspace)),
+    )
 
 
-def _restore_probe_guard(sandbox: SandboxHandle, saved: Mapping[str, bytes]) -> None:
-    """Restore any guarded file a verification probe modified or deleted."""
+def _restore_probe_guard(sandbox: SandboxHandle, snapshot: _ProbeGuardSnapshot) -> None:
+    """Undo any file creation, deletion, or edit caused by a verification probe."""
     workspace = sandbox.workspace_path
-    for rel, data in saved.items():
+    current_paths = _walk_sandbox_files(workspace)
+    # 1. Remove any newly created files/symlinks (including inside write_scope).
+    for rel in sorted(current_paths - snapshot.existing_paths, reverse=True):
+        target = workspace / rel
+        with suppress(OSError):
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            parent = target.parent
+            while parent != workspace and parent.is_relative_to(workspace):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+    # 2. Restore any previously clean tracked files modified or deleted by the probe.
+    if sandbox.is_git_worktree:
+        post_dirty = set(snapshot_sandbox_state(sandbox).mapping().keys())
+        probe_touched_tracked = sorted(
+            (post_dirty & set(snapshot.existing_paths)) - set(snapshot.dirty_bytes)
+        )
+        if probe_touched_tracked:
+            with suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    ["git", "checkout", "HEAD", "--", *probe_touched_tracked],
+                    cwd=workspace,
+                    capture_output=True,
+                    check=False,
+                )
+    # 3. Restore exact bytes of every file that was already dirty before the probe.
+    for rel, data in snapshot.dirty_bytes.items():
         path = workspace / rel
         try:
-            if path.is_file() and path.read_bytes() == data:
+            if path.is_file() and not path.is_symlink() and path.read_bytes() == data:
                 continue
+            if path.is_symlink():
+                path.unlink()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         except OSError:
@@ -993,7 +1069,7 @@ class OrchestrateStage:
     ) -> ReviewVerdict:
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
         schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
-        incremental = task.review_cycle > 0
+        incremental = task.review_cycle > 0 or bool(resolved_repro_commands)
         prior_ctx = (
             f"\nPrevious cycle rejection feedback:\n{task.last_error}\n"
             if incremental and task.last_error
@@ -1204,7 +1280,10 @@ class OrchestrateStage:
                         )
                     )
                     continue
-                result = self._run_repro_command(command=command, sandbox=sandbox)
+                try:
+                    result = self._run_repro_command(command=command, sandbox=sandbox)
+                finally:
+                    _restore_probe_guard(sandbox, guard)
                 (art_dir / f"verify-cycle-{task.review_cycle + 1}-{index}.log").write_text(
                     f"finding: {finding.id}\ncommand: {command}\n"
                     f"exit_code: {result.returncode}\nbroken_probe: {result.broken}\n"
@@ -1292,7 +1371,10 @@ class OrchestrateStage:
         results: list[dict[str, Any]] = []
         try:
             for index, command in enumerate(task.verified_repro_commands, start=1):
-                result = self._run_repro_command(command=command, sandbox=sandbox)
+                try:
+                    result = self._run_repro_command(command=command, sandbox=sandbox)
+                finally:
+                    _restore_probe_guard(sandbox, guard)
                 passed = result.returncode == 0
                 (art_dir / f"recheck-cycle-{task.review_cycle + 1}-{index}.log").write_text(
                     f"command: {command}\nexit_code: {result.returncode}\n"
@@ -1752,10 +1834,11 @@ class OrchestrateStage:
                     )
                 )
 
-            # 0-token pre-check: re-run the prior cycle's proven failing repro commands
+            # 0-token pre-check: re-run any previously proven failing repro commands
+            # (including after human in-place retry_task which resets review_cycle to 0)
             # before spending any reviewer tokens.
             resolved_repro_commands: list[str] = []
-            if verifying.review_cycle > 0 and verifying.verified_repro_commands:
+            if verifying.verified_repro_commands:
                 repro_failures, task_baseline = self._recheck_verified_repro_commands(
                     run_id=run_id,
                     task=verifying,
@@ -1929,22 +2012,30 @@ class OrchestrateStage:
 
             promotion_paths = list(verifying.write_scope)
             seen_paths = set(promotion_paths)
+            deleted_paths: list[str] = []
             promotion_policy = WorkspacePolicy(
                 allowed_write_scope=verifying.write_scope,
                 forbidden_write_scope=hard_forbidden,
             )
             for rel in gate.changed_paths:
-                if rel in seen_paths or is_ephemeral_artifact(rel):
+                if is_ephemeral_artifact(rel):
                     continue
                 if promotion_policy.forbidden_match(rel) is not None:
                     continue
-                seen_paths.add(rel)
-                promotion_paths.append(rel)
+                candidate = sandbox.workspace_path / rel
+                if not candidate.exists() and not candidate.is_symlink():
+                    deleted_paths.append(rel)
+                    continue
+                if rel not in seen_paths:
+                    seen_paths.add(rel)
+                    promotion_paths.append(rel)
             _copy_matching_scope(sandbox.workspace_path, overlay_dir, promotion_paths)
+            _remove_deleted_paths(overlay_dir, deleted_paths)
             if mode == RunMode.EXECUTION and apply_to_workspace:
                 _copy_matching_scope(
                     sandbox.workspace_path, self.workspace_root, promotion_paths
                 )
+                _remove_deleted_paths(self.workspace_root, deleted_paths)
             _write_manifest_md(
                 art_dir=art_dir,
                 task=accepted,
