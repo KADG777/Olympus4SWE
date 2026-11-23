@@ -5643,6 +5643,67 @@ def test_dotfile_literal_promotion_and_anchored_syntax_traceback(tmp_path: Path)
     )
 
 
+def test_replacing_symlink_during_promotion_never_overwrites_target_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "target.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "link.py").symlink_to("target.py")
+    subprocess.run(
+        ["git", "add", "target.py", "link.py"], cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add target and symlink"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    store, run_id = _confirmed_run(tmp_path, mode=RunMode.EXECUTION)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["link.py"],
+            max_cycles=1,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Review",
+                }
+            ],
+        ),
+    )
+
+    def replace_link(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "link.py").unlink()
+        (ws / "link.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    real_copy = orchestrate_module._copy_matching_scope
+
+    def fail_on_overlay(src: Path, dst: Path, write_scope: list[str] | None) -> None:
+        if dst.name == "accepted_overlay":
+            raise OSError("simulated overlay error")
+        real_copy(src, dst, write_scope)
+
+    monkeypatch.setattr(orchestrate_module, "_copy_matching_scope", fail_on_overlay)
+    snap = _retained_stage(
+        store,
+        tmp_path,
+        _AttemptWorker([replace_link]),
+        provider=MockLLMProvider(responder=_passing_reviewer),
+    ).run_execution(run_id=run_id, apply_to_workspace=True)
+
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+    assert (tmp_path / "link.py").is_symlink()
+    assert str((tmp_path / "link.py").readlink()) == "target.py"
+    assert (tmp_path / "target.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
 
 
 

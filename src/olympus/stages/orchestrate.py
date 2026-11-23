@@ -238,6 +238,8 @@ def _copy_matching_scope(
             continue
         dst = dst_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink():
+            dst.unlink()
         shutil.copy2(p, dst)
 
 
