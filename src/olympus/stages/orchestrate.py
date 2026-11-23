@@ -249,7 +249,7 @@ _FREEZE_CONSTRAINT_RE = re.compile(
 )
 _PATH_TOKEN_RE = re.compile(
     r"`([^`\s]+)`|"
-    r"(?<![\w./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.*?\[\]-]+)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})(?![\w./-])"
+    r"(?<![\w./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.*?\[\]-]*)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})(?![\w./-])"
 )
 _IGNORED_PATH_LITERALS = frozenset({"e.g", "i.e", "etc"})
 
@@ -1305,6 +1305,7 @@ class OrchestrateStage:
                 sandbox.workspace_path,
                 probe_ws,
                 symlinks=True,
+                ignore_dangling_symlinks=True,
                 ignore=shutil.ignore_patterns(".git", ".olympus", ".venv", "__pycache__"),
             )
             env = _build_probe_env(
