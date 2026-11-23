@@ -903,6 +903,30 @@ class UserEnabledOlympusAgent(BaseAgent):
             else any(_driver_uses_pi(value) for value in driver_settings)
         )
         self._extra_env = {str(key): str(value) for key, value in (extra_env or {}).items()}
+        # Fallback for Harbor < 0.27 (no MODEL_CONNECTION): forward active provider
+        # credentials in memory at runtime without persisting them in TrialConfig.
+        provider_key = self._provider.casefold()
+        env_groups: tuple[tuple[str, str], ...] = (
+            (("OPENAI_API_KEY", "OPENAI_BASE_URL"),)
+            if provider_key == "openai"
+            else (
+                (("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),)
+                if provider_key == "anthropic"
+                else (
+                    ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+                    ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+                )
+            )
+        )
+        for api_key_var, base_url_var in env_groups:
+            if api_key_var not in self._extra_env:
+                host_key = os.environ.get(api_key_var, "").strip()
+                if host_key:
+                    self._extra_env[api_key_var] = host_key
+            if base_url_var not in self._extra_env:
+                host_base = (self._base_url or os.environ.get(base_url_var, "")).strip()
+                if host_base:
+                    self._extra_env[base_url_var] = host_base
         self._user_agent = user_agent
         self._user_agent_factory = user_agent_factory
         self._user_model_name = user_model_name

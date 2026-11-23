@@ -1872,3 +1872,21 @@ def test_together_install_pi_uploads_and_extracts_local_bundle(tmp_path: Path) -
     assert uploaded == [(bundle.resolve(), "/tmp/olympus-pi-bundle.tar.gz")]
     assert agent._extra_env["OLYMPUS_PI_BIN"] == "/opt/olympus-pi/bin/pi"
     assert any("tar -xzf /tmp/olympus-pi-bundle.tar.gz" in cmd for cmd in commands)
+
+
+def test_together_agent_forwards_host_provider_env_in_memory_and_redacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "sk-runtime-openai-secret-999"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    agent = UserEnabledOlympusAgent(
+        logs_dir=tmp_path / "logs",
+        model_name="openai/gpt-4o",
+        base_url="https://gateway.example/v1",
+        olympus_install="none",
+        install_pi=False,
+    )
+    assert agent._extra_env["OPENAI_API_KEY"] == secret
+    assert agent._extra_env["OPENAI_BASE_URL"] == "https://gateway.example/v1"
+    assert secret in agent._redaction_secrets
