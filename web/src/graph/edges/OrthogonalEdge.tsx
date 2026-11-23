@@ -42,14 +42,7 @@ function OrthogonalEdgeComponent({ source, target, data }: EdgeProps<OrthogonalE
 
 export const OrthogonalEdge = memo(OrthogonalEdgeComponent);
 
-export const EDGE_TONES: EdgeTone[] = [
-  "default",
-  "critical",
-  "blocked",
-  "running",
-  "traversed",
-  "conditional",
-];
+export const EDGE_TONES: EdgeTone[] = ["default", "critical", "blocked", "running"];
 
 /** Fixed-size (userSpaceOnUse) arrowheads, one per tone, so heads never scale with stroke width. */
 export function ArrowMarkers({ prefix }: { prefix: string }) {

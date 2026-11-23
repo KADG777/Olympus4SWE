@@ -260,7 +260,7 @@ function ViewportControls({
 }
 
 export interface GraphCanvasProps<N extends Node, E extends Edge> {
-  /** `data-graph` hook (`dag` | `workflow`). */
+  /** `data-graph` hook (e.g. `dag`). */
   graph: string;
   layout: CanvasLayout | null;
   height: number;

@@ -1,4 +1,4 @@
-/* Topology graph hosts (workflow + task DAG): the React Flow + ELK Graph Island mounts here and
+/* Task DAG graph host: the React Flow + ELK Graph Island mounts here and
  * sets its own adaptive height; cards keep a fixed 1:1 size, so wide graphs pan, never scroll. */
 .graph-host {
   position: relative;
@@ -36,8 +36,7 @@
   border-radius: var(--shape-pill);
 }
 
-.legend-swatch[data-tone="critical"],
-.legend-swatch[data-tone="traversed"] {
+.legend-swatch[data-tone="critical"] {
   background: var(--text-ink);
 }
 
