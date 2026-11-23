@@ -5091,6 +5091,12 @@
             "title": "Design Refs",
             "type": "array"
           },
+          "in_place_recoveries": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "In Place Recoveries",
+            "type": "integer"
+          },
           "kind": {
             "$ref": "#/components/schemas/TaskKind",
             "default": "implement"

@@ -2085,6 +2085,11 @@ export interface components {
             depends_on?: string[];
             /** Design Refs */
             design_refs?: string[];
+            /**
+             * In Place Recoveries
+             * @default 0
+             */
+            in_place_recoveries: number;
             /** @default implement */
             kind: components["schemas"]["TaskKind"];
             /** Last Error */

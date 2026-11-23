@@ -559,6 +559,7 @@ class TaskNode(StrictModel):
     status: TaskStatus = TaskStatus.WAITING
     attempt: int = Field(default=0, ge=0)
     review_cycle: int = Field(default=0, ge=0)
+    in_place_recoveries: int = Field(default=0, ge=0)
     lease_generation: int = Field(default=0, ge=0)
     worktree_path: str | None = None
     commit_sha: str | None = None

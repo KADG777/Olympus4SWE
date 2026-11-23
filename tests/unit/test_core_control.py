@@ -384,6 +384,44 @@ def test_retry_task_is_idempotent_and_state_guarded(tmp_path: Path) -> None:
     assert event.stage == "control"
 
 
+def test_retry_task_preserves_attempt_and_increments_in_place_recoveries(
+    tmp_path: Path,
+) -> None:
+    store, control, run_id, _, _ = _seeded(tmp_path, task_status=TaskStatus.BLOCKED)
+    plan = store.get_run(run_id)["plan"]
+    blocked = plan.tasks[0].model_copy(
+        update={
+            "attempt": 3,
+            "review_cycle": 2,
+            "in_place_recoveries": 1,
+            "last_error": "acceptance check failed",
+        }
+    )
+    store.save_plan(run_id, plan.model_copy(update={"tasks": [blocked]}), actor="test")
+    hash_before = store.get_run(run_id)["plan"].content_hash
+    revision = store.get_run(run_id)["state_revision"]
+
+    control.retry_task(
+        run_id,
+        "T1",
+        operation_id="op-retry-in-place",
+        expected_state_revision=revision,
+        hint="resume on the retained worktree",
+        actor="human",
+    )
+
+    task = store.get_run(run_id)["plan"].tasks[0]
+    assert task.status == TaskStatus.READY
+    assert task.attempt == 3
+    assert task.review_cycle == 0
+    assert task.in_place_recoveries == 2
+    assert task.last_error == (
+        "acceptance check failed\n[Human hint]: resume on the retained worktree"
+    )
+    assert store.get_run(run_id)["plan"].content_hash == hash_before
+    assert "in_place_recoveries" not in task.definition()
+
+
 def test_accept_task_risk_requires_reason_and_is_idempotent(tmp_path: Path) -> None:
     store, control, run_id, _, _ = _seeded(tmp_path, task_status=TaskStatus.BLOCKED)
     revision = store.get_run(run_id)["state_revision"]

@@ -28,7 +28,11 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import RunControl, is_design_bound_to_spec
+from olympus.core.control import (
+    RunControl,
+    is_design_bound_to_spec,
+    is_plan_bound_to_upstream,
+)
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
@@ -61,6 +65,8 @@ ProviderBuilder = Callable[..., LLMProvider]
 _GATE_BY_NODE: dict[str, str] = {spec["node"]: gate for gate, spec in GATE_SPECS.items()}
 _EXECUTE_TYPES = frozenset({"execute_task_dag"})
 _PLAN_ONLY_STOP = "plan"
+_MAX_IN_PLACE_RECOVERIES = 2
+_MAX_PLAN_RECOVERIES = 3
 
 
 @dataclass(frozen=True)
@@ -753,7 +759,7 @@ class SessionRunner:
         snap: dict[str, Any],
         hint: str,
     ) -> SessionEnvelope:
-        """Apply a human hint received while blocked and restart at a safe node."""
+        """Apply a human hint received while blocked and resume at a safe node."""
         clean = hint.strip()
         if not clean:
             return self._emit_pause(
@@ -763,20 +769,129 @@ class SessionRunner:
                 reason="Recovery hint was empty.",
                 message="Recovery hint was empty; describe the path, symbol, or correction.",
             )
+        blocked = self._execution_blocked_tasks(run_id, snap)
+        if blocked:
+            return self._recover_blocked_in_place(run_id, definition, snap, clean, blocked)
+        return self._recover_blocked_planning(run_id, definition, snap, clean)
+
+    def _execution_blocked_tasks(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> list[TaskNode]:
+        """Return BLOCKED tasks only for an approved, upstream-bound executable plan."""
+        plan: TaskPlan | None = snap["plan"]
+        if plan is None:
+            return []
+        blocked = [task for task in plan.tasks if task.status == TaskStatus.BLOCKED]
+        if not blocked:
+            return []
+        if not self.store.is_approved(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+        ):
+            return []
+        if not is_plan_bound_to_upstream(self.store, run_id, snap):
+            return []
+        return blocked
+
+    def _recover_blocked_in_place(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+        blocked: list[TaskNode],
+    ) -> SessionEnvelope:
+        """Retry blocked tasks on their retained worktrees and resume at ``execute``."""
+        recoverable = [
+            task for task in blocked if task.in_place_recoveries < _MAX_IN_PLACE_RECOVERIES
+        ]
+        if not recoverable:
+            reason = (
+                "Task execution is still blocked and the in-place recovery budget "
+                f"(max_in_place_recoveries = {_MAX_IN_PLACE_RECOVERIES}) is exhausted for "
+                f"{', '.join(task.task_id for task in blocked)}. The run stays paused without "
+                "re-planning or retrying again; send 'revise: <change>' to request a requirement "
+                "revision, or resolve the blocker manually."
+            )
+            self._mark_awaiting_human(run_id, snap, None, reason)
+            return self._emit_pause(run_id, PauseKind.BLOCKED, node=None, reason=reason)
+
+        retried: list[str] = []
+        revision = int(self.store.get_run(run_id)["state_revision"])
         try:
-            self.control.request_revision(run_id=run_id, feedback=clean, actor="human")
+            for task in recoverable:
+                result = self.control.retry_task(
+                    run_id,
+                    task.task_id,
+                    operation_id=(
+                        f"in-place-recovery:{run_id}:{task.task_id}:"
+                        f"{task.in_place_recoveries + 1}"
+                    ),
+                    expected_state_revision=revision,
+                    hint=hint,
+                    actor="human",
+                )
+                revision = int(result["state_revision"])
+                retried.append(task.task_id)
         except (ValueError, ConcurrencyConflictError) as exc:
             return self._emit_pause(
                 run_id, PauseKind.BLOCKED, node=None, reason=str(exc), message=str(exc)
             )
-        entry = self._recovery_entry(run_id, definition, snap)
-        augmented = self._augment_input(run_id, snap, clean, "User recovery hint")
+
+        execute_node = self._stage_node_name(definition, "execute_task_dag")
         self.store.append_event(
             run_id=run_id,
             stage="session",
             event_type="session.continued",
             actor="session",
-            payload={"raw_input": augmented, "feedback": clean, "recovery_node": entry},
+            payload={
+                "feedback": hint,
+                "recovery_mode": "in_place",
+                "recovery_node": execute_node,
+                "retried_task_ids": retried,
+            },
+        )
+        return self._drive(
+            run_id=run_id,
+            raw_input=self._current_input(run_id, snap),
+            start_from=execute_node,
+            definition=definition,
+        )
+
+    def _recover_blocked_planning(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+    ) -> SessionEnvelope:
+        """Regenerate the plan (or alignment) for a block that happened before execution."""
+        prior_recoveries = self._planning_recovery_count(run_id)
+        if prior_recoveries >= _MAX_PLAN_RECOVERIES:
+            reason = (
+                "Planning is still blocked and the planning recovery budget "
+                f"(max_plan_recoveries = {_MAX_PLAN_RECOVERIES}) is exhausted. The run stays "
+                "paused without generating another plan; send 'revise: <change>' with a concrete "
+                "requirement change, or resolve the blocker manually."
+            )
+            self._mark_awaiting_human(run_id, snap, None, reason)
+            return self._emit_pause(run_id, PauseKind.BLOCKED, node=None, reason=reason)
+        try:
+            self.control.request_revision(run_id=run_id, feedback=hint, actor="human")
+        except (ValueError, ConcurrencyConflictError) as exc:
+            return self._emit_pause(
+                run_id, PauseKind.BLOCKED, node=None, reason=str(exc), message=str(exc)
+            )
+        entry = self._recovery_entry(run_id, definition, snap)
+        augmented = self._augment_input(run_id, snap, hint, "User recovery hint")
+        self.store.append_event(
+            run_id=run_id,
+            stage="session",
+            event_type="session.continued",
+            actor="session",
+            payload={"raw_input": augmented, "feedback": hint, "recovery_node": entry},
         )
         return self._drive(
             run_id=run_id,
@@ -784,6 +899,19 @@ class SessionRunner:
             start_from=entry,
             definition=definition,
         )
+
+    def _planning_recovery_count(self, run_id: str) -> int:
+        count = 0
+        for event in self.store.list_events(run_id):
+            if event.event_type != "session.continued":
+                continue
+            payload = event.payload
+            if "recovery_node" not in payload:
+                continue
+            if payload.get("recovery_mode") == "in_place":
+                continue
+            count += 1
+        return count
 
     @staticmethod
     def _find_node_by_type(definition: WorkflowDefinition, node_type: str) -> str | None:
