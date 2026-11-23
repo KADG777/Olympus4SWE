@@ -31,9 +31,11 @@ import os
 import posixpath
 import re
 import shlex
+import sys
 import tarfile
 import time
 import tomllib
+import types
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
@@ -78,12 +80,22 @@ OLYMPUS_AGENT_IMPORT_PATH = (
     "tests.evals.benchmarks.harbor_together:UserEnabledOlympusAgent"
 )
 _REDACTED = "***REDACTED***"
-_USER_API_KEY_REFS: dict[str, str] = {}
+_SECRET_STORE_KEY = "_olympus_harbor_together_secret_store"
+
+
+def _user_api_key_refs() -> dict[str, str]:
+    """Process-wide ref store shared across ``__main__`` and qualified imports."""
+    store = sys.modules.get(_SECRET_STORE_KEY)
+    if store is None:
+        store = types.ModuleType(_SECRET_STORE_KEY)
+        store.refs = {}  # type: ignore[attr-defined] -- dynamic module singleton
+        sys.modules[_SECRET_STORE_KEY] = store
+    return store.refs  # type: ignore[attr-defined,no-any-return] -- dict[str, str]
 
 
 def _register_user_api_key(value: str) -> str:
     ref = f"ref:{uuid.uuid4().hex}"
-    _USER_API_KEY_REFS[ref] = value
+    _user_api_key_refs()[ref] = value
     return ref
 
 
@@ -93,7 +105,7 @@ def _resolve_user_api_key(
     if user_api_key:
         return user_api_key
     if user_api_key_ref:
-        return _USER_API_KEY_REFS.get(user_api_key_ref)
+        return _user_api_key_refs().get(user_api_key_ref)
     return None
 
 _SESSION_STATUSES = frozenset({"needs_input", "completed", "failed"})
@@ -191,7 +203,7 @@ def build_repo_discovery_command(*, repo_roots: str | None = None) -> str:
             "  fi\n",
             "done\n",
             'GITDIR=$(find $ROOTS -maxdepth 3 \\( -type d -o -type f \\) -name .git '
-            '2>/dev/null | while IFS= read -r g; do printf "%d %s\\n" "${{#g}}" "$g"; '
+            '2>/dev/null | while IFS= read -r g; do printf "%d %s\\n" "${#g}" "$g"; '
             'done | sort -n | head -1 | cut -d" " -f2-)\n',
             'if [ -n "$GITDIR" ]; then echo "OLYMPUS_REPO=$(dirname "$GITDIR")"; fi\n',
             "exit 0\n",
@@ -562,32 +574,60 @@ def stage_source_archive(source_root: Path | str, archive_path: Path | str) -> P
 
 
 def build_install_script(*, install_target: str, olympus_bin: str = "olympus") -> str:
-    """Install Olympus (or a pip package/archive) and expose the CLI on PATH."""
+    """Install Olympus in an isolated Python >= 3.13 venv and expose the CLI."""
     target = shlex.quote(install_target)
     binary = shlex.quote(olympus_bin)
     return "\n".join(
         [
             "set -eu",
             "mkdir -p /tmp/olympus",
+            "VENV_DIR=/opt/olympus/venv",
+            'if ! mkdir -p /opt/olympus 2>/dev/null || [ ! -w /opt/olympus ]; then '
+            "VENV_DIR=/tmp/olympus-venv; fi",
             'if command -v python3 >/dev/null 2>&1; then PY=python3; '
             'elif command -v python >/dev/null 2>&1; then PY=python; '
-            'else echo "python not found in task container" >&2; exit 1; fi',
-            'if "$PY" -m venv /opt/olympus/venv >/dev/null 2>&1; then',
-            "  PIP=/opt/olympus/venv/bin/pip",
-            "  BIN_DIR=/opt/olympus/venv/bin",
+            'else PY=""; fi',
+            'if [ -n "$PY" ] && "$PY" -c '
+            "'import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)' "
+            '>/dev/null 2>&1 && "$PY" -m venv "$VENV_DIR" >/dev/null 2>&1; then',
+            '  "$VENV_DIR/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true',
+            f'  "$VENV_DIR/bin/python" -m pip install --quiet {target}',
             "else",
-            '  PIP="$PY -m pip"',
-            '  BIN_DIR=""',
+            '  UV_BIN=""',
+            '  UV_BOOT=""',
+            '  if command -v uv >/dev/null 2>&1; then UV_BIN=$(command -v uv);',
+            '  elif [ -x "$HOME/.local/bin/uv" ]; then UV_BIN="$HOME/.local/bin/uv";',
+            '  elif [ -n "$PY" ]; then',
+            "    UV_BOOT=/tmp/olympus-uv",
+            '    mkdir -p "$UV_BOOT"',
+            '    "$PY" -m pip install --quiet --disable-pip-version-check '
+            '--target "$UV_BOOT" uv >/dev/null 2>&1 || '
+            '"$PY" -m pip install --quiet --disable-pip-version-check '
+            '--break-system-packages --target "$UV_BOOT" uv >/dev/null 2>&1',
+            "  fi",
+            '  if [ -n "$UV_BIN" ]; then',
+            '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
+            f'    "$UV_BIN" pip install --quiet --python "$VENV_DIR/bin/python" {target}',
+            '  elif [ -n "$UV_BOOT" ]; then',
+            '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
+            '"$PY" -m uv venv --quiet --python 3.13 "$VENV_DIR"',
+            '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
+            f'"$PY" -m uv pip install --quiet --python "$VENV_DIR/bin/python" {target}',
+            "  elif command -v curl >/dev/null 2>&1; then",
+            "    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1",
+            '    "$HOME/.local/bin/uv" venv --quiet --python 3.13 "$VENV_DIR"',
+            '    "$HOME/.local/bin/uv" pip install --quiet '
+            f'--python "$VENV_DIR/bin/python" {target}',
+            "  else",
+            '    echo "Python >= 3.13 or uv is required to install olympus4swe" >&2',
+            "    exit 1",
+            "  fi",
             "fi",
-            'if [ -n "$BIN_DIR" ]; then "$PIP" install --quiet --upgrade pip '
-            ">/dev/null 2>&1 || true; fi",
-            f'$PIP install --quiet {target} || '
-            f"$PIP install --quiet --break-system-packages {target}",
-            f'if [ -n "$BIN_DIR" ]; then ln -sf "$BIN_DIR"/{binary} '
-            f"/usr/local/bin/{binary}; fi",
-            'export PATH="/opt/olympus/venv/bin:$HOME/.local/bin:/usr/local/bin:$PATH"',
-            f"command -v {binary}",
-            f"{binary} --help >/dev/null 2>&1 || true",
+            f'if [ -w /usr/local/bin ] && [ -x "$VENV_DIR/bin"/{binary} ]; then '
+            f'ln -sf "$VENV_DIR/bin"/{binary} /usr/local/bin/{binary}; fi',
+            'export PATH="$VENV_DIR/bin:$HOME/.local/bin:/usr/local/bin:$PATH"',
+            f'echo "$VENV_DIR/bin"/{binary}',
+            f'"$VENV_DIR/bin"/{binary} --help >/dev/null 2>&1 || true',
         ]
     )
 
@@ -981,14 +1021,29 @@ class UserEnabledOlympusAgent(BaseAgent):
                         self._sim_user.advance_original_index(1)
                 else:
                     consecutive_noops += 1
-                    if not completing:
-                        # A blocked session cannot progress without user input.
-                        self._record_event(turn, "sim_user_silent_on_pause")
-                        break
                     if consecutive_noops >= self._max_consecutive_noops:
                         self._record_event(turn, "noop_budget_exhausted")
                         break
-                    message = "continue"
+                    if not completing:
+                        if envelope.pause_kind == "clarify":
+                            blocker_ids = [
+                                item.split(":", 1)[-1].strip()
+                                for item in envelope.unresolved_blockers
+                                if item.strip()
+                            ]
+                            if blocker_ids:
+                                message = "\n".join(
+                                    f"{bid}: Use your default assumptions and proceed."
+                                    for bid in blocker_ids
+                                )
+                            else:
+                                message = "Use your default assumptions and proceed."
+                        else:
+                            # A blocked session cannot progress without user input.
+                            self._record_event(turn, "sim_user_silent_on_pause")
+                            break
+                    else:
+                        message = "continue"
                 self._record_message(
                     role="user", content=message, turn=turn, kind="simulated_user"
                 )

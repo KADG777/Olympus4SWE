@@ -31,7 +31,8 @@ class InteractiveMinimalPolicy:
     ) -> str:
         snap = runtime.store.get_run(run_id)
         if gate == "spec":
-            blockers = getattr(artifact, "unresolved_blockers", lambda: [])()
+            resolver = getattr(artifact, "unresolved_blockers", None)
+            blockers = resolver() if callable(resolver) else []
             return "await_human" if blockers else "auto_approve"
         if gate == "design":
             violations = validate_design_spec(artifact, snap.get("spec"))

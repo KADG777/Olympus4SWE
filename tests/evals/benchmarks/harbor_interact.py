@@ -57,6 +57,7 @@ class _FallbackExecResult:
 @dataclass(frozen=True)
 class _FallbackCapabilities:
     base_url: bool = True
+    mcp_servers: bool = True
 
 
 ExecResult = _HarborExecResult or _FallbackExecResult
@@ -242,7 +243,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
     """Harbor agent that drives ``olympus session`` across SWE-Interact steps."""
 
     capabilities = (
-        _HarborCapabilities(base_url=True)
+        _HarborCapabilities(base_url=True, mcp_servers=True)
         if _HarborCapabilities is not None
         else _FallbackCapabilities()
     )
@@ -264,6 +265,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         self._interact = InteractOptions.from_kwargs(kwargs, model_name=model_name)
         self._step_index = 0
         self._run_id: str | None = None
+        self._installed_olympus_bin: str | None = None
         self._installed_pi_bin: str | None = None
         super().__init__(
             logs_dir=logs_dir if logs_dir is not None else Path.cwd() / "logs",
@@ -418,16 +420,24 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             install_spec = await self._upload_source_tree(environment, source)
         else:
             install_spec = await self._upload_source_tree(environment, self._project_root())
-        await self._exec(
+        install_result = await self._exec(
             environment,
             self._pip_install_command(
-                install_spec, editable=options.olympus_editable
+                install_spec,
+                editable=options.olympus_editable,
+                olympus_bin=options.olympus_bin,
             ),
             timeout_sec=1800,
         )
+        for line in reversed((install_result.stdout or "").splitlines()):
+            candidate = line.strip()
+            if candidate.startswith("/"):
+                self._installed_olympus_bin = candidate
+                break
+        verify_bin = shlex.quote(self._installed_olympus_bin or options.olympus_bin)
         await self._exec(
             environment,
-            "command -v olympus >/dev/null 2>&1 || "
+            f"command -v {verify_bin} >/dev/null 2>&1 || [ -x {verify_bin} ] || "
             'python3 -c "import olympus; print(olympus.__name__)" >/dev/null',
             timeout_sec=120,
         )
@@ -454,12 +464,65 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         return str(remote_root)
 
     @staticmethod
-    def _pip_install_command(install_spec: str, *, editable: bool = False) -> str:
+    def _pip_install_command(
+        install_spec: str,
+        *,
+        editable: bool = False,
+        olympus_bin: str = "olympus",
+    ) -> str:
+        """Install Olympus in an isolated Python >= 3.13 venv so task site-packages stay clean."""
         quoted = shlex.quote(install_spec)
         target = f"-e {quoted}" if editable else quoted
-        return (
-            "python3 -m pip install --quiet --disable-pip-version-check "
-            f"{target} || python3 -m pip install --quiet --break-system-packages {target}"
+        binary = shlex.quote(olympus_bin)
+        return "\n".join(
+            [
+                "set -eu",
+                "VENV_DIR=/opt/olympus/venv",
+                'if ! mkdir -p /opt/olympus 2>/dev/null || [ ! -w /opt/olympus ]; then '
+                "VENV_DIR=/tmp/olympus-venv; mkdir -p /tmp/olympus; fi",
+                'if command -v python3 >/dev/null 2>&1; then PY=python3; '
+                'elif command -v python >/dev/null 2>&1; then PY=python; '
+                'else PY=""; fi',
+                'if [ -n "$PY" ] && "$PY" -c '
+                "'import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)' "
+                '>/dev/null 2>&1 && "$PY" -m venv "$VENV_DIR" >/dev/null 2>&1; then',
+                f'  "$VENV_DIR/bin/python" -m pip install --quiet '
+                f"--disable-pip-version-check {target}",
+                "else",
+                '  UV_BIN=""',
+                '  UV_BOOT=""',
+                '  if command -v uv >/dev/null 2>&1; then UV_BIN=$(command -v uv);',
+                '  elif [ -x "$HOME/.local/bin/uv" ]; then UV_BIN="$HOME/.local/bin/uv";',
+                '  elif [ -n "$PY" ]; then',
+                "    UV_BOOT=/tmp/olympus-uv",
+                '    mkdir -p "$UV_BOOT"',
+                '    "$PY" -m pip install --quiet --disable-pip-version-check '
+                '--target "$UV_BOOT" uv >/dev/null 2>&1 || '
+                '"$PY" -m pip install --quiet --disable-pip-version-check '
+                '--break-system-packages --target "$UV_BOOT" uv >/dev/null 2>&1',
+                "  fi",
+                '  if [ -n "$UV_BIN" ]; then',
+                '    "$UV_BIN" venv --quiet --python 3.13 "$VENV_DIR"',
+                f'    "$UV_BIN" pip install --quiet --python "$VENV_DIR/bin/python" {target}',
+                '  elif [ -n "$UV_BOOT" ]; then',
+                '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
+                '"$PY" -m uv venv --quiet --python 3.13 "$VENV_DIR"',
+                '    PYTHONPATH="$UV_BOOT${PYTHONPATH:+:$PYTHONPATH}" '
+                f'"$PY" -m uv pip install --quiet --python "$VENV_DIR/bin/python" {target}',
+                "  elif command -v curl >/dev/null 2>&1; then",
+                "    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1",
+                '    "$HOME/.local/bin/uv" venv --quiet --python 3.13 "$VENV_DIR"',
+                '    "$HOME/.local/bin/uv" pip install --quiet '
+                f'--python "$VENV_DIR/bin/python" {target}',
+                "  else",
+                '    echo "Python >= 3.13 or uv is required to install olympus4swe" >&2',
+                "    exit 1",
+                "  fi",
+                "fi",
+                f'if [ -w /usr/local/bin ] && [ -x "$VENV_DIR/bin"/{binary} ]; then '
+                f'ln -sf "$VENV_DIR/bin"/{binary} /usr/local/bin/{binary}; fi',
+                f'echo "$VENV_DIR/bin"/{binary}',
+            ]
         )
 
     async def _upload_bridge_scripts(
@@ -558,7 +621,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             "--phase",
             phase,
             "--olympus-bin",
-            options.olympus_bin,
+            self._installed_olympus_bin or options.olympus_bin,
             "--workspace",
             options.workspace_path,
             "--state-dir",

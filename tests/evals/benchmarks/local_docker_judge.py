@@ -330,7 +330,7 @@ class DockerJudgeBackend:
         self.module = module
         self._image_resolver = image_resolver
         self._cli = cli
-        self._extra_envs = dict(extra_envs or {"IS_SANDBOX": "1"})
+        self._extra_envs = dict(extra_envs if extra_envs is not None else _judge_envs())
         self._restored = False
         mod_id = id(module)
         with _UPSTREAM_JUDGE_ENV_LOCK:
@@ -920,6 +920,14 @@ async def _run_upstream_judge(
     model: str | None,
 ) -> JudgeRunResult:
     pushed_model = False
+    original_judge_model: Any = None
+    llm_cfg = getattr(backend.module, "llm_config", None)
+    custom_anthropic_gateway = bool(
+        model
+        and os.environ.get("ANTHROPIC_BASE_URL")
+        and "claude" not in model.lower()
+        and "anthropic" not in model.lower()
+    )
     if model:
         with _UPSTREAM_JUDGE_ENV_LOCK:
             if not _UPSTREAM_MODEL_STACK:
@@ -928,6 +936,15 @@ async def _run_upstream_judge(
             _UPSTREAM_MODEL_STACK.append(model)
             os.environ["SWT_JUDGE_MODEL"] = model
             pushed_model = True
+            if custom_anthropic_gateway and llm_cfg is not None and hasattr(llm_cfg, "judge_model"):
+                original_judge_model = llm_cfg.judge_model
+                resolved_cls = getattr(llm_cfg, "ResolvedModel", None)
+                if resolved_cls is not None:
+                    llm_cfg.judge_model = lambda *_a, **_kw: resolved_cls(
+                        seat="judge",
+                        backend="native",
+                        model=f"anthropic/{model}",
+                    )
     try:
         result = await backend.module.run_judge(
             task_name,
@@ -942,6 +959,8 @@ async def _run_upstream_judge(
         backend.restore()
         if pushed_model:
             with _UPSTREAM_JUDGE_ENV_LOCK:
+                if original_judge_model is not None and llm_cfg is not None:
+                    llm_cfg.judge_model = original_judge_model
                 if model in _UPSTREAM_MODEL_STACK:
                     _UPSTREAM_MODEL_STACK.remove(model)
                 if _UPSTREAM_MODEL_STACK:

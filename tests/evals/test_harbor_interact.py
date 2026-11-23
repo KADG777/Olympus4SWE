@@ -1669,3 +1669,27 @@ def test_is_ship_reply_rejects_negated_ship_phrases() -> None:
     assert not InteractBridge._is_ship_reply("I don't think you should ship it.")
     assert not InteractBridge._is_ship_reply("We are not ready to ship this yet.")
     assert InteractBridge._is_ship_reply("Looks good, ship it!")
+
+
+def test_interact_agent_declares_mcp_servers_and_uses_isolated_py313_venv(
+    tmp_path: Path,
+) -> None:
+    assert OlympusInteractAgent.capabilities.base_url is True
+    assert OlympusInteractAgent.capabilities.mcp_servers is True
+    script = OlympusInteractAgent._pip_install_command("/tmp/olympus-src")
+    assert "sys.version_info >= (3, 13)" in script
+    assert "--python 3.13" in script
+    assert "VENV_DIR=/opt/olympus/venv" in script
+    assert "VENV_DIR=/tmp/olympus-venv" in script
+
+    def _resolve_bin(command: str, *_args: Any) -> ExecResult:
+        if "pip install" in command:
+            return ExecResult(stdout="/tmp/olympus-venv/bin/olympus\n", stderr="", return_code=0)
+        return ExecResult(stdout="", stderr="", return_code=0)
+
+    env = FakeEnvironment(handler=_resolve_bin)
+    agent = _agent(tmp_path)
+    asyncio.run(agent.setup(env))
+    assert agent._installed_olympus_bin == "/tmp/olympus-venv/bin/olympus"
+    argv = agent._bridge_argv("plan", "/tmp/instr.md", "/logs/agent/step.jsonl")
+    assert argv[argv.index("--olympus-bin") + 1] == "/tmp/olympus-venv/bin/olympus"

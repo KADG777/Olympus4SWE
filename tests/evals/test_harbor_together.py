@@ -178,6 +178,7 @@ def _envelope(
     *,
     run_id: str = "run-1",
     pause_kind: str | None = None,
+    unresolved_blockers: list[str] | None = None,
     changed_files: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -187,7 +188,7 @@ def _envelope(
         "step_mode": "execute",
         "workflow": "full_sdlc_tdd",
         "message": message,
-        "unresolved_blockers": [],
+        "unresolved_blockers": unresolved_blockers or [],
         "changed_files": changed_files or [],
         "error": None,
     }
@@ -385,7 +386,7 @@ def test_completion_callback_off_stops_without_consulting_user(tmp_path: Path) -
 
 def test_silent_user_on_blocked_pause_terminates_cleanly(tmp_path: Path) -> None:
     handler = _SessionHandler(
-        [_envelope("needs_input", "Which API shape?", pause_kind="clarify")]
+        [_envelope("needs_input", "Task blocked on missing secret.", pause_kind="blocked")]
     )
     user = _StubUser([_Decision(action="no-op", content="")])
     agent, environment = _make_agent(tmp_path, handler, user)
@@ -1461,3 +1462,151 @@ def test_run_user_behavior_stages_custom_out_name_for_tag_messages(tmp_path: Pat
     )
     assert res["status"] == "ok"
     assert res["trials"][0]["user_correction"] == 1.0
+
+
+def test_build_install_script_provisions_isolated_py313_venv() -> None:
+    script = build_install_script(install_target="/tmp/olympus/olympus-src.tar.gz")
+    assert "sys.version_info >= (3, 13)" in script
+    assert "--python 3.13" in script
+    assert "VENV_DIR=/opt/olympus/venv" in script
+    assert "VENV_DIR=/tmp/olympus-venv" in script
+
+
+def test_build_repo_discovery_command_executes_cleanly_in_bash(tmp_path: Path) -> None:
+    from tests.evals.benchmarks.harbor_together import build_repo_discovery_command
+
+    nested = tmp_path / "repo"
+    (nested / ".git").mkdir(parents=True)
+    script = build_repo_discovery_command(repo_roots=str(tmp_path))
+    assert "${{#g}}" not in script
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert f"OLYMPUS_REPO={nested}" in proc.stdout
+
+
+def test_local_docker_judge_forwards_anthropic_base_url_for_custom_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tests.evals.benchmarks.local_docker_judge import (
+        DockerJudgeBackend,
+        JudgeInputs,
+        _run_upstream_judge,
+    )
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example/apps/anthropic")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-gateway-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "tok-gateway-test")
+
+    captured: dict[str, Any] = {}
+
+    class _Resolved:
+        def __init__(self, *, seat: str, backend: str, model: str) -> None:
+            self.seat = seat
+            self.backend = backend
+            self.model = model
+
+    def _orig_judge_model(*_a: Any, **_kw: Any) -> Any:
+        raise SystemExit("should be overridden for custom gateway")
+
+    llm_cfg = SimpleNamespace(ResolvedModel=_Resolved, judge_model=_orig_judge_model)
+
+    async def _fake_run_judge(*_a: Any, **_kw: Any) -> Any:
+        resolved = llm_cfg.judge_model()
+        captured["resolved_model"] = resolved.model
+        return SimpleNamespace(
+            verdict={"verdict": "equivalent", "judge_score": 1.0},
+            stdout="ok",
+            stderr="",
+            exit_code=0,
+            sandbox_id="sb-1",
+            judge_model=resolved.model,
+            judge_backend="native",
+        )
+
+    fake_mod = SimpleNamespace(
+        open_judge_sandbox=lambda **_kw: None,
+        run_judge=_fake_run_judge,
+        llm_config=llm_cfg,
+    )
+    backend = DockerJudgeBackend(fake_mod, image_resolver=lambda _t: "img:1")
+    assert backend._extra_envs["ANTHROPIC_BASE_URL"] == "https://gateway.example/apps/anthropic"
+    res = asyncio.run(
+        _run_upstream_judge(
+            backend,
+            task_name="demo",
+            trial_id="t1",
+            inputs=JudgeInputs(phase=2),
+            timeout_sec=60,
+            max_turns=5,
+            model="gateway-model-v1",
+        )
+    )
+    assert captured["resolved_model"] == "anthropic/gateway-model-v1"
+    assert res.verdict["verdict"] == "equivalent"
+    assert llm_cfg.judge_model is _orig_judge_model
+
+
+def test_user_api_key_ref_shared_across_dual_module_loads() -> None:
+    import importlib.util
+    import sys
+
+    from tests.evals.benchmarks import harbor_together as qualified
+
+    name = "_harbor_together_main_copy"
+    spec = importlib.util.spec_from_file_location(name, qualified.__file__)
+    assert spec is not None and spec.loader is not None
+    duplicate = importlib.util.module_from_spec(spec)
+    sys.modules[name] = duplicate
+    try:
+        spec.loader.exec_module(duplicate)
+        ref = duplicate._register_user_api_key("sk-dual-load-secret-999")
+        assert qualified._resolve_user_api_key(user_api_key=None, user_api_key_ref=ref) == (
+            "sk-dual-load-secret-999"
+        )
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_silent_user_on_clarify_proceeds_with_defaults_then_accepts_correction(
+    tmp_path: Path,
+) -> None:
+    handler = _SessionHandler(
+        [
+            _envelope(
+                "needs_input",
+                "Any special Windows flags?",
+                pause_kind="clarify",
+                unresolved_blockers=["ambiguity:AMB-1", "ambiguity:AMB-2"],
+            ),
+            _envelope("completed", "Implemented Windows path fix."),
+            _envelope("completed", "Also fixed _build_project_name."),
+        ],
+        diffs=[
+            "=== /workspace/repo (cumulative vs harbor-base) ===\n",
+            "=== /workspace/repo (cumulative vs harbor-base) ===\n"
+            "diff --git a/a.py b/a.py\n+win\n",
+            "=== /workspace/repo (cumulative vs harbor-base) ===\n"
+            "diff --git a/a.py b/a.py\n+win\n+proj\n",
+        ],
+    )
+    user = _StubUser(
+        [
+            _Decision(action="no-op", content=""),
+            _Decision(action="redirect", content="Also handle _build_project_name."),
+            _Decision(action="stop", content="", stop=True),
+        ]
+    )
+    agent, environment = _make_agent(tmp_path, handler, user)
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Support Windows", environment, SimpleNamespace(metadata=None)))
+    replies = [cmd for cmd in environment.commands() if "session reply" in cmd]
+    assert len(replies) == 2
+    assert "AMB-1: Use your default assumptions and proceed." in replies[0]
+    assert "AMB-2: Use your default assumptions and proceed." in replies[0]
+    assert "_build_project_name" in replies[1]
