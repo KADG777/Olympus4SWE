@@ -683,6 +683,7 @@ _GOAL_SPEC = {
     "deliverable_kind": "library",
     "observable_surfaces": ["calculator module"],
     "actors": ["developer"],
+    "test_seams": ["calculator.divide(a, b)"],
     "requirements": [
         {
             "id": "R1",
