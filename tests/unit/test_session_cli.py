@@ -2778,6 +2778,15 @@ def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: 
                         LLMResponse(content=json.dumps({"action": "approve", "message": "ok"}))
                     ]
                 ),
+                MockLLMProvider(
+                    responses=[
+                        LLMResponse(
+                            content=json.dumps(
+                                {"action": "revise", "feedback": "Proceed", "message": "ok"}
+                            )
+                        )
+                    ]
+                ),
             ):
                 question_intent = parse_reply(
                     provider=provider_impl,

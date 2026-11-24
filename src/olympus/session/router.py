@@ -560,7 +560,9 @@ def _sanitize(
         action = "unknown"
         feedback = ""
     if action in ("reopen", "revise") and (
-        _negated_revision(lowered) or not _has_actionable_text(message)
+        _negated_revision(lowered)
+        or not _has_actionable_text(message)
+        or _is_approval_question(message, lowered)
     ):
         action = "unknown"
         feedback = ""
