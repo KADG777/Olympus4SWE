@@ -443,26 +443,20 @@ def _kill_verified_pid(pid: int, expected_ticks: int, sig: int) -> bool:
     ``start_ticks`` matches ``expected_ticks`` while the pidfd is open, the
     pidfd is pinned to the exact original ``struct pid`` and cannot signal a
     subsequently recycled process even if the original exits immediately after.
+    Never falls back to raw numeric ``os.kill`` if opening a pidfd fails.
     """
     if pid <= 1 or pid == os.getpid():
         return False
     pidfd = _open_pidfd(pid)
-    if pidfd is not None:
-        try:
-            if _proc_start_ticks(pid) != expected_ticks:
-                return False
-            return _send_pidfd_signal(pidfd, sig)
-        finally:
-            with suppress(OSError):
-                os.close(pidfd)
-    # Non-Linux / no-pidfd fallback: verify immediately before os.kill.
-    if _proc_start_ticks(pid) != expected_ticks:
+    if pidfd is None:
         return False
     try:
-        os.kill(pid, sig)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
+        if _proc_start_ticks(pid) != expected_ticks:
+            return False
+        return _send_pidfd_signal(pidfd, sig)
+    finally:
+        with suppress(OSError):
+            os.close(pidfd)
 
 
 def _terminate_process_tree(

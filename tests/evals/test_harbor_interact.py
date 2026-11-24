@@ -2923,16 +2923,27 @@ def test_interact_bridge_concurrent_lock_holder_is_not_killed_without_reclaim(
         ).fetchone() == ("running", prev_rev)
         conn.close()
 
-        # 2. PID-reuse TOCTOU guard: mismatched expected_ticks refuses to call os.kill.
+        # 2. PID-reuse TOCTOU guard: mismatched expected_ticks or unavailable pidfd refuses kill.
         assert _kill_verified_pid(holder.pid, 999_999_999, 15) is False
-        assert holder.poll() is None
-
-        # 3. _terminate_process_tree returns False if target survives SIGKILL (PermissionError),
-        #    and run() aborts without touching DB or erasing bridge-pid.json.
         from unittest.mock import patch
 
         stat = Path(f"/proc/{holder.pid}/stat").read_text(encoding="utf-8")
         holder_ticks = int(stat[stat.rfind(")") + 2 :].split()[19])
+        with (
+            patch(
+                "tests.evals.benchmarks.interact_bridge._open_pidfd",
+                return_value=None,
+            ),
+            patch(
+                "tests.evals.benchmarks.interact_bridge.os.kill",
+                side_effect=AssertionError("must never fall back to raw os.kill"),
+            ),
+        ):
+            assert _kill_verified_pid(holder.pid, holder_ticks, 15) is False
+        assert holder.poll() is None
+
+        # 3. _terminate_process_tree returns False if target survives SIGKILL (PermissionError),
+        #    and run() aborts without touching DB or erasing bridge-pid.json.
         with patch(
             "tests.evals.benchmarks.interact_bridge._send_pidfd_signal",
             return_value=False,
