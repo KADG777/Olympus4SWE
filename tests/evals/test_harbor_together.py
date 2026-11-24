@@ -2504,18 +2504,23 @@ def test_exec_handles_harbor_runtime_error_timeout_without_crashing_trial(
     assert (tmp_path / "timeout_case" / "logs" / "token_usage.json").is_file()
     assert ctx.n_input_tokens == 50
 
-    # Non-timeout RuntimeErrors must still propagate rather than being swallowed.
-    def _non_timeout_error(command: str) -> Any:
-        if "olympus session" in command:
-            raise RuntimeError("docker daemon crashed")
-        return orig_call(command)
+    # Non-timeout RuntimeErrors (even if "timed out" appears in prose) must propagate.
+    for err_msg in (
+        "docker daemon crashed",
+        "Docker daemon crashed while collecting logs for a command that timed out",
+    ):
+        def _non_timeout_error(command: str, *, _msg: str = err_msg) -> Any:
+            if "olympus session" in command:
+                raise RuntimeError(_msg)
+            return orig_call(command)
 
-    agent2, env2 = _make_agent(
-        tmp_path / "crash_case",
-        _non_timeout_error,
-        _StubUser([]),
-        call_user_on_completion=False,
-    )
-    asyncio.run(agent2.setup(env2))
-    with pytest.raises(RuntimeError, match="docker daemon crashed"):
-        asyncio.run(agent2.run("Do the thing", env2, SimpleNamespace(metadata=None)))
+        case_dir = tmp_path / f"crash_{abs(hash(err_msg))}"
+        agent2, env2 = _make_agent(
+            case_dir,
+            _non_timeout_error,
+            _StubUser([]),
+            call_user_on_completion=False,
+        )
+        asyncio.run(agent2.setup(env2))
+        with pytest.raises(RuntimeError, match=err_msg):
+            asyncio.run(agent2.run("Do the thing", env2, SimpleNamespace(metadata=None)))

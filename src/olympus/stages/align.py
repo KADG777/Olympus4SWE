@@ -254,9 +254,10 @@ class AlignStage:
             "- actors: every human/system actor that triggers behavior\n"
             "- test_seams: 1-2 highest-level public seams (HTTP routes, CLI commands, public\n"
             "  APIs) where behavior is verified end to end; never internal file paths or helpers\n"
-            "- every requirement sets actor plus ears_criteria with pattern="
+            "- every requirement sets actor plus 1-2 concise ears_criteria with pattern="
             "ubiquitous|event_driven|state_driven|unwanted_behavior|optional_feature\n"
-            "- acceptance_criteria stay plain strings and must carry measurable thresholds\n"
+            "- omit acceptance_criteria when ears_criteria is set (auto-materialized) to keep\n"
+            "  JSON compact; acceptance_criteria stay plain strings with measurable thresholds\n"
             "- never leak internal implementation (CREATE TABLE, ALTER TABLE, src/*.py paths)\n"
             if strict_canonical
             else ""

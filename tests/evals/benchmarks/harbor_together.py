@@ -1575,7 +1575,7 @@ class UserEnabledOlympusAgent(BaseAgent):
                 timed_out=True,
             )
         except RuntimeError as exc:
-            if "timed out" not in str(exc).lower():
+            if not re.match(r"^command timed out(?:\b|$)", str(exc).strip(), re.IGNORECASE):
                 raise
             return ExecOutcome(
                 stdout="",

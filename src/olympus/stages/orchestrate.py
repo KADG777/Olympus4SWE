@@ -382,8 +382,8 @@ def _spec_forbidden_paths(spec: GoalSpec, workspace_root: Path) -> tuple[str, ..
     return tuple(found)
 
 
-def _format_spec_context(spec: GoalSpec) -> str:
-    """Format constraints, assumptions, test seams, and clarifications for Stage 2 roles."""
+def _format_spec_context(spec: GoalSpec, *, task: TaskNode | None = None) -> str:
+    """Format constraints, assumptions, test seams, clarifications, and referenced requirements."""
     clarifications = [
         {"id": amb.id, "question": amb.question, "answer": amb.answer}
         for amb in spec.open_ambiguities
@@ -394,13 +394,31 @@ def _format_spec_context(spec: GoalSpec) -> str:
         for amb in spec.open_ambiguities
         if amb.answer is None or not amb.answer.strip()
     ]
-    lines = [
-        f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
-        f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
-        "Test seams (verify behavior at these public boundaries): "
-        f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
-        f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
-    ]
+    lines: list[str] = []
+    if task is not None and task.requirement_refs:
+        req_by_id = {req.id: req for req in spec.requirements}
+        matched_reqs = [
+            req_by_id[ref] for ref in dict.fromkeys(task.requirement_refs) if ref in req_by_id
+        ]
+        if matched_reqs:
+            lines.append("Referenced requirements (MUST satisfy):")
+            for req in matched_reqs:
+                lines.append(f"- {req.id}: {req.description}")
+                if req.ears_criteria:
+                    for crit in req.ears_criteria:
+                        lines.append(f"  * {crit.id}: {crit.to_ears_text()}")
+                else:
+                    for criterion in req.acceptance_criteria:
+                        lines.append(f"  * {criterion}")
+    lines.extend(
+        [
+            f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
+            f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+            "Test seams (verify behavior at these public boundaries): "
+            f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
+            f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
+        ]
+    )
     if unresolved:
         lines.append(
             f"Unresolved ambiguities (accepted risk): {json.dumps(unresolved, ensure_ascii=False)}"
@@ -601,6 +619,14 @@ def _format_design_context(design: DesignSpec | None, *, task: TaskNode) -> str:
         for inv in matched_invariants:
             hint = f" [hint: {inv.enforcement_hint}]" if inv.enforcement_hint else ""
             lines.append(f"  * {inv.id} [{inv.category}]: {inv.rule}{hint}")
+    matched_modules = [m for m in design.modules if m.id in task_refs]
+    if matched_modules:
+        lines.append("- Relevant modules:")
+        for mod in matched_modules:
+            lines.append(
+                f"  * {mod.id} ({mod.name}): {mod.responsibility} | "
+                f"target_paths={json.dumps(mod.target_paths, ensure_ascii=False)}"
+            )
     matched_interfaces = [
         iface
         for iface in design.interfaces
@@ -1252,7 +1278,7 @@ class OrchestrateStage:
             [r.model_dump(mode="json") for r in relevant_reqs], ensure_ascii=False
         )
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
-        spec_ctx = _format_spec_context(spec)
+        spec_ctx = _format_spec_context(spec, task=task)
         design_ctx = _format_design_context(design, task=task)
         diff_summary = "\n".join(_diff_summary_lines(diff_text)) or "- (none detected)"
         inline_diff, diff_truncated = _bounded_inline_diff(diff_text)
@@ -1775,7 +1801,7 @@ class OrchestrateStage:
                 ],
                 ensure_ascii=False,
             )
-            spec_ctx = _format_spec_context(spec)
+            spec_ctx = _format_spec_context(spec, task=leased)
             design_ctx = _format_design_context(design, task=leased)
             handoff_block = f"{handoff_context}\n" if handoff_context else ""
             step_guidance = (

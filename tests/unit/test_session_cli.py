@@ -2741,16 +2741,44 @@ def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: 
             "AMB-2": "int and float",
         }
 
-    # 3. Complete explicit ID answers resolve with 0 LLM calls.
-    explicit = parse_reply(
-        provider=forbid,
-        message="AMB-1: return None\nAMB-2: floats only",
-        snapshot=snap,
-        pause_kind=PauseKind.CLARIFY,
-        gate="spec",
-    )
-    assert explicit.action == "clarify"
-    assert explicit.answers == {"AMB-1": "return None", "AMB-2": "floats only"}
+    # 3. Complete explicit ID answers resolve with 0 LLM calls (even when pause_kind=BLOCKED).
+    for pause in (PauseKind.CLARIFY, PauseKind.BLOCKED):
+        explicit = parse_reply(
+            provider=forbid,
+            message="AMB-1: return None\nAMB-2: floats only",
+            snapshot=snap,
+            pause_kind=pause,
+            gate="spec" if pause == PauseKind.CLARIFY else None,
+        )
+        assert explicit.action == "clarify"
+        assert explicit.answers == {"AMB-1": "return None", "AMB-2": "floats only"}
 
-    # 4. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
+    # 4. Failed run recovery hint resolves deterministically with 0 LLM calls.
+    failed_snap = {"status": RunStatus.FAILED, "spec": None, "plan": None}
+    failed_intent = parse_reply(
+        provider=forbid,
+        message="Redo the interrupted step after the transient network error.",
+        snapshot=failed_snap,
+        pause_kind=None,
+    )
+    assert failed_intent.action == "revise"
+    assert failed_intent.feedback == "Redo the interrupted step after the transient network error."
+
+    # 5. Questions with negated revision + approval token must NEVER trigger approve/revise.
+    blocked_no_spec = {"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None}
+    for provider_impl in (
+        MockLLMProvider(responses=[LLMResponse(content="not json")]),
+        MockLLMProvider(
+            responses=[LLMResponse(content=json.dumps({"action": "approve", "message": "ok"}))]
+        ),
+    ):
+        question_intent = parse_reply(
+            provider=provider_impl,
+            message="Keep everything unchanged. Should we proceed?",
+            snapshot=blocked_no_spec,
+            pause_kind=PauseKind.BLOCKED,
+        )
+        assert question_intent.action == "unknown", question_intent
+
+    # 6. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
     assert SessionConfig(workspace_root=tmp_path).worker_max_steps == 40

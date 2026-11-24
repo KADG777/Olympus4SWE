@@ -5798,6 +5798,85 @@ def test_propose_plan_lists_allowed_design_refs_in_modular_prompt(tmp_path: Path
     assert plan.tasks[0].design_refs == ["M-CORE", "IF-RUN"]
 
 
+def test_format_spec_and_design_context_expand_referenced_ids() -> None:
+    from olympus.core.contracts import (
+        AcceptanceCheck,
+        AcceptanceCriterion,
+        CheckKind,
+        DesignModule,
+        DesignSpec,
+        EarsPattern,
+        GoalSpec,
+        RequirementItem,
+        TaskNode,
+    )
+    from olympus.stages.orchestrate import _format_design_context, _format_spec_context
+
+    spec = GoalSpec(
+        goal="Compute division safely",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Reject division by zero with a clear error message",
+                ears_criteria=[
+                    AcceptanceCriterion(
+                        id="R1-C1",
+                        pattern=EarsPattern.UNWANTED_BEHAVIOR,
+                        condition="divisor is zero",
+                        outcome="raise ValueError('division by zero')",
+                    )
+                ],
+            ),
+            RequirementItem(
+                id="R2",
+                description="Unreferenced requirement",
+                acceptance_criteria=["Never included for T1"],
+            ),
+        ],
+    )
+    design = DesignSpec(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        architecture_summary="Single calculator module",
+        modules=[
+            DesignModule(
+                id="M-CALC",
+                name="Calculator",
+                responsibility="Arithmetic operations",
+                requirement_refs=["R1"],
+                target_paths=["calc.py"],
+            )
+        ],
+    )
+    task = TaskNode(
+        task_id="T1",
+        title="Implement R1",
+        objective="Implement R1 in M-CALC.",
+        write_scope=["calc.py"],
+        requirement_refs=["R1"],
+        design_refs=["M-CALC"],
+        acceptance_checks=[
+            AcceptanceCheck(
+                id="C1",
+                kind=CheckKind.COMMAND,
+                description="Verify zero check",
+                command="python -c 'print(1)'",
+            )
+        ],
+    )
+
+    spec_ctx = _format_spec_context(spec, task=task)
+    assert "R1: Reject division by zero with a clear error message" in spec_ctx
+    assert (
+        "R1-C1: IF divisor is zero THEN THE SYSTEM SHALL raise ValueError('division by zero')"
+        in spec_ctx
+    )
+    assert "Unreferenced requirement" not in spec_ctx
+
+    design_ctx = _format_design_context(design, task=task)
+    assert "M-CALC (Calculator): Arithmetic operations" in design_ctx
+
+
 
 
 
