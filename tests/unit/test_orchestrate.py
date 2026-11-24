@@ -5909,10 +5909,14 @@ def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
             "Modifying existing `mypkg.OldClass` or `stdlib.mod.Helper` behavior",
             "Changing unrelated Headers/URL semantics",
             "Do not touch `legacy/` or tests/test_frozen.py",
+            "`mypkg`",
+            "`mypkg.OldClass`",
+            "Headers/URL",
         ],
         constraints=[
             "Test freeze: do not modify `tests/test_frozen.py` or `tests/frozen_*.py`",
             "Do not create `docs/README` or `types.d.ts`",
+            "Do not modify docs/CHANGELOG",
         ],
     )
 
@@ -5926,6 +5930,7 @@ def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
     assert "tests/frozen_*.py" in forbidden
     assert "docs/README" in forbidden
     assert "types.d.ts" in forbidden
+    assert "docs/CHANGELOG" in forbidden
 
 
 

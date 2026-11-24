@@ -332,18 +332,46 @@ def _normalize_repo_rel_pattern(token: str) -> str | None:
     return cleaned
 
 
+def _is_explicit_spec_path(
+    raw: str,
+    norm: str,
+    workspace_root: Path,
+    *,
+    backticked: bool,
+    single_token: bool = False,
+) -> bool:
+    """Return True when a spec token is an explicit repo path/glob rather than prose/symbol."""
+    raw_cleaned = raw.strip().strip("`'\",;:()[]{}").replace("\\", "/")
+    raw_slash = "/" in raw_cleaned
+    has_glob = any(ch in norm for ch in "*?[")
+    target = workspace_root / norm
+    suffix = PurePosixPath(norm).suffix
+    has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix))
+    if has_glob or target.is_file():
+        return True
+    if raw_slash:
+        parts = PurePosixPath(norm).parts
+        first_seg = parts[0] if parts else ""
+        return bool(
+            backticked
+            or target.is_dir()
+            or (first_seg and (workspace_root / first_seg).is_dir())
+            or any(part[:1].islower() for part in parts)
+            or has_file_ext
+        )
+    return (backticked or single_token) and has_file_ext
+
+
 def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
     candidates: list[str] = []
     if not any(ch.isspace() for ch in stripped):
+        is_backticked = stripped.startswith("`") and stripped.endswith("`")
         norm = _normalize_repo_rel_pattern(stripped)
-        if norm is not None and (
-            "/" in norm
-            or any(ch in norm for ch in "*?[")
-            or "." in norm
-            or (workspace_root / norm).exists()
+        if norm is not None and _is_explicit_spec_path(
+            stripped, norm, workspace_root, backticked=is_backticked, single_token=True
         ):
             return [norm]
         return []
@@ -355,23 +383,12 @@ def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
         norm = _normalize_repo_rel_pattern(raw)
         if norm is None:
             continue
-        raw_slash = "/" in raw.strip().strip("`'\",;:()[]{}").replace("\\", "/")
-        has_glob = any(ch in norm for ch in "*?[")
-        target = workspace_root / norm
-        suffix = PurePosixPath(norm).suffix
-        has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix))
-        # In natural-language prose, only treat a token as a forbidden repo path when it
-        # is a glob, an existing file, an explicit slash-delimited existing directory, or
-        # a backticked slash path / lowercase-extension filename (never bare package/CLI
-        # names like `pkg`, dotted class symbols like `pkg.Class`, or unbackticked prose
-        # slash pairs like `Headers/URL`).
-        is_explicit_path = (
-            has_glob
-            or target.is_file()
-            or (raw_slash and target.is_dir())
-            or (backticked is not None and (raw_slash or has_file_ext))
-        )
-        if is_explicit_path and norm not in candidates:
+        if (
+            _is_explicit_spec_path(
+                raw, norm, workspace_root, backticked=backticked is not None
+            )
+            and norm not in candidates
+        ):
             candidates.append(norm)
     return candidates
 
