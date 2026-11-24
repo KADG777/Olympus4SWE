@@ -306,7 +306,7 @@ def _restore_tree_paths(
 
 _FREEZE_CONSTRAINT_RE = re.compile(
     r"\b(?:(?:do not|don't|must not|never|cannot)\s+"
-    r"(?:modify|edit|touch|change|alter|overwrite|delete|remove|rewrite)"
+    r"(?:modify|edit|touch|change|alter|overwrite|delete|remove|rewrite|create)"
     r"|test\s+freeze|frozen|immutable|read[- ]only|forbidden|prohibited|untouched|unchanged)\b",
     re.IGNORECASE,
 )
@@ -359,18 +359,17 @@ def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
         has_glob = any(ch in norm for ch in "*?[")
         target = workspace_root / norm
         suffix = PurePosixPath(norm).suffix
-        has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix)) and (
-            raw_slash or norm.count(".") == 1
-        )
+        has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix))
         # In natural-language prose, only treat a token as a forbidden repo path when it
         # is a glob, an existing file, an explicit slash-delimited existing directory, or
-        # a backticked filename with a lowercase extension (never bare package/CLI names
-        # like `pkg`, dotted symbols like `pkg.Class`, or prose slash pairs like `Headers/URL`).
+        # a backticked slash path / lowercase-extension filename (never bare package/CLI
+        # names like `pkg`, dotted class symbols like `pkg.Class`, or unbackticked prose
+        # slash pairs like `Headers/URL`).
         is_explicit_path = (
             has_glob
             or target.is_file()
             or (raw_slash and target.is_dir())
-            or (backticked is not None and has_file_ext)
+            or (backticked is not None and (raw_slash or has_file_ext))
         )
         if is_explicit_path and norm not in candidates:
             candidates.append(norm)
