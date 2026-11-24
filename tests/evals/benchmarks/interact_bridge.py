@@ -19,6 +19,7 @@ per-step interaction cap was reached, ``4`` invalid bridge configuration.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import fcntl
 import json
@@ -372,10 +373,89 @@ def _collect_verified_targets(
     }
 
 
+_SYS_PIDFD_OPEN = 434
+_SYS_PIDFD_SEND_SIGNAL = 424
+_LIBC: ctypes.CDLL | None = None
+
+
+def _get_libc() -> ctypes.CDLL | None:
+    global _LIBC
+    if _LIBC is not None:
+        return _LIBC
+    if sys.platform != "linux":
+        return None
+    try:
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    return _LIBC
+
+
+def _open_pidfd(pid: int) -> int | None:
+    """Open a Linux pidfd pinned to ``pid``'s kernel ``struct pid``, or None."""
+    if pid <= 1:
+        return None
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if callable(pidfd_open):
+        try:
+            return int(pidfd_open(pid, 0))
+        except (ProcessLookupError, PermissionError, OSError):
+            return None
+    libc = _get_libc()
+    if libc is None:
+        return None
+    ctypes.set_errno(0)
+    fd = int(libc.syscall(_SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0)))
+    if fd < 0:
+        return None
+    return fd
+
+
+def _send_pidfd_signal(pidfd: int, sig: int) -> bool:
+    """Send ``sig`` atomically through a Linux ``pidfd``."""
+    send_fn = getattr(signal, "pidfd_send_signal", None)
+    if callable(send_fn):
+        try:
+            send_fn(pidfd, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+    libc = _get_libc()
+    if libc is None:
+        return False
+    ctypes.set_errno(0)
+    rc = int(
+        libc.syscall(
+            _SYS_PIDFD_SEND_SIGNAL,
+            ctypes.c_int(pidfd),
+            ctypes.c_int(sig),
+            ctypes.c_void_p(0),
+            ctypes.c_uint(0),
+        )
+    )
+    return rc == 0
+
+
 def _kill_verified_pid(pid: int, expected_ticks: int, sig: int) -> bool:
-    """Send ``sig`` to ``pid`` only if its start ticks still match ``expected_ticks``."""
+    """Send ``sig`` to ``pid`` race-freely using a verified Linux ``pidfd``.
+
+    Opening the pidfd *before* reading ``/proc/<pid>/stat`` guarantees that if
+    ``start_ticks`` matches ``expected_ticks`` while the pidfd is open, the
+    pidfd is pinned to the exact original ``struct pid`` and cannot signal a
+    subsequently recycled process even if the original exits immediately after.
+    """
     if pid <= 1 or pid == os.getpid():
         return False
+    pidfd = _open_pidfd(pid)
+    if pidfd is not None:
+        try:
+            if _proc_start_ticks(pid) != expected_ticks:
+                return False
+            return _send_pidfd_signal(pidfd, sig)
+        finally:
+            with suppress(OSError):
+                os.close(pidfd)
+    # Non-Linux / no-pidfd fallback: verify immediately before os.kill.
     if _proc_start_ticks(pid) != expected_ticks:
         return False
     try:
@@ -826,8 +906,12 @@ class InteractBridge:
                     EXIT_SESSION_FAILED,
                 )
         try:
-            if self._cleanup_stale_processes():
-                self._recover_stranded_active_runs()
+            if not self._cleanup_stale_processes():
+                raise BridgeError(
+                    "failed to terminate stale bridge/olympus processes; refusing to proceed",
+                    EXIT_SESSION_FAILED,
+                )
+            self._recover_stranded_active_runs()
             self._write_pid_state()
             if self.config.phase == "plan":
                 self._run_plan()

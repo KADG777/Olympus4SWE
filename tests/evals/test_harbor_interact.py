@@ -2927,14 +2927,15 @@ def test_interact_bridge_concurrent_lock_holder_is_not_killed_without_reclaim(
         assert _kill_verified_pid(holder.pid, 999_999_999, 15) is False
         assert holder.poll() is None
 
-        # 3. _terminate_process_tree returns False if target survives SIGKILL (PermissionError).
+        # 3. _terminate_process_tree returns False if target survives SIGKILL (PermissionError),
+        #    and run() aborts without touching DB or erasing bridge-pid.json.
         from unittest.mock import patch
 
         stat = Path(f"/proc/{holder.pid}/stat").read_text(encoding="utf-8")
         holder_ticks = int(stat[stat.rfind(")") + 2 :].split()[19])
         with patch(
-            "tests.evals.benchmarks.interact_bridge.os.kill",
-            side_effect=PermissionError("denied"),
+            "tests.evals.benchmarks.interact_bridge._send_pidfd_signal",
+            return_value=False,
         ):
             assert (
                 _terminate_process_tree(
@@ -2945,6 +2946,37 @@ def test_interact_bridge_concurrent_lock_holder_is_not_killed_without_reclaim(
                 )
                 is False
             )
+            # Also verify run() with an unlocked state_dir + unkillable stale PID refuses
+            # to proceed, skips DB recovery, and preserves bridge-pid.json intact.
+            stale_dir = tmp_path / "stale-unkillable"
+            stale_dir.mkdir()
+            pid_payload = json.dumps(
+                {
+                    "bridge_pid": holder.pid,
+                    "bridge_pgid": holder.pid,
+                    "bridge_start_ticks": holder_ticks,
+                    "session_token": "unkillable-token",
+                }
+            )
+            (stale_dir / "bridge-pid.json").write_text(pid_payload, encoding="utf-8")
+            stale_args = build_parser().parse_args(
+                [
+                    "--phase",
+                    "plan",
+                    "--workspace",
+                    str(repo),
+                    "--state-dir",
+                    str(stale_dir),
+                    "--plan-out",
+                    str(tmp_path / "plan2.md"),
+                    "--goal",
+                    "Build feature",
+                ]
+            )
+            stale_bridge = InteractBridge(config_from_args(stale_args), client=Mock(), environ={})
+            with pytest.raises(BridgeError, match="failed to terminate stale"):
+                stale_bridge.run()
+            assert (stale_dir / "bridge-pid.json").read_text(encoding="utf-8") == pid_payload
         assert holder.poll() is None
 
         # 4. With --reclaim-stale (e.g. after Harbor step timeout): cleans holder & recovers DB.
