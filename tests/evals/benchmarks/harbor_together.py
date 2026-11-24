@@ -1424,14 +1424,18 @@ class UserEnabledOlympusAgent(BaseAgent):
             self._last_turn_had_usage = self._record_token_usage(envelope)
             if (
                 parsed is not None
-                and envelope.status == "needs_input"
+                and envelope.status in ("needs_input", "failed")
                 and is_infrastructure_block(dict(envelope.raw))
             ):
-                if (
-                    self._run_id
-                    and attempt < self._infra_retries
+                can_retry = (
+                    attempt < self._infra_retries
                     and not self._budget_exhausted()
-                ):
+                    and (
+                        envelope.status == "failed"
+                        or bool(self._run_id)
+                    )
+                )
+                if can_retry:
                     attempt += 1
                     self._write_turn_artifacts(
                         turn, command, outcome, suffix=f"-infra-retry-{attempt}"
@@ -1439,10 +1443,14 @@ class UserEnabledOlympusAgent(BaseAgent):
                     self._record_event(turn, f"infra_retry_{attempt}")
                     if self._infra_retry_backoff_sec > 0:
                         await asyncio.sleep(self._infra_retry_backoff_sec)
-                    current_action = "reply"
-                    current_message = (
-                        "Redo the interrupted step after the transient network error."
-                    )
+                    if self._run_id:
+                        current_action = "reply"
+                        current_message = (
+                            "Redo the interrupted step after the transient network error."
+                        )
+                    else:
+                        current_action = action
+                        current_message = message
                     continue
                 # Exhausted local retries (or budget): fail cleanly without consulting
                 # the simulated user or polluting conversation.jsonl with infra errors.

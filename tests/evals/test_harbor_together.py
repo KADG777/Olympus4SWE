@@ -2436,3 +2436,34 @@ def test_exhausted_infra_retries_stop_cleanly_without_consulting_user(
     assert "infra_retries_exhausted" in convo
     final_env = json.loads((tmp_path / "logs" / "envelope-0.json").read_text(encoding="utf-8"))
     assert final_env["status"] == "failed"
+
+
+def test_failed_turn0_infra_error_retried_locally_on_same_run_id(
+    tmp_path: Path,
+) -> None:
+    failed_env = _envelope(
+        "failed",
+        "pi driver stopped before returning GoalSpec: pi_error: terminated: read ECONNRESET",
+        run_id="run-turn0-fail",
+    )
+    handler = _SessionHandler(
+        [failed_env, _envelope("completed", "Done.", run_id="run-turn0-fail")]
+    )
+    user = _StubUser([])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        call_user_on_completion=False,
+        infra_retries=2,
+        infra_retry_backoff_sec=0.0,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Fix the Windows paths", environment, SimpleNamespace(metadata=None)))
+
+    assert user.calls == []
+    session_cmds = [cmd for cmd in environment.commands() if "session " in cmd]
+    assert len(session_cmds) == 2
+    assert "session start" in session_cmds[0]
+    assert "session reply run-turn0-fail" in session_cmds[1]

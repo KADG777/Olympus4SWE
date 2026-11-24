@@ -341,6 +341,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         self._token_usage: dict[str, Any] | None = None
         self._run_token_usage: dict[str, dict[str, Any]] = {}
         self._reported_run_usage: dict[str, dict[str, Any]] = {}
+        self._prior_step_interrupted = False
         super().__init__(
             logs_dir=logs_dir if logs_dir is not None else Path.cwd() / "logs",
             model_name=model_name,
@@ -897,9 +898,14 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             / f"olympus-interact-{step_tag}.jsonl"
         )
         argv = self._bridge_argv(role, remote_instruction, trajectory)
-        result = await environment.exec(
-            shlex.join(argv), timeout_sec=None, env=self._gateway_env()
-        )
+        try:
+            result = await environment.exec(
+                shlex.join(argv), timeout_sec=None, env=self._gateway_env()
+            )
+        except BaseException:
+            self._prior_step_interrupted = True
+            raise
+        self._prior_step_interrupted = False
         summary = self._parse_bridge_summary(result.stdout)
         if result.return_code != 0 or (summary or {}).get("status") != "ok":
             error = (summary or {}).get("error") or (
@@ -976,6 +982,8 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         ):
             if value:
                 argv += [flag, str(value)]
+        if self._prior_step_interrupted:
+            argv.append("--reclaim-stale")
         return argv
 
     def _write_artifact(self, name: str, content: str) -> Path:

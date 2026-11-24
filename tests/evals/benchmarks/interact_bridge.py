@@ -232,6 +232,9 @@ def _proc_stat_fields(pid: int) -> tuple[int, int, int] | None:
     parts = stat[rparen + 2 :].split()
     if len(parts) <= 19:
         return None
+    # Zombies ('Z') and dead ('X') processes have already exited and cannot be killed.
+    if parts[0] in ("Z", "X"):
+        return None
     try:
         # After ')': [0]=state, [1]=ppid, [2]=pgrp, ..., [19]=starttime
         return int(parts[1]), int(parts[2]), int(parts[19])
@@ -298,8 +301,8 @@ def _collect_verified_targets(
     pgid: int | None,
     start_ticks: int | None,
     session_token: str | None,
-) -> set[int]:
-    """Return live PIDs verified to belong to a prior bridge/olympus invocation.
+) -> dict[int, int]:
+    """Return live ``{pid: start_ticks}`` verified to belong to a prior invocation.
 
     Never returns PIDs that fail identity verification (preventing PID-reuse kills).
     """
@@ -307,7 +310,7 @@ def _collect_verified_targets(
     own_pgid = os.getpgrp()
     proc_root = Path("/proc")
     if not proc_root.is_dir():
-        return set()
+        return {}
 
     proc_info: dict[int, tuple[int, int, int]] = {}
     children_by_ppid: dict[int, list[int]] = {}
@@ -352,7 +355,7 @@ def _collect_verified_targets(
                 seeds.add(cur_pid)
 
     if not seeds:
-        return set()
+        return {}
 
     matched = set(seeds)
     queue = list(seeds)
@@ -362,7 +365,24 @@ def _collect_verified_targets(
             if child not in matched:
                 matched.add(child)
                 queue.append(child)
-    return {p for p in matched if _is_pid_alive(p)}
+    return {
+        p: proc_info[p][2]
+        for p in matched
+        if p in proc_info and _is_pid_alive(p)
+    }
+
+
+def _kill_verified_pid(pid: int, expected_ticks: int, sig: int) -> bool:
+    """Send ``sig`` to ``pid`` only if its start ticks still match ``expected_ticks``."""
+    if pid <= 1 or pid == os.getpid():
+        return False
+    if _proc_start_ticks(pid) != expected_ticks:
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
 
 
 def _terminate_process_tree(
@@ -373,37 +393,34 @@ def _terminate_process_tree(
     session_token: str | None = None,
     wait_sec: float = 1.5,
 ) -> bool:
-    """Terminate verified process-tree targets (group members + detached descendants)."""
+    """Terminate verified process-tree targets (group members + detached descendants).
+
+    Returns True iff at least one verified target was found and all verified targets
+    have exited by the end of cleanup.
+    """
     targets = _collect_verified_targets(
         pid=pid, pgid=pgid, start_ticks=start_ticks, session_token=session_token
     )
     if not targets:
         return False
 
-    # Pin verified (pid -> start_ticks) so members that survive leader exit
-    # remain tracked without risking PID-reuse collisions.
-    captured: dict[int, int | None] = {p: _proc_start_ticks(p) for p in targets}
+    # Pin verified (pid -> start_ticks) captured during scan so members surviving
+    # leader exit stay tracked without ever signaling a recycled PID.
+    captured: dict[int, int] = dict(targets)
 
-    def _still_alive() -> set[int]:
+    def _still_alive() -> dict[int, int]:
         live = _collect_verified_targets(
             pid=pid, pgid=pgid, start_ticks=start_ticks, session_token=session_token
         )
-        for p in live:
-            captured.setdefault(p, _proc_start_ticks(p))
+        for p, ticks in live.items():
+            captured.setdefault(p, ticks)
         for p, ticks in list(captured.items()):
-            if ticks is not None and _proc_start_ticks(p) == ticks:
-                live.add(p)
+            if _proc_start_ticks(p) == ticks:
+                live[p] = ticks
         return live
 
-    any_sent = False
-    for target in sorted(targets):
-        try:
-            os.kill(target, signal.SIGTERM)
-            any_sent = True
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    if not any_sent:
-        return False
+    for target, ticks in sorted(captured.items()):
+        _kill_verified_pid(target, ticks, signal.SIGTERM)
 
     deadline = time.monotonic() + max(0.0, wait_sec)
     while time.monotonic() < deadline:
@@ -411,20 +428,18 @@ def _terminate_process_tree(
             return True
         time.sleep(0.05)
 
-    for target in sorted(_still_alive()):
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(target, signal.SIGKILL)
+    for target, ticks in sorted(_still_alive().items()):
+        _kill_verified_pid(target, ticks, signal.SIGKILL)
 
     kill_deadline = time.monotonic() + 1.0
     while time.monotonic() < kill_deadline:
         still = _still_alive()
         if not still:
-            break
-        for target in sorted(still):
-            with suppress(ProcessLookupError, PermissionError, OSError):
-                os.kill(target, signal.SIGKILL)
+            return True
+        for target, ticks in sorted(still.items()):
+            _kill_verified_pid(target, ticks, signal.SIGKILL)
         time.sleep(0.05)
-    return True
+    return not bool(_still_alive())
 
 
 def append_jsonl(
@@ -491,6 +506,7 @@ class BridgeConfig:
     pi_provider: str | None = None
     thinking_level: str | None = None
     context_window: int | None = None
+    reclaim_stale: bool = False
 
 
 class InteractBridge:
@@ -609,22 +625,26 @@ class InteractBridge:
                 session_token=self._session_token,
             )
 
-    def _cleanup_stale_processes(self) -> None:
-        """Terminate any verified orphaned bridge/olympus processes from an earlier step."""
+    def _cleanup_stale_processes(self) -> bool:
+        """Terminate verified orphaned processes from an earlier step.
+
+        Returns True when no verified stale processes remain alive, False if any
+        verified target survived termination.
+        """
         path = self._pid_path()
         if not path.is_file():
-            return
+            return True
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             with suppress(OSError):
                 path.unlink(missing_ok=True)
-            return
+            return True
         if not isinstance(payload, dict):
-            return
+            return True
         prev_token = payload.get("session_token")
         if prev_token == self._session_token:
-            return
+            return True
         prev_bridge_pid = payload.get("bridge_pid")
         prev_bridge_pgid = payload.get("bridge_pgid")
         prev_bridge_ticks = payload.get("bridge_start_ticks")
@@ -633,26 +653,40 @@ class InteractBridge:
         prev_olympus_ticks = payload.get("olympus_start_ticks")
         token_str = str(prev_token) if isinstance(prev_token, str) and prev_token else None
         cleaned = False
-        if (
-            isinstance(prev_olympus_pid, int)
-            or isinstance(prev_olympus_pgid, int)
-            or token_str is not None
-        ) and _terminate_process_tree(
-            pid=prev_olympus_pid if isinstance(prev_olympus_pid, int) else None,
-            pgid=prev_olympus_pgid if isinstance(prev_olympus_pgid, int) else None,
-            start_ticks=prev_olympus_ticks if isinstance(prev_olympus_ticks, int) else None,
-            session_token=token_str,
-        ):
-            cleaned = True
-        if (
-            isinstance(prev_bridge_pid, int) or isinstance(prev_bridge_pgid, int)
-        ) and _terminate_process_tree(
-            pid=prev_bridge_pid if isinstance(prev_bridge_pid, int) else None,
-            pgid=prev_bridge_pgid if isinstance(prev_bridge_pgid, int) else None,
-            start_ticks=prev_bridge_ticks if isinstance(prev_bridge_ticks, int) else None,
-            session_token=token_str,
-        ):
-            cleaned = True
+        incomplete = False
+        olympus_kwargs = {
+            "pid": prev_olympus_pid if isinstance(prev_olympus_pid, int) else None,
+            "pgid": prev_olympus_pgid if isinstance(prev_olympus_pgid, int) else None,
+            "start_ticks": (
+                prev_olympus_ticks if isinstance(prev_olympus_ticks, int) else None
+            ),
+            "session_token": token_str,
+        }
+        if _collect_verified_targets(**olympus_kwargs):
+            if _terminate_process_tree(**olympus_kwargs):
+                cleaned = True
+            else:
+                incomplete = True
+        bridge_kwargs = {
+            "pid": prev_bridge_pid if isinstance(prev_bridge_pid, int) else None,
+            "pgid": prev_bridge_pgid if isinstance(prev_bridge_pgid, int) else None,
+            "start_ticks": (
+                prev_bridge_ticks if isinstance(prev_bridge_ticks, int) else None
+            ),
+            "session_token": token_str,
+        }
+        if _collect_verified_targets(**bridge_kwargs):
+            if _terminate_process_tree(**bridge_kwargs):
+                cleaned = True
+            else:
+                incomplete = True
+        if incomplete:
+            self.log(
+                "bridge.stale_process_cleanup_incomplete",
+                previous_bridge_pid=prev_bridge_pid,
+                previous_olympus_pid=prev_olympus_pid,
+            )
+            return False
         with suppress(OSError):
             path.unlink(missing_ok=True)
         if cleaned:
@@ -661,6 +695,7 @@ class InteractBridge:
                 previous_bridge_pid=prev_bridge_pid,
                 previous_olympus_pid=prev_olympus_pid,
             )
+        return True
 
     def _recover_stranded_active_runs(self, run_id: str | None = None) -> None:
         """Reset stranded active run statuses in ``olympus.db`` after orphan cleanup.
@@ -722,8 +757,8 @@ class InteractBridge:
                         next_seq = int(seq_row[0]) + 1 if seq_row else 1
                         payload_json = json.dumps(
                             {
-                                "from_status": status_str,
-                                "to_status": "paused",
+                                "from": status_str,
+                                "to": "paused",
                                 "reason": "recovered_stranded_active_run",
                             },
                             sort_keys=True,
@@ -768,11 +803,32 @@ class InteractBridge:
             )
 
     def run(self) -> None:
-        self._cleanup_stale_processes()
-        if self._acquire_state_lock():
-            self._recover_stranded_active_runs()
-        self._write_pid_state()
+        locked = self._acquire_state_lock()
+        if not locked:
+            if not self.config.reclaim_stale:
+                raise BridgeError(
+                    f"another bridge instance holds {self._lock_path()}; refusing to interrupt it",
+                    EXIT_SESSION_FAILED,
+                )
+            if not self._cleanup_stale_processes():
+                raise BridgeError(
+                    "failed to terminate stale bridge processes before reclaiming state_dir",
+                    EXIT_SESSION_FAILED,
+                )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not locked:
+                locked = self._acquire_state_lock()
+                if not locked:
+                    time.sleep(0.05)
+            if not locked:
+                raise BridgeError(
+                    f"state directory lock {self._lock_path()} remained held after stale cleanup",
+                    EXIT_SESSION_FAILED,
+                )
         try:
+            if self._cleanup_stale_processes():
+                self._recover_stranded_active_runs()
+            self._write_pid_state()
             if self.config.phase == "plan":
                 self._run_plan()
             elif self.config.phase == "execute":
@@ -1466,6 +1522,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-commit-file", default="/tmp/base_commit.txt")
     parser.add_argument("--session-timeout", type=float, default=3600.0)
     parser.add_argument("--pi-bin", default=None)
+    parser.add_argument(
+        "--reclaim-stale",
+        action="store_true",
+        default=False,
+        help="Terminate an earlier lock-holding bridge for this state_dir before running.",
+    )
     return parser
 
 
@@ -1509,6 +1571,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         pi_provider=args.pi_provider,
         thinking_level=args.thinking,
         context_window=args.context_window,
+        reclaim_stale=bool(args.reclaim_stale),
     )
 
 

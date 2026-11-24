@@ -2643,17 +2643,30 @@ def test_interact_bridge_cleans_stale_process_and_recovers_stranded_active_run(
         assert unrelated.poll() is None
         assert not (state_dir / "bridge-pid.json").exists()
 
-        # Both runs.status/state_revision AND events.state_revision must be updated together.
+        # Both runs.status/state_revision AND events.state_revision (with from/to keys)
+        # must be updated together so projection sees the transition cleanly.
+        from olympus.web.projection import build_run_projection
+
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
             "SELECT status, state_revision FROM runs WHERE run_id = ?", (run_id,)
         ).fetchone()
-        max_evt_rev = conn.execute(
-            "SELECT MAX(state_revision) FROM events WHERE run_id = ?", (run_id,)
-        ).fetchone()[0]
+        evt_row = conn.execute(
+            "SELECT state_revision, payload_json FROM events "
+            "WHERE run_id = ? ORDER BY event_seq DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
         conn.close()
         assert row == ("paused", prev_rev + 1)
-        assert max_evt_rev == prev_rev + 1
+        assert evt_row is not None
+        assert evt_row[0] == prev_rev + 1
+        evt_payload = json.loads(evt_row[1])
+        assert evt_payload["from"] == "aligning"
+        assert evt_payload["to"] == "paused"
+        projected = build_run_projection(store, repo, run_id)
+        assert projected["status"] == "paused"
+        assert projected["recent_progress"]["event_type"] == "run.status_changed"
+        assert projected["recent_progress"]["to"] == "paused"
     finally:
         for proc in (orphan, unrelated):
             if proc.poll() is None:
@@ -2828,3 +2841,142 @@ def test_harbor_interact_setup_warns_when_litellm_base_url_ends_with_v1(
     assert "alice" not in warnings[0]
     assert "leakme" not in warnings[0]
     assert "https://example.test:8443/compatible-mode/v1" in warnings[0]
+
+
+def test_interact_bridge_concurrent_lock_holder_is_not_killed_without_reclaim(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+    from unittest.mock import Mock
+
+    from olympus.core.contracts import RunMode, RunStatus
+    from olympus.core.store import RunStore
+    from tests.evals.benchmarks.interact_bridge import (
+        BridgeError,
+        InteractBridge,
+        _kill_verified_pid,
+        _terminate_process_tree,
+        build_parser,
+        config_from_args,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    db_path = state_dir / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(title="concurrent", mode=RunMode.EXECUTION, workspace_root=repo)
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="test", stage="align")
+    prev_rev = int(store.get_run(run_id)["state_revision"])
+
+    # Simulate an active bridge holding bridge.lock + bridge-pid.json in another process.
+    holder_script = tmp_path / "holder.py"
+    holder_script.write_text(
+        "import fcntl, json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "state_dir = Path(sys.argv[1])\n"
+        "fd = os.open(str(state_dir / 'bridge.lock'), os.O_CREAT | os.O_RDWR, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "stat = Path(f'/proc/{os.getpid()}/stat').read_text()\n"
+        "ticks = int(stat[stat.rfind(')') + 2:].split()[19])\n"
+        "(state_dir / 'bridge-pid.json').write_text(json.dumps({\n"
+        "  'bridge_pid': os.getpid(), 'bridge_pgid': os.getpgrp(),\n"
+        "  'bridge_start_ticks': ticks, 'session_token': 'active-holder-token'\n"
+        "}))\n"
+        "print('locked', flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    holder = subprocess.Popen(
+        [sys.executable, str(holder_script), str(state_dir)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+
+        # 1. Without --reclaim-stale: second bridge refuses to interrupt holder & leaves DB running.
+        args_no_reclaim = build_parser().parse_args(
+            [
+                "--phase",
+                "plan",
+                "--workspace",
+                str(repo),
+                "--state-dir",
+                str(state_dir),
+                "--plan-out",
+                str(tmp_path / "plan.md"),
+                "--goal",
+                "Build feature",
+            ]
+        )
+        bridge_b = InteractBridge(config_from_args(args_no_reclaim), client=Mock(), environ={})
+        with pytest.raises(BridgeError, match="holds"):
+            bridge_b.run()
+        assert holder.poll() is None
+        conn = sqlite3.connect(str(db_path))
+        assert conn.execute(
+            "SELECT status, state_revision FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone() == ("running", prev_rev)
+        conn.close()
+
+        # 2. PID-reuse TOCTOU guard: mismatched expected_ticks refuses to call os.kill.
+        assert _kill_verified_pid(holder.pid, 999_999_999, 15) is False
+        assert holder.poll() is None
+
+        # 3. _terminate_process_tree returns False if target survives SIGKILL (PermissionError).
+        from unittest.mock import patch
+
+        stat = Path(f"/proc/{holder.pid}/stat").read_text(encoding="utf-8")
+        holder_ticks = int(stat[stat.rfind(")") + 2 :].split()[19])
+        with patch(
+            "tests.evals.benchmarks.interact_bridge.os.kill",
+            side_effect=PermissionError("denied"),
+        ):
+            assert (
+                _terminate_process_tree(
+                    pid=holder.pid,
+                    pgid=holder.pid,
+                    start_ticks=holder_ticks,
+                    wait_sec=0.05,
+                )
+                is False
+            )
+        assert holder.poll() is None
+
+        # 4. With --reclaim-stale (e.g. after Harbor step timeout): cleans holder & recovers DB.
+        args_reclaim = build_parser().parse_args(
+            [
+                "--phase",
+                "plan",
+                "--workspace",
+                str(repo),
+                "--state-dir",
+                str(state_dir),
+                "--plan-out",
+                str(tmp_path / "plan.md"),
+                "--goal",
+                "Build feature",
+                "--reclaim-stale",
+            ]
+        )
+        bridge_c = InteractBridge(config_from_args(args_reclaim), client=Mock(), environ={})
+        with patch(
+            "tests.evals.benchmarks.interact_bridge.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, '{"status":"completed"}', ""),
+        ):
+            bridge_c.run()
+        holder.wait(timeout=5)
+        assert holder.returncode is not None
+        conn = sqlite3.connect(str(db_path))
+        assert conn.execute(
+            "SELECT status, state_revision FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone() == ("paused", prev_rev + 1)
+        conn.close()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
