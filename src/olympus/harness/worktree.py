@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -76,9 +77,13 @@ class SandboxBaseline:
     base_commit: str | None = None
     preexisting_ephemeral: tuple[str, ...] = ()
     preexisting_dirs: tuple[str, ...] | None = None
+    text_snapshots: tuple[tuple[str, str], ...] = ()
 
     def mapping(self) -> dict[str, str | None]:
         return dict(self.entries)
+
+    def text_mapping(self) -> dict[str, str]:
+        return dict(self.text_snapshots)
 
 
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -173,6 +178,7 @@ def create_sandbox(
     shutil.copytree(
         root,
         sandbox_dir,
+        symlinks=True,
         ignore=shutil.ignore_patterns(".git", ".venv", ".olympus", "__pycache__"),
     )
     return SandboxHandle(
@@ -195,6 +201,7 @@ def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> N
                 "entries": [list(e) for e in baseline.entries],
                 "preexisting_ephemeral": list(baseline.preexisting_ephemeral),
                 "preexisting_dirs": baseline.preexisting_dirs,
+                "text_snapshots": [list(item) for item in baseline.text_snapshots],
             },
         ),
         encoding="utf-8",
@@ -218,12 +225,23 @@ def load_sandbox_baseline(handle: SandboxHandle) -> SandboxBaseline | None:
             else ()
         )
         raw_dirs = payload.get("preexisting_dirs")
+        raw_texts = payload.get("text_snapshots", [])
+        text_snapshots = (
+            tuple(
+                (str(item[0]), str(item[1]))
+                for item in raw_texts
+                if isinstance(item, list) and len(item) == 2
+            )
+            if isinstance(raw_texts, list)
+            else ()
+        )
         return SandboxBaseline(
             is_git=bool(payload["is_git"]),
             entries=entries,
             base_commit=base_commit,
             preexisting_ephemeral=preexisting_ephemeral,
             preexisting_dirs=tuple(raw_dirs) if isinstance(raw_dirs, list) else None,
+            text_snapshots=text_snapshots,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -337,7 +355,62 @@ def _overlay_file_block(ws: Path, rel: str) -> str:
     ).rstrip()
 
 
-def _modified_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
+_MAX_TEXT_SNAPSHOT_BYTES = 4 * 1024 * 1024
+
+
+def _unified_text_diff_from_strings(before_text: str, after_path: Path, rel: str) -> str | None:
+    try:
+        after_raw = after_path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in after_raw:
+        return None
+    try:
+        after_text = after_raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    diff_lines = list(
+        difflib.unified_diff(
+            before_text.splitlines(keepends=True),
+            after_text.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+            lineterm="\n",
+        )
+    )
+    if not diff_lines:
+        return None
+    rendered = "".join(line if line.endswith("\n") else f"{line}\n" for line in diff_lines)
+    return f"diff --git a/{rel} b/{rel}\n{rendered}".rstrip()
+
+
+def _unified_text_diff_block(before_path: Path, after_path: Path, rel: str) -> str | None:
+    try:
+        before_raw = before_path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in before_raw:
+        return None
+    try:
+        before_text = before_raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return _unified_text_diff_from_strings(before_text, after_path, rel)
+
+
+def _modified_file_block(
+    ws: Path,
+    rel: str,
+    base_commit: str | None,
+    *,
+    repo_root: Path | None = None,
+    baseline_text: str | None = None,
+) -> str:
+    after_path = ws / rel
+    if baseline_text is not None and after_path.is_file():
+        unified = _unified_text_diff_from_strings(baseline_text, after_path, rel)
+        if unified is not None:
+            return unified
     if _is_tracked_at_base(ws, base_commit, rel):
         assert base_commit is not None
         diff_out = _run_git(
@@ -345,6 +418,12 @@ def _modified_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
         ).stdout.rstrip()
         if diff_out:
             return diff_out
+    if repo_root is not None and repo_root != ws:
+        before_path = repo_root / rel
+        if before_path.is_file() and not before_path.is_symlink() and after_path.is_file():
+            unified = _unified_text_diff_block(before_path, after_path, rel)
+            if unified is not None:
+                return unified
     return _overlay_file_block(ws, rel)
 
 
@@ -385,6 +464,7 @@ def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> s
             renames[old] = match
             added.discard(match)
 
+    before_texts = baseline.text_mapping()
     blocks: list[str] = []
     for rel in sorted(changed):
         if rel in renames:
@@ -401,7 +481,15 @@ def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> s
         elif rel in deleted:
             blocks.append(_deleted_file_block(ws, rel, base_commit))
         elif rel in modified:
-            blocks.append(_modified_file_block(ws, rel, base_commit))
+            blocks.append(
+                _modified_file_block(
+                    ws,
+                    rel,
+                    base_commit,
+                    repo_root=handle.repo_root,
+                    baseline_text=before_texts.get(rel),
+                )
+            )
     return "\n\n".join(blocks) if blocks else "(no changes)"
 
 
@@ -514,12 +602,30 @@ def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
     preexisting_dirs = (
         tuple(sorted(directories)) if (untracked_complete and walk_complete) else None
     )
+    text_snapshots: list[tuple[str, str]] = []
+    for rel in sorted(entries):
+        candidate = ws / rel
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        try:
+            if candidate.stat().st_size > _MAX_TEXT_SNAPSHOT_BYTES:
+                continue
+            raw = candidate.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw:
+            continue
+        try:
+            text_snapshots.append((rel, raw.decode("utf-8")))
+        except UnicodeDecodeError:
+            continue
     return SandboxBaseline(
         is_git=base_commit is not None,
         entries=tuple(sorted(entries.items())),
         base_commit=base_commit,
         preexisting_ephemeral=ephemeral,
         preexisting_dirs=preexisting_dirs,
+        text_snapshots=tuple(text_snapshots),
     )
 
 

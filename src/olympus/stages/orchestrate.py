@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -23,6 +23,7 @@ from olympus.core.contracts import (
     ApprovalRecord,
     ApprovalTarget,
     CheckKind,
+    DeliverableKind,
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
@@ -59,6 +60,7 @@ from olympus.harness.driver import (
     default_driver_factories,
     resolve_driver_spec,
 )
+from olympus.harness.escape_hatches import scan_diff_escape_hatches
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
 from olympus.harness.structured import run_structured_turn
@@ -85,6 +87,11 @@ from olympus.stages.common import (
     format_workspace_inventory,
     resolve_stage_driver,
 )
+from olympus.stages.verify_product import (
+    PRODUCT_VERIFIED_EVENT,
+    ProductVerificationResult,
+    verify_product_delivery,
+)
 from olympus.tools.aci import IGNORED_DIR_NAMES, WorkspacePolicy, WorkspaceToolkit
 
 if TYPE_CHECKING:
@@ -104,7 +111,10 @@ Rules:
    kind='independent_review' instead.
 5. Acceptance check commands execute with cwd ALREADY set to an isolated sandbox copy of the repo.
    NEVER use 'cd <host_path>' or hardcoded host workspace paths inside check commands; use
-   repo-relative paths only. When writing inline 'python -c "..."' commands, NEVER chain
+   repo-relative paths only. Every kind='command' check MUST be completely self-contained (use
+   `python -m pytest ...` with in-process test clients or start/stop an ephemeral-port server
+   inside the test; NEVER curl or request a hardcoded port like `127.0.0.1:5000` assuming a
+   server is already running). When writing inline 'python -c "..."' commands, NEVER chain
    '; try:', '; except:', '; for ', '; if ', or '; def ' on a single line (Python raises
    SyntaxError)—use real '\\n' newlines, simple expressions/asserts, or 'python -m pytest ...'.
 6. Honor all GoalSpec constraints and resolved open_ambiguities answers in task objectives/checks.
@@ -146,7 +156,9 @@ Rules:
 5. Read relevant files first using absolute paths under the sandbox root, and only write or edit
    files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
    non-forbidden integration edits.
-6. Put self-test databases, uploads, and temp files in $TMPDIR or remove them before finishing.
+6. Put self-test databases, uploads, and temp files in $TMPDIR or remove them before finishing;
+   when starting a background server in shell, record its exact PID (`$!`) and `kill "$PID"`
+   instead of broad `pkill -f`.
 7. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding. Once all acceptance checks pass cleanly, stop
    iterating and deliver your final summary immediately instead of over-polishing."""
@@ -180,6 +192,47 @@ Two-axis rules:
    'pre_existing'. Set passed=false whenever an 'important' Axis A defect exists; set passed=true
    only if implementation genuinely satisfies the task and no 'important' defects remain.
 6. Output ONLY a single JSON object conforming to ReviewVerdict."""
+
+_GLOBAL_REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of
+Olympus4SWE.
+You have ZERO prior conversation history with the implementers. You are strictly read-only: inspect,
+probe, but never edit repository files.
+Every planned task has finished. Audit the COMPOSED delivery as one product against the full
+GoalSpec (all requirements, out_of_scope, constraints, and resolved clarifications), not task by
+task.
+Two-axis rules:
+1. Every finding MUST set `axis`: `axis="spec"` for a broken requirement, out-of-scope addition, or
+   runtime/edge-case defect; `axis="standards"` for repo conventions, smells, or style. A standards
+   finding is always `severity="nit"` and always a concrete `file_path` plus `line`.
+2. An `axis="spec"` finding may be `severity="important"` ONLY when it includes:
+   - `requirement_ref`: the exact GoalSpec requirement id it breaks, and
+   - `repro_command`: one self-contained shell command that runs from the delivery root, exits
+     NON-ZERO while the defect exists, and exits ZERO once it is fixed.
+   The command must not modify repository files. If you cannot produce such a command, report the
+   finding as `severity="nit"` prose instead of inventing an unproven blocker.
+3. Chronos deterministically re-runs every Axis A `important` `repro_command` and drops any finding
+   whose command exits 0 (disproven), is missing, times out, or hits a broken probe.
+4. The runtime product verification report in the prompt is authoritative for boot, primary-surface
+   and restart health: never re-report a failure it already proved, and never claim a surface works
+   when its report says otherwise.
+5. Classify each non-standards finding strictly as 'important' (blocks pass), 'nit', or
+   'pre_existing'. Set passed=false whenever an 'important' Axis A defect exists; set passed=true
+   only if the delivered product genuinely satisfies the full GoalSpec.
+6. Output ONLY a single JSON object conforming to ReviewVerdict."""
+
+_REPAIR_SYSTEM_PROMPT = """You are the Stage 2 Post-DAG Repair Engineer (Hephaestus) of Olympus4SWE.
+Every planned task is accepted and composed into one delivery. Deterministic product verification or
+the unified cold-start review found real defects in the composed product.
+Rules:
+1. Fix ONLY the defects named in the failure diagnostics; do not rewrite unrelated files, add
+   speculative abstractions, or expand scope.
+2. Work seam-first at the reported boundary (booted server, primary surface, failing command), and
+   verify the fix with the exact failing checks before finishing.
+3. The whole repository is writable, but paths frozen by the GoalSpec stay forbidden and every
+   command acceptance check of the accepted tasks must pass again.
+4. Do not silence defects with escape hatches: no bare `# noqa`, no bare `# type: ignore`, no bare
+   `except:`, no `except Exception: pass`, no `@ts-ignore`, and no undocumented `eslint-disable`.
+5. End with a short summary naming each fixed defect and the command output that proves it."""
 
 
 def _plan_binding(
@@ -572,6 +625,8 @@ def _write_manifest_md(
     failed_checks = [check for check in checks if not check.passed]
     if verdict is not None:
         outcome = "accepted" if verdict.passed else "rejected"
+    elif task.status == TaskStatus.ACCEPTED:
+        outcome = "accepted"
     elif any(check.evidence_ref is not None for check in failed_checks):
         outcome = "checks_failed"
     else:
@@ -883,6 +938,49 @@ def _format_rejection_reason(verdict: ReviewVerdict) -> str:
                 f"    {line}" for line in finding.verification_output.splitlines()
             )
     return "\n".join(lines)
+
+
+class _RunInactive(Exception):
+    """Raised when accepted-change promotion observes a paused or cancelled run."""
+
+    def __init__(self, status: RunStatus) -> None:
+        self.status = status
+        super().__init__(status.value)
+
+
+def _tail_lines(path: str, *, limit: int = 40) -> str:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-limit:])
+
+
+def _read_product_report(run_dir: Path) -> str:
+    report_path = run_dir / "artifacts" / "verify_product" / "report.json"
+    try:
+        return report_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(product verification report unavailable)"
+
+
+def _product_failure_summary(
+    product: ProductVerificationResult, verdict: ReviewVerdict | None
+) -> str | None:
+    """Render the exact post-DAG failure diagnostics handed to a repair turn."""
+    lines: list[str] = []
+    if not product.passed:
+        lines.append(f"Post-DAG product verification failed: {product.summary}")
+        lines.extend(f"- {failure}" for failure in product.failures)
+        if product.report_path is not None:
+            lines.append(f"Full report: {product.report_path}")
+        if product.boot_log_path is not None:
+            tail = _tail_lines(product.boot_log_path)
+            if tail:
+                lines.append(f"boot.log tail:\n{tail}")
+    if verdict is not None and not verdict.passed:
+        lines.append(_format_rejection_reason(verdict))
+    return "\n".join(lines) if lines else None
 
 
 class _ReviewOutputError(ValueError):
@@ -1497,12 +1595,19 @@ class OrchestrateStage:
         *,
         run_id: str,
         spec: GoalSpec,
-        task: TaskNode,
         sandbox: SandboxHandle,
         verdict: ReviewVerdict,
         art_dir: Path,
+        task: TaskNode | None = None,
+        task_label: str | None = None,
+        attempt: int = 1,
+        review_cycle: int = 0,
+        log_prefix: str = "verify-cycle",
     ) -> ReviewVerdict:
         """Deterministically keep only run-proven Axis A blockers from an Argus verdict."""
+        label = task.task_id if task is not None else (task_label or verdict.task_id)
+        attempt_no = task.attempt if task is not None else attempt
+        cycle = task.review_cycle if task is not None else review_cycle
         valid_req_ids = frozenset(req.id for req in spec.requirements)
         findings: list[ReviewFinding] = []
         verified_commands: list[str] = []
@@ -1554,7 +1659,7 @@ class OrchestrateStage:
                 )
                 continue
             result = self._run_repro_command(command=command, sandbox=sandbox)
-            (art_dir / f"verify-cycle-{task.review_cycle + 1}-{index}.log").write_text(
+            (art_dir / f"{log_prefix}-{cycle + 1}-{index}.log").write_text(
                 f"finding: {finding.id}\ncommand: {command}\n"
                 f"exit_code: {result.returncode}\nbroken_probe: {result.broken}\n"
                 f"--- output ---\n{result.output}\n",
@@ -1604,9 +1709,9 @@ class OrchestrateStage:
             event_type="review.verdict_verified",
             actor="chronos",
             payload={
-                "task_id": task.task_id,
-                "attempt": task.attempt,
-                "review_cycle": task.review_cycle + 1,
+                "task_id": label,
+                "attempt": attempt_no,
+                "review_cycle": cycle + 1,
                 "passed": passed,
                 "verified_important": sum(
                     1
@@ -1737,6 +1842,7 @@ class OrchestrateStage:
         handoff_context: str = "",
         strict_scope: bool = True,
         sibling_write_scopes: Sequence[str] = (),
+        defer_review: bool = False,
     ) -> TaskNode:
         leased = self.store.acquire_task_lease(run_id, task_id, actor="chronos")
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
@@ -1983,6 +2089,50 @@ class OrchestrateStage:
                     )
                 )
 
+            escape = scan_diff_escape_hatches(
+                diff_text,
+                sandbox.workspace_path,
+                baseline_roots=(self._run_dir(run_id) / "accepted_overlay", self.workspace_root),
+            )
+            if escape.rejected:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type="task.escape_hatch_rejected",
+                    actor="chronos",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "llm_calls": 0,
+                        "rules": sorted({violation.rule for violation in escape.violations}),
+                        "violations": [
+                            {
+                                "file_path": violation.file_path,
+                                "line": violation.line,
+                                "rule": violation.rule,
+                                "message": violation.message,
+                            }
+                            for violation in escape.violations
+                        ],
+                    },
+                )
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=verifying.acceptance_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=escape.rejection_message(),
+                        checks=verifying.acceptance_checks,
+                    )
+                )
+
             if not loop_res.completed and not (
                 loop_res.stop_reason == "max_steps_exceeded" and gate.changed_paths
             ):
@@ -2075,203 +2225,115 @@ class OrchestrateStage:
                     event_type="review.repro_commands_cleared",
                 )
 
-            check_summary = "\n".join(
-                f"- {c.id} ({c.kind.value}): passed={c.passed}" for c in updated_checks
-            )
-            try:
-                verdict = self._run_independent_review(
+            verdict: ReviewVerdict | None = None
+            if defer_review:
+                final_checks = [
+                    check.model_copy(
+                        update={"passed": False, "evidence_ref": f"deferred:post_dag:{art_dir}"}
+                    )
+                    if check.kind == CheckKind.INDEPENDENT_REVIEW
+                    else check
+                    for check in updated_checks
+                ]
+                self.store.append_event(
                     run_id=run_id,
-                    spec=spec,
-                    task=verifying,
-                    sandbox=sandbox,
-                    diff_text=diff_text,
-                    diff_path=diff_file,
-                    check_summary=check_summary,
-                    art_dir=art_dir,
-                    reviewer=reviewer,
-                    design=design,
-                    advisory_out_of_scope=gate.advisory_out_of_scope,
-                    resolved_repro_commands=resolved_repro_commands,
+                    stage="verify",
+                    event_type="task.review_deferred",
+                    actor="chronos",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "review_mode": "post_dag",
+                    },
                 )
-            except BudgetExhaustedError as exc:
-                return retain(
-                    self._pause_for_budget(
-                        run_id=run_id,
-                        task=verifying,
-                        reason=f"Paused due to budget limit: {exc}",
-                    )
-                )
-            except (_ReviewCancelled, _ReviewOutputError) as exc:
-                _write_manifest_md(
-                    art_dir=art_dir,
-                    task=verifying,
-                    diff_text=diff_text,
-                    checks=updated_checks,
-                    verdict=None,
-                    receipt=loop_res.receipt,
-                )
-                if isinstance(exc, _ReviewCancelled):
-                    interrupted.set()
-                    return retain(self._return_interrupted_task(run_id, verifying))
-                return retain(
-                    self._fail_or_requeue(
-                        run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
-                    )
-                )
-
-            verdict = self._verify_review_verdict(
-                run_id=run_id,
-                spec=spec,
-                task=verifying,
-                sandbox=sandbox,
-                verdict=verdict,
-                art_dir=art_dir,
-            )
-            (art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json").write_text(
-                verdict.model_dump_json(indent=2), encoding="utf-8"
-            )
-            self.store.append_event(
-                run_id=run_id,
-                stage="verify",
-                event_type="review.verdict_recorded",
-                actor="argus",
-                payload={
-                    "task_id": verifying.task_id,
-                    "attempt": verifying.attempt,
-                    "passed": verdict.passed,
-                    "important_count": sum(
-                        1
-                        for f in verdict.findings
-                        if f.severity == ReviewSeverity.IMPORTANT
-                    ),
-                    "nit_count": sum(
-                        1 for f in verdict.findings if f.severity == ReviewSeverity.NIT
-                    ),
-                    "dropped_unverified_count": verdict.dropped_unverified_count,
-                },
-            )
-            if not verdict.passed:
-                _write_manifest_md(
-                    art_dir=art_dir,
-                    task=verifying,
-                    diff_text=diff_text,
-                    checks=updated_checks,
-                    verdict=verdict,
-                    receipt=loop_res.receipt,
-                )
-                return retain(
-                    self._fail_or_requeue(
-                        run_id=run_id,
-                        task=verifying,
-                        reason=_format_rejection_reason(verdict),
-                        checks=updated_checks,
-                        verified_repro_commands=[
-                            f.repro_command
-                            for f in verdict.findings
-                            if f.severity == ReviewSeverity.IMPORTANT
-                            and f.verified is True
-                            and f.repro_command
-                        ],
-                    )
-                )
-
-            verdict_path = str(art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json")
-            final_checks = [
-                c.model_copy(update={"passed": True, "evidence_ref": verdict_path})
-                if c.kind == CheckKind.INDEPENDENT_REVIEW
-                else c
-                for c in updated_checks
-            ]
-            removed_artifact_set = set(removed_artifacts)
-            promotion_paths: list[str] = []
-            seen_paths: set[str] = set()
-            deleted_paths: list[str] = []
-            recreated_paths: set[str] = set()
-            promotion_policy = WorkspacePolicy(
-                allowed_write_scope=verifying.write_scope,
-                forbidden_write_scope=hard_forbidden,
-            )
-            for rel in gate.changed_paths:
-                if rel in removed_artifact_set:
-                    continue
-                if promotion_policy.forbidden_match(rel) is not None:
-                    continue
-                candidate = sandbox.workspace_path / rel
-                if not candidate.is_file() and not candidate.is_symlink():
-                    deleted_paths.append(rel)
-                    continue
-                recreated_paths.add(rel)
-                if rel not in seen_paths:
-                    seen_paths.add(rel)
-                    promotion_paths.append(rel)
-
-            with self._promotion_lock:
-                run_status = self.store.get_run(run_id)["status"]
-                if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
-                    interrupted.set()
-                    retain_sandbox = run_status == RunStatus.PAUSED
-                    return self._return_interrupted_task(run_id, verifying)
-                touched_paths = [*promotion_paths, *deleted_paths]
-                prev_deletions = load_accepted_deletions(self._run_dir(run_id))
-                overlay_backup = _snapshot_tree_paths(overlay_dir, touched_paths)
-                workspace_backup = (
-                    _snapshot_tree_paths(self.workspace_root, touched_paths)
-                    if mode == RunMode.EXECUTION and apply_to_workspace
-                    else None
+            else:
+                check_summary = "\n".join(
+                    f"- {c.id} ({c.kind.value}): passed={c.passed}" for c in updated_checks
                 )
                 try:
-                    if mode == RunMode.EXECUTION and apply_to_workspace:
-                        remove_deleted_paths(
-                            self.workspace_root,
-                            deleted_paths,
-                            forbidden_write_scope=hard_forbidden,
-                            ignore_errors=False,
-                        )
-                        if promotion_paths:
-                            _copy_matching_scope(
-                                sandbox.workspace_path,
-                                self.workspace_root,
-                                promotion_paths,
-                            )
-                    remove_deleted_paths(
-                        overlay_dir,
-                        deleted_paths,
-                        forbidden_write_scope=hard_forbidden,
-                        ignore_errors=False,
+                    verdict = self._run_independent_review(
+                        run_id=run_id,
+                        spec=spec,
+                        task=verifying,
+                        sandbox=sandbox,
+                        diff_text=diff_text,
+                        diff_path=diff_file,
+                        check_summary=check_summary,
+                        art_dir=art_dir,
+                        reviewer=reviewer,
+                        design=design,
+                        advisory_out_of_scope=gate.advisory_out_of_scope,
+                        resolved_repro_commands=resolved_repro_commands,
                     )
-                    if promotion_paths:
-                        _copy_matching_scope(
-                            sandbox.workspace_path,
-                            overlay_dir,
-                            promotion_paths,
+                except BudgetExhaustedError as exc:
+                    return retain(
+                        self._pause_for_budget(
+                            run_id=run_id,
+                            task=verifying,
+                            reason=f"Paused due to budget limit: {exc}",
                         )
-                    next_deletions = set(prev_deletions)
-                    next_deletions.difference_update(recreated_paths)
-                    next_deletions.update(deleted_paths)
-                    save_accepted_deletions(self._run_dir(run_id), next_deletions)
-                except OSError as exc:
-                    rollback_errors: list[str] = []
-                    if workspace_backup is not None:
-                        try:
-                            _restore_tree_paths(self.workspace_root, workspace_backup)
-                        except OSError as rb_exc:
-                            rollback_errors.append(f"workspace rollback: {rb_exc}")
-                    try:
-                        _restore_tree_paths(overlay_dir, overlay_backup)
-                    except OSError as rb_exc:
-                        rollback_errors.append(f"overlay rollback: {rb_exc}")
-                    try:
-                        save_accepted_deletions(self._run_dir(run_id), prev_deletions)
-                    except OSError as rb_exc:
-                        rollback_errors.append(f"deletions rollback: {rb_exc}")
-                    reason = f"Failed to promote task changes: {exc}"
-                    if rollback_errors:
-                        reason = f"{reason} (rollback errors: {'; '.join(rollback_errors)})"
+                    )
+                except (_ReviewCancelled, _ReviewOutputError) as exc:
                     _write_manifest_md(
                         art_dir=art_dir,
                         task=verifying,
                         diff_text=diff_text,
-                        checks=final_checks,
+                        checks=updated_checks,
+                        verdict=None,
+                        receipt=loop_res.receipt,
+                    )
+                    if isinstance(exc, _ReviewCancelled):
+                        interrupted.set()
+                        return retain(self._return_interrupted_task(run_id, verifying))
+                    return retain(
+                        self._fail_or_requeue(
+                            run_id=run_id,
+                            task=verifying,
+                            reason=str(exc),
+                            checks=updated_checks,
+                        )
+                    )
+
+                verdict = self._verify_review_verdict(
+                    run_id=run_id,
+                    spec=spec,
+                    task=verifying,
+                    sandbox=sandbox,
+                    verdict=verdict,
+                    art_dir=art_dir,
+                )
+                verdict_path = str(
+                    art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json"
+                )
+                (art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json").write_text(
+                    verdict.model_dump_json(indent=2), encoding="utf-8"
+                )
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type="review.verdict_recorded",
+                    actor="argus",
+                    payload={
+                        "task_id": verifying.task_id,
+                        "attempt": verifying.attempt,
+                        "passed": verdict.passed,
+                        "important_count": sum(
+                            1
+                            for f in verdict.findings
+                            if f.severity == ReviewSeverity.IMPORTANT
+                        ),
+                        "nit_count": sum(
+                            1 for f in verdict.findings if f.severity == ReviewSeverity.NIT
+                        ),
+                        "dropped_unverified_count": verdict.dropped_unverified_count,
+                    },
+                )
+                if not verdict.passed:
+                    _write_manifest_md(
+                        art_dir=art_dir,
+                        task=verifying,
+                        diff_text=diff_text,
+                        checks=updated_checks,
                         verdict=verdict,
                         receipt=loop_res.receipt,
                     )
@@ -2279,10 +2341,56 @@ class OrchestrateStage:
                         self._fail_or_requeue(
                             run_id=run_id,
                             task=verifying,
-                            reason=reason,
-                            checks=final_checks,
+                            reason=_format_rejection_reason(verdict),
+                            checks=updated_checks,
+                            verified_repro_commands=[
+                                f.repro_command
+                                for f in verdict.findings
+                                if f.severity == ReviewSeverity.IMPORTANT
+                                and f.verified is True
+                                and f.repro_command
+                            ],
                         )
                     )
+                final_checks = [
+                    c.model_copy(update={"passed": True, "evidence_ref": verdict_path})
+                    if c.kind == CheckKind.INDEPENDENT_REVIEW
+                    else c
+                    for c in updated_checks
+                ]
+
+            try:
+                self._apply_promotion(
+                    run_id=run_id,
+                    source_workspace=sandbox.workspace_path,
+                    changed_paths=gate.changed_paths,
+                    allowed_scope=verifying.write_scope,
+                    hard_forbidden=hard_forbidden,
+                    excluded_paths=removed_artifacts,
+                    write_workspace=mode == RunMode.EXECUTION and apply_to_workspace,
+                    strict_scope=strict_scope,
+                )
+            except _RunInactive as exc:
+                interrupted.set()
+                retain_sandbox = exc.status == RunStatus.PAUSED
+                return self._return_interrupted_task(run_id, verifying)
+            except OSError as exc:
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=final_checks,
+                    verdict=verdict,
+                    receipt=loop_res.receipt,
+                )
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Failed to promote task changes: {exc}",
+                        checks=final_checks,
+                    )
+                )
 
             try:
                 accepted = self.store.update_task_with_lease(
@@ -2322,6 +2430,106 @@ class OrchestrateStage:
         finally:
             if not retain_sandbox:
                 remove_sandbox(sandbox)
+
+    def _apply_promotion(
+        self,
+        *,
+        run_id: str,
+        source_workspace: Path,
+        changed_paths: Sequence[str],
+        allowed_scope: Sequence[str],
+        hard_forbidden: Sequence[str],
+        excluded_paths: Collection[str] = (),
+        write_workspace: bool = False,
+        strict_scope: bool = True,
+    ) -> tuple[list[str], list[str]]:
+        """Copy accepted paths into the overlay (and workspace) with rollback on failure."""
+        overlay_dir = self._run_dir(run_id) / "accepted_overlay"
+        run_dir = self._run_dir(run_id)
+        excluded = set(excluded_paths)
+        policy = WorkspacePolicy(
+            allowed_write_scope=list(allowed_scope),
+            forbidden_write_scope=list(hard_forbidden),
+        )
+        promotion_paths: list[str] = []
+        deleted_paths: list[str] = []
+        recreated_paths: set[str] = set()
+        seen_paths: set[str] = set()
+        for rel in changed_paths:
+            if rel in excluded:
+                continue
+            if policy.forbidden_match(rel) is not None:
+                continue
+            if strict_scope and not policy.allows_relative_path(rel):
+                raise OSError(
+                    f"Refusing to promote out-of-scope path '{rel}' "
+                    f"(allowed write_scope: {list(allowed_scope)})"
+                )
+            candidate = source_workspace / rel
+            if not candidate.is_file() and not candidate.is_symlink():
+                deleted_paths.append(rel)
+                continue
+            recreated_paths.add(rel)
+            if rel not in seen_paths:
+                seen_paths.add(rel)
+                promotion_paths.append(rel)
+
+        with self._promotion_lock:
+            run_status = self.store.get_run(run_id)["status"]
+            if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                raise _RunInactive(run_status)
+            touched_paths = [*promotion_paths, *deleted_paths]
+            prev_deletions = load_accepted_deletions(run_dir)
+            overlay_backup = _snapshot_tree_paths(overlay_dir, touched_paths)
+            workspace_backup = (
+                _snapshot_tree_paths(self.workspace_root, touched_paths)
+                if write_workspace
+                else None
+            )
+            try:
+                if write_workspace:
+                    remove_deleted_paths(
+                        self.workspace_root,
+                        deleted_paths,
+                        forbidden_write_scope=hard_forbidden,
+                        ignore_errors=False,
+                    )
+                    if promotion_paths:
+                        _copy_matching_scope(
+                            source_workspace, self.workspace_root, promotion_paths
+                        )
+                remove_deleted_paths(
+                    overlay_dir,
+                    deleted_paths,
+                    forbidden_write_scope=hard_forbidden,
+                    ignore_errors=False,
+                )
+                if promotion_paths:
+                    _copy_matching_scope(source_workspace, overlay_dir, promotion_paths)
+                next_deletions = set(prev_deletions)
+                next_deletions.difference_update(recreated_paths)
+                next_deletions.update(deleted_paths)
+                save_accepted_deletions(run_dir, next_deletions)
+            except OSError as exc:
+                rollback_errors: list[str] = []
+                if workspace_backup is not None:
+                    try:
+                        _restore_tree_paths(self.workspace_root, workspace_backup)
+                    except OSError as rb_exc:
+                        rollback_errors.append(f"workspace rollback: {rb_exc}")
+                try:
+                    _restore_tree_paths(overlay_dir, overlay_backup)
+                except OSError as rb_exc:
+                    rollback_errors.append(f"overlay rollback: {rb_exc}")
+                try:
+                    save_accepted_deletions(run_dir, prev_deletions)
+                except OSError as rb_exc:
+                    rollback_errors.append(f"deletions rollback: {rb_exc}")
+                reason = str(exc)
+                if rollback_errors:
+                    reason = f"{reason} (rollback errors: {'; '.join(rollback_errors)})"
+                raise OSError(reason) from exc
+        return promotion_paths, deleted_paths
 
     def _fail_or_requeue(
         self,
@@ -2392,6 +2600,764 @@ class OrchestrateStage:
             event_type="task.budget_paused",
         )
 
+    def _delivery_guards_ok(
+        self, *, run_id: str, spec: GoalSpec, plan: TaskPlan, snap: dict[str, Any]
+    ) -> bool:
+        """Mirror the delivery-check guard chain before verifying or completing a run."""
+        return (
+            any(task.status == TaskStatus.ACCEPTED for task in plan.tasks)
+            and snap["spec"] is not None
+            and snap["spec"].content_hash == spec.content_hash
+            and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
+            and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
+            and self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            )
+            and self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.TASK_PLAN,
+                target_id=plan.plan_id,
+                target_hash=plan.content_hash,
+            )
+        )
+
+    def _finalize_accepted_run(
+        self,
+        *,
+        run_id: str,
+        spec: GoalSpec,
+        design: DesignSpec | None,
+        plan: TaskPlan,
+        snap: dict[str, Any],
+        worker: tuple[AgentDriver, str | None],
+        reviewer: tuple[AgentDriver, str | None],
+        post_dag_unified: bool,
+        max_repair_rounds: int,
+        apply_to_workspace: bool,
+        worker_max_steps: int | None,
+    ) -> tuple[RunStatus, dict[str, Any]]:
+        """Run delivery checks, product verification and the unified post-DAG review loop."""
+        run_dir = self._run_dir(run_id)
+        overlay_dir = run_dir / "accepted_overlay"
+        detail: dict[str, Any] = {
+            "accepted": sum(1 for task in plan.tasks if task.status == TaskStatus.ACCEPTED),
+            "total": len(plan.tasks),
+        }
+        if not self._delivery_guards_ok(run_id=run_id, spec=spec, plan=plan, snap=snap):
+            return RunStatus.COMPLETED, detail
+        delivery_receipt: dict[str, Any] | None = None
+        if plan.delivery_checks:
+            delivery_receipt = run_delivery_checks(
+                plan,
+                workspace_root=self.workspace_root,
+                overlay_dir=overlay_dir,
+                run_dir=run_dir,
+                sandbox_root=self.sandbox_root,
+            )
+            self.store.append_event(
+                run_id=run_id,
+                stage="verify",
+                event_type=DELIVERY_EVENT,
+                actor="chronos",
+                payload=delivery_receipt,
+            )
+        if not any(task.status == TaskStatus.ACCEPTED for task in plan.tasks):
+            return RunStatus.COMPLETED, detail
+        repairable_kind = spec.deliverable_kind in (
+            DeliverableKind.WEB_APP,
+            DeliverableKind.REST_API,
+        )
+        repair_round = 0
+        verified_repro_commands = self._load_post_dag_repros(run_dir)
+        while True:
+            product = verify_product_delivery(
+                spec=spec,
+                plan=plan,
+                workspace_root=self.workspace_root,
+                overlay_dir=overlay_dir,
+                run_dir=run_dir,
+                sandbox_root=self.sandbox_root,
+                delivery_receipt=delivery_receipt,
+            )
+            self.store.append_event(
+                run_id=run_id,
+                stage="verify",
+                event_type=PRODUCT_VERIFIED_EVENT,
+                actor="chronos",
+                payload=product.as_payload(),
+            )
+            repro_failures: list[str] = []
+            if verified_repro_commands:
+                repro_failures, _still_failing = self._recheck_post_dag_repros(
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    repro_commands=verified_repro_commands,
+                    repair_round=repair_round,
+                )
+            verdict: ReviewVerdict | None = None
+            verdict_path: Path | None = None
+            if post_dag_unified and product.passed and not repro_failures:
+                try:
+                    verdict, verdict_path = self._review_composed_delivery(
+                        run_id=run_id,
+                        spec=spec,
+                        plan=plan,
+                        reviewer=reviewer,
+                        run_dir=run_dir,
+                        repair_round=repair_round,
+                    )
+                except BudgetExhaustedError as exc:
+                    detail.update({"reason": "budget_exhausted", "failure": str(exc)})
+                    return RunStatus.AWAITING_HUMAN, detail
+                except _ReviewCancelled:
+                    detail["reason"] = "turn_cancelled"
+                    return RunStatus.AWAITING_HUMAN, detail
+                except _ReviewOutputError as exc:
+                    detail.update(
+                        {"reason": "review_output_invalid", "failure": str(exc)}
+                    )
+                    return RunStatus.AWAITING_HUMAN, detail
+                added_repro = False
+                for finding in verdict.findings:
+                    if (
+                        finding.severity == ReviewSeverity.IMPORTANT
+                        and finding.verified is True
+                        and finding.repro_command
+                        and finding.repro_command not in verified_repro_commands
+                    ):
+                        verified_repro_commands.append(finding.repro_command)
+                        added_repro = True
+                if added_repro:
+                    self._save_post_dag_repros(run_dir, verified_repro_commands)
+            failure_parts: list[str] = []
+            base_failure = _product_failure_summary(product, verdict)
+            if base_failure:
+                failure_parts.append(base_failure)
+            if repro_failures:
+                failure_parts.append(
+                    "Previously verified defect repro command(s) still fail:\n"
+                    + "\n".join(f"- {item}" for item in repro_failures)
+                )
+            failure_text = "\n\n".join(failure_parts) if failure_parts else None
+            if failure_text is None:
+                if post_dag_unified and verdict is not None and verdict_path is not None:
+                    self._mark_deferred_reviews_passed(
+                        run_id=run_id, plan=plan, evidence_ref=str(verdict_path)
+                    )
+                detail["product_verified"] = True
+                return RunStatus.COMPLETED, detail
+            if not (post_dag_unified or repairable_kind):
+                # Non-HTTP per-task runs record the product receipt without gating.
+                detail["product_verified"] = product.passed
+                detail["failure"] = failure_text
+                return RunStatus.COMPLETED, detail
+            repaired = False
+            while repair_round < max_repair_rounds:
+                current = self.store.get_run(run_id)
+                if current["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                    return current["status"], detail
+                if not current["budget_ledger"].can_reserve(current["budget_policy"]):
+                    detail.update({"reason": "budget_exhausted", "failure": failure_text})
+                    return RunStatus.AWAITING_HUMAN, detail
+                repair_round += 1
+                outcome = self._run_post_dag_repair(
+                    run_id=run_id,
+                    spec=spec,
+                    design=design,
+                    plan=plan,
+                    mode=snap["mode"],
+                    apply_to_workspace=apply_to_workspace,
+                    worker=worker,
+                    failure_text=failure_text,
+                    repair_round=repair_round,
+                    worker_max_steps=worker_max_steps,
+                )
+                if outcome == "inactive":
+                    return self.store.get_run(run_id)["status"], detail
+                if outcome == "budget_exhausted":
+                    detail.update({"reason": "budget_exhausted", "failure": failure_text})
+                    return RunStatus.AWAITING_HUMAN, detail
+                repaired = outcome == "applied"
+                if repaired:
+                    break
+            if not repaired:
+                detail.update(
+                    {
+                        "reason": "post_dag_verification_failed",
+                        "failure": failure_text,
+                        "repair_rounds": repair_round,
+                    }
+                )
+                return RunStatus.AWAITING_HUMAN, detail
+            if plan.delivery_checks:
+                delivery_receipt = run_delivery_checks(
+                    plan,
+                    workspace_root=self.workspace_root,
+                    overlay_dir=overlay_dir,
+                    run_dir=run_dir,
+                    sandbox_root=self.sandbox_root,
+                )
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="verify",
+                    event_type=DELIVERY_EVENT,
+                    actor="chronos",
+                    payload=delivery_receipt,
+                )
+            snap = self.store.get_run(run_id)
+            if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                return snap["status"], detail
+
+    @staticmethod
+    def _post_dag_repros_path(run_dir: Path) -> Path:
+        return run_dir / "artifacts" / "post_dag" / "verified_repro_commands.json"
+
+    def _load_post_dag_repros(self, run_dir: Path) -> list[str]:
+        path = self._post_dag_repros_path(run_dir)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip() and item not in out:
+                out.append(item)
+        return out
+
+    def _save_post_dag_repros(self, run_dir: Path, commands: list[str]) -> None:
+        path = self._post_dag_repros_path(run_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(commands, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _recheck_post_dag_repros(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        repro_commands: list[str],
+        repair_round: int,
+    ) -> tuple[list[str], list[str]]:
+        """Deterministically re-run previously verified post-DAG repro commands."""
+        art_dir = run_dir / "artifacts" / "post_dag" / f"repro-check-{repair_round + 1}"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        sandbox = create_sandbox(
+            self.workspace_root,
+            label=f"{run_id}-postdag-repro-{repair_round + 1}",
+            sandbox_root=self.sandbox_root,
+        )
+        failures: list[str] = []
+        still_failing: list[str] = []
+        try:
+            accepted_deletions = sorted(load_accepted_deletions(run_dir))
+            if accepted_deletions:
+                remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
+            _copy_matching_scope(
+                run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
+            )
+            env = build_sandbox_env(sandbox.workspace_path, host_root=self.workspace_root)
+            for index, command in enumerate(repro_commands, start=1):
+                try:
+                    proc = subprocess.run(
+                        ["bash", "-lc", command],
+                        cwd=sandbox.workspace_path,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    still_failing.append(command)
+                    failures.append(f"repro `{command}` timed out after 60s")
+                    continue
+                (art_dir / f"repro-{index}.log").write_text(
+                    f"command: {command}\nexit_code: {proc.returncode}\n"
+                    f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n",
+                    encoding="utf-8",
+                )
+                if proc.returncode != 0:
+                    still_failing.append(command)
+                    output = (proc.stderr or proc.stdout).strip()[-400:]
+                    failures.append(
+                        f"repro `{command}` still fails (exit {proc.returncode})"
+                        + (f": {output}" if output else "")
+                    )
+            self.store.append_event(
+                run_id=run_id,
+                stage="verify",
+                event_type="post_dag.repro_rechecked",
+                actor="chronos",
+                payload={
+                    "repair_round": repair_round,
+                    "checked_count": len(repro_commands),
+                    "still_failing_count": len(still_failing),
+                },
+            )
+            return failures, still_failing
+        finally:
+            remove_sandbox(sandbox)
+
+    def _mark_deferred_reviews_passed(
+        self, *, run_id: str, plan: TaskPlan, evidence_ref: str
+    ) -> None:
+        """Promote deferred INDEPENDENT_REVIEW checks on accepted tasks once global Argus passes."""
+        for task in plan.tasks:
+            if task.status != TaskStatus.ACCEPTED:
+                continue
+            has_pending_review = any(
+                check.kind == CheckKind.INDEPENDENT_REVIEW and not check.passed
+                for check in task.acceptance_checks
+            )
+            if not has_pending_review:
+                continue
+            def _promote_review_check(task_node: TaskNode) -> TaskNode:
+                return task_node.model_copy(
+                    update={
+                        "acceptance_checks": [
+                            c.model_copy(update={"passed": True, "evidence_ref": evidence_ref})
+                            if c.kind == CheckKind.INDEPENDENT_REVIEW
+                            else c
+                            for c in task_node.acceptance_checks
+                        ]
+                    }
+                )
+
+            self.store.update_task_with_lease(
+                run_id,
+                task.task_id,
+                expected_lease_generation=task.lease_generation,
+                mutator=_promote_review_check,
+                actor="argus",
+                event_type="task.deferred_review_passed",
+            )
+
+    def _review_composed_delivery(
+        self,
+        *,
+        run_id: str,
+        spec: GoalSpec,
+        plan: TaskPlan,
+        reviewer: tuple[AgentDriver, str | None],
+        run_dir: Path,
+        repair_round: int,
+    ) -> tuple[ReviewVerdict, Path]:
+        """One cold-start Argus review over the whole composed delivery."""
+        art_dir = run_dir / "artifacts" / "post_dag" / f"round-{repair_round + 1}"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        sandbox = create_sandbox(
+            self.workspace_root,
+            label=f"{run_id}-global-review-{repair_round + 1}",
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            accepted_deletions = sorted(load_accepted_deletions(run_dir))
+            if accepted_deletions:
+                remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
+            _copy_matching_scope(
+                run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
+            )
+            diff_text = capture_sandbox_diff(sandbox)
+            diff_file = art_dir / "diff.patch"
+            diff_file.write_text(diff_text, encoding="utf-8")
+            diff_summary = "\n".join(_diff_summary_lines(diff_text)) or "- (none detected)"
+            inline_diff, diff_truncated = _bounded_inline_diff(diff_text)
+            task_scope_json = json.dumps(
+                [
+                    {
+                        "task_id": task.task_id,
+                        "title": task.title,
+                        "objective": task.objective,
+                        "requirement_refs": task.requirement_refs,
+                        "write_scope": task.write_scope,
+                    }
+                    for task in plan.tasks
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            reqs_json = json.dumps(
+                [requirement.model_dump(mode="json") for requirement in spec.requirements],
+                ensure_ascii=False,
+            )
+            product_report = _read_product_report(run_dir)
+            user_prompt = (
+                f"Delivery sandbox root: {sandbox.workspace_path}\n"
+                f"Accepted task scope: {task_scope_json}\n"
+                f"All GoalSpec requirements: {reqs_json}\n"
+                f"{_format_spec_context(spec)}\n"
+                f"Out of scope (MUST NOT be added): "
+                f"{json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
+                f"Runtime product verification report:\n{product_report}\n\n"
+                f"Changed files (per-file summary):\n{diff_summary}\n\n"
+                f"Composed diff (inline{' truncated' if diff_truncated else ''}):\n{inline_diff}\n"
+            )
+            if diff_truncated:
+                user_prompt += (
+                    f"\nThe inline diff was truncated at {_INLINE_DIFF_BUDGET} characters. "
+                    f"The complete diff is saved at: {diff_file}\n"
+                )
+            user_prompt += (
+                "Set task_id='post-dag'. Return ReviewVerdict JSON matching schema:\n"
+                f"{json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)}"
+            )
+            driver, model = reviewer
+            request = DriverTurnRequest(
+                workspace_path=sandbox.workspace_path,
+                env_root=sandbox.workspace_path,
+                system_prompt=_GLOBAL_REVIEWER_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                actor="argus:post-dag",
+                read_only=True,
+                max_steps=16,
+                trace_path=art_dir / "global-review.jsonl",
+                model=model,
+            )
+            verdict: ReviewVerdict | None = None
+            for attempt in range(2):
+                outcome = driver.run_turn(
+                    request,
+                    on_event=self.on_driver_event,
+                    on_handle=self.on_driver_handle,
+                )
+                if outcome.stop_reason == "cancelled":
+                    raise _ReviewCancelled
+                if outcome.stop_reason.startswith("budget_exhausted"):
+                    raise BudgetExhaustedError(outcome.stop_reason)
+                if not outcome.completed:
+                    raise _ReviewOutputError(
+                        f"Reviewer stopped early: {outcome.stop_reason}"
+                    )
+                try:
+                    verdict = parse_model_json(outcome.final_content, ReviewVerdict)
+                except (json.JSONDecodeError, ValidationError) as exc:
+                    if attempt == 1:
+                        raise _ReviewOutputError(
+                            "Reviewer returned invalid ReviewVerdict JSON"
+                        ) from exc
+                    request = request.model_copy(
+                        update={
+                            "user_prompt": (
+                                f"{user_prompt}\n\n[PREVIOUS OUTPUT FAILED VALIDATION]\n"
+                                "Your previous response did not match ReviewVerdict. "
+                                "Return only the corrected JSON object matching the schema "
+                                f"above.\nPrevious response:\n{outcome.final_content}"
+                            ),
+                            "trace_path": art_dir / "global-review-repair.jsonl",
+                        }
+                    )
+                else:
+                    break
+            assert verdict is not None
+            verdict = verdict.model_copy(
+                update={"task_id": "post-dag", "attempt": 1, "incremental_only": False}
+            )
+            (art_dir / "argus-verdict.json").write_text(
+                verdict.model_dump_json(indent=2), encoding="utf-8"
+            )
+            verified = self._verify_review_verdict(
+                run_id=run_id,
+                spec=spec,
+                sandbox=sandbox,
+                verdict=verdict,
+                art_dir=art_dir,
+                task_label="post-dag",
+                attempt=1,
+                review_cycle=repair_round,
+                log_prefix="verify-post-dag",
+            )
+            verdict_file = art_dir / "verdict.json"
+            verdict_file.write_text(verified.model_dump_json(indent=2), encoding="utf-8")
+            self.store.append_event(
+                run_id=run_id,
+                stage="verify",
+                event_type="review.verdict_recorded",
+                actor="argus",
+                payload={
+                    "task_id": "post-dag",
+                    "attempt": 1,
+                    "review_cycle": repair_round + 1,
+                    "mode": "post_dag",
+                    "passed": verified.passed,
+                    "important_count": sum(
+                        1
+                        for f in verified.findings
+                        if f.severity == ReviewSeverity.IMPORTANT
+                    ),
+                    "nit_count": sum(
+                        1 for f in verified.findings if f.severity == ReviewSeverity.NIT
+                    ),
+                    "dropped_unverified_count": verified.dropped_unverified_count,
+                },
+            )
+            return verified, verdict_file
+        finally:
+            remove_sandbox(sandbox)
+
+    def _record_repair_rejection(
+        self, *, run_id: str, repair_round: int, reason: str
+    ) -> None:
+        self.store.append_event(
+            run_id=run_id,
+            stage="orchestrate",
+            event_type="post_dag.repair_rejected",
+            actor="chronos",
+            payload={"repair_round": repair_round, "reason": reason},
+        )
+
+    def _run_composed_command_checks(
+        self, *, sandbox: SandboxHandle, plan: TaskPlan, art_dir: Path
+    ) -> list[str]:
+        """Re-run every accepted task's command check against the composed delivery."""
+        failures: list[str] = []
+        env = build_sandbox_env(sandbox.workspace_path, host_root=self.workspace_root)
+        for task in plan.tasks:
+            if task.status != TaskStatus.ACCEPTED:
+                continue
+            for index, check in enumerate(task.acceptance_checks, start=1):
+                if check.kind != CheckKind.COMMAND or not check.command:
+                    continue
+                try:
+                    proc = subprocess.run(
+                        ["bash", "-lc", check.command],
+                        cwd=sandbox.workspace_path,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    failures.append(
+                        f"Repaired delivery timed out on {task.task_id}/{check.id}"
+                    )
+                    continue
+                log_path = art_dir / f"repair-check-{task.task_id}-{index}.log"
+                log_path.write_text(
+                    f"command: {check.command}\nexit_code: {proc.returncode}\n"
+                    f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n",
+                    encoding="utf-8",
+                )
+                if proc.returncode != 0:
+                    failures.append(
+                        f"Command check {task.task_id}/{check.id} still fails "
+                        f"(exit {proc.returncode}):\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}"
+                    )
+        return failures
+
+    def _run_post_dag_repair(
+        self,
+        *,
+        run_id: str,
+        spec: GoalSpec,
+        design: DesignSpec | None,
+        plan: TaskPlan,
+        mode: RunMode,
+        apply_to_workspace: bool,
+        worker: tuple[AgentDriver, str | None],
+        failure_text: str,
+        repair_round: int,
+        worker_max_steps: int | None,
+    ) -> Literal["applied", "rejected", "inactive", "budget_exhausted"]:
+        """One focused Hephaestus repair turn over the composed delivery."""
+        current = self.store.get_run(run_id)
+        if current["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            return "inactive"
+        if not current["budget_ledger"].can_reserve(current["budget_policy"]):
+            return "budget_exhausted"
+        run_dir = self._run_dir(run_id)
+        art_dir = run_dir / "artifacts" / "post_dag" / f"repair-{repair_round}"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        sandbox = create_sandbox(
+            self.workspace_root,
+            label=f"{run_id}-postdag-repair-{repair_round}",
+            sandbox_root=self.sandbox_root,
+        )
+        try:
+            accepted_deletions = sorted(load_accepted_deletions(run_dir))
+            if accepted_deletions:
+                remove_deleted_paths(sandbox.workspace_path, accepted_deletions)
+            _copy_matching_scope(
+                run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
+            )
+            baseline = snapshot_sandbox_state(sandbox)
+            spec_forbidden = _spec_forbidden_paths(spec, self.workspace_root)
+            approved_scope: list[str] = []
+            for task in plan.tasks:
+                for pattern in task.write_scope:
+                    if pattern and pattern not in approved_scope:
+                        approved_scope.append(pattern)
+            if not approved_scope:
+                approved_scope = ["."]
+            design_ctx = ""
+            if design is not None:
+                design_ctx = (
+                    "Design modules: "
+                    + json.dumps(
+                        [
+                            {
+                                "id": module.id,
+                                "name": module.name,
+                                "target_paths": module.target_paths,
+                            }
+                            for module in design.modules
+                        ],
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            checks_json = json.dumps(
+                [
+                    {
+                        "task_id": task.task_id,
+                        "checks": [
+                            check.model_dump(
+                                include={"id", "kind", "description", "command"}, mode="json"
+                            )
+                            for check in task.acceptance_checks
+                            if check.kind == CheckKind.COMMAND
+                        ],
+                    }
+                    for task in plan.tasks
+                    if task.status == TaskStatus.ACCEPTED
+                ],
+                ensure_ascii=False,
+            )
+            user_prompt = (
+                f"Sandbox workspace root: {sandbox.workspace_path}\n"
+                "Every planned task is accepted; this is a post-DAG repair turn over the "
+                "composed delivery.\n"
+                f"{failure_text}\n\n"
+                f"{_format_spec_context(spec)}\n"
+                f"{design_ctx}"
+                f"Approved repair write_scope (strictly enforced): "
+                f"{json.dumps(approved_scope, ensure_ascii=False)}\n"
+                f"Out of scope (MUST NOT be added): "
+                f"{json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
+                f"Frozen forbidden paths: {json.dumps(list(spec_forbidden), ensure_ascii=False)}\n"
+                f"Command checks that must pass again: {checks_json}\n"
+                "Fix the reported defects with targeted edits inside the approved write_scope, "
+                "then stop."
+            )
+            driver, model = worker
+            request = DriverTurnRequest(
+                workspace_path=sandbox.workspace_path,
+                env_root=self.workspace_root,
+                system_prompt=_REPAIR_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                actor=f"hephaestus:repair-{repair_round}",
+                strict_scope=True,
+                write_scope=approved_scope,
+                forbidden_globs=list(spec_forbidden),
+                max_steps=worker_max_steps,
+                trace_path=art_dir / "repair.jsonl",
+                model=model,
+            )
+            outcome = driver.run_turn(
+                request, on_event=self.on_driver_event, on_handle=self.on_driver_handle
+            )
+            self.store.append_event(
+                run_id=run_id,
+                stage="orchestrate",
+                event_type="post_dag.repair_turn_completed",
+                actor="hephaestus",
+                payload={
+                    "repair_round": repair_round,
+                    "actor": request.actor,
+                    "completed": outcome.completed,
+                    "stop_reason": outcome.stop_reason,
+                },
+            )
+            current = self.store.get_run(run_id)
+            if current["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                return "inactive"
+            if outcome.stop_reason == "cancelled":
+                return "inactive"
+            if outcome.stop_reason.startswith("budget_exhausted"):
+                return "budget_exhausted"
+            if not outcome.completed:
+                self._record_repair_rejection(
+                    run_id=run_id,
+                    repair_round=repair_round,
+                    reason=f"Repair turn did not complete cleanly: {outcome.stop_reason}",
+                )
+                return "rejected"
+            clean_ephemeral_artifacts(sandbox, baseline, write_scope=approved_scope)
+            diff_text = capture_sandbox_diff(sandbox, baseline)
+            (art_dir / "diff.patch").write_text(diff_text, encoding="utf-8")
+            gate = run_diff_gate(
+                sandbox,
+                baseline,
+                allowed_write_scope=approved_scope,
+                forbidden_globs=spec_forbidden,
+                strict_scope=True,
+            )
+            if gate.rejected:
+                self._record_repair_rejection(
+                    run_id=run_id,
+                    repair_round=repair_round,
+                    reason=gate.rejection_message(),
+                )
+                return "rejected"
+            escape = scan_diff_escape_hatches(
+                diff_text,
+                sandbox.workspace_path,
+                baseline_roots=(self._run_dir(run_id) / "accepted_overlay", self.workspace_root),
+            )
+            if escape.rejected:
+                self._record_repair_rejection(
+                    run_id=run_id,
+                    repair_round=repair_round,
+                    reason=escape.rejection_message(),
+                )
+                return "rejected"
+            check_failures = self._run_composed_command_checks(
+                sandbox=sandbox, plan=plan, art_dir=art_dir
+            )
+            if check_failures:
+                self._record_repair_rejection(
+                    run_id=run_id,
+                    repair_round=repair_round,
+                    reason="\n".join(check_failures),
+                )
+                return "rejected"
+            try:
+                promotion_paths, deleted_paths = self._apply_promotion(
+                    run_id=run_id,
+                    source_workspace=sandbox.workspace_path,
+                    changed_paths=gate.changed_paths,
+                    allowed_scope=approved_scope,
+                    hard_forbidden=spec_forbidden,
+                    write_workspace=mode == RunMode.EXECUTION and apply_to_workspace,
+                )
+            except _RunInactive:
+                return "inactive"
+            except OSError as exc:
+                self._record_repair_rejection(
+                    run_id=run_id,
+                    repair_round=repair_round,
+                    reason=f"Failed to promote repair changes: {exc}",
+                )
+                return "rejected"
+            self.store.append_event(
+                run_id=run_id,
+                stage="orchestrate",
+                event_type="post_dag.repair_applied",
+                actor="chronos",
+                payload={
+                    "repair_round": repair_round,
+                    "changed_paths": list(promotion_paths),
+                    "deleted_paths": list(deleted_paths),
+                },
+            )
+            return "applied"
+        finally:
+            remove_sandbox(sandbox)
+
     def run_execution(
         self,
         *,
@@ -2400,12 +3366,23 @@ class OrchestrateStage:
         worker_max_steps: int | None = None,
         serial_execution: bool = False,
         strict_scope: bool | None = None,
+        review_mode: Literal["post_dag", "per_task"] = "post_dag",
+        max_repair_rounds: int = 2,
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules.
 
         ``strict_scope`` defaults to ``None`` (auto): enforced only for waves with concurrent
         sibling tasks. Explicit ``True``/``False`` overrides that heuristic.
+
+        ``review_mode="post_dag"`` (default) skips per-ticket Argus reviews on multi-task
+        DAGs and runs one unified global review over the composed delivery instead;
+        ``"per_task"`` keeps the legacy per-ticket review cadence. Single-task plans always
+        keep per-task review. ``max_repair_rounds`` bounds the post-DAG repair loop.
         """
+        if review_mode not in ("post_dag", "per_task"):
+            raise ValueError(f"Unknown review_mode {review_mode!r}")
+        if max_repair_rounds < 0:
+            raise ValueError("max_repair_rounds must be >= 0")
         spec = self._require_confirmed_spec(run_id)
         registry = self.driver_registry.with_factories(
             default_driver_factories(
@@ -2530,6 +3507,7 @@ class OrchestrateStage:
                 plan = snap["plan"]
                 assert plan is not None
                 policy = snap["budget_policy"]
+                post_dag_unified = review_mode == "post_dag" and len(plan.tasks) > 1
 
                 ready: list[TaskNode] = []
                 capacity = limit - len(in_flight)
@@ -2570,6 +3548,7 @@ class OrchestrateStage:
                                 handoff_context=handoff,
                                 strict_scope=task_strict_scope,
                                 sibling_write_scopes=sibling_write_scopes,
+                                defer_review=post_dag_unified,
                             )
                             in_flight[future] = task
                 if in_flight:
@@ -2584,62 +3563,55 @@ class OrchestrateStage:
                         t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED)
                         for t in plan.tasks
                     )
-                    if (
-                        all_done
-                        and plan.delivery_checks
-                        and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
-                        and snap["spec"] is not None
-                        and snap["spec"].content_hash == spec.content_hash
-                        and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
-                        and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
-                        and self.store.is_approved(
-                            run_id=run_id,
-                            target=ApprovalTarget.GOAL_SPEC,
-                            target_id=spec.spec_id,
-                            target_hash=spec.content_hash,
-                        )
-                        and self.store.is_approved(
-                            run_id=run_id,
-                            target=ApprovalTarget.TASK_PLAN,
-                            target_id=plan.plan_id,
-                            target_hash=plan.content_hash,
-                        )
-                    ):
-                        run_dir = self._run_dir(run_id)
-                        receipt = run_delivery_checks(
-                            plan,
-                            workspace_root=self.workspace_root,
-                            overlay_dir=run_dir / "accepted_overlay",
-                            run_dir=run_dir,
-                            sandbox_root=self.sandbox_root,
-                        )
+                    if not all_done:
                         try:
-                            self.store.append_event(
-                                run_id=run_id,
-                                stage="verify",
-                                event_type=DELIVERY_EVENT,
+                            self.store.set_run_status(
+                                run_id,
+                                RunStatus.AWAITING_HUMAN,
+                                expected_revision=int(snap["state_revision"]),
                                 actor="chronos",
-                                payload=receipt,
-                                expected_state_revision=snap["state_revision"],
+                                stage="orchestrate",
+                                detail={
+                                    "accepted": sum(
+                                        1
+                                        for t in plan.tasks
+                                        if t.status == TaskStatus.ACCEPTED
+                                    ),
+                                    "total": len(plan.tasks),
+                                },
                             )
                         except ConcurrencyConflictError:
                             continue
-                    target_status = (
-                        RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
-                    )
+                        return self.store.get_run(run_id)
+                    try:
+                        target_status, detail = self._finalize_accepted_run(
+                            run_id=run_id,
+                            spec=spec,
+                            design=design,
+                            plan=plan,
+                            snap=snap,
+                            worker=worker,
+                            reviewer=reviewer,
+                            post_dag_unified=post_dag_unified,
+                            max_repair_rounds=max_repair_rounds,
+                            apply_to_workspace=apply_to_workspace,
+                            worker_max_steps=worker_max_steps,
+                        )
+                    except ConcurrencyConflictError:
+                        continue
+                    if target_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                        return self.store.get_run(run_id)
+                    current = self.store.get_run(run_id)
+                    if current["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                        return current
                     try:
                         self.store.set_run_status(
                             run_id,
                             target_status,
-                            expected_revision=int(snap["state_revision"]),
+                            expected_revision=int(current["state_revision"]),
                             actor="chronos",
                             stage="orchestrate",
-                            detail={
-                                "accepted": sum(
-                                    1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                                ),
-                                "total": len(plan.tasks),
-                            },
+                            detail=detail,
                         )
                     except ConcurrencyConflictError:
                         continue

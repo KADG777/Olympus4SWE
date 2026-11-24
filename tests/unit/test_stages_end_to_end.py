@@ -354,7 +354,9 @@ def test_stage2_end_to_end_rework_cold_review_and_dag_unlock(tmp_path: Path) -> 
         orch.run_execution(run_id=run_id)
 
     orch.approve_plan(run_id=run_id, approver="zeus")
-    final_snap = orch.run_execution(run_id=run_id, apply_to_workspace=True)
+    final_snap = orch.run_execution(
+        run_id=run_id, apply_to_workspace=True, review_mode="per_task"
+    )
 
     assert final_snap["status"] == RunStatus.COMPLETED
     tasks_by_id = {t.task_id: t for t in final_snap["plan"].tasks}

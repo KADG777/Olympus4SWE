@@ -116,7 +116,11 @@ Rules:
     state both the selected `choice` and its concrete `cost` (what gets harder or more
     expensive, or which capability is reduced). Match the GoalSpec language. Base entries on
     the proposed design and known constraints. Use [] if no such decision applies.
-13. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+13. Honor every resolved `open_ambiguities` answer and the declared `deliverable_kind` /
+    `observable_surfaces`: when `deliverable_kind='web_app'`, at least one module MUST own a
+    user-facing web UI surface in its `target_paths` (served entrypoint, page, or static
+    asset); never design backend-only modules for a `web_app`.
+14. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:
