@@ -1,0 +1,45 @@
+# Copy to config.yaml and replace model IDs and example prices before use.
+database: ~/.config/olympus-key-ledger/ledger.sqlite3
+default_pools:
+  openai: chat
+  anthropic: messages
+pools:
+  chat:
+    dialect: openai
+    base_url: https://api.openai.com/v1
+    rotation: round_robin
+    cooldown_seconds: 60
+    inject_stream_usage: true
+    currency: USD
+    # Optional hard limits, applied to recorded spend.
+    # budget: {daily: "5", total: "30"}
+    keys:
+      - key_alias: chat-a
+        secret: env:LEDGER_CHAT_A
+        # budget: {daily: "3"}
+      - key_alias: chat-b
+        secret: env:LEDGER_CHAT_B
+    pricing:
+      example-chat-model:
+        currency: USD
+        input_per_1m: "2.50"
+        output_per_1m: "10.00"
+        cached_input_per_1m: "1.25"
+        cache_write_per_1m: "0"
+  messages:
+    dialect: anthropic
+    base_url: https://api.anthropic.com
+    rotation: least_cost
+    currency: USD
+    keys:
+      - key_alias: messages-a
+        secret: env:LEDGER_MESSAGES_A
+      - key_alias: messages-b
+        secret: env:LEDGER_MESSAGES_B
+    pricing:
+      example-messages-model:
+        currency: USD
+        input_per_1m: "3"
+        output_per_1m: "15"
+        cached_input_per_1m: "0.3"
+        cache_write_per_1m: "3.75"

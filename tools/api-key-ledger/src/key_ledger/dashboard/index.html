@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>API Key Ledger</title>
+    <link rel="stylesheet" href="/dashboard.css">
+    <script src="/dashboard.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>API Key Ledger</h1>
+          <p>Local API usage and key health</p>
+        </div>
+        <div class="refresh">
+          <span id="connection" role="status">Connecting</span>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+      </header>
+      <section aria-label="Usage totals" id="totals" class="totals"></section>
+      <div class="charts">
+        <section class="panel" aria-labelledby="spend-title">
+          <h2 id="spend-title">Daily spend</h2>
+          <p class="note">Last 14 days · UTC</p>
+          <div id="spend"></div>
+        </section>
+        <section class="panel" aria-labelledby="tokens-title">
+          <h2 id="tokens-title">Tokens by model</h2>
+          <p class="note">Input and output · last 14 days</p>
+          <div id="tokens"></div>
+        </section>
+      </div>
+      <section class="panel" aria-labelledby="keys-title">
+        <h2 id="keys-title">Key health</h2>
+        <p class="note">Configure key slots in local YAML. Use the CLI to enable, disable, or reset them.</p>
+        <div id="keys" class="table-wrap"></div>
+      </section>
+      <section class="panel" aria-labelledby="models-title">
+        <h2 id="models-title">Model costs</h2>
+        <div id="models" class="table-wrap"></div>
+      </section>
+      <section class="panel" aria-labelledby="events-title">
+        <h2 id="events-title">Recent attempts</h2>
+        <div id="events" class="table-wrap"></div>
+      </section>
+    </main>
+  </body>
+</html>
