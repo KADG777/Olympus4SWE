@@ -104,6 +104,7 @@ class SessionConfig:
     pi_provider: str | None = None
     thinking_level: str | None = None
     context_window: int | None = None
+    worker_max_steps: int | None = 40
     provider_builder: ProviderBuilder | None = None
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -423,6 +424,8 @@ class SessionRunner:
                 )
             pending_gate = gate or self._gate_from_node(node)
             if pending_gate is None:
+                if pause_kind == PauseKind.BLOCKED:
+                    return self._recover_blocked(run_id, definition, snap, text)
                 return self._emit_pause(
                     run_id,
                     PauseKind.APPROVAL,
@@ -601,6 +604,7 @@ class SessionRunner:
             auto_approve=False,
             approver=f"session:{policy_name.value}",
             topology=definition.topology,
+            worker_max_steps=self.config.worker_max_steps,
             apply_to_workspace=self.config.step_mode == StepMode.EXECUTE,
             gate_policy=policy,
             sandbox_root=self.sandbox_root,

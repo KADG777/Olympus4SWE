@@ -960,7 +960,7 @@ class UserEnabledOlympusAgent(BaseAgent):
         user_agent_factory: Callable[[], Any] | None = None,
         # Budgets
         trial_budget_sec: float = 5400.0,
-        per_turn_timeout_sec: float = 1800.0,
+        per_turn_timeout_sec: float = 3600.0,
         max_consecutive_noops: int = 4,
         infra_retries: int = 2,
         infra_retry_backoff_sec: float = 1.0,
@@ -1571,6 +1571,15 @@ class UserEnabledOlympusAgent(BaseAgent):
             return ExecOutcome(
                 stdout="",
                 stderr=f"[olympus] exec capped at {capped}s — abandoning call",
+                return_code=-1,
+                timed_out=True,
+            )
+        except RuntimeError as exc:
+            if "timed out" not in str(exc).lower():
+                raise
+            return ExecOutcome(
+                stdout="",
+                stderr=f"[olympus] {exc}",
                 return_code=-1,
                 timed_out=True,
             )

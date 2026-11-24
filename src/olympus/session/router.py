@@ -37,9 +37,12 @@ Return ONLY one JSON object:
 Routing rules:
 - action=clarify only when the human answers one or more listed ambiguity/critique IDs.
 - action=approve only when the human explicitly approves the pending artifact/gate.
-- action=revise when the human rejects or asks to change the current plan/spec.
+- action=revise when the human rejects, asks to change the current plan/spec, or supplies new
+  concrete domain facts/constraints/requirements while paused on clarification without answering
+  the listed IDs verbatim.
 - action=reopen when the run is already completed and the human asks for follow-up work.
-- action=unknown when the reply is ambiguous; do not guess.
+- action=unknown when the reply is ambiguous, a pure refusal, or a question about defaults;
+  do not guess.
 - Use only the IDs listed in the context; omit answers for anything not addressed."""
 
 
@@ -203,6 +206,7 @@ _DEFAULT_ACCEPTANCE_PATTERNS = tuple(
         r"(?:defaults?|recommendations?)\b",
         r"^\s*(?:the\s+|your\s+)?(?:defaults?|default\s+(?:assumptions?|answers?|choices?)|"
         r"recommendations?)\s*[.!]?\s*$",
+        r"^\s*(?:please\s+)?(?:go\s+on|go\s+ahead|continue|proceed|carry\s+on|keep\s+going)\s*[.!]?\s*$",
     )
 )
 _QUESTION_PREFIX_RE = re.compile(
@@ -572,6 +576,78 @@ def _sanitize(
     )
 
 
+def _fast_path_intent(
+    *,
+    message: str,
+    snapshot: dict[str, Any],
+    pause_kind: PauseKind | None,
+    completed: bool,
+) -> ReplyIntent | None:
+    """Resolve unambiguous replies deterministically without an extra LLM round-trip."""
+    if completed:
+        return None
+    lowered = message.casefold().strip()
+    if not lowered:
+        return None
+    if (
+        pause_kind == PauseKind.BLOCKED
+        and _has_actionable_text(message)
+        and not (
+            _negated_revision(lowered)
+            or _negated_approval(lowered)
+            or _negated_defaults(lowered)
+        )
+    ):
+        return ReplyIntent(
+            action="revise",
+            feedback=message.strip(),
+            message="Deterministic fast-path: blocked recovery hint",
+        )
+    if _pending_blockers(snapshot):
+        explicit_answers, explicit_resolutions = _extract_explicit_clarifications(
+            message, snapshot
+        )
+        defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
+        if defaults is not None:
+            default_answers, default_resolutions = defaults
+            default_answers.update(
+                {
+                    key: value
+                    for key, value in explicit_answers.items()
+                    if not _is_default_delegation(value)
+                }
+            )
+            default_resolutions.update(
+                {
+                    key: value
+                    for key, value in explicit_resolutions.items()
+                    if not _is_default_delegation(value)
+                }
+            )
+            if default_answers or default_resolutions:
+                return ReplyIntent(
+                    action="clarify",
+                    answers=default_answers,
+                    resolutions=default_resolutions,
+                    message="Deterministic fast-path: default assumptions accepted",
+                )
+        spec: GoalSpec | None = snapshot.get("spec")
+        needed_answers = _blocking_ambiguity_ids(spec)
+        needed_resolutions = _blocking_critique_ids(spec)
+        if (
+            (explicit_answers or explicit_resolutions)
+            and needed_answers.issubset(explicit_answers)
+            and needed_resolutions.issubset(explicit_resolutions)
+        ):
+            return ReplyIntent(
+                action="clarify",
+                answers=explicit_answers,
+                resolutions=explicit_resolutions,
+                message="Deterministic fast-path: all pending blockers answered",
+            )
+    return None
+
+
 def parse_reply(
     *,
     provider: LLMProvider,
@@ -582,6 +658,14 @@ def parse_reply(
     completed: bool = False,
 ) -> ReplyIntent:
     """Translate prose into a sanitised intent; malformed output degrades safely."""
+    fast = _fast_path_intent(
+        message=message,
+        snapshot=snapshot,
+        pause_kind=pause_kind,
+        completed=completed,
+    )
+    if fast is not None:
+        return fast
     user_prompt = _reply_context(
         message=message,
         snapshot=snapshot,

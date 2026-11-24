@@ -118,6 +118,9 @@ Rules:
    paths do not exist yet (greenfield), emit TaskPlan JSON directly without running glob/grep.
 9. Output ONLY a single raw JSON object starting with '{' matching TaskPlan (NEVER call an
    invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys).
+   Keep the TaskPlan JSON concise: each task `objective` should be 2-4 crisp sentences referencing
+   `requirement_refs` and `design_refs` (never copy-paste full GoalSpec/DesignSpec prose; workers
+   already receive both specs).
 10. Ground checks in observed reality: acceptance_checks commands MUST only use paths named by
     the Observed workspace files, the task's own write_scope, and tools/packages actually
     available in the environment. NEVER invent uninstalled third-party packages, never
@@ -142,7 +145,8 @@ Rules:
    files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
    non-forbidden integration edits.
 5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
-   fix every Important finding before concluding."""
+   fix every Important finding before concluding. Once all acceptance checks pass cleanly, stop
+   iterating and deliver your final summary immediately instead of over-polishing."""
 
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
 You have ZERO prior conversation history with the implementer. You are strictly read-only: inspect,

@@ -127,10 +127,11 @@ Rules:
    framework). If it is a new standalone product unrelated to the workspace files, treat it as
    GREENFIELD immediately: do NOT call tools to inspect unrelated host repo files or treat
    host files as contradictions; synthesize the standalone GoalSpec directly.
-10. Language Mirroring: Write all human-facing prose (`goal`, `description`,
+10. Language Mirroring & Conciseness: ALWAYS write all human-facing prose (`goal`, `description`,
    `acceptance_criteria`, `out_of_scope`, `constraints`, `question`, `impact`, `options`,
-   `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
-   `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
+   `default_assumption`) in the exact same natural language as `Raw user goal` (never switch
+   languages; keep IDs and enum values in ASCII). Keep each requirement and criterion crisp and
+   concise (1-2 sentences each, not multi-paragraph essays).
 11. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
    copy the exact verbatim string from `assumptions` into `agent_high_impact_assumptions` (or leave
    `agent_high_impact_assumptions` as `[]`). Do not mark user decisions or confirmed clarifications

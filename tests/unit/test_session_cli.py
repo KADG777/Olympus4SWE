@@ -2702,3 +2702,55 @@ def test_budget_paused_execution_resumes_in_place_without_replanning(
     assert not any(e.event_type == "run.revision_requested" for e in events)
     continuations = [e.payload for e in events if e.event_type == "session.continued"]
     assert continuations and continuations[-1].get("recovery_mode") == "resume_execution"
+
+
+def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: Path) -> None:
+    from olympus.session.contracts import PauseKind
+    from olympus.session.router import parse_reply
+    from olympus.session.runner import SessionConfig
+
+    def _forbid_llm(_m: object, _t: object) -> LLMResponse:
+        raise AssertionError("fast-path should resolve without invoking LLM")
+
+    forbid = MockLLMProvider(responder=_forbid_llm)
+    spec = GoalSpec.model_validate(_goal_spec(ambiguity=True, two_ambiguities=True))
+    snap = {"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None}
+
+    # 1. Blocked recovery hint resolves deterministically with 0 LLM calls.
+    blocked_intent = parse_reply(
+        provider=forbid,
+        message="Retry after transient network error.",
+        snapshot=snap,
+        pause_kind=PauseKind.BLOCKED,
+    )
+    assert blocked_intent.action == "revise"
+    assert blocked_intent.feedback == "Retry after transient network error."
+
+    # 2. Standalone continuation replies accept recorded defaults during clarify with 0 LLM calls.
+    for phrase in ("Go on", "continue", "proceed.", "Please go ahead"):
+        intent = parse_reply(
+            provider=forbid,
+            message=phrase,
+            snapshot=snap,
+            pause_kind=PauseKind.CLARIFY,
+            gate="spec",
+        )
+        assert intent.action == "clarify"
+        assert intent.answers == {
+            "AMB-1": "raise ValueError('zero')",
+            "AMB-2": "int and float",
+        }
+
+    # 3. Complete explicit ID answers resolve with 0 LLM calls.
+    explicit = parse_reply(
+        provider=forbid,
+        message="AMB-1: return None\nAMB-2: floats only",
+        snapshot=snap,
+        pause_kind=PauseKind.CLARIFY,
+        gate="spec",
+    )
+    assert explicit.action == "clarify"
+    assert explicit.answers == {"AMB-1": "return None", "AMB-2": "floats only"}
+
+    # 4. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
+    assert SessionConfig(workspace_root=tmp_path).worker_max_steps == 40
