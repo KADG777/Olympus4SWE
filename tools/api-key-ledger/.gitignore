@@ -1,0 +1,7 @@
+/config.yaml
+/config.yml
+/secrets.json
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
