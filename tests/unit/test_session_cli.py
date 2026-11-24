@@ -2702,3 +2702,256 @@ def test_budget_paused_execution_resumes_in_place_without_replanning(
     assert not any(e.event_type == "run.revision_requested" for e in events)
     continuations = [e.payload for e in events if e.event_type == "session.continued"]
     assert continuations and continuations[-1].get("recovery_mode") == "resume_execution"
+
+
+def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: Path) -> None:
+    from olympus.session.contracts import PauseKind
+    from olympus.session.router import parse_reply
+    from olympus.session.runner import SessionConfig
+
+    def _forbid_llm(_m: object, _t: object) -> LLMResponse:
+        raise AssertionError("fast-path should resolve without invoking LLM")
+
+    forbid = MockLLMProvider(responder=_forbid_llm)
+    spec = GoalSpec.model_validate(_goal_spec(ambiguity=True, two_ambiguities=True))
+    snap = {"status": RunStatus.AWAITING_HUMAN, "spec": spec, "plan": None}
+
+    # 1. Blocked recovery hint resolves deterministically with 0 LLM calls.
+    blocked_intent = parse_reply(
+        provider=forbid,
+        message="Retry after transient network error.",
+        snapshot=snap,
+        pause_kind=PauseKind.BLOCKED,
+    )
+    assert blocked_intent.action == "revise"
+    assert blocked_intent.feedback == "Retry after transient network error."
+
+    # 2. Standalone continuation replies accept recorded defaults during clarify with 0 LLM calls.
+    for phrase in ("Go on", "continue", "proceed.", "Please go ahead"):
+        intent = parse_reply(
+            provider=forbid,
+            message=phrase,
+            snapshot=snap,
+            pause_kind=PauseKind.CLARIFY,
+            gate="spec",
+        )
+        assert intent.action == "clarify"
+        assert intent.answers == {
+            "AMB-1": "raise ValueError('zero')",
+            "AMB-2": "int and float",
+        }
+
+    # 3. Complete explicit ID answers resolve with 0 LLM calls (even when pause_kind=BLOCKED).
+    for pause in (PauseKind.CLARIFY, PauseKind.BLOCKED):
+        explicit = parse_reply(
+            provider=forbid,
+            message="AMB-1: return None\nAMB-2: floats only",
+            snapshot=snap,
+            pause_kind=pause,
+            gate="spec" if pause == PauseKind.CLARIFY else None,
+        )
+        assert explicit.action == "clarify"
+        assert explicit.answers == {"AMB-1": "return None", "AMB-2": "floats only"}
+
+    # 4. Failed run recovery hint resolves deterministically with 0 LLM calls.
+    failed_snap = {"status": RunStatus.FAILED, "spec": None, "plan": None}
+    failed_intent = parse_reply(
+        provider=forbid,
+        message="Redo the interrupted step after the transient network error.",
+        snapshot=failed_snap,
+        pause_kind=None,
+    )
+    assert failed_intent.action == "revise"
+    assert failed_intent.feedback == "Redo the interrupted step after the transient network error."
+
+    # 5. Pure or negated proceed/approve questions must NEVER trigger approve/revise.
+    blocked_no_spec = {"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None}
+    for test_snap, test_pause in (
+        (blocked_no_spec, PauseKind.BLOCKED),
+        (failed_snap, None),
+    ):
+        for test_msg in ("Should we proceed?", "Keep everything unchanged. Should we proceed?"):
+            for provider_impl in (
+                MockLLMProvider(responses=[LLMResponse(content="not json")]),
+                MockLLMProvider(
+                    responses=[
+                        LLMResponse(content=json.dumps({"action": "approve", "message": "ok"}))
+                    ]
+                ),
+                MockLLMProvider(
+                    responses=[
+                        LLMResponse(
+                            content=json.dumps(
+                                {"action": "revise", "feedback": "Proceed", "message": "ok"}
+                            )
+                        )
+                    ]
+                ),
+            ):
+                question_intent = parse_reply(
+                    provider=provider_impl,
+                    message=test_msg,
+                    snapshot=test_snap,
+                    pause_kind=test_pause,
+                )
+                assert question_intent.action == "unknown", (test_msg, test_pause, question_intent)
+
+    # 6. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
+    assert SessionConfig(workspace_root=tmp_path).worker_max_steps == 40
+
+
+def test_reply_requeues_stranded_running_or_verifying_task_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming a paused/recovered run with a stranded VERIFYING task must requeue and complete."""
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 4)
+    _patch_provider(monkeypatch, script)
+
+    code, handoff = _invoke(
+        ["start", "Build a calculator library", "--step-mode", "plan_only", *_base(repo, state)]
+    )
+    assert code == 0 and handoff["pause_kind"] == "plan_handoff", handoff
+    run_id = str(handoff["run_id"])
+
+    # Simulate an abrupt kill/timeout while T1 was mid-flight in VERIFYING status.
+    store = RunStore(state / "olympus.db")
+    leased = store.acquire_task_lease(run_id, "T1", actor="chronos")
+    store.update_task_with_lease(
+        run_id,
+        "T1",
+        expected_lease_generation=leased.lease_generation,
+        mutator=lambda node: node.model_copy(update={"status": TaskStatus.VERIFYING}),
+        actor="chronos",
+        event_type="task.verifying",
+    )
+    snap2 = store.get_run(run_id)
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        expected_revision=int(snap2["state_revision"]),
+        actor="session",
+        stage="session",
+        detail={"reason": "Recovered stranded run"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="session",
+        event_type="session.paused",
+        actor="session",
+        payload={"pause_kind": "blocked", "node": None, "reason": "Recovered stranded run"},
+    )
+
+    code2, resumed = _invoke(
+        ["reply", run_id, "Resume after timeout", "--step-mode", "execute", *_base(repo, state)]
+    )
+    assert code2 == 0 and resumed["status"] == "completed", resumed
+    events = store.list_events(run_id)
+    assert not any(e.event_type == "run.revision_requested" for e in events)
+    requeues = [e for e in events if e.event_type == "task.requeued"]
+    assert requeues and requeues[-1].payload["task_id"] == "T1"
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("requeued_task_ids") == ["T1"]
+
+
+def test_reply_requeues_stranded_task_alongside_blocked_sibling_on_in_place_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-place recovery of a BLOCKED task must also requeue any stranded RUNNING/VERIFYING peer."""
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    plan_two = _plan()
+    plan_two["tasks"].append(
+        {
+            "task_id": "T2",
+            "title": "Helper module",
+            "objective": "Add helper.py",
+            "write_scope": ["helper.py"],
+            "requirement_refs": ["R1"],
+            "depends_on": [],
+            "acceptance_checks": [
+                {
+                    "id": "C2",
+                    "kind": "command",
+                    "description": "Import helper",
+                    "command": "python3 -c 'import helper'",
+                }
+            ],
+        }
+    )
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(plan_two))
+    script.workers.extend(
+        [
+            ("calculator.py", _CALC_CODE),
+            ("helper.py", "VALUE = 1\n"),
+            ("calculator.py", _CALC_CODE),
+            ("helper.py", "VALUE = 1\n"),
+        ]
+    )
+    _patch_provider(monkeypatch, script)
+
+    code, handoff = _invoke(
+        ["start", "Build a calculator library", "--step-mode", "plan_only", *_base(repo, state)]
+    )
+    assert code == 0 and handoff["pause_kind"] == "plan_handoff", handoff
+    run_id = str(handoff["run_id"])
+
+    store = RunStore(state / "olympus.db")
+    l1 = store.acquire_task_lease(run_id, "T1", actor="chronos")
+    store.update_task_with_lease(
+        run_id,
+        "T1",
+        expected_lease_generation=l1.lease_generation,
+        mutator=lambda node: node.model_copy(
+            update={"status": TaskStatus.BLOCKED, "last_error": "needs hint"}
+        ),
+        actor="chronos",
+        event_type="task.blocked",
+    )
+    l2 = store.acquire_task_lease(run_id, "T2", actor="chronos")
+    store.update_task_with_lease(
+        run_id,
+        "T2",
+        expected_lease_generation=l2.lease_generation,
+        mutator=lambda node: node.model_copy(update={"status": TaskStatus.VERIFYING}),
+        actor="chronos",
+        event_type="task.verifying",
+    )
+    snap2 = store.get_run(run_id)
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        expected_revision=int(snap2["state_revision"]),
+        actor="session",
+        stage="session",
+        detail={"reason": "Blocked with stranded peer"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="session",
+        event_type="session.paused",
+        actor="session",
+        payload={"pause_kind": "blocked", "node": None, "reason": "Blocked with stranded peer"},
+    )
+
+    code2, resumed = _invoke(
+        ["reply", run_id, "Fix both tasks", "--step-mode", "execute", *_base(repo, state)]
+    )
+    assert code2 == 0 and resumed["status"] == "completed", resumed
+    events = store.list_events(run_id)
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations
+    assert continuations[-1].get("retried_task_ids") == ["T1"]
+    assert continuations[-1].get("requeued_task_ids") == ["T2"]

@@ -2467,3 +2467,60 @@ def test_failed_turn0_infra_error_retried_locally_on_same_run_id(
     assert len(session_cmds) == 2
     assert "session start" in session_cmds[0]
     assert "session reply run-turn0-fail" in session_cmds[1]
+
+
+def test_exec_handles_harbor_runtime_error_timeout_without_crashing_trial(
+    tmp_path: Path,
+) -> None:
+    turn0 = _envelope(
+        "needs_input",
+        "Clarify?",
+        pause_kind="clarify",
+        token_usage={"llm_calls": 1, "input_tokens": 50, "output_tokens": 10},
+    )
+    handler = _SessionHandler([turn0])
+    orig_call = handler.__call__
+    session_calls = 0
+
+    def _timeout_on_turn1(command: str) -> Any:
+        nonlocal session_calls
+        if "olympus session" in command:
+            session_calls += 1
+            if session_calls == 2:
+                raise RuntimeError("Command timed out after 1800 seconds")
+        return orig_call(command)
+
+    agent, environment = _make_agent(
+        tmp_path / "timeout_case",
+        _timeout_on_turn1,
+        _StubUser(["Go on"]),
+        call_user_on_completion=False,
+    )
+    ctx = SimpleNamespace(metadata=None)
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Do the thing", environment, ctx))
+
+    assert (tmp_path / "timeout_case" / "logs" / "command-1" / "timed-out.txt").is_file()
+    assert (tmp_path / "timeout_case" / "logs" / "token_usage.json").is_file()
+    assert ctx.n_input_tokens == 50
+
+    # Non-timeout RuntimeErrors (even if "timed out" appears in prose) must propagate.
+    for err_msg in (
+        "docker daemon crashed",
+        "Docker daemon crashed while collecting logs for a command that timed out",
+    ):
+        def _non_timeout_error(command: str, *, _msg: str = err_msg) -> Any:
+            if "olympus session" in command:
+                raise RuntimeError(_msg)
+            return orig_call(command)
+
+        case_dir = tmp_path / f"crash_{abs(hash(err_msg))}"
+        agent2, env2 = _make_agent(
+            case_dir,
+            _non_timeout_error,
+            _StubUser([]),
+            call_user_on_completion=False,
+        )
+        asyncio.run(agent2.setup(env2))
+        with pytest.raises(RuntimeError, match=err_msg):
+            asyncio.run(agent2.run("Do the thing", env2, SimpleNamespace(metadata=None)))

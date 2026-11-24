@@ -5798,6 +5798,142 @@ def test_propose_plan_lists_allowed_design_refs_in_modular_prompt(tmp_path: Path
     assert plan.tasks[0].design_refs == ["M-CORE", "IF-RUN"]
 
 
+def test_format_spec_and_design_context_expand_referenced_ids() -> None:
+    from olympus.core.contracts import (
+        AcceptanceCheck,
+        AcceptanceCriterion,
+        CheckKind,
+        DesignModule,
+        DesignSpec,
+        EarsPattern,
+        GoalSpec,
+        RequirementItem,
+        TaskNode,
+    )
+    from olympus.stages.orchestrate import _format_design_context, _format_spec_context
+
+    spec = GoalSpec(
+        goal="Compute division safely",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Reject division by zero with a clear error message",
+                acceptance_criteria=[
+                    "IF divisor is zero THEN THE SYSTEM SHALL raise ValueError('division by zero')",
+                    "Each division completes in under 5 ms",
+                ],
+                ears_criteria=[
+                    AcceptanceCriterion(
+                        id="R1-C1",
+                        pattern=EarsPattern.UNWANTED_BEHAVIOR,
+                        condition="divisor is zero",
+                        outcome="raise ValueError('division by zero')",
+                    )
+                ],
+            ),
+            RequirementItem(
+                id="R2",
+                description="Unreferenced requirement",
+                acceptance_criteria=["Never included for T1"],
+            ),
+        ],
+    )
+    design = DesignSpec(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        architecture_summary="Single calculator module",
+        modules=[
+            DesignModule(
+                id="M-CALC",
+                name="Calculator",
+                responsibility="Arithmetic operations",
+                requirement_refs=["R1"],
+                target_paths=["calc.py"],
+            )
+        ],
+    )
+    task = TaskNode(
+        task_id="T1",
+        title="Implement R1",
+        objective="Implement R1 in M-CALC.",
+        write_scope=["calc.py"],
+        requirement_refs=["R1"],
+        design_refs=["M-CALC"],
+        acceptance_checks=[
+            AcceptanceCheck(
+                id="C1",
+                kind=CheckKind.COMMAND,
+                description="Verify zero check",
+                command="python -c 'print(1)'",
+            )
+        ],
+    )
+
+    spec_ctx = _format_spec_context(spec, task=task)
+    assert "R1: Reject division by zero with a clear error message" in spec_ctx
+    assert (
+        "R1-C1: IF divisor is zero THEN THE SYSTEM SHALL raise ValueError('division by zero')"
+        in spec_ctx
+    )
+    assert "Each division completes in under 5 ms" in spec_ctx
+    assert spec_ctx.count("raise ValueError('division by zero')") == 1
+    assert "Unreferenced requirement" not in spec_ctx
+
+    design_ctx = _format_design_context(design, task=task)
+    assert "M-CALC (Calculator): Arithmetic operations" in design_ctx
+
+
+def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
+    tmp_path: Path,
+) -> None:
+    from olympus.core.contracts import GoalSpec, RequirementItem
+    from olympus.stages.orchestrate import _spec_forbidden_paths
+
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_frozen.py").write_text("", encoding="utf-8")
+    (tmp_path / "legacy").mkdir()
+
+    spec = GoalSpec(
+        goal="Add feature to mypkg",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Add feature",
+                acceptance_criteria=["Works"],
+            )
+        ],
+        out_of_scope=[
+            "CLI (`mypkg` command) flags or output formatting",
+            "Modifying existing `mypkg.OldClass` or `stdlib.mod.Helper` behavior",
+            "Changing unrelated Headers/URL semantics",
+            "Do not touch `legacy/` or tests/test_frozen.py",
+            "`mypkg`",
+            "`mypkg.OldClass`",
+            "Headers/URL",
+        ],
+        constraints=[
+            "Test freeze: do not modify `tests/test_frozen.py` or `tests/frozen_*.py`",
+            "Do not create `docs/README` or `types.d.ts`",
+            "Do not modify docs/CHANGELOG or `.env`",
+        ],
+    )
+
+    forbidden = _spec_forbidden_paths(spec, tmp_path)
+    assert "mypkg" not in forbidden
+    assert "mypkg.OldClass" not in forbidden
+    assert "stdlib.mod.Helper" not in forbidden
+    assert "Headers/URL" not in forbidden
+    assert "legacy" in forbidden
+    assert "tests/test_frozen.py" in forbidden
+    assert "tests/frozen_*.py" in forbidden
+    assert "docs/README" in forbidden
+    assert "types.d.ts" in forbidden
+    assert "docs/CHANGELOG" in forbidden
+    assert ".env" in forbidden
+
+
 
 
 

@@ -104,6 +104,7 @@ class SessionConfig:
     pi_provider: str | None = None
     thinking_level: str | None = None
     context_window: int | None = None
+    worker_max_steps: int | None = 40
     provider_builder: ProviderBuilder | None = None
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -423,6 +424,8 @@ class SessionRunner:
                 )
             pending_gate = gate or self._gate_from_node(node)
             if pending_gate is None:
+                if pause_kind == PauseKind.BLOCKED:
+                    return self._recover_blocked(run_id, definition, snap, text)
                 return self._emit_pause(
                     run_id,
                     PauseKind.APPROVAL,
@@ -601,6 +604,7 @@ class SessionRunner:
             auto_approve=False,
             approver=f"session:{policy_name.value}",
             topology=definition.topology,
+            worker_max_steps=self.config.worker_max_steps,
             apply_to_workspace=self.config.step_mode == StepMode.EXECUTE,
             gate_policy=policy,
             sandbox_root=self.sandbox_root,
@@ -809,7 +813,13 @@ class SessionRunner:
             pending = [
                 task
                 for task in (plan.tasks if plan is not None else [])
-                if task.status in (TaskStatus.READY, TaskStatus.WAITING)
+                if task.status
+                in (
+                    TaskStatus.READY,
+                    TaskStatus.WAITING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.VERIFYING,
+                )
             ]
             if pending:
                 return self._resume_execution_in_place(run_id, definition, snap, clean)
@@ -840,6 +850,31 @@ class SessionRunner:
             return []
         return [task for task in plan.tasks if task.status == TaskStatus.BLOCKED]
 
+    def _requeue_stranded_in_flight(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> list[str]:
+        """Reset any stranded RUNNING/VERIFYING tasks back to READY before resuming."""
+        plan: TaskPlan | None = snap["plan"]
+        requeued: list[str] = []
+        if plan is None:
+            return requeued
+        for task in plan.tasks:
+            if task.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                continue
+            with suppress(ValueError, ConcurrencyConflictError, NotFoundError):
+                self.store.update_task_with_lease(
+                    run_id,
+                    task.task_id,
+                    expected_lease_generation=task.lease_generation,
+                    mutator=lambda node: node.model_copy(
+                        update={"status": TaskStatus.READY}
+                    ),
+                    actor="session",
+                    event_type="task.requeued",
+                )
+                requeued.append(task.task_id)
+        return requeued
+
     def _resume_execution_in_place(
         self,
         run_id: str,
@@ -847,7 +882,10 @@ class SessionRunner:
         snap: dict[str, Any],
         hint: str,
     ) -> SessionEnvelope:
-        """Resume an execution pause (e.g. budget pause) without invalidating the approved plan."""
+        """Resume an execution pause (e.g. budget pause or crash recovery) in place."""
+        requeued = self._requeue_stranded_in_flight(run_id, snap)
+        if requeued:
+            snap = self.store.get_run(run_id)
         if snap["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
             with suppress(ValueError, ConcurrencyConflictError):
                 self.store.set_run_status(
@@ -868,6 +906,7 @@ class SessionRunner:
                 "feedback": hint,
                 "recovery_mode": "resume_execution",
                 "recovery_node": execute_node,
+                **({"requeued_task_ids": requeued} if requeued else {}),
             },
         )
         return self._drive(
@@ -900,6 +939,7 @@ class SessionRunner:
             self._mark_awaiting_human(run_id, snap, None, reason)
             return self._emit_pause(run_id, PauseKind.BLOCKED, node=None, reason=reason)
 
+        requeued = self._requeue_stranded_in_flight(run_id, snap)
         retried: list[str] = []
         revision = int(self.store.get_run(run_id)["state_revision"])
         try:
@@ -933,6 +973,7 @@ class SessionRunner:
                 "recovery_mode": "in_place",
                 "recovery_node": execute_node,
                 "retried_task_ids": retried,
+                **({"requeued_task_ids": requeued} if requeued else {}),
             },
         )
         return self._drive(

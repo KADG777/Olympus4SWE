@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 from pydantic import ConfigDict
 
-from olympus.core.contracts import CritiqueSeverity, GoalSpec, StrictModel, TaskPlan
+from olympus.core.contracts import CritiqueSeverity, GoalSpec, RunStatus, StrictModel, TaskPlan
 from olympus.providers.base import ChatMessage, LLMProvider
 from olympus.session.contracts import PauseKind
 
@@ -37,9 +37,12 @@ Return ONLY one JSON object:
 Routing rules:
 - action=clarify only when the human answers one or more listed ambiguity/critique IDs.
 - action=approve only when the human explicitly approves the pending artifact/gate.
-- action=revise when the human rejects or asks to change the current plan/spec.
+- action=revise when the human rejects, asks to change the current plan/spec, or supplies new
+  concrete domain facts/constraints/requirements while paused on clarification without answering
+  the listed IDs verbatim.
 - action=reopen when the run is already completed and the human asks for follow-up work.
-- action=unknown when the reply is ambiguous; do not guess.
+- action=unknown when the reply is ambiguous, a pure refusal, or a question about defaults;
+  do not guess.
 - Use only the IDs listed in the context; omit answers for anything not addressed."""
 
 
@@ -203,6 +206,7 @@ _DEFAULT_ACCEPTANCE_PATTERNS = tuple(
         r"(?:defaults?|recommendations?)\b",
         r"^\s*(?:the\s+|your\s+)?(?:defaults?|default\s+(?:assumptions?|answers?|choices?)|"
         r"recommendations?)\s*[.!]?\s*$",
+        r"^\s*(?:please\s+)?(?:go\s+on|go\s+ahead|continue|proceed|carry\s+on|keep\s+going)\s*[.!]?\s*$",
     )
 )
 _QUESTION_PREFIX_RE = re.compile(
@@ -388,6 +392,35 @@ def _extract_explicit_clarifications(
     return answers, resolutions
 
 
+def _merge_default_and_explicit(
+    defaults: tuple[dict[str, str], dict[str, str]],
+    explicit_answers: dict[str, str],
+    explicit_resolutions: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Merge deterministic defaults with explicit per-ID answers (explicit text wins)."""
+    default_answers, default_resolutions = defaults
+    default_answers.update(
+        {
+            key: value
+            for key, value in explicit_answers.items()
+            if not _is_default_delegation(value)
+        }
+    )
+    default_resolutions.update(
+        {
+            key: value
+            for key, value in explicit_resolutions.items()
+            if not _is_default_delegation(value)
+        }
+    )
+    return default_answers, default_resolutions
+
+
+def _is_approval_question(message: str, lowered: str) -> bool:
+    """True for pure confirmation/proceed questions that must never trigger execution."""
+    return _is_question(message) and any(token in lowered for token in _APPROVE_TOKENS)
+
+
 def _keyword_fallback(
     message: str,
     *,
@@ -401,18 +434,7 @@ def _keyword_fallback(
     answers, resolutions = _extract_explicit_clarifications(message, snapshot)
     defaults = _default_acceptance(text, snapshot=snapshot, message=message)
     if defaults is not None:
-        default_answers, default_resolutions = defaults
-        default_answers.update(
-            {key: value for key, value in answers.items() if not _is_default_delegation(value)}
-        )
-        default_resolutions.update(
-            {
-                key: value
-                for key, value in resolutions.items()
-                if not _is_default_delegation(value)
-            }
-        )
-        answers, resolutions = default_answers, default_resolutions
+        answers, resolutions = _merge_default_and_explicit(defaults, answers, resolutions)
     if answers or resolutions:
         return ReplyIntent(
             action="clarify",
@@ -442,8 +464,11 @@ def _keyword_fallback(
         return ReplyIntent(
             action="revise", feedback=message.strip(), message="Keyword fallback: revision"
         )
-    if pause_kind == PauseKind.BLOCKED and _has_actionable_text(message) and not (
-        _negated_revision(text) or _negated_defaults(text)
+    if (
+        pause_kind == PauseKind.BLOCKED
+        and _has_actionable_text(message)
+        and not _is_approval_question(message, text)
+        and not (_negated_revision(text) or _negated_defaults(text))
     ):
         # Any concrete hint (path, symbol, diagnosis, redirect) is actionable recovery
         # context while blocked; never deadlock on an unmappable reply.
@@ -452,7 +477,12 @@ def _keyword_fallback(
             feedback=message.strip(),
             message="Keyword fallback: blocked recovery hint",
         )
-    if any(token in text for token in _APPROVE_TOKENS):
+    if (
+        any(token in text for token in _APPROVE_TOKENS)
+        and not _is_question(message)
+        and not _negated_revision(text)
+        and not _negated_defaults(text)
+    ):
         return ReplyIntent(action="approve", message="Keyword fallback: approval")
     return ReplyIntent(action="unknown", message="Could not parse the reply safely")
 
@@ -499,22 +529,9 @@ def _sanitize(
     if defaults is not None:
         # A human delegation to defaults resolves every remaining blocker
         # deterministically; explicit per-ID text in the message still wins.
-        default_answers, default_resolutions = defaults
-        default_answers.update(
-            {
-                key: value
-                for key, value in explicit_answers.items()
-                if not _is_default_delegation(value)
-            }
+        answers, resolutions = _merge_default_and_explicit(
+            defaults, explicit_answers, explicit_resolutions
         )
-        default_resolutions.update(
-            {
-                key: value
-                for key, value in explicit_resolutions.items()
-                if not _is_default_delegation(value)
-            }
-        )
-        answers, resolutions = default_answers, default_resolutions
     action = raw.action
     feedback = raw.feedback.strip()
     if answers or resolutions:
@@ -523,7 +540,7 @@ def _sanitize(
     elif action == "clarify":
         action = "unknown"
     if action == "approve" and (
-        _negated_approval(lowered) or _negated_defaults(lowered)
+        _negated_approval(lowered) or _negated_defaults(lowered) or _is_question(message)
     ):
         revise = any(token in lowered for token in _REVISE_TOKENS) and not _negated_revision(
             lowered
@@ -543,7 +560,9 @@ def _sanitize(
         action = "unknown"
         feedback = ""
     if action in ("reopen", "revise") and (
-        _negated_revision(lowered) or not _has_actionable_text(message)
+        _negated_revision(lowered)
+        or not _has_actionable_text(message)
+        or _is_approval_question(message, lowered)
     ):
         action = "unknown"
         feedback = ""
@@ -555,6 +574,7 @@ def _sanitize(
         action in ("unknown", "approve", "reopen")
         and pause_kind == PauseKind.BLOCKED
         and _has_actionable_text(message)
+        and not _is_approval_question(message, lowered)
         and not _negated_revision(lowered)
         and not _negated_approval(lowered)
         and not _negated_defaults(lowered)
@@ -572,6 +592,71 @@ def _sanitize(
     )
 
 
+def _fast_path_intent(
+    *,
+    message: str,
+    snapshot: dict[str, Any],
+    pause_kind: PauseKind | None,
+    completed: bool,
+) -> ReplyIntent | None:
+    """Resolve unambiguous replies deterministically without an extra LLM round-trip."""
+    if completed:
+        return None
+    lowered = message.casefold().strip()
+    if not lowered:
+        return None
+    if _pending_blockers(snapshot):
+        explicit_answers, explicit_resolutions = _extract_explicit_clarifications(
+            message, snapshot
+        )
+        defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
+        if defaults is not None:
+            merged_answers, merged_resolutions = _merge_default_and_explicit(
+                defaults, explicit_answers, explicit_resolutions
+            )
+            if merged_answers or merged_resolutions:
+                return ReplyIntent(
+                    action="clarify",
+                    answers=merged_answers,
+                    resolutions=merged_resolutions,
+                    message="Deterministic fast-path: default assumptions accepted",
+                )
+        spec: GoalSpec | None = snapshot.get("spec")
+        needed_answers = _blocking_ambiguity_ids(spec)
+        needed_resolutions = _blocking_critique_ids(spec)
+        if (
+            (explicit_answers or explicit_resolutions)
+            and needed_answers.issubset(explicit_answers)
+            and needed_resolutions.issubset(explicit_resolutions)
+        ):
+            return ReplyIntent(
+                action="clarify",
+                answers=explicit_answers,
+                resolutions=explicit_resolutions,
+                message="Deterministic fast-path: all pending blockers answered",
+            )
+        if explicit_answers or explicit_resolutions:
+            # Partial explicit answers must flow through LLM + sanitizer rather than
+            # being swallowed as a generic blocked-recovery revision.
+            return None
+    if (
+        (pause_kind == PauseKind.BLOCKED or snapshot.get("status") == RunStatus.FAILED)
+        and _has_actionable_text(message)
+        and not _is_question(message)
+        and not (
+            _negated_revision(lowered)
+            or _negated_approval(lowered)
+            or _negated_defaults(lowered)
+        )
+    ):
+        return ReplyIntent(
+            action="revise",
+            feedback=message.strip(),
+            message="Deterministic fast-path: blocked recovery hint",
+        )
+    return None
+
+
 def parse_reply(
     *,
     provider: LLMProvider,
@@ -582,6 +667,14 @@ def parse_reply(
     completed: bool = False,
 ) -> ReplyIntent:
     """Translate prose into a sanitised intent; malformed output degrades safely."""
+    fast = _fast_path_intent(
+        message=message,
+        snapshot=snapshot,
+        pause_kind=pause_kind,
+        completed=completed,
+    )
+    if fast is not None:
+        return fast
     user_prompt = _reply_context(
         message=message,
         snapshot=snapshot,

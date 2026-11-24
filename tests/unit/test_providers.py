@@ -1092,18 +1092,20 @@ def test_dialects_handle_gateway_quirks_and_unwrap_transport_errors(
     def timeout_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(httpx.ReadTimeout) as openai_timeout:
         OpenAIChatDialect(http_client=_mock_client(timeout_handler)).send(
             EndpointTarget("sk-test", "https://gateway.invalid"),
             model="m",
             messages=[ChatMessage(role="user", content="hi")],
         )
-    with pytest.raises(httpx.ReadTimeout):
+    assert openai_timeout.value.__cause__ is None
+    with pytest.raises(httpx.ReadTimeout) as anthropic_timeout:
         AnthropicMessagesDialect(http_client=_mock_client(timeout_handler)).send(
             EndpointTarget("sk-test", "https://gateway.invalid"),
             model="m",
             messages=[ChatMessage(role="user", content="hi")],
         )
+    assert anthropic_timeout.value.__cause__ is None
 
     hosts: list[str] = []
 

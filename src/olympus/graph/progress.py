@@ -93,6 +93,13 @@ def resolve_resume_node(
     names = {node.name for node in definition.nodes}
     run_id = str(snap["run_id"])
 
+    spec = snap.get("spec")
+    if spec is not None and not is_artifact_approved(store, run_id, "spec", snap):
+        if "gate_spec" in names:
+            return "gate_spec"
+        if "align" in names:
+            return "align"
+
     if (
         snap["plan"] is not None
         and is_artifact_approved(store, run_id, "plan", snap)

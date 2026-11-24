@@ -100,7 +100,7 @@ Rules:
    (unless vertical tracer-bullet slicing applies).
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
-4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
+4. Keep tasks cohesive (prefer 1-2 checks per task, at most 3; no redundant prose checks).
    Valid acceptance_checks[*].kind values are strictly: 'command', 'independent_review', or 'human'
    (NEVER invent values like 'review'). Whenever kind='command', supply a non-empty shell string
    in 'command' (e.g. 'python -m pytest ...'); if there is no shell command, use
@@ -118,13 +118,18 @@ Rules:
    paths do not exist yet (greenfield), emit TaskPlan JSON directly without running glob/grep.
 9. Output ONLY a single raw JSON object starting with '{' matching TaskPlan (NEVER call an
    invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys).
+   Keep the TaskPlan JSON concise: each task `objective` should be 2-4 crisp sentences referencing
+   `requirement_refs` and `design_refs` (never copy-paste full GoalSpec/DesignSpec prose; workers
+   already receive both specs).
 10. Ground checks in observed reality: acceptance_checks commands MUST only use paths named by
     the Observed workspace files, the task's own write_scope, and tools/packages actually
     available in the environment. NEVER invent uninstalled third-party packages, never
-    reference a test directory that neither exists nor is created inside the task's write_scope,
-    and never assume a module/runner exists without observing it. When a task creates its own
-    test file, target that exact path; otherwise prefer inline 'python -c' assertions that
-    import only artifacts the task itself delivers."""
+    reference a test directory or file that neither exists nor is created inside the task's
+    write_scope, and never assume a module/runner exists without observing it. Prefer standard
+    repo test commands (e.g. `python -m pytest <existing_or_task_test_file> -q`). When using
+    inline `python -c`, keep it to a short direct behavioral assertion; NEVER write multi-line
+    AST, regex, or `git show` diff-inspection scripts (use `independent_review` for structural
+    or diff-scope checks so checks cannot contradict each other)."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
@@ -142,7 +147,8 @@ Rules:
    files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
    non-forbidden integration edits.
 5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
-   fix every Important finding before concluding."""
+   fix every Important finding before concluding. Once all acceptance checks pass cleanly, stop
+   iterating and deliver your final summary immediately instead of over-polishing."""
 
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
 You have ZERO prior conversation history with the implementer. You are strictly read-only: inspect,
@@ -302,7 +308,7 @@ def _restore_tree_paths(
 
 _FREEZE_CONSTRAINT_RE = re.compile(
     r"\b(?:(?:do not|don't|must not|never|cannot)\s+"
-    r"(?:modify|edit|touch|change|alter|overwrite|delete|remove|rewrite)"
+    r"(?:modify|edit|touch|change|alter|overwrite|delete|remove|rewrite|create)"
     r"|test\s+freeze|frozen|immutable|read[- ]only|forbidden|prohibited|untouched|unchanged)\b",
     re.IGNORECASE,
 )
@@ -328,18 +334,47 @@ def _normalize_repo_rel_pattern(token: str) -> str | None:
     return cleaned
 
 
+def _is_explicit_spec_path(
+    raw: str,
+    norm: str,
+    workspace_root: Path,
+    *,
+    backticked: bool,
+    single_token: bool = False,
+) -> bool:
+    """Return True when a spec token is an explicit repo path/glob rather than prose/symbol."""
+    raw_cleaned = raw.strip().strip("`'\",;:()[]{}").replace("\\", "/")
+    raw_slash = "/" in raw_cleaned
+    has_glob = any(ch in norm for ch in "*?[")
+    target = workspace_root / norm
+    suffix = PurePosixPath(norm).suffix
+    has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix))
+    if has_glob or target.is_file():
+        return True
+    if raw_slash:
+        parts = PurePosixPath(norm).parts
+        first_seg = parts[0] if parts else ""
+        return bool(
+            backticked
+            or target.is_dir()
+            or (first_seg and (workspace_root / first_seg).is_dir())
+            or any(part[:1].islower() for part in parts)
+            or has_file_ext
+        )
+    is_dotfile = norm.startswith(".") and len(norm) > 1 and norm[1].isalnum()
+    return (backticked or single_token) and (has_file_ext or is_dotfile)
+
+
 def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
     candidates: list[str] = []
     if not any(ch.isspace() for ch in stripped):
+        is_backticked = stripped.startswith("`") and stripped.endswith("`")
         norm = _normalize_repo_rel_pattern(stripped)
-        if norm is not None and (
-            "/" in norm
-            or any(ch in norm for ch in "*?[")
-            or "." in norm
-            or (workspace_root / norm).exists()
+        if norm is not None and _is_explicit_spec_path(
+            stripped, norm, workspace_root, backticked=is_backticked, single_token=True
         ):
             return [norm]
         return []
@@ -351,13 +386,12 @@ def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
         norm = _normalize_repo_rel_pattern(raw)
         if norm is None:
             continue
-        is_explicit_path = (
-            "/" in norm
-            or any(ch in norm for ch in "*?[")
-            or (workspace_root / norm).exists()
-            or (backticked is not None and "." in norm)
-        )
-        if is_explicit_path and norm not in candidates:
+        if (
+            _is_explicit_spec_path(
+                raw, norm, workspace_root, backticked=backticked is not None
+            )
+            and norm not in candidates
+        ):
             candidates.append(norm)
     return candidates
 
@@ -378,8 +412,8 @@ def _spec_forbidden_paths(spec: GoalSpec, workspace_root: Path) -> tuple[str, ..
     return tuple(found)
 
 
-def _format_spec_context(spec: GoalSpec) -> str:
-    """Format constraints, assumptions, test seams, and clarifications for Stage 2 roles."""
+def _format_spec_context(spec: GoalSpec, *, task: TaskNode | None = None) -> str:
+    """Format constraints, assumptions, test seams, clarifications, and referenced requirements."""
     clarifications = [
         {"id": amb.id, "question": amb.question, "answer": amb.answer}
         for amb in spec.open_ambiguities
@@ -390,13 +424,33 @@ def _format_spec_context(spec: GoalSpec) -> str:
         for amb in spec.open_ambiguities
         if amb.answer is None or not amb.answer.strip()
     ]
-    lines = [
-        f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
-        f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
-        "Test seams (verify behavior at these public boundaries): "
-        f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
-        f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
-    ]
+    lines: list[str] = []
+    if task is not None and task.requirement_refs:
+        req_by_id = {req.id: req for req in spec.requirements}
+        matched_reqs = [
+            req_by_id[ref] for ref in dict.fromkeys(task.requirement_refs) if ref in req_by_id
+        ]
+        if matched_reqs:
+            lines.append("Referenced requirements (MUST satisfy):")
+            for req in matched_reqs:
+                lines.append(f"- {req.id}: {req.description}")
+                rendered_ears: set[str] = set()
+                for crit in req.ears_criteria:
+                    ears_text = crit.to_ears_text()
+                    rendered_ears.add(ears_text)
+                    lines.append(f"  * {crit.id}: {ears_text}")
+                for criterion in req.acceptance_criteria:
+                    if criterion not in rendered_ears:
+                        lines.append(f"  * {criterion}")
+    lines.extend(
+        [
+            f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
+            f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+            "Test seams (verify behavior at these public boundaries): "
+            f"{json.dumps(spec.test_seams, ensure_ascii=False)}",
+            f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
+        ]
+    )
     if unresolved:
         lines.append(
             f"Unresolved ambiguities (accepted risk): {json.dumps(unresolved, ensure_ascii=False)}"
@@ -597,6 +651,14 @@ def _format_design_context(design: DesignSpec | None, *, task: TaskNode) -> str:
         for inv in matched_invariants:
             hint = f" [hint: {inv.enforcement_hint}]" if inv.enforcement_hint else ""
             lines.append(f"  * {inv.id} [{inv.category}]: {inv.rule}{hint}")
+    matched_modules = [m for m in design.modules if m.id in task_refs]
+    if matched_modules:
+        lines.append("- Relevant modules:")
+        for mod in matched_modules:
+            lines.append(
+                f"  * {mod.id} ({mod.name}): {mod.responsibility} | "
+                f"target_paths={json.dumps(mod.target_paths, ensure_ascii=False)}"
+            )
     matched_interfaces = [
         iface
         for iface in design.interfaces
@@ -662,15 +724,18 @@ Modular product decomposition (topology={topology}):
 
 _VERTICAL_PLANNER_GUIDANCE = """
 Vertical tracer-bullet decomposition (topology={topology}):
+- Keep total slice count minimal (1-2 cohesive slices for single-package or focused changes, at
+  most 3 for multi-module work) so execution avoids redundant cold-start exploration and review
+  overhead across tiny serial slices; group closely related capabilities sharing the same files
+  into one cohesive slice instead of emitting one task per requirement.
 - If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
   `kind='contract'` task owning those paths before Slice 1.
-- Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
-  the smallest vertical path that wires core storage/logic to one observable user-facing seam
-  named by GoalSpec.test_seams or observable_surfaces, with at least one executable
-  kind='command' seam check proving the path runs.
-- Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
-  each delivers exactly one observable capability end to end (its storage/logic plus seam
-  wiring) and carries its own executable kind='command' seam test.
+- Emit Slice 1 as ONE runnable end-to-end tracer bullet (kind='implement', role='engineer')
+  that wires core storage/logic to an observable user-facing seam named by GoalSpec.test_seams
+  or observable_surfaces, with at least one executable kind='command' seam check proving the
+  path runs.
+- Emit additional Slices 2..N only when distinct capabilities or modules genuinely merit separate
+  deliveries (each carrying its own executable kind='command' seam test).
 - NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
   routes/templates/static wave, and no bulk test-only wave after unverified code waves.
 - NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,
@@ -1771,7 +1836,7 @@ class OrchestrateStage:
                 ],
                 ensure_ascii=False,
             )
-            spec_ctx = _format_spec_context(spec)
+            spec_ctx = _format_spec_context(spec, task=leased)
             design_ctx = _format_design_context(design, task=leased)
             handoff_block = f"{handoff_context}\n" if handoff_context else ""
             step_guidance = (

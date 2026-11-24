@@ -127,10 +127,11 @@ Rules:
    framework). If it is a new standalone product unrelated to the workspace files, treat it as
    GREENFIELD immediately: do NOT call tools to inspect unrelated host repo files or treat
    host files as contradictions; synthesize the standalone GoalSpec directly.
-10. Language Mirroring: Write all human-facing prose (`goal`, `description`,
+10. Language Mirroring & Conciseness: ALWAYS write all human-facing prose (`goal`, `description`,
    `acceptance_criteria`, `out_of_scope`, `constraints`, `question`, `impact`, `options`,
-   `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
-   `Raw user goal` is Chinese), keeping IDs and enum values in ASCII.
+   `default_assumption`) in the exact same natural language as `Raw user goal` (never switch
+   languages; keep IDs and enum values in ASCII). Keep each requirement and criterion crisp and
+   concise (1-2 sentences each, not multi-paragraph essays).
 11. Assumption Provenance: For assumptions you introduce that materially affect scope or acceptance,
    copy the exact verbatim string from `assumptions` into `agent_high_impact_assumptions` (or leave
    `agent_high_impact_assumptions` as `[]`). Do not mark user decisions or confirmed clarifications
@@ -253,9 +254,10 @@ class AlignStage:
             "- actors: every human/system actor that triggers behavior\n"
             "- test_seams: 1-2 highest-level public seams (HTTP routes, CLI commands, public\n"
             "  APIs) where behavior is verified end to end; never internal file paths or helpers\n"
-            "- every requirement sets actor plus ears_criteria with pattern="
+            "- every requirement sets actor plus 1-2 concise ears_criteria with pattern="
             "ubiquitous|event_driven|state_driven|unwanted_behavior|optional_feature\n"
-            "- acceptance_criteria stay plain strings and must carry measurable thresholds\n"
+            "- omit acceptance_criteria when ears_criteria is set (auto-materialized) to keep\n"
+            "  JSON compact; acceptance_criteria stay plain strings with measurable thresholds\n"
             "- never leak internal implementation (CREATE TABLE, ALTER TABLE, src/*.py paths)\n"
             if strict_canonical
             else ""

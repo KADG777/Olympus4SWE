@@ -65,7 +65,10 @@ def is_design_bound_to_spec(
         target_hash=spec.content_hash,
     )
     if spec_rowid is None:
-        return True
+        # When GoalSpec exists and is not yet approved (e.g. after reopen or clarify),
+        # any DesignSpec bound to a GoalSpec is stale until the current GoalSpec is
+        # approved; only a spec-independent design (no spec_id/spec_hash) can proceed.
+        return design.spec_id is None and design.spec_hash is None
     hash_mismatch = design.spec_hash is not None and design.spec_hash != spec.content_hash
     id_mismatch = design.spec_id is not None and design.spec_id != spec.spec_id
     if hash_mismatch or id_mismatch:
@@ -98,7 +101,9 @@ def is_plan_bound_to_upstream(
             target_hash=spec.content_hash,
         )
     )
-    if spec is not None and spec_approved and plan.spec_hash is not None:
+    if spec is not None and plan.spec_hash is not None:
+        if not spec_approved:
+            return False
         if plan.spec_hash != spec.content_hash:
             return False
         if plan.spec_id is not None and plan.spec_id != spec.spec_id:

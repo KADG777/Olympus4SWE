@@ -99,7 +99,9 @@ class AnthropicMessagesDialect:
             ) from exc
         except anthropic.APIConnectionError as exc:
             if isinstance(exc.__cause__, httpx.HTTPError):
-                raise exc.__cause__ from exc
+                # Break the SDK's exc.__cause__ link so re-raising cannot form a
+                # circular __cause__ chain (which hangs traceback formatters).
+                raise exc.__cause__ from None
             raise
         finally:
             if owned_client is not None:
