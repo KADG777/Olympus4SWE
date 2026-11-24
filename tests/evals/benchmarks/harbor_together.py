@@ -46,6 +46,14 @@ from pathlib import Path
 from typing import Any
 
 try:  # Imported as ``tests.evals.benchmarks.harbor_together``.
+    from .interact_bridge import is_infrastructure_block
+except ImportError:  # Loaded as a bare top-level module by standalone tooling.
+    try:
+        from tests.evals.benchmarks.interact_bridge import is_infrastructure_block
+    except ImportError:
+        from interact_bridge import is_infrastructure_block  # type: ignore[no-redef]
+
+try:  # Imported as ``tests.evals.benchmarks.harbor_together``.
     from .token_usage import (
         build_budget_settled_command,
         merge_token_usage,
@@ -954,6 +962,8 @@ class UserEnabledOlympusAgent(BaseAgent):
         trial_budget_sec: float = 5400.0,
         per_turn_timeout_sec: float = 1800.0,
         max_consecutive_noops: int = 4,
+        infra_retries: int = 2,
+        infra_retry_backoff_sec: float = 1.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -1058,6 +1068,8 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._trial_budget_sec = float(trial_budget_sec)
         self._per_turn_timeout_sec = float(per_turn_timeout_sec)
         self._max_consecutive_noops = max(1, int(max_consecutive_noops))
+        self._infra_retries = max(0, int(infra_retries))
+        self._infra_retry_backoff_sec = max(0.0, float(infra_retry_backoff_sec))
 
         self._task_instruction = ""
         self._discovered_repo: str | None = None
@@ -1387,24 +1399,91 @@ class UserEnabledOlympusAgent(BaseAgent):
         message: str,
     ) -> SessionEnvelopeView:
         self._last_turn_had_usage = False
-        command = self._session_command(action, message=message)
-        outcome = await self._exec(
-            environment,
-            command,
-            cwd=self._repo or "/",
-            timeout_sec=self._turn_timeout(),
-        )
-        self._write_turn_artifacts(turn, command, outcome)
-        envelope = parse_session_envelope(outcome.stdout)
-        if envelope is None:
-            detail = (outcome.stderr or outcome.stdout or "").strip()
-            if outcome.timed_out:
-                detail = detail or "olympus session timed out"
-            envelope = SessionEnvelopeView.failure(
-                detail[:2000] or "olympus session produced no JSON envelope"
+        attempt = 0
+        current_action = action
+        current_message = message
+        while True:
+            command = self._session_command(current_action, message=current_message)
+            outcome = await self._exec(
+                environment,
+                command,
+                cwd=self._repo or "/",
+                timeout_sec=self._turn_timeout(),
             )
-        self._run_id = envelope.run_id or self._run_id
-        self._last_turn_had_usage = self._record_token_usage(envelope)
+            parsed = parse_session_envelope(outcome.stdout)
+            if parsed is None:
+                detail = (outcome.stderr or outcome.stdout or "").strip()
+                if outcome.timed_out:
+                    detail = detail or "olympus session timed out"
+                envelope = SessionEnvelopeView.failure(
+                    detail[:2000] or "olympus session produced no JSON envelope"
+                )
+            else:
+                envelope = parsed
+            self._run_id = envelope.run_id or self._run_id
+            self._last_turn_had_usage = self._record_token_usage(envelope)
+            if (
+                parsed is not None
+                and envelope.status in ("needs_input", "failed")
+                and is_infrastructure_block(dict(envelope.raw))
+            ):
+                can_retry = (
+                    attempt < self._infra_retries
+                    and not self._budget_exhausted()
+                    and (
+                        envelope.status == "failed"
+                        or bool(self._run_id)
+                    )
+                )
+                if can_retry:
+                    attempt += 1
+                    self._write_turn_artifacts(
+                        turn, command, outcome, suffix=f"-infra-retry-{attempt}"
+                    )
+                    self._record_event(turn, f"infra_retry_{attempt}")
+                    if self._infra_retry_backoff_sec > 0:
+                        await asyncio.sleep(self._infra_retry_backoff_sec)
+                    if self._run_id:
+                        current_action = "reply"
+                        current_message = (
+                            "Redo the interrupted step after the transient network error."
+                        )
+                    else:
+                        current_action = action
+                        current_message = message
+                    continue
+                # Exhausted local retries (or budget): fail cleanly without consulting
+                # the simulated user or polluting conversation.jsonl with infra errors.
+                self._write_turn_artifacts(turn, command, outcome)
+                self._record_event(turn, "infra_retries_exhausted")
+                failed_raw = {
+                    **dict(envelope.raw),
+                    "status": "failed",
+                    "error": envelope.error or envelope.message,
+                }
+                (self.logs_dir / f"envelope-{turn}.json").write_text(
+                    json.dumps(
+                        _redact_json_value(failed_raw, self._redaction_secrets),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return SessionEnvelopeView(
+                    run_id=envelope.run_id or self._run_id,
+                    status="failed",
+                    message=envelope.message,
+                    pause_kind=envelope.pause_kind,
+                    workflow=envelope.workflow,
+                    unresolved_blockers=envelope.unresolved_blockers,
+                    changed_files=envelope.changed_files,
+                    error=envelope.error or envelope.message,
+                    raw=failed_raw,
+                )
+            break
+
+        self._write_turn_artifacts(turn, command, outcome)
         await self._capture_git_diff(environment, turn=turn)
         self._record_message(
             role="agent",
@@ -1618,8 +1697,10 @@ class UserEnabledOlympusAgent(BaseAgent):
         self._last_cumulative_diff = cumulative
 
 
-    def _write_turn_artifacts(self, turn: int, command: str, outcome: ExecOutcome) -> None:
-        directory = self.logs_dir / f"command-{turn}"
+    def _write_turn_artifacts(
+        self, turn: int, command: str, outcome: ExecOutcome, *, suffix: str = ""
+    ) -> None:
+        directory = self.logs_dir / f"command-{turn}{suffix}"
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "command.txt").write_text(
             redact_text(command, self._redaction_secrets) + "\n", encoding="utf-8"

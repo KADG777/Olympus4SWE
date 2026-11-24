@@ -20,6 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 try:  # Harbor is optional; only present in the benchmark operator environment.
     from harbor.agents.base import BaseAgent as _HarborAgentBase
@@ -340,6 +341,7 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         self._token_usage: dict[str, Any] | None = None
         self._run_token_usage: dict[str, dict[str, Any]] = {}
         self._reported_run_usage: dict[str, dict[str, Any]] = {}
+        self._prior_step_interrupted = False
         super().__init__(
             logs_dir=logs_dir if logs_dir is not None else Path.cwd() / "logs",
             model_name=model_name,
@@ -392,8 +394,31 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         except (AttributeError, ValueError):
             return _empty_model_connection()
 
+    @staticmethod
+    def _sanitize_url_for_log(url: str) -> str:
+        """Strip userinfo, query, and fragment before logging a URL."""
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{host}:{parts.port}" if parts.port is not None else host
+        if parts.scheme and netloc:
+            sanitized = f"{parts.scheme}://{netloc}{parts.path}"
+        elif netloc:
+            sanitized = f"{netloc}{parts.path}"
+        else:
+            sanitized = parts.path
+        return redact_text(sanitized)
+
     async def setup(self, environment: Any) -> None:
         """Install Olympus and the bridge scripts inside the task container."""
+        litellm_base = os.environ.get("LITELLM_BASE_URL", "").strip()
+        if urlsplit(litellm_base).path.rstrip("/").endswith("/v1"):
+            self.logger.warning(
+                "LITELLM_BASE_URL (%s) ends with '/v1'; SWE-Interact's user-server "
+                "appends '/v1' automatically, which can cause /v1/v1 404 responses.",
+                self._sanitize_url_for_log(litellm_base),
+            )
         options = self._interact
         bridge_dir = PurePosixPath(BRIDGE_DIR)
         logs_dir = PurePosixPath(self.environment_logs_dir)
@@ -873,9 +898,14 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
             / f"olympus-interact-{step_tag}.jsonl"
         )
         argv = self._bridge_argv(role, remote_instruction, trajectory)
-        result = await environment.exec(
-            shlex.join(argv), timeout_sec=None, env=self._gateway_env()
-        )
+        try:
+            result = await environment.exec(
+                shlex.join(argv), timeout_sec=None, env=self._gateway_env()
+            )
+        except BaseException:
+            self._prior_step_interrupted = True
+            raise
+        self._prior_step_interrupted = False
         summary = self._parse_bridge_summary(result.stdout)
         if result.return_code != 0 or (summary or {}).get("status") != "ok":
             error = (summary or {}).get("error") or (
@@ -952,6 +982,8 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         ):
             if value:
                 argv += [flag, str(value)]
+        if self._prior_step_interrupted:
+            argv.append("--reclaim-stale")
         return argv
 
     def _write_artifact(self, name: str, content: str) -> Path:

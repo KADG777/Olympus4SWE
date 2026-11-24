@@ -2361,3 +2361,109 @@ def test_token_usage_recovers_from_db_when_later_turn_raises_or_returns_empty_by
         asyncio.run(agent_b.run("Do the thing", env_b, ctx_b))
     art_b = json.loads((tmp_path / "case_b" / "logs" / "token_usage.json").read_text())
     assert art_b["input_tokens"] == 300
+
+
+def test_transient_infra_block_retried_locally_without_consulting_user(
+    tmp_path: Path,
+) -> None:
+    handler = _SessionHandler(
+        [
+            _envelope(
+                "needs_input",
+                (
+                    "pi driver stopped before returning TaskPlan: "
+                    "pi_error: terminated: read ECONNRESET"
+                ),
+                pause_kind="blocked",
+                run_id="run-infra",
+            ),
+            _envelope("completed", "Implemented cleanly.", run_id="run-infra"),
+        ]
+    )
+    user = _StubUser([])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        call_user_on_completion=False,
+        infra_retries=2,
+        infra_retry_backoff_sec=0.0,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Fix the Windows paths", environment, SimpleNamespace(metadata=None)))
+
+    assert user.calls == []
+    session_cmds = [cmd for cmd in environment.commands() if "session " in cmd]
+    assert len(session_cmds) == 2
+    assert "session start" in session_cmds[0]
+    assert "session reply run-infra" in session_cmds[1]
+    assert (tmp_path / "logs" / "command-0-infra-retry-1" / "stdout.txt").is_file()
+    convo = (tmp_path / "logs" / "conversation.jsonl").read_text(encoding="utf-8")
+    assert "ECONNRESET" not in convo
+    assert "infra_retry_1" in convo
+    assert "Implemented cleanly." in convo
+
+
+def test_exhausted_infra_retries_stop_cleanly_without_consulting_user(
+    tmp_path: Path,
+) -> None:
+    err_env = _envelope(
+        "needs_input",
+        "pi driver stopped before returning TaskPlan: pi_error: terminated: read ECONNRESET",
+        pause_kind="blocked",
+        run_id="run-infra-fail",
+    )
+    handler = _SessionHandler([err_env, err_env, err_env])
+    user = _StubUser(["Should never be consulted"])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        call_user_on_completion=True,
+        infra_retries=2,
+        infra_retry_backoff_sec=0.0,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Fix the Windows paths", environment, SimpleNamespace(metadata=None)))
+
+    assert user.calls == []
+    session_cmds = [cmd for cmd in environment.commands() if "session " in cmd]
+    assert len(session_cmds) == 3
+    convo = (tmp_path / "logs" / "conversation.jsonl").read_text(encoding="utf-8")
+    assert "ECONNRESET" not in convo
+    assert "infra_retries_exhausted" in convo
+    final_env = json.loads((tmp_path / "logs" / "envelope-0.json").read_text(encoding="utf-8"))
+    assert final_env["status"] == "failed"
+
+
+def test_failed_turn0_infra_error_retried_locally_on_same_run_id(
+    tmp_path: Path,
+) -> None:
+    failed_env = _envelope(
+        "failed",
+        "pi driver stopped before returning GoalSpec: pi_error: terminated: read ECONNRESET",
+        run_id="run-turn0-fail",
+    )
+    handler = _SessionHandler(
+        [failed_env, _envelope("completed", "Done.", run_id="run-turn0-fail")]
+    )
+    user = _StubUser([])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        call_user_on_completion=False,
+        infra_retries=2,
+        infra_retry_backoff_sec=0.0,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Fix the Windows paths", environment, SimpleNamespace(metadata=None)))
+
+    assert user.calls == []
+    session_cmds = [cmd for cmd in environment.commands() if "session " in cmd]
+    assert len(session_cmds) == 2
+    assert "session start" in session_cmds[0]
+    assert "session reply run-turn0-fail" in session_cmds[1]

@@ -5704,6 +5704,101 @@ def test_replacing_symlink_during_promotion_never_overwrites_target_on_rollback(
     assert (tmp_path / "target.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
+def test_propose_plan_lists_allowed_design_refs_in_modular_prompt(tmp_path: Path) -> None:
+    from olympus.core.contracts import (
+        ApprovalDecision,
+        ApprovalRecord,
+        ApprovalTarget,
+        DataEntity,
+        DesignModule,
+        DesignSpec,
+        InterfaceContract,
+    )
+
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+    design = DesignSpec(
+        design_id="design-allowlist",
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        architecture_summary="Two-module design",
+        modules=[
+            DesignModule(
+                id="M-CORE",
+                name="Core",
+                responsibility="Core logic",
+                target_paths=["feature.py"],
+                requirement_refs=["R1"],
+            )
+        ],
+        interfaces=[
+            InterfaceContract(
+                id="IF-RUN",
+                provider_module_id="M-CORE",
+                consumer_module_ids=[],
+                signature="run() -> int",
+                error_cases=["ValueError"],
+            )
+        ],
+        data_models=[
+            DataEntity(
+                name="InternalRowModel",
+                fields=["id: str"],
+                owner_module_id="M-CORE",
+            )
+        ],
+    )
+    store.save_design(run_id, design, actor="design")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+            reason="approved",
+        )
+    )
+
+    user_prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        user_prompts.append(messages[-1].content)
+        payload = _plan_payload(
+            spec_id=spec.spec_id,
+            spec_hash=spec.content_hash,
+            file_name="feature.py",
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Check feature",
+                    "command": "python -c 'print(1)'",
+                }
+            ],
+        )
+        payload["design_id"] = design.design_id
+        payload["design_hash"] = design.content_hash
+        payload["tasks"][0]["design_refs"] = ["M-CORE", "IF-RUN"]
+        return LLMResponse(content=json.dumps(payload))
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    plan = orch.propose_plan(run_id=run_id, topology="modular_product")
+    assert len(user_prompts) == 1
+    assert "Allowed task.design_refs IDs" in user_prompts[0]
+    assert "IF-RUN, M-CORE" in user_prompts[0]
+    assert plan.tasks[0].design_refs == ["M-CORE", "IF-RUN"]
+
+
+
 
 
 

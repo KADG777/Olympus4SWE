@@ -543,7 +543,11 @@ def test_validate_plan_checks_design_refs_and_coverage() -> None:
             _task("T2", requirement_refs=["R1"], design_refs=["M2"], depends_on=["T1"]),
         ],
     )
-    assert any("unknown design element" in v for v in validate_plan(bad_ref, spec, design=design))
+    bad_violations = validate_plan(bad_ref, spec, design=design)
+    assert any(
+        "unknown design element" in v and "allowed design_refs: IF1, M1, M2" in v
+        for v in bad_violations
+    )
 
     orphan = TaskPlan(
         plan_id="plan-design-orphan",
