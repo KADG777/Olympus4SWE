@@ -355,11 +355,22 @@ def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
         norm = _normalize_repo_rel_pattern(raw)
         if norm is None:
             continue
+        raw_slash = "/" in raw.strip().strip("`'\",;:()[]{}").replace("\\", "/")
+        has_glob = any(ch in norm for ch in "*?[")
+        target = workspace_root / norm
+        suffix = PurePosixPath(norm).suffix
+        has_file_ext = bool(re.fullmatch(r"\.[a-z][a-z0-9]{0,7}", suffix)) and (
+            raw_slash or norm.count(".") == 1
+        )
+        # In natural-language prose, only treat a token as a forbidden repo path when it
+        # is a glob, an existing file, an explicit slash-delimited existing directory, or
+        # a backticked filename with a lowercase extension (never bare package/CLI names
+        # like `pkg`, dotted symbols like `pkg.Class`, or prose slash pairs like `Headers/URL`).
         is_explicit_path = (
-            "/" in norm
-            or any(ch in norm for ch in "*?[")
-            or (workspace_root / norm).exists()
-            or (backticked is not None and "." in norm)
+            has_glob
+            or target.is_file()
+            or (raw_slash and target.is_dir())
+            or (backticked is not None and has_file_ext)
         )
         if is_explicit_path and norm not in candidates:
             candidates.append(norm)

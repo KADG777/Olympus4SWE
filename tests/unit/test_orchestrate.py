@@ -5883,6 +5883,48 @@ def test_format_spec_and_design_context_expand_referenced_ids() -> None:
     assert "M-CALC (Calculator): Arithmetic operations" in design_ctx
 
 
+def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
+    tmp_path: Path,
+) -> None:
+    from olympus.core.contracts import GoalSpec, RequirementItem
+    from olympus.stages.orchestrate import _spec_forbidden_paths
+
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_frozen.py").write_text("", encoding="utf-8")
+    (tmp_path / "legacy").mkdir()
+
+    spec = GoalSpec(
+        goal="Add feature to mypkg",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Add feature",
+                acceptance_criteria=["Works"],
+            )
+        ],
+        out_of_scope=[
+            "CLI (`mypkg` command) flags or output formatting",
+            "Modifying existing `mypkg.OldClass` or `stdlib.mod.Helper` behavior",
+            "Changing unrelated Headers/URL semantics",
+            "Do not touch `legacy/` or tests/test_frozen.py",
+        ],
+        constraints=[
+            "Test freeze: do not modify `tests/test_frozen.py` or `tests/frozen_*.py`",
+        ],
+    )
+
+    forbidden = _spec_forbidden_paths(spec, tmp_path)
+    assert "mypkg" not in forbidden
+    assert "mypkg.OldClass" not in forbidden
+    assert "stdlib.mod.Helper" not in forbidden
+    assert "Headers/URL" not in forbidden
+    assert "legacy" in forbidden
+    assert "tests/test_frozen.py" in forbidden
+    assert "tests/frozen_*.py" in forbidden
+
+
 
 
 
