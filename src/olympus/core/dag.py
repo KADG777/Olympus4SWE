@@ -1179,12 +1179,14 @@ def validate_plan(
                 f"({design.content_hash})"
             )
         known_design_refs = {m.id for m in design.modules} | {i.id for i in design.interfaces}
+        allowed_design_refs = ", ".join(sorted(known_design_refs)) or "none"
         referenced: set[str] = set()
         for task in plan.tasks:
             for ref in task.design_refs:
                 if ref not in known_design_refs:
                     violations.append(
-                        f"Task {task.task_id} references unknown design element: {ref}"
+                        f"Task {task.task_id} references unknown design element: {ref} "
+                        f"(allowed design_refs: {allowed_design_refs})"
                     )
                 else:
                     referenced.add(ref)

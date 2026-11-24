@@ -394,6 +394,13 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
 
     async def setup(self, environment: Any) -> None:
         """Install Olympus and the bridge scripts inside the task container."""
+        litellm_base = os.environ.get("LITELLM_BASE_URL", "").strip()
+        if litellm_base.rstrip("/").endswith("/v1"):
+            self.logger.warning(
+                "LITELLM_BASE_URL (%s) ends with '/v1'; SWE-Interact's user-server "
+                "appends '/v1' automatically, which can cause /v1/v1 404 responses.",
+                litellm_base,
+            )
         options = self._interact
         bridge_dir = PurePosixPath(BRIDGE_DIR)
         logs_dir = PurePosixPath(self.environment_logs_dir)

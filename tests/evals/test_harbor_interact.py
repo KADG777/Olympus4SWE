@@ -2556,3 +2556,104 @@ def test_interact_populate_context_reports_step_deltas_and_sums_distinct_runs(
     assert ctx4.metadata["token_usage"]["cache_read_tokens"] == 100
     assert ctx4.metadata["token_usage"]["output_tokens"] == 45
     assert ctx4.metadata["token_usage"]["total_tokens"] == 355
+
+
+def test_interact_bridge_cleans_stale_process_and_recovers_stranded_active_run(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+    from unittest.mock import Mock, patch
+
+    from tests.evals.benchmarks.interact_bridge import (
+        InteractBridge,
+        build_parser,
+        config_from_args,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    # Spawn a real sleeper process in its own session to simulate an orphaned previous step.
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    try:
+        (state_dir / "bridge-pid.json").write_text(
+            json.dumps(
+                {
+                    "bridge_pid": orphan.pid,
+                    "bridge_pgid": orphan.pid,
+                    "olympus_pid": None,
+                    "olympus_pgid": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Seed a stranded active run in olympus.db (stuck in 'aligning' after external timeout).
+        db_path = state_dir / "olympus.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE runs ("
+            "run_id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+            "state_revision INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO runs (run_id, status, state_revision, updated_at) "
+            "VALUES ('run-stranded', 'aligning', 3, '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        args = build_parser().parse_args(
+            [
+                "--phase",
+                "plan",
+                "--workspace",
+                str(repo),
+                "--state-dir",
+                str(state_dir),
+                "--plan-out",
+                str(tmp_path / "plan.md"),
+                "--goal",
+                "Build feature",
+            ]
+        )
+        bridge = InteractBridge(config_from_args(args), client=Mock(), environ={})
+        with patch(
+            "tests.evals.benchmarks.interact_bridge.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, '{"status":"completed"}', ""),
+        ):
+            bridge.run()
+
+        orphan.wait(timeout=5)
+        assert orphan.returncode is not None
+        assert not (state_dir / "bridge-pid.json").exists()
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT status, state_revision FROM runs WHERE run_id = 'run-stranded'"
+        ).fetchone()
+        conn.close()
+        assert row == ("paused", 4)
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+
+def test_harbor_interact_setup_warns_when_litellm_base_url_ends_with_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("LITELLM_BASE_URL", "https://example.test/compatible-mode/v1")
+    agent = OlympusInteractAgent(
+        logs_dir=tmp_path / "logs",
+        olympus_install_command="true",
+        install_pi=False,
+    )
+    env = FakeEnvironment()
+    with caplog.at_level("WARNING"):
+        asyncio.run(agent.setup(env))
+    assert any("appends '/v1' automatically" in rec.message for rec in caplog.records)

@@ -996,6 +996,15 @@ class OrchestrateStage:
             binding_lines.append(
                 f"Set design_id='{design.design_id}' and design_hash='{design.content_hash}'."
             )
+            if modular:
+                allowed_refs = sorted(
+                    {m.id for m in design.modules} | {i.id for i in design.interfaces}
+                )
+                allowed_refs_csv = ", ".join(allowed_refs) if allowed_refs else "(none)"
+                binding_lines.append(
+                    "Allowed task.design_refs IDs (use ONLY IDs from this exact set; NEVER "
+                    f"data_models or invariant names): {allowed_refs_csv}."
+                )
         if spec is not None:
             binding_lines.append(
                 f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'."
