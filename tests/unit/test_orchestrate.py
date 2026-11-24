@@ -5916,7 +5916,7 @@ def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
         constraints=[
             "Test freeze: do not modify `tests/test_frozen.py` or `tests/frozen_*.py`",
             "Do not create `docs/README` or `types.d.ts`",
-            "Do not modify docs/CHANGELOG",
+            "Do not modify docs/CHANGELOG or `.env`",
         ],
     )
 
@@ -5931,6 +5931,7 @@ def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
     assert "docs/README" in forbidden
     assert "types.d.ts" in forbidden
     assert "docs/CHANGELOG" in forbidden
+    assert ".env" in forbidden
 
 
 

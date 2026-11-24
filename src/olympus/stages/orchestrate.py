@@ -359,7 +359,8 @@ def _is_explicit_spec_path(
             or any(part[:1].islower() for part in parts)
             or has_file_ext
         )
-    return (backticked or single_token) and has_file_ext
+    is_dotfile = norm.startswith(".") and len(norm) > 1 and norm[1].isalnum()
+    return (backticked or single_token) and (has_file_ext or is_dotfile)
 
 
 def _extract_spec_path_candidates(text: str, workspace_root: Path) -> list[str]:
