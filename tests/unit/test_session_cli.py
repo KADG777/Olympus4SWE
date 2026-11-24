@@ -2764,21 +2764,28 @@ def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: 
     assert failed_intent.action == "revise"
     assert failed_intent.feedback == "Redo the interrupted step after the transient network error."
 
-    # 5. Questions with negated revision + approval token must NEVER trigger approve/revise.
+    # 5. Pure or negated proceed/approve questions must NEVER trigger approve/revise.
     blocked_no_spec = {"status": RunStatus.AWAITING_HUMAN, "spec": None, "plan": None}
-    for provider_impl in (
-        MockLLMProvider(responses=[LLMResponse(content="not json")]),
-        MockLLMProvider(
-            responses=[LLMResponse(content=json.dumps({"action": "approve", "message": "ok"}))]
-        ),
+    for test_snap, test_pause in (
+        (blocked_no_spec, PauseKind.BLOCKED),
+        (failed_snap, None),
     ):
-        question_intent = parse_reply(
-            provider=provider_impl,
-            message="Keep everything unchanged. Should we proceed?",
-            snapshot=blocked_no_spec,
-            pause_kind=PauseKind.BLOCKED,
-        )
-        assert question_intent.action == "unknown", question_intent
+        for test_msg in ("Should we proceed?", "Keep everything unchanged. Should we proceed?"):
+            for provider_impl in (
+                MockLLMProvider(responses=[LLMResponse(content="not json")]),
+                MockLLMProvider(
+                    responses=[
+                        LLMResponse(content=json.dumps({"action": "approve", "message": "ok"}))
+                    ]
+                ),
+            ):
+                question_intent = parse_reply(
+                    provider=provider_impl,
+                    message=test_msg,
+                    snapshot=test_snap,
+                    pause_kind=test_pause,
+                )
+                assert question_intent.action == "unknown", (test_msg, test_pause, question_intent)
 
     # 6. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
     assert SessionConfig(workspace_root=tmp_path).worker_max_steps == 40

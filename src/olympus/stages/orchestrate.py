@@ -404,11 +404,13 @@ def _format_spec_context(spec: GoalSpec, *, task: TaskNode | None = None) -> str
             lines.append("Referenced requirements (MUST satisfy):")
             for req in matched_reqs:
                 lines.append(f"- {req.id}: {req.description}")
-                if req.ears_criteria:
-                    for crit in req.ears_criteria:
-                        lines.append(f"  * {crit.id}: {crit.to_ears_text()}")
-                else:
-                    for criterion in req.acceptance_criteria:
+                rendered_ears: set[str] = set()
+                for crit in req.ears_criteria:
+                    ears_text = crit.to_ears_text()
+                    rendered_ears.add(ears_text)
+                    lines.append(f"  * {crit.id}: {ears_text}")
+                for criterion in req.acceptance_criteria:
+                    if criterion not in rendered_ears:
                         lines.append(f"  * {criterion}")
     lines.extend(
         [
@@ -1278,7 +1280,7 @@ class OrchestrateStage:
             [r.model_dump(mode="json") for r in relevant_reqs], ensure_ascii=False
         )
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
-        spec_ctx = _format_spec_context(spec, task=task)
+        spec_ctx = _format_spec_context(spec)
         design_ctx = _format_design_context(design, task=task)
         diff_summary = "\n".join(_diff_summary_lines(diff_text)) or "- (none detected)"
         inline_diff, diff_truncated = _bounded_inline_diff(diff_text)

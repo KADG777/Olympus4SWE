@@ -5818,6 +5818,10 @@ def test_format_spec_and_design_context_expand_referenced_ids() -> None:
             RequirementItem(
                 id="R1",
                 description="Reject division by zero with a clear error message",
+                acceptance_criteria=[
+                    "IF divisor is zero THEN THE SYSTEM SHALL raise ValueError('division by zero')",
+                    "Each division completes in under 5 ms",
+                ],
                 ears_criteria=[
                     AcceptanceCriterion(
                         id="R1-C1",
@@ -5871,6 +5875,8 @@ def test_format_spec_and_design_context_expand_referenced_ids() -> None:
         "R1-C1: IF divisor is zero THEN THE SYSTEM SHALL raise ValueError('division by zero')"
         in spec_ctx
     )
+    assert "Each division completes in under 5 ms" in spec_ctx
+    assert spec_ctx.count("raise ValueError('division by zero')") == 1
     assert "Unreferenced requirement" not in spec_ctx
 
     design_ctx = _format_design_context(design, task=task)

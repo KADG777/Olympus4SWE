@@ -416,6 +416,11 @@ def _merge_default_and_explicit(
     return default_answers, default_resolutions
 
 
+def _is_approval_question(message: str, lowered: str) -> bool:
+    """True for pure confirmation/proceed questions that must never trigger execution."""
+    return _is_question(message) and any(token in lowered for token in _APPROVE_TOKENS)
+
+
 def _keyword_fallback(
     message: str,
     *,
@@ -462,6 +467,7 @@ def _keyword_fallback(
     if (
         pause_kind == PauseKind.BLOCKED
         and _has_actionable_text(message)
+        and not _is_approval_question(message, text)
         and not (_negated_revision(text) or _negated_defaults(text))
     ):
         # Any concrete hint (path, symbol, diagnosis, redirect) is actionable recovery
@@ -541,8 +547,12 @@ def _sanitize(
         )
         action = "revise" if revise else "unknown"
         feedback = message.strip() if revise else ""
-    elif action == "approve" and _negated_revision(lowered):
-        # A "do not change anything / keep unchanged" reply is never an approval.
+    elif (
+        action == "approve"
+        and _negated_revision(lowered)
+        and not any(token in lowered for token in _APPROVE_TOKENS)
+    ):
+        # A pure "do not change anything" reply is never an approval.
         action = "unknown"
         feedback = ""
     if action == "reopen" and (_negated_approval(lowered) or _negated_defaults(lowered)):
@@ -562,6 +572,7 @@ def _sanitize(
         action in ("unknown", "approve", "reopen")
         and pause_kind == PauseKind.BLOCKED
         and _has_actionable_text(message)
+        and not _is_approval_question(message, lowered)
         and not _negated_revision(lowered)
         and not _negated_approval(lowered)
         and not _negated_defaults(lowered)
@@ -629,6 +640,7 @@ def _fast_path_intent(
     if (
         (pause_kind == PauseKind.BLOCKED or snapshot.get("status") == RunStatus.FAILED)
         and _has_actionable_text(message)
+        and not _is_question(message)
         and not (
             _negated_revision(lowered)
             or _negated_approval(lowered)
