@@ -1425,23 +1425,54 @@ class UserEnabledOlympusAgent(BaseAgent):
             if (
                 parsed is not None
                 and envelope.status == "needs_input"
-                and self._run_id
                 and is_infrastructure_block(dict(envelope.raw))
-                and attempt < self._infra_retries
-                and not self._budget_exhausted()
             ):
-                attempt += 1
-                self._write_turn_artifacts(
-                    turn, command, outcome, suffix=f"-infra-retry-{attempt}"
+                if (
+                    self._run_id
+                    and attempt < self._infra_retries
+                    and not self._budget_exhausted()
+                ):
+                    attempt += 1
+                    self._write_turn_artifacts(
+                        turn, command, outcome, suffix=f"-infra-retry-{attempt}"
+                    )
+                    self._record_event(turn, f"infra_retry_{attempt}")
+                    if self._infra_retry_backoff_sec > 0:
+                        await asyncio.sleep(self._infra_retry_backoff_sec)
+                    current_action = "reply"
+                    current_message = (
+                        "Redo the interrupted step after the transient network error."
+                    )
+                    continue
+                # Exhausted local retries (or budget): fail cleanly without consulting
+                # the simulated user or polluting conversation.jsonl with infra errors.
+                self._write_turn_artifacts(turn, command, outcome)
+                self._record_event(turn, "infra_retries_exhausted")
+                failed_raw = {
+                    **dict(envelope.raw),
+                    "status": "failed",
+                    "error": envelope.error or envelope.message,
+                }
+                (self.logs_dir / f"envelope-{turn}.json").write_text(
+                    json.dumps(
+                        _redact_json_value(failed_raw, self._redaction_secrets),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
-                self._record_event(turn, f"infra_retry_{attempt}")
-                if self._infra_retry_backoff_sec > 0:
-                    await asyncio.sleep(self._infra_retry_backoff_sec)
-                current_action = "reply"
-                current_message = (
-                    "Redo the interrupted step after the transient network error."
+                return SessionEnvelopeView(
+                    run_id=envelope.run_id or self._run_id,
+                    status="failed",
+                    message=envelope.message,
+                    pause_kind=envelope.pause_kind,
+                    workflow=envelope.workflow,
+                    unresolved_blockers=envelope.unresolved_blockers,
+                    changed_files=envelope.changed_files,
+                    error=envelope.error or envelope.message,
+                    raw=failed_raw,
                 )
-                continue
             break
 
         self._write_turn_artifacts(turn, command, outcome)

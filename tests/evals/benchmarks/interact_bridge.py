@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -54,6 +56,8 @@ _ACTIVE_RUN_STATUSES = frozenset(
     {"running", "aligning", "designing", "planning", "executing"}
 )
 _PID_FILE_NAME = "bridge-pid.json"
+_LOCK_FILE_NAME = "bridge.lock"
+_SESSION_ENV_VAR = "OLYMPUS_BRIDGE_SESSION"
 
 DEFAULT_INITIAL_QUESTION = (
     "Hi! I'm starting work in this repository. What change would you like me to make? "
@@ -214,103 +218,212 @@ def _is_pid_alive(pid: int) -> bool:
         return exc.errno == errno.EPERM
 
 
-def _descendant_pids(root_pids: set[int]) -> list[int]:
-    """Best-effort Linux /proc traversal to find child/grandchild PIDs."""
+def _proc_stat_fields(pid: int) -> tuple[int, int, int] | None:
+    """Return ``(ppid, pgid, start_ticks)`` from ``/proc/<pid>/stat``, or None."""
+    if pid <= 1:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    rparen = stat.rfind(")")
+    if rparen < 0:
+        return None
+    parts = stat[rparen + 2 :].split()
+    if len(parts) <= 19:
+        return None
+    try:
+        # After ')': [0]=state, [1]=ppid, [2]=pgrp, ..., [19]=starttime
+        return int(parts[1]), int(parts[2]), int(parts[19])
+    except ValueError:
+        return None
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    fields = _proc_stat_fields(pid)
+    return fields[2] if fields is not None else None
+
+
+def _proc_has_env_token(pid: int, token: str) -> bool:
+    if pid <= 1 or not token:
+        return False
+    needle = f"{_SESSION_ENV_VAR}={token}".encode()
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return needle in raw.split(b"\x00")
+
+
+def _db_has_live_holder(db_path: Path) -> bool:
+    """Return True if another live process has ``db_path`` (or its WAL/SHM/journal) open."""
     proc_root = Path("/proc")
-    if not proc_root.is_dir() or not root_pids:
-        return []
-    children_by_ppid: dict[int, list[int]] = {}
+    if not proc_root.is_dir():
+        return False
+    try:
+        resolved = str(db_path.resolve())
+    except OSError:
+        resolved = str(db_path)
+    targets = {
+        resolved,
+        f"{resolved}-wal",
+        f"{resolved}-shm",
+        f"{resolved}-journal",
+    }
+    own_pid = os.getpid()
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
+        if pid == own_pid:
+            continue
+        fd_dir = entry / "fd"
         try:
-            stat = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+            fd_entries = list(fd_dir.iterdir())
         except OSError:
             continue
-        rparen = stat.rfind(")")
-        if rparen < 0:
+        for fd_entry in fd_entries:
+            try:
+                link_target = os.readlink(fd_entry)
+            except OSError:
+                continue
+            if link_target in targets:
+                return True
+    return False
+
+
+def _collect_verified_targets(
+    *,
+    pid: int | None,
+    pgid: int | None,
+    start_ticks: int | None,
+    session_token: str | None,
+) -> set[int]:
+    """Return live PIDs verified to belong to a prior bridge/olympus invocation.
+
+    Never returns PIDs that fail identity verification (preventing PID-reuse kills).
+    """
+    own_pid = os.getpid()
+    own_pgid = os.getpgrp()
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+
+    proc_info: dict[int, tuple[int, int, int]] = {}
+    children_by_ppid: dict[int, list[int]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
             continue
-        parts = stat[rparen + 2 :].split()
-        if len(parts) < 2:
+        cur_pid = int(entry.name)
+        if cur_pid <= 1 or cur_pid == own_pid:
             continue
-        try:
-            ppid = int(parts[1])
-        except ValueError:
+        fields = _proc_stat_fields(cur_pid)
+        if fields is None:
             continue
-        children_by_ppid.setdefault(ppid, []).append(pid)
-    descendants: list[int] = []
-    seen = set(root_pids)
-    queue = list(root_pids)
+        ppid, cur_pgid, cur_ticks = fields
+        proc_info[cur_pid] = (ppid, cur_pgid, cur_ticks)
+        children_by_ppid.setdefault(ppid, []).append(cur_pid)
+
+    seeds: set[int] = set()
+    root_verified = False
+    if pid is not None and pid in proc_info and start_ticks is not None:
+        _, _, cur_ticks = proc_info[pid]
+        if cur_ticks == start_ticks:
+            seeds.add(pid)
+            root_verified = True
+
+    if session_token:
+        for cur_pid in proc_info:
+            if _proc_has_env_token(cur_pid, session_token):
+                seeds.add(cur_pid)
+
+    # If we have a verified process group (either via the verified leader or via a
+    # surviving member carrying the session token), include all group members started
+    # at or after the group leader so SIGTERM-ignoring siblings cannot escape.
+    if (
+        pgid is not None
+        and pgid > 1
+        and pgid != own_pgid
+        and start_ticks is not None
+        and (root_verified or any(proc_info[s][1] == pgid for s in seeds if s in proc_info))
+    ):
+        for cur_pid, (_ppid, cur_pgid, cur_ticks) in proc_info.items():
+            if cur_pgid == pgid and cur_ticks >= start_ticks:
+                seeds.add(cur_pid)
+
+    if not seeds:
+        return set()
+
+    matched = set(seeds)
+    queue = list(seeds)
     while queue:
         cur = queue.pop(0)
         for child in children_by_ppid.get(cur, ()):
-            if child not in seen:
-                seen.add(child)
-                descendants.append(child)
+            if child not in matched:
+                matched.add(child)
                 queue.append(child)
-    return descendants
-
-
-def _send_signal_safe(pid: int | None, pgid: int | None, sig: int) -> bool:
-    own_pid = os.getpid()
-    own_pgid = os.getpgrp()
-    sent = False
-    if pgid is not None and pgid > 1 and pgid != own_pgid:
-        try:
-            os.killpg(pgid, sig)
-            sent = True
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    if pid is not None and pid > 1 and pid != own_pid:
-        try:
-            os.kill(pid, sig)
-            sent = True
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    return sent
+    return {p for p in matched if _is_pid_alive(p)}
 
 
 def _terminate_process_tree(
     *,
     pid: int | None,
     pgid: int | None,
-    wait_sec: float = 2.0,
+    start_ticks: int | None = None,
+    session_token: str | None = None,
+    wait_sec: float = 1.5,
 ) -> bool:
-    """Terminate a process group and any detached descendants safely."""
-    own_pid = os.getpid()
-    own_pgid = os.getpgrp()
-    roots = {p for p in (pid,) if p is not None and p > 1 and p != own_pid}
-    descendants = [p for p in _descendant_pids(roots) if p != own_pid]
-    tracked_pids = [p for p in (*roots, *descendants) if _is_pid_alive(p)]
-    has_pgid = pgid is not None and pgid > 1 and pgid != own_pgid
-    if not tracked_pids and not has_pgid:
+    """Terminate verified process-tree targets (group members + detached descendants)."""
+    targets = _collect_verified_targets(
+        pid=pid, pgid=pgid, start_ticks=start_ticks, session_token=session_token
+    )
+    if not targets:
         return False
-    # Signal the parent/group first with SIGTERM so it can reap children cleanly,
-    # then signal any detached descendants (e.g. start_new_session=True workers).
-    any_sent = _send_signal_safe(pid, pgid, signal.SIGTERM)
-    for child in descendants:
+
+    # Pin verified (pid -> start_ticks) so members that survive leader exit
+    # remain tracked without risking PID-reuse collisions.
+    captured: dict[int, int | None] = {p: _proc_start_ticks(p) for p in targets}
+
+    def _still_alive() -> set[int]:
+        live = _collect_verified_targets(
+            pid=pid, pgid=pgid, start_ticks=start_ticks, session_token=session_token
+        )
+        for p in live:
+            captured.setdefault(p, _proc_start_ticks(p))
+        for p, ticks in list(captured.items()):
+            if ticks is not None and _proc_start_ticks(p) == ticks:
+                live.add(p)
+        return live
+
+    any_sent = False
+    for target in sorted(targets):
         try:
-            child_pgid = os.getpgid(child)
-        except OSError:
-            child_pgid = None
-        if _send_signal_safe(child, child_pgid, signal.SIGTERM):
+            os.kill(target, signal.SIGTERM)
             any_sent = True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     if not any_sent:
         return False
+
     deadline = time.monotonic() + max(0.0, wait_sec)
     while time.monotonic() < deadline:
-        if not any(_is_pid_alive(p) for p in (*roots, *descendants)):
+        if not _still_alive():
             return True
         time.sleep(0.05)
-    _send_signal_safe(pid, pgid, signal.SIGKILL)
-    for child in descendants:
-        if _is_pid_alive(child):
-            try:
-                child_pgid = os.getpgid(child)
-            except OSError:
-                child_pgid = None
-            _send_signal_safe(child, child_pgid, signal.SIGKILL)
+
+    for target in sorted(_still_alive()):
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(target, signal.SIGKILL)
+
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        still = _still_alive()
+        if not still:
+            break
+        for target in sorted(still):
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(target, signal.SIGKILL)
+        time.sleep(0.05)
     return True
 
 
@@ -396,29 +509,73 @@ class InteractBridge:
         self.dialogue: list[dict[str, str]] = []
         self.run_id = ""
         self.token_usage: dict[str, Any] | None = None
+        self._session_token = uuid.uuid4().hex
+        self._bridge_start_ticks = _proc_start_ticks(os.getpid())
         self._active_olympus_pid: int | None = None
         self._active_olympus_pgid: int | None = None
+        self._active_olympus_start_ticks: int | None = None
+        self._defer_signal = False
+        self._deferred_signum: int | None = None
+        self._lock_fd: int | None = None
 
     def _pid_path(self) -> Path:
         return self.config.state_dir / _PID_FILE_NAME
 
+    def _lock_path(self) -> Path:
+        return self.config.state_dir / _LOCK_FILE_NAME
+
+    def _acquire_state_lock(self) -> bool:
+        try:
+            self.config.state_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._lock_path()), os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            with suppress(OSError):
+                os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def _release_state_lock(self) -> None:
+        fd = self._lock_fd
+        self._lock_fd = None
+        if fd is None:
+            return
+        with suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(fd)
+
     def _write_pid_state(
-        self, *, olympus_pid: int | None = None, olympus_pgid: int | None = None
+        self,
+        *,
+        olympus_pid: int | None = None,
+        olympus_pgid: int | None = None,
+        olympus_start_ticks: int | None = None,
     ) -> None:
         self._active_olympus_pid = olympus_pid
         self._active_olympus_pgid = olympus_pgid
+        self._active_olympus_start_ticks = olympus_start_ticks
         try:
             self.config.state_dir.mkdir(parents=True, exist_ok=True)
             payload = {
                 "bridge_pid": os.getpid(),
                 "bridge_pgid": os.getpgrp(),
+                "bridge_start_ticks": self._bridge_start_ticks,
                 "olympus_pid": olympus_pid,
                 "olympus_pgid": olympus_pgid,
+                "olympus_start_ticks": olympus_start_ticks,
+                "session_token": self._session_token,
                 "updated_at": time.time(),
             }
-            self._pid_path().write_text(
+            tmp_path = self.config.state_dir / f".{_PID_FILE_NAME}.{os.getpid()}.tmp"
+            tmp_path.write_text(
                 json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
             )
+            os.replace(tmp_path, self._pid_path())
         except OSError:
             pass
 
@@ -428,9 +585,9 @@ class InteractBridge:
             if not path.is_file():
                 return
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and payload.get("bridge_pid") not in (
+            if isinstance(payload, dict) and payload.get("session_token") not in (
                 None,
-                os.getpid(),
+                self._session_token,
             ):
                 return
             path.unlink(missing_ok=True)
@@ -440,13 +597,20 @@ class InteractBridge:
     def terminate_active_subprocess(self) -> None:
         pid = self._active_olympus_pid
         pgid = self._active_olympus_pgid
+        start_ticks = self._active_olympus_start_ticks
         self._active_olympus_pid = None
         self._active_olympus_pgid = None
+        self._active_olympus_start_ticks = None
         if pid is not None or pgid is not None:
-            _terminate_process_tree(pid=pid, pgid=pgid)
+            _terminate_process_tree(
+                pid=pid,
+                pgid=pgid,
+                start_ticks=start_ticks,
+                session_token=self._session_token,
+            )
 
     def _cleanup_stale_processes(self) -> None:
-        """Terminate any orphaned bridge/olympus processes left by an external step timeout."""
+        """Terminate any verified orphaned bridge/olympus processes from an earlier step."""
         path = self._pid_path()
         if not path.is_file():
             return
@@ -458,19 +622,26 @@ class InteractBridge:
             return
         if not isinstance(payload, dict):
             return
-        own_pid = os.getpid()
+        prev_token = payload.get("session_token")
+        if prev_token == self._session_token:
+            return
         prev_bridge_pid = payload.get("bridge_pid")
         prev_bridge_pgid = payload.get("bridge_pgid")
+        prev_bridge_ticks = payload.get("bridge_start_ticks")
         prev_olympus_pid = payload.get("olympus_pid")
         prev_olympus_pgid = payload.get("olympus_pgid")
-        if prev_bridge_pid == own_pid:
-            return
+        prev_olympus_ticks = payload.get("olympus_start_ticks")
+        token_str = str(prev_token) if isinstance(prev_token, str) and prev_token else None
         cleaned = False
         if (
-            isinstance(prev_olympus_pid, int) or isinstance(prev_olympus_pgid, int)
+            isinstance(prev_olympus_pid, int)
+            or isinstance(prev_olympus_pgid, int)
+            or token_str is not None
         ) and _terminate_process_tree(
             pid=prev_olympus_pid if isinstance(prev_olympus_pid, int) else None,
             pgid=prev_olympus_pgid if isinstance(prev_olympus_pgid, int) else None,
+            start_ticks=prev_olympus_ticks if isinstance(prev_olympus_ticks, int) else None,
+            session_token=token_str,
         ):
             cleaned = True
         if (
@@ -478,6 +649,8 @@ class InteractBridge:
         ) and _terminate_process_tree(
             pid=prev_bridge_pid if isinstance(prev_bridge_pid, int) else None,
             pgid=prev_bridge_pgid if isinstance(prev_bridge_pgid, int) else None,
+            start_ticks=prev_bridge_ticks if isinstance(prev_bridge_ticks, int) else None,
+            session_token=token_str,
         ):
             cleaned = True
         with suppress(OSError):
@@ -492,39 +665,95 @@ class InteractBridge:
     def _recover_stranded_active_runs(self, run_id: str | None = None) -> None:
         """Reset stranded active run statuses in ``olympus.db`` after orphan cleanup.
 
-        Only invoked once no live bridge/olympus process owns ``state_dir``, so
-        an externally killed step cannot deadlock subsequent steps with
-        ``Run <id> is currently active (...)``.
+        Only mutates ``runs`` when no live process holds ``olympus.db`` open, and
+        inserts a matching ``events`` row in the same transaction so ``state_revision``
+        stays consistent with ``RunStore``.
         """
         db_path = self.config.state_dir / "olympus.db"
         if not db_path.is_file() or db_path.stat().st_size == 0:
             return
+        if _db_has_live_holder(db_path):
+            self.log("bridge.stranded_run_recovery_skipped", reason="db_held_by_live_process")
+            return
         conn: sqlite3.Connection | None = None
         recovered: list[tuple[str, str]] = []
         try:
-            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            conn = sqlite3.connect(str(db_path), timeout=0.5, isolation_level=None)
+            conn.execute("BEGIN IMMEDIATE")
+            if _db_has_live_holder(db_path):
+                conn.execute("ROLLBACK")
+                self.log(
+                    "bridge.stranded_run_recovery_skipped",
+                    reason="db_held_by_live_process",
+                )
+                return
+            has_events_table = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+                ).fetchone()
+                is not None
+            )
             if run_id:
                 rows = conn.execute(
-                    "SELECT run_id, status FROM runs WHERE run_id = ?",
+                    "SELECT run_id, status, state_revision FROM runs WHERE run_id = ?",
                     (run_id,),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT run_id, status FROM runs").fetchall()
+                rows = conn.execute(
+                    "SELECT run_id, status, state_revision FROM runs"
+                ).fetchall()
             now_iso = datetime.now(UTC).isoformat()
-            for row_run_id, status in rows:
+            for row_run_id, status, rev in rows:
                 status_str = str(status or "").strip().lower()
                 if status_str not in _ACTIVE_RUN_STATUSES:
                     continue
+                new_rev = int(rev) + 1
                 cur = conn.execute(
-                    "UPDATE runs SET status = ?, state_revision = state_revision + 1, "
-                    "updated_at = ? WHERE run_id = ? AND status = ?",
-                    ("paused", now_iso, str(row_run_id), str(status)),
+                    "UPDATE runs SET status = ?, state_revision = ?, "
+                    "updated_at = ? WHERE run_id = ? AND status = ? AND state_revision = ?",
+                    ("paused", new_rev, now_iso, str(row_run_id), str(status), int(rev)),
                 )
                 if cur.rowcount:
+                    if has_events_table:
+                        seq_row = conn.execute(
+                            "SELECT COALESCE(MAX(event_seq), 0) FROM events WHERE run_id = ?",
+                            (str(row_run_id),),
+                        ).fetchone()
+                        next_seq = int(seq_row[0]) + 1 if seq_row else 1
+                        payload_json = json.dumps(
+                            {
+                                "from_status": status_str,
+                                "to_status": "paused",
+                                "reason": "recovered_stranded_active_run",
+                            },
+                            sort_keys=True,
+                        )
+                        conn.execute(
+                            "INSERT INTO events "
+                            "(run_id, event_seq, event_id, stage, event_type, actor, "
+                            "payload_json, state_revision, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                str(row_run_id),
+                                next_seq,
+                                f"evt-{uuid.uuid4().hex[:12]}",
+                                "session",
+                                "run.status_changed",
+                                "bridge",
+                                payload_json,
+                                new_rev,
+                                now_iso,
+                            ),
+                        )
                     recovered.append((str(row_run_id), status_str))
             if recovered:
-                conn.commit()
+                conn.execute("COMMIT")
+            else:
+                conn.execute("ROLLBACK")
         except sqlite3.Error as exc:
+            if conn is not None:
+                with suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
             self.log("bridge.stranded_run_recovery_error", error=str(exc))
             return
         finally:
@@ -540,7 +769,8 @@ class InteractBridge:
 
     def run(self) -> None:
         self._cleanup_stale_processes()
-        self._recover_stranded_active_runs()
+        if self._acquire_state_lock():
+            self._recover_stranded_active_runs()
         self._write_pid_state()
         try:
             if self.config.phase == "plan":
@@ -554,6 +784,7 @@ class InteractBridge:
         finally:
             self.terminate_active_subprocess()
             self._clear_pid_state()
+            self._release_state_lock()
 
     def _run_plan(self) -> None:
         goal = self._initial_goal()
@@ -895,43 +1126,81 @@ class InteractBridge:
     def _run_olympus_subprocess(
         self, argv: list[str], env: dict[str, str]
     ) -> subprocess.CompletedProcess[str]:
+        child_env = dict(env)
+        child_env[_SESSION_ENV_VAR] = self._session_token
         if subprocess.run is not _ORIG_SUBPROCESS_RUN:
             return subprocess.run(
                 argv,
                 capture_output=True,
                 text=True,
                 timeout=self.config.session_timeout,
-                env=env,
+                env=child_env,
                 check=False,
             )
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
+        self._defer_signal = True
         try:
-            pgid: int | None = os.getpgid(proc.pid)
-        except OSError:
-            pgid = proc.pid
-        self._write_pid_state(olympus_pid=proc.pid, olympus_pgid=pgid)
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=child_env,
+                start_new_session=True,
+            )
+            try:
+                pgid: int | None = os.getpgid(proc.pid)
+            except OSError:
+                pgid = proc.pid
+            start_ticks = _proc_start_ticks(proc.pid)
+            self._write_pid_state(
+                olympus_pid=proc.pid,
+                olympus_pgid=pgid,
+                olympus_start_ticks=start_ticks,
+            )
+        finally:
+            self._defer_signal = False
+        if self._deferred_signum is not None:
+            signum = self._deferred_signum
+            self._deferred_signum = None
+            self.terminate_active_subprocess()
+            self._close_and_reap(proc)
+            raise BridgeError(
+                f"bridge interrupted by signal {signum}", EXIT_SESSION_FAILED
+            )
         try:
             stdout, stderr = proc.communicate(timeout=self.config.session_timeout)
-        except subprocess.TimeoutExpired:
-            _terminate_process_tree(pid=proc.pid, pgid=pgid)
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
+        except BaseException:
+            _terminate_process_tree(
+                pid=proc.pid,
+                pgid=pgid,
+                start_ticks=start_ticks,
+                session_token=self._session_token,
+                wait_sec=1.0,
+            )
+            self._close_and_reap(proc)
             raise
         finally:
-            self._write_pid_state(olympus_pid=None, olympus_pgid=None)
+            self._write_pid_state(
+                olympus_pid=None, olympus_pgid=None, olympus_start_ticks=None
+            )
         return subprocess.CompletedProcess(
             argv, proc.returncode if proc.returncode is not None else 1, stdout, stderr
         )
+
+    @staticmethod
+    def _close_and_reap(proc: subprocess.Popen[str]) -> None:
+        """Close pipes before waiting so detached descendants cannot hang reap."""
+        for pipe in (proc.stdout, proc.stderr, proc.stdin):
+            if pipe is not None:
+                with suppress(OSError):
+                    pipe.close()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                proc.kill()
+            with suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=2.0)
 
     def invoke(self, subcommand: str, message: str, *, step_mode: str) -> dict[str, Any]:
         argv = self.session_argv(subcommand, message, step_mode)
@@ -1253,6 +1522,9 @@ def main(argv: list[str] | None = None) -> int:
     prev_handlers: dict[int, Any] = {}
 
     def _handle_termination(signum: int, _frame: Any) -> None:
+        if bridge._defer_signal:
+            bridge._deferred_signum = signum
+            return
         bridge.terminate_active_subprocess()
         raise BridgeError(
             f"bridge interrupted by signal {signum}", EXIT_SESSION_FAILED

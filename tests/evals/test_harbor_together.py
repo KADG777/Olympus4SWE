@@ -2403,3 +2403,36 @@ def test_transient_infra_block_retried_locally_without_consulting_user(
     assert "ECONNRESET" not in convo
     assert "infra_retry_1" in convo
     assert "Implemented cleanly." in convo
+
+
+def test_exhausted_infra_retries_stop_cleanly_without_consulting_user(
+    tmp_path: Path,
+) -> None:
+    err_env = _envelope(
+        "needs_input",
+        "pi driver stopped before returning TaskPlan: pi_error: terminated: read ECONNRESET",
+        pause_kind="blocked",
+        run_id="run-infra-fail",
+    )
+    handler = _SessionHandler([err_env, err_env, err_env])
+    user = _StubUser(["Should never be consulted"])
+    agent, environment = _make_agent(
+        tmp_path,
+        handler,
+        user,
+        call_user_on_completion=True,
+        infra_retries=2,
+        infra_retry_backoff_sec=0.0,
+    )
+
+    asyncio.run(agent.setup(environment))
+    asyncio.run(agent.run("Fix the Windows paths", environment, SimpleNamespace(metadata=None)))
+
+    assert user.calls == []
+    session_cmds = [cmd for cmd in environment.commands() if "session " in cmd]
+    assert len(session_cmds) == 3
+    convo = (tmp_path / "logs" / "conversation.jsonl").read_text(encoding="utf-8")
+    assert "ECONNRESET" not in convo
+    assert "infra_retries_exhausted" in convo
+    final_env = json.loads((tmp_path / "logs" / "envelope-0.json").read_text(encoding="utf-8"))
+    assert final_env["status"] == "failed"

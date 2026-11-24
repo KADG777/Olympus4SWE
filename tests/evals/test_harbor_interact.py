@@ -2580,32 +2580,41 @@ def test_interact_bridge_cleans_stale_process_and_recovers_stranded_active_run(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
     )
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
     try:
+        from tests.evals.benchmarks.interact_bridge import _proc_start_ticks
+
+        orphan_ticks = _proc_start_ticks(orphan.pid)
+        assert orphan_ticks is not None
         (state_dir / "bridge-pid.json").write_text(
             json.dumps(
                 {
                     "bridge_pid": orphan.pid,
                     "bridge_pgid": orphan.pid,
-                    "olympus_pid": None,
-                    "olympus_pgid": None,
+                    "bridge_start_ticks": orphan_ticks,
+                    "olympus_pid": unrelated.pid,
+                    "olympus_pgid": unrelated.pid,
+                    # Mismatched start ticks simulate OS PID reuse -> must NOT kill unrelated.
+                    "olympus_start_ticks": (orphan_ticks or 1) + 999_999,
+                    "session_token": "stale-token",
                 }
             ),
             encoding="utf-8",
         )
-        # Seed a stranded active run in olympus.db (stuck in 'aligning' after external timeout).
+        # Seed a stranded active run in a real RunStore DB (stuck in 'aligning').
+        from olympus.core.contracts import RunMode, RunStatus
+        from olympus.core.store import RunStore
+
         db_path = state_dir / "olympus.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "CREATE TABLE runs ("
-            "run_id TEXT PRIMARY KEY, status TEXT NOT NULL, "
-            "state_revision INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+        store = RunStore(db_path)
+        run_id = store.create_run(
+            title="stranded", mode=RunMode.EXECUTION, workspace_root=repo
         )
-        conn.execute(
-            "INSERT INTO runs (run_id, status, state_revision, updated_at) "
-            "VALUES ('run-stranded', 'aligning', 3, '2026-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
+        store.set_run_status(run_id, RunStatus.ALIGNING, actor="test", stage="align")
+        prev_rev = int(store.get_run(run_id)["state_revision"])
 
         args = build_parser().parse_args(
             [
@@ -2630,24 +2639,177 @@ def test_interact_bridge_cleans_stale_process_and_recovers_stranded_active_run(
 
         orphan.wait(timeout=5)
         assert orphan.returncode is not None
+        # Unrelated process whose PID did not match start_ticks must still be alive!
+        assert unrelated.poll() is None
         assert not (state_dir / "bridge-pid.json").exists()
 
+        # Both runs.status/state_revision AND events.state_revision must be updated together.
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
-            "SELECT status, state_revision FROM runs WHERE run_id = 'run-stranded'"
+            "SELECT status, state_revision FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        max_evt_rev = conn.execute(
+            "SELECT MAX(state_revision) FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        conn.close()
+        assert row == ("paused", prev_rev + 1)
+        assert max_evt_rev == prev_rev + 1
+    finally:
+        for proc in (orphan, unrelated):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+def test_interact_bridge_skips_recovery_when_live_process_holds_db(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+    from unittest.mock import Mock
+
+    from olympus.core.contracts import RunMode, RunStatus
+    from olympus.core.store import RunStore
+    from tests.evals.benchmarks.interact_bridge import (
+        InteractBridge,
+        build_parser,
+        config_from_args,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    db_path = state_dir / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(title="active", mode=RunMode.EXECUTION, workspace_root=repo)
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="test", stage="align")
+    prev_rev = int(store.get_run(run_id)["state_revision"])
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sqlite3, sys, time; "
+                "c = sqlite3.connect(sys.argv[1]); "
+                "c.execute('SELECT 1 FROM runs').fetchall(); "
+                "print('ready', flush=True); time.sleep(30)"
+            ),
+            str(db_path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        args = build_parser().parse_args(
+            [
+                "--phase",
+                "plan",
+                "--workspace",
+                str(repo),
+                "--state-dir",
+                str(state_dir),
+                "--plan-out",
+                str(tmp_path / "plan.md"),
+                "--goal",
+                "Build feature",
+            ]
+        )
+        bridge = InteractBridge(config_from_args(args), client=Mock(), environ={})
+        bridge._recover_stranded_active_runs()
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT status, state_revision FROM runs WHERE run_id = ?", (run_id,)
         ).fetchone()
         conn.close()
-        assert row == ("paused", 4)
+        assert row == ("running", prev_rev)
     finally:
-        if orphan.poll() is None:
-            orphan.kill()
-            orphan.wait(timeout=5)
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+def test_interact_bridge_popen_timeout_kills_detached_descendant_and_sigterm_ignorer(
+    tmp_path: Path,
+) -> None:
+    import time as time_mod
+    from unittest.mock import Mock
+
+    from tests.evals.benchmarks.interact_bridge import (
+        BridgeError,
+        InteractBridge,
+        _is_pid_alive,
+        build_parser,
+        config_from_args,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    pids_file = tmp_path / "spawned-pids.json"
+    fake_olympus = tmp_path / "fake_olympus.py"
+    fake_olympus.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, signal, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"pids_file = Path({str(pids_file)!r})\n"
+        "# Spawn detached grandchild holding stdout open + SIGTERM-ignoring sibling in same pgid.\n"
+        "detached = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "ignorer = subprocess.Popen(\n"
+        "    [sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'],\n"
+        ")\n"
+        "pids_file.write_text(json.dumps({'detached': detached.pid, 'ignorer': ignorer.pid}))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake_olympus.chmod(0o755)
+
+    args = build_parser().parse_args(
+        [
+            "--phase",
+            "plan",
+            "--olympus-bin",
+            str(fake_olympus),
+            "--workspace",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--plan-out",
+            str(tmp_path / "plan.md"),
+            "--goal",
+            "Build feature",
+            "--session-timeout",
+            "0.6",
+            "--infra-retries",
+            "0",
+        ]
+    )
+    bridge = InteractBridge(config_from_args(args), client=Mock(), environ=os.environ.copy())
+    t0 = time_mod.monotonic()
+    with pytest.raises(BridgeError, match="timed out"):
+        bridge.run()
+    elapsed = time_mod.monotonic() - t0
+    # Must return promptly after 0.6s timeout + ~1s SIGTERM->SIGKILL grace (never hang 30s).
+    assert elapsed < 5.0
+    spawned = json.loads(pids_file.read_text(encoding="utf-8"))
+    assert not _is_pid_alive(spawned["detached"])
+    assert not _is_pid_alive(spawned["ignorer"])
 
 
 def test_harbor_interact_setup_warns_when_litellm_base_url_ends_with_v1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setenv("LITELLM_BASE_URL", "https://example.test/compatible-mode/v1")
+    monkeypatch.setenv(
+        "LITELLM_BASE_URL",
+        "https://alice:topsecretpass@example.test:8443/compatible-mode/v1?token=leakme",
+    )
     agent = OlympusInteractAgent(
         logs_dir=tmp_path / "logs",
         olympus_install_command="true",
@@ -2656,4 +2818,13 @@ def test_harbor_interact_setup_warns_when_litellm_base_url_ends_with_v1(
     env = FakeEnvironment()
     with caplog.at_level("WARNING"):
         asyncio.run(agent.setup(env))
-    assert any("appends '/v1' automatically" in rec.message for rec in caplog.records)
+    warnings = [
+        rec.message
+        for rec in caplog.records
+        if "appends '/v1' automatically" in rec.message
+    ]
+    assert warnings
+    assert "topsecretpass" not in warnings[0]
+    assert "alice" not in warnings[0]
+    assert "leakme" not in warnings[0]
+    assert "https://example.test:8443/compatible-mode/v1" in warnings[0]

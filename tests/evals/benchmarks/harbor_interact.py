@@ -20,6 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 try:  # Harbor is optional; only present in the benchmark operator environment.
     from harbor.agents.base import BaseAgent as _HarborAgentBase
@@ -392,14 +393,30 @@ class OlympusInteractAgent(_AgentBase or _FallbackAgent):
         except (AttributeError, ValueError):
             return _empty_model_connection()
 
+    @staticmethod
+    def _sanitize_url_for_log(url: str) -> str:
+        """Strip userinfo, query, and fragment before logging a URL."""
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{host}:{parts.port}" if parts.port is not None else host
+        if parts.scheme and netloc:
+            sanitized = f"{parts.scheme}://{netloc}{parts.path}"
+        elif netloc:
+            sanitized = f"{netloc}{parts.path}"
+        else:
+            sanitized = parts.path
+        return redact_text(sanitized)
+
     async def setup(self, environment: Any) -> None:
         """Install Olympus and the bridge scripts inside the task container."""
         litellm_base = os.environ.get("LITELLM_BASE_URL", "").strip()
-        if litellm_base.rstrip("/").endswith("/v1"):
+        if urlsplit(litellm_base).path.rstrip("/").endswith("/v1"):
             self.logger.warning(
                 "LITELLM_BASE_URL (%s) ends with '/v1'; SWE-Interact's user-server "
                 "appends '/v1' automatically, which can cause /v1/v1 404 responses.",
-                litellm_base,
+                self._sanitize_url_for_log(litellm_base),
             )
         options = self._interact
         bridge_dir = PurePosixPath(BRIDGE_DIR)
