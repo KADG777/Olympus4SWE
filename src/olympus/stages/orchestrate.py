@@ -100,7 +100,7 @@ Rules:
    (unless vertical tracer-bullet slicing applies).
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
-4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
+4. Keep tasks cohesive (prefer 1-2 checks per task, at most 3; no redundant prose checks).
    Valid acceptance_checks[*].kind values are strictly: 'command', 'independent_review', or 'human'
    (NEVER invent values like 'review'). Whenever kind='command', supply a non-empty shell string
    in 'command' (e.g. 'python -m pytest ...'); if there is no shell command, use
@@ -124,10 +124,12 @@ Rules:
 10. Ground checks in observed reality: acceptance_checks commands MUST only use paths named by
     the Observed workspace files, the task's own write_scope, and tools/packages actually
     available in the environment. NEVER invent uninstalled third-party packages, never
-    reference a test directory that neither exists nor is created inside the task's write_scope,
-    and never assume a module/runner exists without observing it. When a task creates its own
-    test file, target that exact path; otherwise prefer inline 'python -c' assertions that
-    import only artifacts the task itself delivers."""
+    reference a test directory or file that neither exists nor is created inside the task's
+    write_scope, and never assume a module/runner exists without observing it. Prefer standard
+    repo test commands (e.g. `python -m pytest <existing_or_task_test_file> -q`). When using
+    inline `python -c`, keep it to a short direct behavioral assertion; NEVER write multi-line
+    AST, regex, or `git show` diff-inspection scripts (use `independent_review` for structural
+    or diff-scope checks so checks cannot contradict each other)."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.

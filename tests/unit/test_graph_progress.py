@@ -346,6 +346,39 @@ def test_resolve_resume_node_returns_none_without_terminal_gate(store: RunStore)
     assert resolve_resume_node(definition, store.get_run(run_id), store=store) is None
 
 
+def test_resolve_resume_node_routes_to_gate_spec_on_reopened_unapproved_spec(
+    store: RunStore,
+) -> None:
+    """Reopen/clarify with unapproved GoalSpec v2 must return gate_spec, not stale downstream."""
+    from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
+
+    run_id = _new_run(store)
+    spec_v1 = _make_spec()
+    design_v1 = _make_design(spec_v1)
+    plan_v1 = _make_plan(spec_v1).model_copy(
+        update={
+            "design_id": design_v1.design_id,
+            "design_hash": design_v1.content_hash,
+        }
+    )
+    store.save_spec(run_id, spec_v1)
+    _approve(store, run_id, "spec", spec_v1)
+    store.save_design(run_id, design_v1)
+    _approve(store, run_id, "design", design_v1)
+    store.save_plan(run_id, plan_v1)
+    _approve(store, run_id, "plan", plan_v1)
+
+    # Simulate reopen -> align -> clarify saving unapproved GoalSpec v2 with stale v1 design/plan.
+    spec_v2 = spec_v1.model_copy(update={"version": 2, "goal": "Add tests in a separate commit"})
+    store.save_spec(run_id, spec_v2)
+
+    snap = store.get_run(run_id)
+    assert is_design_bound_to_spec(store, run_id, snap) is False
+    assert is_plan_bound_to_upstream(store, run_id, snap) is False
+    assert resolve_resume_node(load_workflow("full_sdlc_tdd"), snap, store=store) == "gate_spec"
+    assert resolve_resume_node(load_workflow("product_blueprint"), snap, store=store) == "gate_spec"
+
+
 # ------------------------------------------------------------------- workflow view
 
 
