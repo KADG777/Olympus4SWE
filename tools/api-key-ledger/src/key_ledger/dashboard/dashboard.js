@@ -3,6 +3,13 @@
 const $ = (id) => document.getElementById(id);
 const number = new Intl.NumberFormat();
 const connection = $("connection");
+const keyStates = new Map([
+  ["active", ["Active", "status-active"]],
+  ["cooldown", ["Cooldown", "status-waiting"]],
+  ["quarantined", ["Quarantined", "status-blocked"]],
+  ["budget_exceeded", ["Budget exceeded", "status-blocked"]],
+  ["disabled", ["Disabled", "status-muted"]],
+]);
 let loading = false;
 
 function node(tag, text, className) {
@@ -24,6 +31,11 @@ function metric(label, value) {
   const tile = node("div", undefined, "metric");
   tile.append(node("strong", value), node("span", label));
   return tile;
+}
+
+function keyState(status) {
+  const [label, style] = keyStates.get(status) || [status, "status-muted"];
+  return node("span", label, `status-chip ${style}`);
 }
 
 function chart(container, rows, label, value, annotation) {
@@ -103,7 +115,7 @@ function render(daily, models, keys, events) {
   table($("keys"), ["Pool", "Key", "Status", "Selections", "Today", "Total", "Cooldown ends"],
     keys.map((key) => [
       key.pool_id, key.key_alias,
-      node("span", key.status, key.status === "active" ? "good" : "attention"),
+      keyState(key.status),
       tokens(key.selections), amount(key.daily_spend, key.currency),
       amount(key.total_spend, key.currency), key.cooldown_until || "—",
     ]));
@@ -131,8 +143,10 @@ async function refresh() {
     ]);
     render(daily.rows, models.rows, keys.keys, events.events);
     connection.textContent = "Live";
+    connection.dataset.state = "live";
   } catch {
     connection.textContent = "Unable to refresh";
+    connection.dataset.state = "error";
   } finally {
     loading = false;
   }
