@@ -722,15 +722,18 @@ Modular product decomposition (topology={topology}):
 
 _VERTICAL_PLANNER_GUIDANCE = """
 Vertical tracer-bullet decomposition (topology={topology}):
+- Keep total slice count minimal (1-2 cohesive slices for single-package or focused changes, at
+  most 3 for multi-module work) so execution avoids redundant cold-start exploration and review
+  overhead across tiny serial slices; group closely related capabilities sharing the same files
+  into one cohesive slice instead of emitting one task per requirement.
 - If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
   `kind='contract'` task owning those paths before Slice 1.
-- Emit Slice 1 as ONE thin runnable end-to-end tracer bullet (kind='implement', role='engineer'):
-  the smallest vertical path that wires core storage/logic to one observable user-facing seam
-  named by GoalSpec.test_seams or observable_surfaces, with at least one executable
-  kind='command' seam check proving the path runs.
-- Emit Slices 2..N as cohesive vertical user-story slices (kind='implement', role='engineer'):
-  each delivers exactly one observable capability end to end (its storage/logic plus seam
-  wiring) and carries its own executable kind='command' seam test.
+- Emit Slice 1 as ONE runnable end-to-end tracer bullet (kind='implement', role='engineer')
+  that wires core storage/logic to an observable user-facing seam named by GoalSpec.test_seams
+  or observable_surfaces, with at least one executable kind='command' seam check proving the
+  path runs.
+- Emit additional Slices 2..N only when distinct capabilities or modules genuinely merit separate
+  deliveries (each carrying its own executable kind='command' seam test).
 - NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
   routes/templates/static wave, and no bulk test-only wave after unverified code waves.
 - NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,

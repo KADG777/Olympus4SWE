@@ -2798,3 +2798,64 @@ def test_parse_reply_fast_paths_avoid_llm_and_accept_standalone_go_on(tmp_path: 
 
     # 6. Headless SessionConfig uses a bounded worker_max_steps default for convergence.
     assert SessionConfig(workspace_root=tmp_path).worker_max_steps == 40
+
+
+def test_reply_requeues_stranded_running_or_verifying_task_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming a paused/recovered run with a stranded VERIFYING task must requeue and complete."""
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    script = SessionScript()
+    script.align.append(json.dumps(_goal_spec()))
+    script.design.append(json.dumps(_design()))
+    script.plan.append(json.dumps(_plan()))
+    script.workers.extend([("calculator.py", _CALC_CODE)] * 4)
+    _patch_provider(monkeypatch, script)
+
+    code, handoff = _invoke(
+        ["start", "Build a calculator library", "--step-mode", "plan_only", *_base(repo, state)]
+    )
+    assert code == 0 and handoff["pause_kind"] == "plan_handoff", handoff
+    run_id = str(handoff["run_id"])
+
+    # Simulate an abrupt kill/timeout while T1 was mid-flight in VERIFYING status.
+    store = RunStore(state / "olympus.db")
+    leased = store.acquire_task_lease(run_id, "T1", actor="chronos")
+    store.update_task_with_lease(
+        run_id,
+        "T1",
+        expected_lease_generation=leased.lease_generation,
+        mutator=lambda node: node.model_copy(update={"status": TaskStatus.VERIFYING}),
+        actor="chronos",
+        event_type="task.verifying",
+    )
+    snap2 = store.get_run(run_id)
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        expected_revision=int(snap2["state_revision"]),
+        actor="session",
+        stage="session",
+        detail={"reason": "Recovered stranded run"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="session",
+        event_type="session.paused",
+        actor="session",
+        payload={"pause_kind": "blocked", "node": None, "reason": "Recovered stranded run"},
+    )
+
+    code2, resumed = _invoke(
+        ["reply", run_id, "Resume after timeout", "--step-mode", "execute", *_base(repo, state)]
+    )
+    assert code2 == 0 and resumed["status"] == "completed", resumed
+    events = store.list_events(run_id)
+    assert not any(e.event_type == "run.revision_requested" for e in events)
+    requeues = [e for e in events if e.event_type == "task.requeued"]
+    assert requeues and requeues[-1].payload["task_id"] == "T1"
+    continuations = [e.payload for e in events if e.event_type == "session.continued"]
+    assert continuations and continuations[-1].get("requeued_task_ids") == ["T1"]

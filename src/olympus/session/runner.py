@@ -813,7 +813,13 @@ class SessionRunner:
             pending = [
                 task
                 for task in (plan.tasks if plan is not None else [])
-                if task.status in (TaskStatus.READY, TaskStatus.WAITING)
+                if task.status
+                in (
+                    TaskStatus.READY,
+                    TaskStatus.WAITING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.VERIFYING,
+                )
             ]
             if pending:
                 return self._resume_execution_in_place(run_id, definition, snap, clean)
@@ -851,7 +857,27 @@ class SessionRunner:
         snap: dict[str, Any],
         hint: str,
     ) -> SessionEnvelope:
-        """Resume an execution pause (e.g. budget pause) without invalidating the approved plan."""
+        """Resume an execution pause (e.g. budget pause or crash recovery) in place."""
+        plan: TaskPlan | None = snap["plan"]
+        requeued: list[str] = []
+        if plan is not None:
+            for task in plan.tasks:
+                if task.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                    continue
+                with suppress(ValueError, ConcurrencyConflictError, NotFoundError):
+                    self.store.update_task_with_lease(
+                        run_id,
+                        task.task_id,
+                        expected_lease_generation=task.lease_generation,
+                        mutator=lambda node: node.model_copy(
+                            update={"status": TaskStatus.READY}
+                        ),
+                        actor="session",
+                        event_type="task.requeued",
+                    )
+                    requeued.append(task.task_id)
+        if requeued:
+            snap = self.store.get_run(run_id)
         if snap["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
             with suppress(ValueError, ConcurrencyConflictError):
                 self.store.set_run_status(
@@ -872,6 +898,7 @@ class SessionRunner:
                 "feedback": hint,
                 "recovery_mode": "resume_execution",
                 "recovery_node": execute_node,
+                **({"requeued_task_ids": requeued} if requeued else {}),
             },
         )
         return self._drive(
