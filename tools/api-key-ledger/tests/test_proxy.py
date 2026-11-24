@@ -331,3 +331,131 @@ def test_stream_options_can_be_disabled_and_redirects_are_never_followed(
         assert "location" not in response.headers
     (sent,) = observed
     assert "stream_options" not in sent.content.decode()
+
+
+@pytest.mark.parametrize("placeholder", ["test", "4"])
+def test_short_caller_key_preserves_model_tag_and_cost(
+    config: Config, credentials: dict[tuple[str, str], Credential], placeholder: str
+) -> None:
+    model = "claude-4-7-sonnet-latest"
+    tag = "pytest-4"
+    pool = config.pools["chat"]
+    pool.pricing[model] = pool.pricing["mock-model"]
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"model": json.loads(request.content)["model"], "usage": OPENAI_USAGE}
+        )
+
+    app = create_app(config, credentials, transport=httpx.MockTransport(upstream))
+    with local_client(app) as client:
+        for label, model_id in [(tag, model), (placeholder, placeholder)]:
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": model_id},
+                headers={"authorization": f"Bearer {placeholder}", "x-ledger-tag": label},
+            )
+            assert response.status_code == 200
+        exact, preserved = client.get("/api/events").json()["events"]
+    assert preserved["model"] == model and preserved["tag"] == tag
+    assert preserved["pricing_status"] == "priced" and preserved["cost"] == "0.000235"
+    assert exact["model"] is None and exact["tag"] is None
+
+
+@pytest.mark.parametrize("status", [400, 404, 422, 500])
+def test_upstream_error_keeps_diagnostics_without_storing_body(
+    config: Config,
+    credentials: dict[tuple[str, str], Credential],
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+) -> None:
+    provider_key = credentials["chat", "a"].value
+    caller_key = "caller-credential-12345"
+    message = "invalid model diagnostic for this request"
+    payload = {
+        "error": {
+            "code": status,
+            "message": f"{message}: {provider_key}",
+            "details": [{caller_key: [f"Bearer {caller_key}", "pytest"]}],
+        },
+    }
+    # JSON escapes must be decoded before credential redaction.
+    escaped_key = "".join(f"\\u{ord(char):04x}" for char in provider_key)
+    encoded = json.dumps(payload).replace(provider_key, escaped_key).encode()
+    calls: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            status,
+            stream=MockStream([encoded[:20], encoded[20:]]),
+            headers={"content-type": "application/json", "set-cookie": "discard-this"},
+        )
+
+    caplog.set_level(logging.INFO)
+    app = create_app(config, credentials, transport=httpx.MockTransport(upstream))
+    with local_client(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "mock-model"},
+            headers={"authorization": f"Bearer {caller_key}", "x-api-key": "test"},
+        )
+        assert response.status_code == status
+        error = response.json()["error"]
+        assert error["code"] == status
+        assert error["message"] == f"{message}: [redacted]"
+        assert error["details"] == [{"[redacted]": ["Bearer [redacted]", "pytest"]}]
+        assert "set-cookie" not in response.headers
+        assert len(calls) == 1
+        events = client.get("/api/events")
+        (event,) = events.json()["events"]
+        assert event["outcome"] == "upstream_error" and event["http_status"] == status
+
+    with sqlite3.connect(config.database) as db:
+        dump = "\n".join(db.iterdump())
+    for private in (provider_key, caller_key, message):
+        assert private not in events.text and private not in dump and private not in caplog.text
+
+
+def test_html_upstream_error_is_redacted_plain_text(
+    config: Config, credentials: dict[tuple[str, str], Credential]
+) -> None:
+    key = credentials["messages", "c"].value
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            text=f"\x1b<script>invalid schema {key}</script>",
+            headers={"content-type": "text/html"},
+        )
+
+    app = create_app(config, credentials, transport=httpx.MockTransport(upstream))
+    with local_client(app) as client:
+        response = client.post("/v1/messages", json={"model": "mock-model"})
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.text == "<script>invalid schema [redacted]</script>"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"x" * (64 * 1024) + b"discarded tail", b"4 " * 9000],
+    ids=["oversized-upstream", "redaction-expansion"],
+)
+def test_error_body_size_is_bounded_before_and_after_redaction(
+    config: Config, credentials: dict[tuple[str, str], Credential], body: bytes
+) -> None:
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, stream=MockStream([body[:30_000], body[30_000:]]))
+
+    app = create_app(config, credentials, transport=httpx.MockTransport(upstream))
+    with local_client(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "mock-model"},
+            headers={"authorization": "Bearer 4"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "upstream_error"
+    assert len(response.content) <= 64 * 1024

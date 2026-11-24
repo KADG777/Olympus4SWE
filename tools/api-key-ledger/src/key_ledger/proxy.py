@@ -32,8 +32,12 @@ _LOCAL_HOST = re.compile(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?", 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+\-]{0,159}", re.ASCII)
 _MODEL_ID = re.compile(r"[\w][\w./:@+\-]{0,255}")
 _ANTHROPIC_HEADER = re.compile(r"[A-Za-z0-9,_. \-]{1,1024}", re.ASCII)
+_ERROR_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _MAX_REQUEST = 8 * 1024 * 1024
 _MAX_JSON_RESPONSE = 16 * 1024 * 1024
+_MAX_ERROR_RESPONSE = 64 * 1024
+_SUBSTRING_SECRET_MIN = 8
+_REDACTED = "[redacted]"
 _FAILOVER_AUTH = {401, 402, 403}
 _SECURITY_HEADERS = (
     (b"cache-control", b"no-store"),
@@ -131,8 +135,14 @@ def parse_since(value: str) -> float:
     return (parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)).timestamp()
 
 
+def _contains_credential(value: str, secrets: set[str]) -> bool:
+    return value in secrets or any(
+        len(secret) >= _SUBSTRING_SECRET_MIN and secret in value for secret in secrets
+    )
+
+
 def _safe_label(value: str | None, secrets: set[str]) -> str | None:
-    if value is None or not _LABEL.fullmatch(value) or any(secret in value for secret in secrets):
+    if value is None or not _LABEL.fullmatch(value) or _contains_credential(value, secrets):
         return None
     return value
 
@@ -141,10 +151,78 @@ def _safe_model(value: object, secrets: set[str]) -> str | None:
     if (
         not isinstance(value, str)
         or not _MODEL_ID.fullmatch(value)
-        or any(secret in value for secret in secrets)
+        or _contains_credential(value, secrets)
     ):
         return None
     return value
+
+
+def _error_redactor(provider_keys: set[str], caller_keys: set[str]) -> re.Pattern[str]:
+    # Provider keys reach the upstream. Mask them even when embedded in error text.
+    literals = provider_keys | {key for key in caller_keys if len(key) >= _SUBSTRING_SECRET_MIN}
+    parts = [re.escape(key) for key in sorted(literals, key=len, reverse=True)]
+    short_keys = caller_keys - literals
+    if short_keys:
+        short = "|".join(re.escape(key) for key in sorted(short_keys, key=len, reverse=True))
+        # Preserve identifiers like "pytest" when a caller uses "test" as a dummy key.
+        parts.append(rf"(?<![\w./:@+\-])(?:{short})(?![\w./:@+\-])")
+    return re.compile("|".join(parts) if parts else r"(?!)")
+
+
+def _redact_text(value: str, pattern: re.Pattern[str]) -> str:
+    return pattern.sub(_REDACTED, _ERROR_CONTROLS.sub("", value))
+
+
+def _redact_json(value: Any, pattern: re.Pattern[str]) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value, pattern)
+    if isinstance(value, dict):
+        return {
+            _redact_text(key, pattern): _redact_json(item, pattern) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item, pattern) for item in value]
+    if type(value) in {int, float} and pattern.fullmatch(str(value)):
+        return _REDACTED
+    return value
+
+
+async def _upstream_error_response(
+    upstream: httpx.Response, provider_keys: set[str], caller_keys: set[str]
+) -> Response:
+    status = upstream.status_code
+    fallback = _error(
+        status if 400 <= status < 600 else 502,
+        "upstream_error",
+        "The upstream rejected the request.",
+        upstream_status=status,
+    )
+    if (
+        not 400 <= status < 600
+        or upstream.headers.get("content-encoding", "identity").lower() != "identity"
+    ):
+        return fallback
+    try:
+        async with asyncio.timeout(5):
+            raw = await _bounded_body(upstream.aiter_bytes(), _MAX_ERROR_RESPONSE)
+        if not raw:
+            return fallback
+        text = raw.decode("utf-8-sig")
+        pattern = _error_redactor(provider_keys, caller_keys)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            media_type = upstream.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if media_type == "application/json" or media_type.endswith("+json"):
+                return fallback
+            response = Response(
+                _redact_text(text, pattern), status_code=status, media_type="text/plain"
+            )
+        else:
+            response = JSONResponse(_redact_json(payload, pattern), status_code=status)
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError, _BodyTooLarge):
+        return fallback
+    return response if len(response.body) <= _MAX_ERROR_RESPONSE else fallback
 
 
 def _upstream_headers(
@@ -358,13 +436,11 @@ class Gateway:
                     finish("quarantined")
                     return None
                 if not 200 <= status < 300:
-                    finish("upstream_error")
-                    return _error(
-                        status if status >= 400 else 502,
-                        "upstream_error",
-                        "The upstream rejected the request.",
-                        upstream_status=status,
+                    response = await _upstream_error_response(
+                        upstream, self.secrets, secrets - self.secrets
                     )
+                    finish("upstream_error")
+                    return response
                 if upstream.headers.get("content-encoding", "identity").lower() != "identity":
                     finish("upstream_error")
                     return _error(

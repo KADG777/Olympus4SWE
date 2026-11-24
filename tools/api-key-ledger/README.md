@@ -39,7 +39,8 @@ and `serve --host ::1` selects IPv6 loopback. Point your SDK or CLI at the appro
 Set a local placeholder such as `ledger-local` if the caller SDK requires a key. The proxy
 constructs upstream authentication with the selected slot. With multiple pools for a dialect,
 set its ID in `default_pools` or use the named route. A single matching pool becomes the default
-automatically. The upstream base URL can include a gateway path prefix or a final `/v1`.
+automatically. For OpenAI-compatible pools, a host-only upstream URL defaults to `/v1`.
+A configured path such as `/api/v3` or `/v1beta/openai` is used as the SDK base path.
 
 Optional `X-Ledger-Sticky-Key` pins a scope to a healthy slot. Use a short non-secret identifier
 such as a test case ID. SQLite stores its SHA-256 digest. Optional `X-Ledger-Tag` adds
@@ -54,14 +55,15 @@ an attribution label such as `pytest` or `eval-v1`. Tags support letters, number
 - A pre-stream `429` honors `Retry-After` or uses the pool's cooldown. A pre-stream
   `401`, `402`, or `403` quarantines the slot. The gateway tries another eligible slot once per
   request and records each attempt. Exhaustion returns structured `503`, including slot counts
-  by availability. A stream that has started remains on its original slot and records partial
-  usage on error or disconnect.
+  by availability. Other upstream HTTP errors preserve their status and a credential-redacted
+  body of up to 64 KiB. Oversized or unreadable bodies get a generic error message. A stream
+  that has started remains on its original slot and records partial usage on error or disconnect.
 - Slot and pool budgets can define `daily` and/or `total` caps in the pool currency. The day
-  rolls over at midnight UTC. A capped pool allows one in-flight attempt at a time. A capped slot
-  allows one in-flight attempt on that slot. If the relevant budget is occupied, the gateway can
-  return a temporary `503` with a `busy` count. A request admitted below a cap can itself cross
-  it when usage arrives. The new spend blocks subsequent requests. Unpriced usage and missing
-  upstream usage have unknown cost and are surfaced separately.
+  rolls over at midnight UTC. Each attempt checks recorded spend at admission. Multiple
+  attempts may run concurrently while recorded spend is below the cap, and their final charges
+  may together cross it. Once recorded spend reaches the cap, subsequent requests skip the
+  affected slots. Unpriced usage and missing upstream usage have unknown cost and are surfaced
+  separately.
 - Price snapshots are immutable. Tokens include total input, output, cached input reads, and
   cache writes. Cached reads and writes are subsets of the total input. Unknown components
   remain null in event records. The gateway uses the returned model ID when available.

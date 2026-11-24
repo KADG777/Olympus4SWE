@@ -13,6 +13,7 @@ from key_ledger.config import (
     Config,
     ConfigError,
     Credential,
+    Pool,
     load_config,
     resolve_credentials,
 )
@@ -64,31 +65,91 @@ def test_rotation_sticky_and_restart(
     assert len(restarted.events()) == 4
 
 
-def test_atomic_capped_reservation_and_immutable_history(
+@pytest.mark.parametrize(
+    ("dialect", "base_url", "endpoint"),
+    [
+        ("openai", "https://gateway.test/", "https://gateway.test/v1/chat/completions"),
+        ("openai", "https://gateway.test/v1/", "https://gateway.test/v1/chat/completions"),
+        (
+            "openai",
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        (
+            "openai",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        ),
+        (
+            "openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        ),
+        ("anthropic", "https://gateway.test", "https://gateway.test/v1/messages"),
+        ("anthropic", "https://gateway.test/team", "https://gateway.test/team/v1/messages"),
+        ("anthropic", "https://gateway.test/team/v1/", "https://gateway.test/team/v1/messages"),
+    ],
+)
+def test_upstream_endpoint(dialect: str, base_url: str, endpoint: str) -> None:
+    pool = Pool.model_validate(
+        {
+            "dialect": dialect,
+            "base_url": base_url,
+            "keys": [{"key_alias": "a", "secret": "env:TEST_KEY"}],
+        }
+    )
+    assert pool.endpoint == endpoint
+
+
+def test_concurrent_capped_pool_and_immutable_history(
     config: Config,
     credentials: dict[tuple[str, str], Credential],
 ) -> None:
     config.pools["chat"].budget = Budget(daily="0.00002")
     ledgers = [Ledger(config, credentials), Ledger(config, credentials)]
 
-    def try_select(ledger: Ledger) -> Attempt | None:
-        return ledger.reserve("chat", model="mock-model", sticky_key=None, tag=None, tried=set())[0]
-
     with ThreadPoolExecutor(max_workers=2) as pool:
-        attempts = list(pool.map(try_select, ledgers))
-    (winning,) = [attempt for attempt in attempts if attempt is not None]
-    finish(ledgers[0], winning)
-    assert try_select(ledgers[1]) is None
+        first, second = pool.map(reserve, ledgers)
+    assert {first.key_alias, second.key_alias} == {"a", "b"}
+    finish(ledgers[0], first)
+    rejected, health = ledgers[1].reserve(
+        "chat", model="mock-model", sticky_key=None, tag=None, tried=set()
+    )
+    assert rejected is None and health == {"budget_exceeded": 2}
+    finish(ledgers[1], second)
     assert {row["status"] for row in ledgers[0].key_statuses() if row["pool_id"] == "chat"} == {
         "budget_exceeded"
     }
-    (event,) = ledgers[0].events()
+    events = ledgers[0].events()
+    assert len(events) == 2
     config.pools["chat"].pricing["mock-model"].input_per_1m *= 10
-    assert Ledger(config, credentials).events() == [event]
-    assert event["cost"] == "0.00002"
-    assert event["price_snapshot"]["input_per_1m"] == "2"
-    ledgers[0].change_key("chat", winning.key_alias, "reset")
-    assert try_select(ledgers[0]) is None
+    assert Ledger(config, credentials).events() == events
+    assert all(event["cost"] == "0.00002" for event in events)
+    assert all(event["price_snapshot"]["input_per_1m"] == "2" for event in events)
+    ledgers[0].change_key("chat", first.key_alias, "reset")
+    rejected, _ = ledgers[0].reserve(
+        "chat", model="mock-model", sticky_key=None, tag=None, tried=set()
+    )
+    assert rejected is None
+
+
+def test_concurrent_sticky_requests_on_capped_slot(
+    config: Config, credentials: dict[tuple[str, str], Credential]
+) -> None:
+    config.pools["chat"].keys[0].budget = Budget(total="0.00002")
+    ledger = Ledger(config, credentials)
+    first = reserve(ledger, "pinned")
+    second = reserve(ledger, "pinned")
+    assert first.key_alias == second.key_alias == "a"
+
+    finish(ledger, first)
+    third = reserve(ledger, "pinned")
+    assert third.key_alias == "b"
+    finish(ledger, second)
+    finish(ledger, third)
+    states = {row["key_alias"]: row for row in ledger.key_statuses() if row["pool_id"] == "chat"}
+    assert states["a"]["status"] == "budget_exceeded"
+    assert states["a"]["total_spend"] == "0.00004"
 
 
 def test_stale_attempt_recovery_and_cli(

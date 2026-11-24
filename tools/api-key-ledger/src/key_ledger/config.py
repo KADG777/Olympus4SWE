@@ -107,7 +107,9 @@ class Pool(Settings):
     @property
     def endpoint(self) -> str:
         base = self.base_url
-        if not urlsplit(base).path.endswith("/v1"):
+        path = urlsplit(base).path
+        needs_version = not path if self.dialect == "openai" else not path.endswith("/v1")
+        if needs_version:
             base += "/v1"
         return base + DIALECT_PATH[self.dialect]
 

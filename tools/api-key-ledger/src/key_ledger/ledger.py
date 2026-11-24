@@ -99,10 +99,6 @@ def _over_budget(budget: Budget, total: int, daily: int) -> bool:
     )
 
 
-def _capped(budget: Budget) -> bool:
-    return budget.daily is not None or budget.total is not None
-
-
 class Ledger:
     def __init__(
         self, config: Config, credentials: Mapping[tuple[str, str], Credential] | None = None
@@ -226,17 +222,11 @@ class Ledger:
         with self._transaction() as db:
             now = time.time()
             self._recover_expired(db, now)
+            # Check settled spend inside the same write transaction as admission.
             states = self._states(db, pool_id, pool, now)
-            busy = {
-                row["key_alias"]
-                for row in db.execute(
-                    "SELECT key_alias FROM reservations WHERE pool_id=?", (pool_id,)
-                )
-            }
             health: Counter[str] = Counter()
             available: dict[str, _SlotState] = {}
             pinned = None
-            pinned_busy = False
             if sticky_key:
                 pinned = db.execute(
                     "SELECT key_alias FROM sticky_scopes WHERE pool_id=? AND sticky_key=?",
@@ -251,17 +241,10 @@ class Ledger:
                         status = "configuration_changed"
                     elif alias in tried:
                         status = "attempted"
-                    elif (_capped(pool.budget) and busy) or (
-                        _capped(state.slot.budget) and alias in busy
-                    ):
-                        status = "busy"
                     else:
                         available[alias] = state
                 health[status] += 1
-                if pinned and alias == pinned["key_alias"] and status == "busy":
-                    # In-flight spend can make a pin ineligible. Keep it until settlement.
-                    pinned_busy = True
-            if not available or pinned_busy:
+            if not available:
                 return None, dict(health)
 
             chosen = available.get(pinned["key_alias"]) if pinned else None
