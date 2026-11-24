@@ -31,7 +31,8 @@ GOAL_SPEC: dict[str, object] = {
     "spec_id": "spec-inventory",
     "version": 1,
     "goal": "Build an inventory REST API for operators",
-    "deliverable_kind": "rest_api",
+    # This fixture's worker delivers modules only, never a bootable HTTP service.
+    "deliverable_kind": "library",
     "observable_surfaces": ["HTTP API"],
     "actors": ["operator"],
     "test_seams": ["POST /items", "GET /items/{item_id}"],
@@ -700,7 +701,8 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
         "spec_id": "spec-b001",
         "version": 1,
         "goal": "Add per-API-key rate limiting to the HTTP layer.",
-        "deliverable_kind": "rest_api",
+        # The B-001 fixture repo is a library-style module set, not a bootable service.
+        "deliverable_kind": "library",
         "observable_surfaces": ["HTTP layer", "src/api/server.py", "src/api/store.py"],
         "actors": ["api_client", "admin"],
         "requirements": [

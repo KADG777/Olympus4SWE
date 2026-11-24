@@ -3015,7 +3015,7 @@ def test_multiwave_diff_and_argus_prompt_exclude_unchanged_upstream_overlay(
             }
         ),
     )
-    out = stage.run_execution(run_id=run_id)
+    out = stage.run_execution(run_id=run_id, review_mode="per_task")
 
     assert out["status"] == RunStatus.COMPLETED
     assert set(prompts) == {"T0", "T1"}
@@ -5235,3 +5235,688 @@ def test_spec_forbidden_paths_ignores_bare_pkg_names_symbols_and_prose_slashes(
     assert "types.d.ts" in forbidden
     assert "docs/CHANGELOG" in forbidden
     assert ".env" in forbidden
+
+
+class _RepairAwareWorker:
+    """Write scripted task files, then apply scripted repairs on task-less turns."""
+
+    name = "repair-aware"
+    supports_steer = False
+
+    def __init__(
+        self,
+        files: dict[str, dict[str, str]],
+        repairs: Sequence[dict[str, str]] = (),
+    ) -> None:
+        self._files = files
+        self._repairs = list(repairs)
+        self.turns: list[str] = []
+        self.repair_prompts: list[str] = []
+
+    def steer(self, guidance: str, *, source: str) -> bool:
+        del guidance, source
+        return False
+
+    def cancel(self, *, reason: str) -> None:
+        del reason
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        if request.task_id is None:
+            self.turns.append(request.actor)
+            self.repair_prompts.append(request.user_prompt)
+            index = min(len(self.repair_prompts) - 1, len(self._repairs) - 1)
+            payload = self._repairs[index] if self._repairs else {}
+            for rel_path, content in payload.items():
+                target = request.workspace_path / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="repair done",
+                steps_taken=1,
+                driver_name=self.name,
+            )
+        self.turns.append(request.task_id)
+        for rel_path, content in self._files[request.task_id].items():
+            target = request.workspace_path / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content="done",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+_PASSING_VERDICT: dict[str, Any] = {
+    "task_id": "post-dag",
+    "attempt": 1,
+    "passed": True,
+    "summary": "Unified review passed",
+    "findings": [],
+}
+
+
+def _review_rejection(
+    *,
+    file_path: str = "feature.py",
+    repro_command: str = "python3 -c 'import feature; assert feature.GUARD'",
+    requirement_ref: str = "R1",
+) -> dict[str, Any]:
+    return {
+        "task_id": "post-dag",
+        "attempt": 1,
+        "passed": False,
+        "summary": "Composed delivery misses a requirement",
+        "findings": [
+            {
+                "id": "F1",
+                "axis": "spec",
+                "severity": "important",
+                "file_path": file_path,
+                "line": 1,
+                "requirement_ref": requirement_ref,
+                "repro_command": repro_command,
+                "message": "Missing guard in the composed delivery",
+            }
+        ],
+    }
+
+
+def _scripted_reviewer(
+    responses: Sequence[dict[str, Any]], calls: list[str] | None = None
+) -> MockLLMProvider:
+    record = calls if calls is not None else []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        if "Independent Verifier" not in messages[0].content:
+            raise AssertionError("Unexpected non-review LLM call")
+        record.append(messages[1].content)
+        index = min(len(record) - 1, len(responses) - 1)
+        return LLMResponse(content=json.dumps(responses[index]))
+
+    return MockLLMProvider(responder=responder)
+
+
+def _two_task_feature_plan(spec: GoalSpec) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-post-dag",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Feature flag",
+                    "objective": "Ship the flag module",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["feature.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Flag imports",
+                            "command": "python3 -c 'import feature; assert feature.FLAG'",
+                        },
+                        {
+                            "id": "T1-REV",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Cold review",
+                        },
+                    ],
+                },
+                {
+                    "task_id": "T2",
+                    "title": "Extra module",
+                    "objective": "Ship the extra module",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["extra.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T2-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Extra exists",
+                            "command": "test -f extra.py",
+                        },
+                        {
+                            "id": "T2-REV",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Cold review",
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+
+
+def _web_spec() -> GoalSpec:
+    from olympus.core.contracts import DeliverableKind
+
+    return GoalSpec(
+        spec_id="spec-web-product",
+        goal="Ship a blacknote web app",
+        requirements=[
+            {
+                "id": "R1",
+                "description": "Serve the blacknote primary surface",
+                "acceptance_criteria": ["GET / returns 200"],
+            }
+        ],
+        deliverable_kind=DeliverableKind.WEB_APP,
+    )
+
+
+_WEB_APP_404 = """
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ["PORT"])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"detail":"Not Found"}')
+
+    def log_message(self, format, *args):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"""
+
+_WEB_APP_200 = """
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ["PORT"])
+BODY = b"<html><body><h1>blacknote</h1></body></html>"
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(BODY)))
+            self.end_headers()
+            self.wfile.write(BODY)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"""
+
+
+def _seed_web_run(tmp_path: Path) -> tuple[RunStore, str, GoalSpec]:
+    store = RunStore(tmp_path / ".olympus" / "web-product.db")
+    run_id = store.create_run(
+        title="Web product",
+        mode=RunMode.EXECUTION,
+        budget_policy=BudgetPolicy(max_concurrent_tasks=1),
+    )
+    spec = _web_spec()
+    store.save_spec(run_id, spec)
+    AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path).confirm_spec(
+        run_id=run_id, approver="zeus"
+    )
+    return store, run_id, spec
+
+
+def _web_plan(spec: GoalSpec) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-web-product",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Serve pages",
+                    "objective": "Serve GET / from the delivered app",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["app.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Entrypoint exists",
+                            "command": "test -f app.py",
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T2",
+                    "title": "Notes module",
+                    "objective": "Ship the notes helper",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["notes.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T2-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "Notes exists",
+                            "command": "test -f notes.py",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+
+def test_multi_task_post_dag_runs_one_global_review_and_skips_per_task_reviews(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _two_task_feature_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker(
+        {"T1": {"feature.py": "FLAG = True\n"}, "T2": {"extra.py": "EXTRA = True\n"}}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert {task.status for task in out["plan"].tasks} == {TaskStatus.ACCEPTED}
+    assert len(review_prompts) == 1
+    assert "COMPOSED delivery" in review_prompts[0] or "Accepted task scope" in review_prompts[0]
+    events = store.list_events(run_id)
+    deferred = [e for e in events if e.event_type == "task.review_deferred"]
+    assert {e.payload["task_id"] for e in deferred} == {"T1", "T2"}
+    recorded = [e for e in events if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["task_id"] for e in recorded] == ["post-dag"]
+    assert sorted(worker.turns) == ["T1", "T2"]
+    assert out["plan"].content_hash == plan.content_hash
+
+
+def test_escape_hatch_pre_gate_blocks_without_consuming_reviewer_calls(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[_marker_command_check()],
+        ),
+    )
+    reviewer = _scripted_reviewer([_PASSING_VERDICT])
+    worker = _RepairAwareWorker(
+        {
+            "T1": {
+                "feature.py": (
+                    "FLAG = True\n"
+                    "def load():\n"
+                    "    try:\n"
+                    "        return 1\n"
+                    "    except Exception:\n"
+                    "        pass\n"
+                    "VALUE = 1  # type: ignore\n"
+                )
+            }
+        }
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.AWAITING_HUMAN
+    task = out["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert "Escape-hatch pre-gate rejected" in (task.last_error or "")
+    assert "silent-except" in (task.last_error or "")
+    assert reviewer.recorded_requests == []
+    events = store.list_events(run_id)
+    rejected = [e for e in events if e.event_type == "task.escape_hatch_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].payload["llm_calls"] == 0
+    assert "bare-type-ignore" in rejected[0].payload["rules"]
+    assert not (tmp_path / "feature.py").exists()
+
+
+def test_post_dag_verified_blocker_triggers_repair_and_completes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=1)
+    )
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _two_task_feature_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer(
+        [_review_rejection(), _PASSING_VERDICT], review_prompts
+    )
+    worker = _RepairAwareWorker(
+        {"T1": {"feature.py": "FLAG = True\n"}, "T2": {"extra.py": "EXTRA = True\n"}},
+        repairs=[{"feature.py": "FLAG = True\nGUARD = True\n"}],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert {task.status for task in out["plan"].tasks} == {TaskStatus.ACCEPTED}
+    assert len(review_prompts) == 2
+    assert worker.turns == ["T1", "T2", "hephaestus:repair-1"]
+    assert "Review rejected" in worker.repair_prompts[0]
+    assert "assert feature.GUARD" in worker.repair_prompts[0]
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert "GUARD = True" in (overlay / "feature.py").read_text(encoding="utf-8")
+    events = store.list_events(run_id)
+    applied = [e for e in events if e.event_type == "post_dag.repair_applied"]
+    assert len(applied) == 1
+    assert applied[0].payload["changed_paths"] == ["feature.py"]
+    assert out["plan"].content_hash == plan.content_hash
+
+
+def test_post_dag_repair_exhaustion_awaits_human(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=1)
+    )
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _two_task_feature_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_review_rejection()], review_prompts)
+    worker = _RepairAwareWorker(
+        {"T1": {"feature.py": "FLAG = True\n"}, "T2": {"extra.py": "EXTRA = True\n"}}
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id, max_repair_rounds=1)
+
+    assert out["status"] == RunStatus.AWAITING_HUMAN
+    assert {task.status for task in out["plan"].tasks} == {TaskStatus.ACCEPTED}
+    assert worker.turns == ["T1", "T2", "hephaestus:repair-1"]
+    # Round 2 catches the still-failing repro deterministically without another Argus call.
+    assert len(review_prompts) == 1
+    assert out["plan"].content_hash == plan.content_hash
+
+
+def test_post_dag_verified_repro_blocks_completion_even_if_next_review_passes(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=1)
+    )
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _two_task_feature_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    # Even if round-2 Argus would pass, the still-failing verified repro blocks completion.
+    reviewer = _scripted_reviewer([_review_rejection(), _PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker(
+        {"T1": {"feature.py": "FLAG = True\n"}, "T2": {"extra.py": "EXTRA = True\n"}},
+        repairs=[{"extra.py": "EXTRA = True\nUNRELATED = 1\n"}],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id, max_repair_rounds=1)
+
+    assert out["status"] == RunStatus.AWAITING_HUMAN
+    assert len(review_prompts) == 1
+    rechecked = [e for e in store.list_events(run_id) if e.event_type == "post_dag.repro_rechecked"]
+    assert len(rechecked) == 1
+    assert rechecked[0].payload["still_failing_count"] == 1
+
+    # Resuming from awaiting_human must still re-run persisted verified repros and block completion.
+    resumed = stage.run_execution(run_id=run_id, max_repair_rounds=0)
+    assert resumed["status"] == RunStatus.AWAITING_HUMAN
+    assert len(review_prompts) == 1
+
+    # Direct promotion must also refuse paths outside allowed_scope.
+    src_ws = tmp_path / "direct_src"
+    src_ws.mkdir()
+    (src_ws / "unplanned.py").write_text("BAD = 1\n", encoding="utf-8")
+    with pytest.raises(OSError, match="out-of-scope"):
+        stage._apply_promotion(
+            run_id=run_id,
+            source_workspace=src_ws,
+            changed_paths=["unplanned.py"],
+            allowed_scope=["feature.py", "extra.py"],
+            hard_forbidden=(),
+        )
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert not (overlay / "unplanned.py").exists()
+
+
+def test_post_dag_repair_enforces_approved_write_scope(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=1)
+    )
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = _two_task_feature_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_review_rejection(), _PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker(
+        {"T1": {"feature.py": "FLAG = True\n"}, "T2": {"extra.py": "EXTRA = True\n"}},
+        repairs=[{"unplanned.py": "OUT_OF_SCOPE = True\n"}],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id, max_repair_rounds=1)
+
+    assert out["status"] == RunStatus.AWAITING_HUMAN
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert not (overlay / "unplanned.py").exists()
+    rejected = [e for e in store.list_events(run_id) if e.event_type == "post_dag.repair_rejected"]
+    assert len(rejected) == 1
+    assert "unplanned.py" in rejected[0].payload["reason"]
+    assert out["plan"].content_hash == plan.content_hash
+
+
+def test_cancelled_sibling_cannot_bypass_final_product_and_review_gate(tmp_path: Path) -> None:
+    from olympus.core.contracts import AcceptanceCheck
+
+    _init_repo(tmp_path)
+    store, run_id, spec = _seed_web_run(tmp_path)
+    plan = _web_plan(spec)
+    cancelled_tasks = [
+        task.model_copy(update={"status": TaskStatus.CANCELLED})
+        if task.task_id == "T2"
+        else task.model_copy(
+            update={
+                "acceptance_checks": [
+                    *task.acceptance_checks,
+                    AcceptanceCheck(
+                        id="T1-REV",
+                        kind=CheckKind.INDEPENDENT_REVIEW,
+                        description="Deferred cold review",
+                    ),
+                ]
+            }
+        )
+        for task in plan.tasks
+    ]
+    plan_with_cancelled = plan.model_copy(update={"tasks": cancelled_tasks})
+    _approve_plan(store, run_id, plan_with_cancelled)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker({"T1": {"app.py": _WEB_APP_404}})
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id, max_repair_rounds=0)
+
+    assert out["status"] == RunStatus.AWAITING_HUMAN
+    t1 = next(task for task in out["plan"].tasks if task.task_id == "T1")
+    review_checks = [c for c in t1.acceptance_checks if c.kind == CheckKind.INDEPENDENT_REVIEW]
+    assert review_checks and review_checks[0].passed is False
+    product_events = [
+        e.payload for e in store.list_events(run_id) if e.event_type == "product.verified"
+    ]
+    assert len(product_events) == 1 and product_events[0]["passed"] is False
+
+
+def test_web_app_product_404_repairs_without_spending_reviewer_tokens(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id, spec = _seed_web_run(tmp_path)
+    plan = _web_plan(spec)
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker(
+        {
+            "T1": {"app.py": _WEB_APP_404},
+            "T2": {"notes.py": "NOTES = True\n"},
+        },
+        repairs=[{"app.py": _WEB_APP_200}],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED, out
+    assert worker.turns == ["T1", "T2", "hephaestus:repair-1"]
+    assert "GET /" in worker.repair_prompts[0] and "404" in worker.repair_prompts[0]
+    # No Argus tokens were spent while the product could not even serve GET /.
+    assert len(review_prompts) == 1
+    events = store.list_events(run_id)
+    product_events = [e.payload for e in events if e.event_type == "product.verified"]
+    assert [payload["passed"] for payload in product_events] == [False, True]
+    overlay = tmp_path / ".olympus" / "runs" / run_id / "accepted_overlay"
+    assert "blacknote" in (overlay / "app.py").read_text(encoding="utf-8")
+    assert out["plan"].content_hash == plan.content_hash
+
+
+def test_single_task_web_app_product_failure_repairs_and_completes(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id, spec = _seed_web_run(tmp_path)
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-web-single",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T1",
+                    "title": "Serve pages",
+                    "objective": "Serve GET / from the delivered app",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["app.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-REV",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Cold review",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    _approve_plan(store, run_id, plan)
+    review_prompts: list[str] = []
+    reviewer = _scripted_reviewer([_PASSING_VERDICT], review_prompts)
+    worker = _RepairAwareWorker(
+        {"T1": {"app.py": _WEB_APP_404}},
+        repairs=[{"app.py": _WEB_APP_200}],
+    )
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=reviewer,
+        execution_drivers=ExecutionDriversConfig(worker_driver="repair-aware"),
+        driver_registry=DriverRegistry({"repair-aware": worker}),
+    )
+
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED, out
+    assert worker.turns == ["T1", "hephaestus:repair-1"]
+    # Single-task runs keep exactly one per-task review; no global review is added.
+    assert len(review_prompts) == 1
+    events = store.list_events(run_id)
+    assert not [e for e in events if e.event_type == "task.review_deferred"]
+    recorded = [e for e in events if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["task_id"] for e in recorded] == ["T1"]
+    assert out["plan"].content_hash == plan.content_hash
