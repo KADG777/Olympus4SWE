@@ -850,6 +850,31 @@ class SessionRunner:
             return []
         return [task for task in plan.tasks if task.status == TaskStatus.BLOCKED]
 
+    def _requeue_stranded_in_flight(
+        self, run_id: str, snap: dict[str, Any]
+    ) -> list[str]:
+        """Reset any stranded RUNNING/VERIFYING tasks back to READY before resuming."""
+        plan: TaskPlan | None = snap["plan"]
+        requeued: list[str] = []
+        if plan is None:
+            return requeued
+        for task in plan.tasks:
+            if task.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                continue
+            with suppress(ValueError, ConcurrencyConflictError, NotFoundError):
+                self.store.update_task_with_lease(
+                    run_id,
+                    task.task_id,
+                    expected_lease_generation=task.lease_generation,
+                    mutator=lambda node: node.model_copy(
+                        update={"status": TaskStatus.READY}
+                    ),
+                    actor="session",
+                    event_type="task.requeued",
+                )
+                requeued.append(task.task_id)
+        return requeued
+
     def _resume_execution_in_place(
         self,
         run_id: str,
@@ -858,24 +883,7 @@ class SessionRunner:
         hint: str,
     ) -> SessionEnvelope:
         """Resume an execution pause (e.g. budget pause or crash recovery) in place."""
-        plan: TaskPlan | None = snap["plan"]
-        requeued: list[str] = []
-        if plan is not None:
-            for task in plan.tasks:
-                if task.status not in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
-                    continue
-                with suppress(ValueError, ConcurrencyConflictError, NotFoundError):
-                    self.store.update_task_with_lease(
-                        run_id,
-                        task.task_id,
-                        expected_lease_generation=task.lease_generation,
-                        mutator=lambda node: node.model_copy(
-                            update={"status": TaskStatus.READY}
-                        ),
-                        actor="session",
-                        event_type="task.requeued",
-                    )
-                    requeued.append(task.task_id)
+        requeued = self._requeue_stranded_in_flight(run_id, snap)
         if requeued:
             snap = self.store.get_run(run_id)
         if snap["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
@@ -931,6 +939,7 @@ class SessionRunner:
             self._mark_awaiting_human(run_id, snap, None, reason)
             return self._emit_pause(run_id, PauseKind.BLOCKED, node=None, reason=reason)
 
+        requeued = self._requeue_stranded_in_flight(run_id, snap)
         retried: list[str] = []
         revision = int(self.store.get_run(run_id)["state_revision"])
         try:
@@ -964,6 +973,7 @@ class SessionRunner:
                 "recovery_mode": "in_place",
                 "recovery_node": execute_node,
                 "retried_task_ids": retried,
+                **({"requeued_task_ids": requeued} if requeued else {}),
             },
         )
         return self._drive(
