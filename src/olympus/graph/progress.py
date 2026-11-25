@@ -112,7 +112,7 @@ def resolve_resume_node(
                         and ev.payload.get("node") == align_node
                     )
                     if has_graph
-                    else (ev.event_type == "spec.saved" and ev.actor == "align")
+                    else ev.event_type == "spec.aligned"
                 )
                 for ev in events
             )

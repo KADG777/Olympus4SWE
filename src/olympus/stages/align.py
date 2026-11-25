@@ -611,9 +611,7 @@ def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
     if latest_restart_seq == 0:
         return False
     return not any(
-        ev.event_seq > latest_restart_seq
-        and ev.event_type == "spec.saved"
-        and ev.actor == "align"
+        ev.event_seq > latest_restart_seq and ev.event_type == "spec.aligned"
         for ev in events
     )
 
@@ -824,7 +822,22 @@ class AlignStage:
                 "status": SpecStatus.AWAITING_HUMAN,
             }
         )
-        self.store.save_spec(run_id, spec, actor="align")
+        self.store.save_spec(
+            run_id,
+            spec,
+            actor="align",
+            extra_events=[
+                (
+                    "align",
+                    "spec.aligned",
+                    {
+                        "spec_id": spec.spec_id,
+                        "version": spec.version,
+                        "spec_hash": spec.content_hash,
+                    },
+                )
+            ],
+        )
         if exhausted_violations:
             self.store.append_event(
                 run_id=run_id,

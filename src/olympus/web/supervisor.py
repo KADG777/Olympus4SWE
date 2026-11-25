@@ -246,18 +246,42 @@ class RunSupervisor:
                 self._managed_runs.add(run_id)
         return supervised
 
-    def _observer(self, run_id: str) -> Callable[[str, dict[str, Any]], None]:
+    def _observer(
+        self, run_id: str, *, abort_on_unfulfilled_revision: bool = False
+    ) -> Callable[[str, dict[str, Any]], None]:
         def _observe(event: str, payload: dict[str, Any]) -> None:
             event_type = _ENGINE_EVENT_TO_STORE.get(event)
             if event_type is None:
                 return
-            self.store.append_event(
-                run_id=run_id,
-                stage="graph",
-                event_type=event_type,
-                actor="supervisor",
-                payload=dict(payload),
-            )
+            if not abort_on_unfulfilled_revision:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="graph",
+                    event_type=event_type,
+                    actor="supervisor",
+                    payload=dict(payload),
+                )
+                return
+            while True:
+                pre = self.store.get_run(run_id)
+                if self._has_pending_restart(run_id) or has_unfulfilled_revision(
+                    self.store.list_events(run_id)
+                ):
+                    raise ConcurrencyConflictError(
+                        f"Run {run_id} was superseded by a pending revision"
+                    )
+                try:
+                    self.store.append_event(
+                        run_id=run_id,
+                        stage="graph",
+                        event_type=event_type,
+                        actor="supervisor",
+                        payload=dict(payload),
+                        expected_state_revision=int(pre["state_revision"]),
+                    )
+                    return
+                except ConcurrencyConflictError:
+                    continue
 
         return _observe
 
@@ -461,16 +485,23 @@ class RunSupervisor:
             if snap["plan"] is not None:
                 state["plan"] = snap["plan"].model_dump(mode="json")
 
+            abort_on_unfulfilled = entry_node is None or entry_node.type != "align_goal"
             try:
                 result = run_graph(
                     graph,
                     state,
-                    observer=self._observer(run_id),
+                    observer=self._observer(
+                        run_id, abort_on_unfulfilled_revision=abort_on_unfulfilled
+                    ),
                     max_steps=runtime.max_steps * 2,
                     start_from=effective_start,
                 )
-            except Exception:
-                if self._has_pending_restart(run_id):
+            except Exception as exc:
+                if self._has_pending_restart(run_id) or (
+                    isinstance(exc, ConcurrencyConflictError)
+                    and abort_on_unfulfilled
+                    and has_unfulfilled_revision(self.store.list_events(run_id))
+                ):
                     latest_snap = self.store.get_run(run_id)
                     return {
                         "run_id": run_id,
@@ -486,9 +517,8 @@ class RunSupervisor:
             finally:
                 with self._guard:
                     self._active_turns.pop(run_id, None)
-            if self._has_pending_restart(run_id) or (
-                (entry_node is None or entry_node.type != "align_goal")
-                and has_unfulfilled_revision(self.store.list_events(run_id))
+            if self._has_pending_restart(run_id) or has_unfulfilled_revision(
+                self.store.list_events(run_id)
             ):
                 latest_snap = self.store.get_run(run_id)
                 return {
@@ -504,6 +534,10 @@ class RunSupervisor:
             paused_node = result.get("_paused_node")
             while True:
                 latest = self.store.get_run(run_id)
+                if self._has_pending_restart(run_id) or has_unfulfilled_revision(
+                    self.store.list_events(run_id)
+                ):
+                    break
                 if paused_node:
                     if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                         break

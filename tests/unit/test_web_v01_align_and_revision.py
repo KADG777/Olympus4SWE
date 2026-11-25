@@ -1097,6 +1097,30 @@ def test_approve_spec_rejected_while_revision_unfulfilled(tmp_path: Path) -> Non
         )
         assert blocked.status_code == 400, blocked.text
         assert "awaiting revision realignment" in blocked.text
+
+        # Spoofing actor="align" via clarify must not forge realignment completion.
+        spoof = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "clarify",
+                "answers": {},
+                "actor": "align",
+                "auto_advance": False,
+            },
+        )
+        assert spoof.status_code == 200, spoof.text
+        spoof_proj = _projection(client, run_id)
+        still_blocked = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": spoof_proj["spec"]["content_hash"],
+                "expected_state_revision": spoof_proj["state_revision"],
+                "auto_advance": False,
+            },
+        )
+        assert still_blocked.status_code == 400, still_blocked.text
+        assert "awaiting revision realignment" in still_blocked.text
     finally:
         supervisor.shutdown()
 
@@ -1147,6 +1171,55 @@ def test_revision_during_resynthesis_failure_abort_does_not_clobber_running(
             ev.event_seq > rev_seq and ev.event_type == "spec.resynthesis_failed"
             for ev in events
         )
+        assert app.store.get_run(run_id)["status"] == RunStatus.RUNNING
+    finally:
+        supervisor.shutdown()
+
+
+def test_late_revision_after_graph_return_not_overwritten_by_status_cas_retry(
+    tmp_path: Path,
+) -> None:
+    """Revision landing right before post-graph set_run_status must stay RUNNING."""
+    from unittest.mock import patch
+
+    answers = {"A1-format": "CSV", "A2-scope": "当前筛选结果"}
+    responder = _BlueprintResponder(answers=answers)
+    app, supervisor, client = _make_app(tmp_path, responder)
+    responder.store = app.store
+    try:
+        run_id = _start_run(supervisor)
+        orig_set_status = app.store.set_run_status
+        injected = False
+
+        def inject_before_awaiting(rid: str, status: RunStatus, **kwargs: object) -> int:
+            nonlocal injected
+            if (
+                rid == run_id
+                and status == RunStatus.AWAITING_HUMAN
+                and kwargs.get("stage") == "graph"
+                and not injected
+            ):
+                injected = True
+                rev = client.post(
+                    f"/api/runs/{run_id}/command",
+                    json={
+                        "action": "request_revision",
+                        "feedback": "改成支持分批下载",
+                        "auto_advance": False,
+                    },
+                )
+                assert rev.status_code == 200, rev.text
+            return orig_set_status(rid, status, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(app.store, "set_run_status", inject_before_awaiting):
+            clarify = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "clarify", "answers": answers},
+            )
+            assert clarify.status_code == 200, clarify.text
+            supervisor.wait(run_id, timeout=30)
+
+        assert injected is True
         assert app.store.get_run(run_id)["status"] == RunStatus.RUNNING
     finally:
         supervisor.shutdown()
