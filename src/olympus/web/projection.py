@@ -1530,6 +1530,7 @@ def build_run_projection(
     run_id: str,
     *,
     artifacts_root: Path | None = None,
+    supervised: bool | None = None,
 ) -> dict[str, Any]:
     """Derive a complete read-only Ariadne console view from SQLite events and run artifacts."""
     snap = store.get_run(run_id, include_approval_baselines=True)
@@ -1672,11 +1673,14 @@ def build_run_projection(
         stop_after=workflow_view.get("stop_after"),
     )
 
+    is_supervised = (
+        any(ev.stage == "graph" for ev in events) if supervised is None else supervised
+    )
     try:
         strict_canonical = load_workflow(workflow_name).align_strict_canonical()
     except Exception:  # noqa: BLE001 - fallback for legacy/unknown workflows
         strict_canonical = True
-    pending_resynthesis = has_pending_resynthesis(
+    pending_resynthesis = is_supervised and has_pending_resynthesis(
         events,
         spec,
         spec_approved=spec_approved,

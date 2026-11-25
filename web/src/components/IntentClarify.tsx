@@ -109,9 +109,11 @@ export function ClarifyPanel({
   const generation = generationOverride ?? state?.clarifyGeneration ?? 0;
   const pending = projection ? pendingAmbiguities(projection) : [];
   const submittedNotes = projection?.clarification_notes || [];
-  const showPanel =
+  const showForm =
     pending.length > 0 ||
     Boolean(projection?.spec && !projection.spec_approved && projection.resynthesis_error);
+  const showNotes = submittedNotes.length > 0;
+  const showPanel = showForm || showNotes;
   // Answers in progress survive live updates until the question set itself changes.
   const signature = projection
     ? `${projection.run_id}:${generation}:${pending.map((amb) => `${amb.id}:${amb.question || ""}`).join("|")}`
@@ -133,24 +135,32 @@ export function ClarifyPanel({
     <section className="clarify-panel" id="clarify-panel" hidden={!showPanel} aria-labelledby="clarify-title">
       <div className="card-head">
         <h2 className="card-title" id="clarify-title">
-          待澄清问题
+          {showForm ? "待澄清问题" : "已提交补充说明"}
         </h2>
-        <span className="card-note">回答后生成新的 GoalSpec 版本，旧批准指纹随之失效</span>
+        <span className="card-note">
+          {showForm
+            ? "回答后生成新的 GoalSpec 版本，旧批准指纹随之失效"
+            : "补充约束已随澄清记录保存，融合状态会同步更新"}
+        </span>
       </div>
-      <div className="clarify-items" id="clarify-items" ref={items} key={signature}>
-        {pending.map((amb) => (
-          <ClarifyItem amb={amb} key={amb.id} />
-        ))}
-      </div>
-      <textarea
-        key={generation}
-        ref={noteInput}
-        id="clarify-note-input"
-        className="field clarify-note-input"
-        rows={3}
-        placeholder="可选：补充产品边界、固定分类、排除项或额外约束…"
-      />
-      {submittedNotes.length ? (
+      {showForm ? (
+        <>
+          <div className="clarify-items" id="clarify-items" ref={items} key={signature}>
+            {pending.map((amb) => (
+              <ClarifyItem amb={amb} key={amb.id} />
+            ))}
+          </div>
+          <textarea
+            key={generation}
+            ref={noteInput}
+            id="clarify-note-input"
+            className="field clarify-note-input"
+            rows={3}
+            placeholder="可选：补充产品边界、固定分类、排除项或额外约束…"
+          />
+        </>
+      ) : null}
+      {showNotes ? (
         <div className="clarify-notes" id="clarify-notes" aria-label="已提交的补充说明">
           {submittedNotes.map((note) => (
             <span className="clarify-note-pill" data-consumed={note.consumed ? "true" : "false"} key={note.event_seq}>
@@ -162,17 +172,19 @@ export function ClarifyPanel({
           ))}
         </div>
       ) : null}
-      <div className="clarify-actions">
-        <button
-          type="button"
-          className="btn btn-primary"
-          id="btn-clarify-submit"
-          disabled={submitting}
-          onClick={submit}
-        >
-          {submitting ? "提交中…" : "提交澄清并推进"}
-        </button>
-      </div>
+      {showForm ? (
+        <div className="clarify-actions">
+          <button
+            type="button"
+            className="btn btn-primary"
+            id="btn-clarify-submit"
+            disabled={submitting}
+            onClick={submit}
+          >
+            {submitting ? "提交中…" : "提交澄清并推进"}
+          </button>
+        </div>
+      ) : null}
     </section>
   );
 }

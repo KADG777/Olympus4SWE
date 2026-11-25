@@ -477,7 +477,8 @@ export function QuickRulingDrawer({
               ) : null}
 
               {pendingClarifications.length > 0 ||
-              Boolean(projection.spec && !projection.spec_approved && projection.resynthesis_error) ? (
+              Boolean(projection.spec && !projection.spec_approved && projection.resynthesis_error) ||
+              (projection.clarification_notes?.length ?? 0) > 0 ? (
                 <ClarifyPanel
                   projection={projection}
                   generation={clarifyGen}

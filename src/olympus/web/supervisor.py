@@ -86,6 +86,7 @@ class RunSupervisor:
         self._active_tokens: dict[str, int] = {}
         self._next_token: int = 0
         self._pending_resume: dict[str, int] = {}
+        self._pending_restarts: dict[str, tuple[int, str, str]] = {}
         self._providers: dict[str, LLMProvider] = {}
         self._active_turns: dict[str, list[ActiveTurnHandle]] = {}
         self.dotenv_loaded = self._load_dotenv()
@@ -382,6 +383,18 @@ class RunSupervisor:
                     driver_config=driver_config,
                     workspace_root=ws,
                 )
+                if self._has_pending_restart(run_id):
+                    latest_snap = self.store.get_run(run_id)
+                    return {
+                        "run_id": run_id,
+                        "workflow": definition.name,
+                        "topology": definition.topology,
+                        "stop_after": definition.stop_after,
+                        "status": latest_snap["status"].value,
+                        "state_revision": latest_snap["state_revision"],
+                        "paused": None,
+                        "superseded": True,
+                    }
                 if resynth_failed is not None:
                     return resynth_failed
                 snap = self.store.get_run(run_id)
@@ -433,9 +446,35 @@ class RunSupervisor:
                     max_steps=runtime.max_steps * 2,
                     start_from=effective_start,
                 )
+            except Exception:
+                if self._has_pending_restart(run_id):
+                    latest_snap = self.store.get_run(run_id)
+                    return {
+                        "run_id": run_id,
+                        "workflow": definition.name,
+                        "topology": definition.topology,
+                        "stop_after": definition.stop_after,
+                        "status": latest_snap["status"].value,
+                        "state_revision": latest_snap["state_revision"],
+                        "paused": None,
+                        "superseded": True,
+                    }
+                raise
             finally:
                 with self._guard:
                     self._active_turns.pop(run_id, None)
+            if self._has_pending_restart(run_id):
+                latest_snap = self.store.get_run(run_id)
+                return {
+                    "run_id": run_id,
+                    "workflow": definition.name,
+                    "topology": definition.topology,
+                    "stop_after": definition.stop_after,
+                    "status": latest_snap["status"].value,
+                    "state_revision": latest_snap["state_revision"],
+                    "paused": None,
+                    "superseded": True,
+                }
             paused_node = result.get("_paused_node")
             while True:
                 latest = self.store.get_run(run_id)
@@ -542,6 +581,8 @@ class RunSupervisor:
                 strict_canonical=definition.align_strict_canonical(),
             )
         except Exception as exc:  # noqa: BLE001 - pause in place, never drop human answers
+            if self._has_pending_restart(run_id):
+                return None
             return self._pause_after_resynthesis_failure(run_id, definition, spec, exc)
         return None
 
@@ -592,6 +633,10 @@ class RunSupervisor:
             "error": reason,
         }
 
+    def _has_pending_restart(self, run_id: str) -> bool:
+        with self._guard:
+            return run_id in self._pending_restarts
+
     def _release_token(self, run_id: str, token: int, *, clear_pending: bool = False) -> None:
         """Release active ownership only if ``token`` still owns ``run_id``."""
         with self._guard:
@@ -599,6 +644,7 @@ class RunSupervisor:
                 self._active_tokens.pop(run_id, None)
                 if clear_pending:
                     self._pending_resume.pop(run_id, None)
+                    self._pending_restarts.pop(run_id, None)
 
     def _spec_needs_resynthesis(
         self, run_id: str, definition: WorkflowDefinition, snap: dict[str, Any]
@@ -630,12 +676,13 @@ class RunSupervisor:
     ) -> dict[str, Any]:
         """Run ``_advance`` and drain any coalesced mid-flight resumes for ``token``."""
         current_start = start_from
+        current_raw_input = raw_input
         current_recompute = recompute_entry
         while True:
             start_rev = int(self.store.get_run(run_id)["state_revision"])
             result = self._advance(
                 run_id,
-                raw_input=raw_input,
+                raw_input=current_raw_input,
                 start_from=current_start,
                 auto_approve=auto_approve,
                 recompute_entry=current_recompute,
@@ -643,10 +690,16 @@ class RunSupervisor:
             with self._guard:
                 if self._active_tokens.get(run_id) != token:
                     return result
-                if run_id not in self._pending_resume:
+                pending_restart = self._pending_restarts.pop(run_id, None)
+                pending_rev = self._pending_resume.pop(run_id, None)
+                if pending_restart is None and pending_rev is None:
                     self._active_tokens.pop(run_id, None)
                     return result
-                pending_rev = self._pending_resume.pop(run_id)
+            if pending_restart is not None:
+                _, current_start, current_raw_input = pending_restart
+                current_recompute = False
+                continue
+            assert pending_rev is not None
             snap = self.store.get_run(run_id)
             definition = load_workflow(snap["workflow_name"])
             entry = self.resume_node(definition, snap)
@@ -676,11 +729,14 @@ class RunSupervisor:
                 or already_at_same_gate
             ):
                 with self._guard:
-                    if self._active_tokens.get(run_id) == token and run_id in self._pending_resume:
+                    if self._active_tokens.get(run_id) == token and (
+                        run_id in self._pending_resume or run_id in self._pending_restarts
+                    ):
                         continue
                     if self._active_tokens.get(run_id) == token:
                         self._active_tokens.pop(run_id, None)
                 return result
+            current_raw_input = self._recorded_raw_input(run_id, current_raw_input)
             current_start = entry
             current_recompute = True
 
@@ -703,6 +759,12 @@ class RunSupervisor:
                 if run_id in self._active_tokens:
                     prev_rev = self._pending_resume.get(run_id, -1)
                     self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
+                    if not recompute_entry and start_from is not None:
+                        self._pending_restarts[run_id] = (
+                            int(snap["state_revision"]),
+                            start_from,
+                            raw_input,
+                        )
                     active_future = self._future_by_run.get(run_id)
                 else:
                     self._next_token += 1
@@ -739,6 +801,12 @@ class RunSupervisor:
             if run_id in self._active_tokens:
                 prev_rev = self._pending_resume.get(run_id, -1)
                 self._pending_resume[run_id] = max(prev_rev, int(snap["state_revision"]))
+                if not recompute_entry and start_from is not None:
+                    self._pending_restarts[run_id] = (
+                        int(snap["state_revision"]),
+                        start_from,
+                        raw_input,
+                    )
                 coalesced = True
             else:
                 self._next_token += 1
@@ -999,6 +1067,12 @@ class RunSupervisor:
             f"{self._recorded_raw_input(run_id, str(snap['title']))}"
             f"\n\n[User revision feedback]\n{clean}"
         )
+        definition = load_workflow(snap["workflow_name"])
+        align_node = next(
+            (node.name for node in definition.nodes if node.type == "align_goal"), None
+        )
+        if align_node is None:
+            raise ValueError(f"Workflow {definition.name} has no align stage node")
         self.store.append_event(
             run_id=run_id,
             stage="graph",
@@ -1008,6 +1082,7 @@ class RunSupervisor:
                 "raw_input": augmented,
                 "constraints": self._recorded_constraints(run_id),
                 "feedback": clean,
+                "restart_node": align_node,
                 "workspace_id": snap.get("workspace_id"),
                 "workspace_mode": snap.get("workspace_mode") or "brownfield",
                 "task_type": snap.get("task_type") or "feature",
@@ -1015,12 +1090,7 @@ class RunSupervisor:
                 "scope_paths": list(snap.get("scope_paths") or []),
             },
         )
-        definition = load_workflow(snap["workflow_name"])
-        align_node = next(
-            (node.name for node in definition.nodes if node.type == "align_goal"), None
-        )
-        if align_node is None:
-            raise ValueError(f"Workflow {definition.name} has no align stage node")
+        self.cancel_active_turns(run_id, reason="revision_requested")
         return self._launch(
             run_id,
             raw_input=augmented,

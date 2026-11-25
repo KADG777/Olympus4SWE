@@ -93,6 +93,32 @@ def resolve_resume_node(
     names = {node.name for node in definition.nodes}
     run_id = str(snap["run_id"])
 
+    align_node = next(
+        (node.name for node in definition.nodes if node.type == "align_goal"), None
+    )
+    if align_node is not None:
+        events = store.list_events(run_id)
+        latest_restart_seq = 0
+        for ev in events:
+            if ev.event_type in ("run.revision_requested", "run.reopened"):
+                latest_restart_seq = max(latest_restart_seq, ev.event_seq)
+        if latest_restart_seq > 0:
+            has_graph = any(ev.stage == "graph" for ev in events)
+            realigned = any(
+                ev.event_seq > latest_restart_seq
+                and (
+                    (
+                        ev.event_type == "graph.node_finished"
+                        and ev.payload.get("node") == align_node
+                    )
+                    if has_graph
+                    else ev.event_type == "spec.saved"
+                )
+                for ev in events
+            )
+            if not realigned:
+                return align_node
+
     spec = snap.get("spec")
     if spec is not None and not is_artifact_approved(store, run_id, "spec", snap):
         if "gate_spec" in names:

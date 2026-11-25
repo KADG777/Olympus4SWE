@@ -563,11 +563,12 @@ def _consumed_note_state(window: Sequence[RunEvent], *, spec_id: str) -> tuple[s
             continue
         if event.payload.get("spec_id") not in (None, "", spec_id):
             continue
+        if "consumed_note_ids" not in event.payload:
+            legacy_cutoff_seq = max(legacy_cutoff_seq, event.event_seq)
+            continue
         ids = event.payload.get("consumed_note_ids")
         if isinstance(ids, list):
             consumed_ids.update(str(item) for item in ids if item)
-        else:
-            legacy_cutoff_seq = max(legacy_cutoff_seq, event.event_seq)
     return consumed_ids, legacy_cutoff_seq
 
 
@@ -626,10 +627,6 @@ def has_pending_resynthesis(
         ):
             saw_clarification = True
     if not saw_clarification:
-        return False
-    # A bare ``spec.clarified`` event (empty answers, defaults only) is not a body change.
-    # Strict-canonical repair only applies once a real human answer landed.
-    if not _needs_clarification_resynthesis(spec, [], strict_canonical=False):
         return False
     return _needs_clarification_resynthesis(spec, [], strict_canonical=strict_canonical)
 

@@ -465,6 +465,9 @@ class RunControl:
         expected_target_hash: str | None = None,
         operation_id: None = None,
         command_meta: Mapping[str, Any] | None = None,
+        pre_confirm_check: (
+            Callable[[Mapping[str, Any], sqlite3.Connection | None], None] | None
+        ) = None,
     ) -> GoalSpec: ...
 
     @overload
@@ -480,6 +483,9 @@ class RunControl:
         expected_target_hash: str | None = None,
         operation_id: str,
         command_meta: Mapping[str, Any] | None = None,
+        pre_confirm_check: (
+            Callable[[Mapping[str, Any], sqlite3.Connection | None], None] | None
+        ) = None,
     ) -> dict[str, Any]: ...
 
     def confirm_spec(
@@ -494,6 +500,9 @@ class RunControl:
         expected_target_hash: str | None = None,
         operation_id: str | None = None,
         command_meta: Mapping[str, Any] | None = None,
+        pre_confirm_check: (
+            Callable[[Mapping[str, Any], sqlite3.Connection | None], None] | None
+        ) = None,
     ) -> GoalSpec | dict[str, Any]:
         """Freeze and approve the current GoalSpec once blocking ambiguities are resolved."""
 
@@ -532,6 +541,8 @@ class RunControl:
                 raise ConcurrencyConflictError(_TARGET_HASH_MISMATCH)
             if spec is None:
                 raise ValueError(f"Run {run_id} has no GoalSpec to confirm")
+            if pre_confirm_check is not None:
+                pre_confirm_check(snap, conn)
             blockers = spec.unresolved_blockers()
             if blockers and not accept_risk:
                 raise ValueError(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -16,10 +17,12 @@ from olympus.core.contracts import (
     EarsPattern,
     GoalSpec,
     RequirementItem,
+    RunStatus,
     SpecStatus,
 )
 from olympus.core.store import RunStore
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
+from olympus.stages.align import clarification_note_states, has_pending_resynthesis
 from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
 
@@ -532,3 +535,234 @@ def test_reopen_run_restarts_completed_run_and_is_idempotent(tmp_path: Path) -> 
         assert non_completed.status_code == 400, non_completed.text
     finally:
         supervisor.shutdown()
+
+
+def test_request_revision_during_inflight_resynthesis_realigns_with_feedback(
+    tmp_path: Path,
+) -> None:
+    """Revision coalesced while resynthesis is active must still re-run align with feedback."""
+    resynth_entered = threading.Event()
+    allow_resynth = threading.Event()
+    align_prompts: list[str] = []
+    answers = {"A1-format": "Excel 工作簿", "A2-scope": "全量订单"}
+    draft = _draft_spec()
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system = messages[0].content
+        user = messages[1].content
+        if "Fuse EVERY human clarification" in system:
+            resynth_entered.set()
+            assert allow_resynth.wait(timeout=10.0)
+            return LLMResponse(content=_fused_spec(draft, answers, []).model_dump_json())
+        if "Requirements Alignment Architect" in system:
+            align_prompts.append(user)
+            if "按周汇总" in user:
+                revised = draft.model_copy(
+                    update={
+                        "spec_id": "spec-orders-weekly",
+                        "goal": "构建按周汇总的订单导出服务",
+                        "open_ambiguities": [],
+                    }
+                )
+                return LLMResponse(content=revised.model_dump_json())
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {system[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        clarify = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "clarify", "answers": answers},
+        )
+        assert clarify.status_code == 200, clarify.text
+        assert resynth_entered.wait(timeout=10.0)
+
+        revision = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "改为按周汇总并保留下载历史",
+                "operation_id": "op-rev-inflight",
+            },
+        )
+        assert revision.status_code == 200, revision.text
+        assert revision.json()["command_result"]["workflow"].get("coalesced") is True
+
+        allow_resynth.set()
+        supervisor.wait(run_id, timeout=30)
+
+        after = _projection(client, run_id)
+        assert len(align_prompts) == 2
+        assert "改为按周汇总并保留下载历史" in align_prompts[1]
+        assert after["spec"]["spec_id"] == "spec-orders-weekly"
+        assert after["status"] == "awaiting_human"
+        assert after["pending_resynthesis"] is False
+    finally:
+        allow_resynth.set()
+        supervisor.shutdown()
+
+
+def test_default_answers_still_require_strict_canonical_resynthesis(tmp_path: Path) -> None:
+    """Strict-canonical spec missing test_seams must still require repair on default answers."""
+    incomplete_draft = _draft_spec().model_copy(update={"test_seams": []})
+    repaired = _draft_spec().model_copy(update={"open_ambiguities": []})
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system = messages[0].content
+        if "Fuse EVERY human clarification" in system:
+            return LLMResponse(content=repaired.model_dump_json())
+        if "Requirements Alignment Architect" in system:
+            return LLMResponse(content=incomplete_draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {system[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        clarify = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "clarify",
+                "answers": {"A1-format": "CSV", "A2-scope": "当前筛选结果"},
+                "auto_advance": False,
+            },
+        )
+        assert clarify.status_code == 200, clarify.text
+        proj = _projection(client, run_id)
+        assert proj["pending_resynthesis"] is True
+
+        blocked = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": proj["spec"]["content_hash"],
+                "expected_state_revision": proj["state_revision"],
+            },
+        )
+        assert blocked.status_code == 400, blocked.text
+    finally:
+        supervisor.shutdown()
+
+
+def test_approve_spec_conflict_and_replay_precedence_during_pending_resynthesis(
+    tmp_path: Path,
+) -> None:
+    """Stale revision/hash return 409 and replay returns 200 before the 400 resynthesis guard."""
+    answers = {"A1-format": "CSV", "A2-scope": "当前筛选结果"}
+    responder = _BlueprintResponder(answers=answers)
+    app, supervisor, client = _make_app(tmp_path, responder)
+    responder.store = app.store
+    try:
+        run_id = _start_run(supervisor)
+        before = _projection(client, run_id)
+        old_hash = before["spec"]["content_hash"]
+        old_rev = before["state_revision"]
+
+        clarify = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "clarify",
+                "answers": answers,
+                "clarification_note": "补充审计日志字段",
+                "auto_advance": False,
+            },
+        )
+        assert clarify.status_code == 200, clarify.text
+        pending = _projection(client, run_id)
+        assert pending["pending_resynthesis"] is True
+
+        stale_rev = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": pending["spec"]["content_hash"],
+                "expected_state_revision": old_rev,
+            },
+        )
+        assert stale_rev.status_code == 409, stale_rev.text
+
+        stale_hash = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": old_hash,
+                "expected_state_revision": pending["state_revision"],
+            },
+        )
+        assert stale_hash.status_code == 409, stale_hash.text
+
+        current_blocked = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": pending["spec"]["content_hash"],
+                "expected_state_revision": pending["state_revision"],
+            },
+        )
+        assert current_blocked.status_code == 400, current_blocked.text
+    finally:
+        supervisor.shutdown()
+
+
+def test_unsupervised_run_does_not_report_pending_resynthesis(tmp_path: Path) -> None:
+    """Unsupervised runs must not show pending_resynthesis or block approval in projection."""
+    responder = _BlueprintResponder(answers={})
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = app.store.create_run(title="Unsupervised Clarify")
+        app.store.save_spec(run_id, _draft_spec())
+        app.store.set_run_status(run_id, RunStatus.AWAITING_HUMAN)
+
+        clarify = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "clarify",
+                "answers": {"A1-format": "Excel", "A2-scope": "全量订单"},
+                "clarification_note": "人工自行确认",
+            },
+        )
+        assert clarify.status_code == 200, clarify.text
+        proj = _projection(client, run_id)
+        assert proj["pending_resynthesis"] is False
+        assert (proj.get("hitl_banner") or {}).get("kind") != "resynthesizing"
+
+        approved = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": proj["spec"]["content_hash"],
+                "expected_state_revision": proj["state_revision"],
+            },
+        )
+        assert approved.status_code == 200, approved.text
+    finally:
+        supervisor.shutdown()
+
+
+def test_malformed_consumed_note_ids_does_not_mark_notes_consumed(tmp_path: Path) -> None:
+    """Non-list consumed_note_ids must not trigger the legacy cutoff fallback."""
+    store = RunStore(tmp_path / "malformed.db")
+    run_id = store.create_run(title="Malformed Resynth")
+    spec = _draft_spec().model_copy(update={"open_ambiguities": []})
+    store.save_spec(run_id, spec)
+    store.append_event(
+        run_id=run_id,
+        stage="align",
+        event_type="spec.clarification_note",
+        actor="zeus",
+        payload={"spec_id": spec.spec_id, "feedback": "固定分类不可改"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="align",
+        event_type="spec.resynthesized",
+        actor="align",
+        payload={"spec_id": spec.spec_id, "consumed_note_ids": {"bad": True}},
+    )
+    events = store.list_events(run_id)
+    states = clarification_note_states(events, spec_id=spec.spec_id)
+    assert len(states) == 1
+    assert states[0][1] is False
+    assert has_pending_resynthesis(events, spec, spec_approved=False) is True

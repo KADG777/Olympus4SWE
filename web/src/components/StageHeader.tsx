@@ -21,9 +21,7 @@ export function StageHeader({ workbench, state }: { workbench: Workbench; state:
   const paused = projection?.status === "paused";
   const hasTasks = Boolean(projection?.dag.nodes.length);
   const showPause = Boolean(projection && hasTasks && (projection.status === "running" || paused));
-  const canReopen = Boolean(
-    projection && projection.status === "completed" && !projection.blueprint_completed,
-  );
+  const canReopen = Boolean(projection && projection.status === "completed");
   const stages = projection?.stage_pipeline || [];
   return (
     <header className="stage-head">

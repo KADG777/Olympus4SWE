@@ -8,9 +8,10 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -724,6 +725,7 @@ class AriadneApp:
             self._workspace_for(run_id),
             run_id,
             artifacts_root=self.artifacts_root,
+            supervised=self.supervisor.is_supervised(run_id),
         )
         return RunProjection.model_validate(proj).model_dump(mode="json", by_alias=True)
 
@@ -795,27 +797,45 @@ class AriadneApp:
             if action == "pause" and not cmd_result.get("deduplicated"):
                 self.supervisor.cancel_active_turns(run_id, reason="human_paused")
         elif action == "approve_spec":
+            pre_confirm_check: (
+                Callable[[Mapping[str, Any], sqlite3.Connection | None], None] | None
+            ) = None
             if self.supervisor.is_supervised(run_id):
-                current = self.store.get_run(run_id)
-                pending_spec = current["spec"]
-                if pending_spec is not None:
+
+                def _check_not_pending_resynthesis(
+                    current: Mapping[str, Any], conn: sqlite3.Connection | None
+                ) -> None:
+                    pending_spec = current["spec"]
+                    if pending_spec is None:
+                        return
+                    events = (
+                        self.store.list_events_in_tx(conn, run_id)
+                        if conn is not None
+                        else self.store.list_events(run_id)
+                    )
                     spec_approved = self.store.is_approved(
                         run_id=run_id,
                         target=ApprovalTarget.GOAL_SPEC,
                         target_id=pending_spec.spec_id,
                         target_hash=pending_spec.content_hash,
                     )
+                    try:
+                        strict = load_workflow(
+                            str(current["workflow_name"])
+                        ).align_strict_canonical()
+                    except Exception:  # noqa: BLE001 - fallback for legacy workflows
+                        strict = True
                     if has_pending_resynthesis(
-                        self.store.list_events(run_id),
+                        events,
                         pending_spec,
                         spec_approved=spec_approved,
-                        strict_canonical=load_workflow(
-                            current["workflow_name"]
-                        ).align_strict_canonical(),
+                        strict_canonical=strict,
                     ):
                         raise ValueError(
                             "GoalSpec is awaiting clarification resynthesis before approval"
                         )
+
+                pre_confirm_check = _check_not_pending_resynthesis
             spec_result = self.control.confirm_spec(
                 run_id=run_id,
                 approver=actor,
@@ -825,6 +845,7 @@ class AriadneApp:
                 expected_target_hash=target_hash,
                 operation_id=operation_id,
                 command_meta=dispatch_meta,
+                pre_confirm_check=pre_confirm_check,
             )
             cmd_result = (
                 spec_result
