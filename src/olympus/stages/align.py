@@ -388,6 +388,30 @@ def _clause_reflection_violations(
     return []
 
 
+_INTRO_HEADING_RE = re.compile(
+    r"^(?:以下是|以下为|针对|关于|补充说明|说明|备注|核心边界|澄清回复|"
+    r"(?:here\s+are|the\s+following|notes?|context|summary|constraints?|"
+    r"requirements?|clarifications?|boundaries)\b).*[:：]\s*$",
+    re.IGNORECASE,
+)
+_SUBSTANTIVE_DIRECTIVE_RE = re.compile(
+    r"(?:\b(?:must|shall|require|required|enable|enabled|support|use|keep|allow)\b|"
+    r"必须|启用|支持|强制|要求|保留|禁止|禁用)",
+    re.IGNORECASE,
+)
+
+
+def _is_intro_heading(line: str) -> bool:
+    """True only for pure introductory headings ending in a single colon."""
+    if _LIST_PREFIX_RE.match(line) or _NEGATION_CLAUSE_RE.search(line):
+        return False
+    if line.count(":") + line.count("：") != 1:
+        return False
+    if _SUBSTANTIVE_DIRECTIVE_RE.search(line):
+        return False
+    return bool(_INTRO_HEADING_RE.match(line))
+
+
 def _resynthesis_fidelity_violations(
     current: GoalSpec,
     candidate: GoalSpec,
@@ -458,7 +482,8 @@ def _resynthesis_fidelity_violations(
                 "Additional human instructions must be fused into goal, requirements, "
                 "acceptance_criteria, constraints, or out_of_scope (not assumptions alone)."
             )
-        for line in extra_lines:
+        substantive_lines = [line for line in extra_lines if not _is_intro_heading(line)]
+        for line in substantive_lines or extra_lines:
             violations.extend(
                 _clause_reflection_violations(
                     "Additional human instruction",

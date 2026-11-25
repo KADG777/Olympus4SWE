@@ -175,7 +175,8 @@ Two-axis rules:
      concrete `file_path` plus `line`.
 2. An `axis="spec"` finding may be `severity="important"` ONLY when it includes:
    - `requirement_ref`: the exact GoalSpec requirement id it breaks, and
-   - `repro_command`: one self-contained shell command that runs from the sandbox repo root,
+   - `repro_command`: one self-contained shell command that runs from the sandbox repo root using
+     relative paths only (never hardcode absolute sandbox paths or leading `cd /... &&` prefixes),
      exits NON-ZERO while the defect exists, and exits ZERO once it is fixed.
    The command must not modify repository files. If you cannot produce such a command, report the
    finding as `severity="nit"` prose instead of inventing an unproven blocker.
@@ -206,8 +207,9 @@ Two-axis rules:
    finding is always `severity="nit"` and always a concrete `file_path` plus `line`.
 2. An `axis="spec"` finding may be `severity="important"` ONLY when it includes:
    - `requirement_ref`: the exact GoalSpec requirement id it breaks, and
-   - `repro_command`: one self-contained shell command that runs from the delivery root, exits
-     NON-ZERO while the defect exists, and exits ZERO once it is fixed.
+   - `repro_command`: one self-contained shell command that runs from the delivery root using
+     relative paths only (never hardcode absolute sandbox paths or leading `cd /... &&` prefixes),
+     exits NON-ZERO while the defect exists, and exits ZERO once it is fixed.
    The command must not modify repository files. If you cannot produce such a command, report the
    finding as `severity="nit"` prose instead of inventing an unproven blocker.
 3. Chronos deterministically re-runs every Axis A `important` `repro_command` and drops any finding
@@ -1507,6 +1509,78 @@ class OrchestrateStage:
         )
         return verdict
 
+    _REPRO_SANDBOX_TOKEN = "__OLYMPUS_SANDBOX_ROOT__"
+
+    @classmethod
+    def _normalize_repro_command(
+        cls,
+        command: str,
+        *,
+        sandbox_path: Path,
+        sandbox_root: Path | None = None,
+        target_path: Path | None = None,
+    ) -> str:
+        """Keep reviewer repro commands portable across sandboxes.
+
+        When ``target_path`` is omitted (persistence time), mid-command absolute sandbox
+        paths become ``__OLYMPUS_SANDBOX_ROOT__`` so single/double-quoted inline scripts
+        stay intact. When ``target_path`` is supplied (execution time), the placeholder
+        is materialized to the live target sandbox path.
+        """
+        cleaned = command.strip()
+        if not cleaned:
+            return cleaned
+        candidates: list[str] = []
+        for path in (sandbox_path.resolve(), sandbox_path):
+            text = str(path).rstrip("/")
+            if text and text not in candidates:
+                candidates.append(text)
+        roots: list[str] = []
+        for root in (
+            sandbox_root.resolve() if sandbox_root is not None else None,
+            sandbox_root,
+            sandbox_path.resolve().parent,
+            sandbox_path.parent,
+        ):
+            if root is None:
+                continue
+            text = str(root).rstrip("/")
+            if text and text not in roots:
+                roots.append(text)
+
+        sibling_label_pat = (
+            r"(?:run-[^/\s\"';&()]+|[^/\s\"';&()]+-(?:global-review|postdag-repro)-\d+"
+            r"|[^/\s\"';&()]+-product-[0-9a-f]+)"
+        )
+
+        # Strip leading `cd <sandbox> &&` or `cd <sandbox_root>/<sibling> &&` prefixes
+        # when the cd targets the sandbox root itself (preserving subdirectory cd).
+        for path_text in candidates:
+            escaped = re.escape(path_text)
+            cleaned = re.sub(
+                rf"^\s*cd\s+(?:\"|\')?{escaped}/?(?:\"|\')?\s*(?:&&|;)\s*",
+                "",
+                cleaned,
+            )
+        for root_text in roots:
+            escaped_root = re.escape(root_text)
+            cleaned = re.sub(
+                rf"^\s*cd\s+(?:\"|\')?{escaped_root}/{sibling_label_pat}/?(?:\"|\')?\s*(?:&&|;)\s*",
+                "",
+                cleaned,
+            )
+
+        placeholder = cls._REPRO_SANDBOX_TOKEN
+        for path_text in candidates:
+            cleaned = cleaned.replace(path_text, placeholder)
+        for root_text in roots:
+            escaped_root = re.escape(root_text)
+            cleaned = re.sub(rf"{escaped_root}/{sibling_label_pat}", placeholder, cleaned)
+
+        if target_path is not None:
+            cleaned = cleaned.replace(placeholder, str(target_path.resolve()).rstrip("/"))
+        return cleaned.strip()
+
     def _run_repro_command(
         self, *, command: str, sandbox: SandboxHandle
     ) -> _ReproResult:
@@ -1550,9 +1624,16 @@ class OrchestrateStage:
                     tmp_dir=probe_tmp,
                     home_dir=probe_home,
                 )
+                env["OLYMPUS_SANDBOX_ROOT"] = str(probe_ws.resolve())
+                exec_command = self._normalize_repro_command(
+                    command,
+                    sandbox_path=sandbox.workspace_path,
+                    sandbox_root=self.sandbox_root,
+                    target_path=probe_ws,
+                )
                 try:
                     proc = subprocess.run(
-                        ["bash", "--norc", "--noprofile", "-c", command],
+                        ["bash", "--norc", "--noprofile", "-c", exec_command],
                         cwd=probe_ws,
                         env=env,
                         capture_output=True,
@@ -1645,7 +1726,11 @@ class OrchestrateStage:
                     )
                 )
                 continue
-            command = (finding.repro_command or "").strip()
+            command = self._normalize_repro_command(
+                finding.repro_command or "",
+                sandbox_path=sandbox.workspace_path,
+                sandbox_root=self.sandbox_root,
+            )
             if not command:
                 dropped += 1
                 findings.append(
@@ -1684,7 +1769,11 @@ class OrchestrateStage:
                 continue
             findings.append(
                 finding.model_copy(
-                    update={"verified": True, "verification_output": result.output}
+                    update={
+                        "repro_command": command,
+                        "verified": True,
+                        "verification_output": result.output,
+                    }
                 )
             )
             if command not in verified_commands:
@@ -1738,7 +1827,12 @@ class OrchestrateStage:
         still_verified: list[str] = []
         resolved: list[str] = []
         results: list[dict[str, Any]] = []
-        for index, command in enumerate(task.verified_repro_commands, start=1):
+        for index, raw_command in enumerate(task.verified_repro_commands, start=1):
+            command = self._normalize_repro_command(
+                raw_command,
+                sandbox_path=sandbox.workspace_path,
+                sandbox_root=self.sandbox_root,
+            )
             result = self._run_repro_command(command=command, sandbox=sandbox)
             passed = result.returncode == 0
             (art_dir / f"recheck-cycle-{task.review_cycle + 1}-{index}.log").write_text(
@@ -2860,10 +2954,22 @@ class OrchestrateStage:
                 run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
             )
             env = build_sandbox_env(sandbox.workspace_path, host_root=self.workspace_root)
-            for index, command in enumerate(repro_commands, start=1):
+            env["OLYMPUS_SANDBOX_ROOT"] = str(sandbox.workspace_path.resolve())
+            for index, raw_command in enumerate(repro_commands, start=1):
+                command = self._normalize_repro_command(
+                    raw_command,
+                    sandbox_path=sandbox.workspace_path,
+                    sandbox_root=self.sandbox_root,
+                )
+                exec_command = self._normalize_repro_command(
+                    command,
+                    sandbox_path=sandbox.workspace_path,
+                    sandbox_root=self.sandbox_root,
+                    target_path=sandbox.workspace_path,
+                )
                 try:
                     proc = subprocess.run(
-                        ["bash", "-lc", command],
+                        ["bash", "--norc", "--noprofile", "-c", exec_command],
                         cwd=sandbox.workspace_path,
                         env=env,
                         capture_output=True,
