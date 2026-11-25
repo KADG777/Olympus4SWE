@@ -106,6 +106,38 @@ export const DELIVERY_STATUS: Record<string, [string, Variant]> = {
   unverified: ["◷ 未验证", "muted"],
 };
 
+export const POST_DAG_STATUS: Record<string, [string, Variant]> = {
+  idle: ["◷ 待验证", "muted"],
+  verifying: ["▶ 验证中", "live"],
+  repairing: ["▶ 定向修复中", "live"],
+  passed: ["✓ 交付已通过", "ok"],
+  paused: ["◷ 已暂停", "warn"],
+  failed: ["✕ 交付未通过", "bad"],
+  awaiting_human: ["⚠ 待人工裁决", "warn"],
+};
+
+export const POST_DAG_PHASE: Record<string, string> = {
+  verify: "实机验证",
+  recheck: "复现复检",
+  review: "Argus 复核",
+  repair: "定向修复",
+};
+
+export const POST_DAG_OUTCOME: Record<string, [string, Variant]> = {
+  passed: ["✓ 通过", "ok"],
+  applied: ["✓ 已应用", "ok"],
+  completed: ["✓ 已完成", "ok"],
+  failed: ["✕ 失败", "bad"],
+  rejected: ["✕ 已拒绝", "bad"],
+};
+
+export function formatDurationMs(durationMs: number | null | undefined): string {
+  const value = Number(durationMs) || 0;
+  if (value <= 0) return "未记录耗时";
+  if (value >= 1000) return `${(value / 1000).toFixed(1)} s`;
+  return `${value} ms`;
+}
+
 export const LIVE_TASK_STATUSES = new Set(["running", "verifying"]);
 
 export function localizeTriageReason(text: string): string {

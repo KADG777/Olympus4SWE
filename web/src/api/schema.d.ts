@@ -1499,6 +1499,8 @@ export interface components {
             has_screenshot: boolean;
             /** Passed */
             passed: boolean;
+            /** Screenshot Sha256 */
+            screenshot_sha256?: string | null;
             /** Summary */
             summary: string;
             /** Verified At */
@@ -3073,7 +3075,10 @@ export interface operations {
     };
     get_product_artifact_api_runs__run_id__product_artifact__kind__get: {
         parameters: {
-            query?: never;
+            query?: {
+                v?: number | null;
+                sha?: string | null;
+            };
             header?: never;
             path: {
                 run_id: string;

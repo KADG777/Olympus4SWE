@@ -845,6 +845,7 @@ class ProductVerificationView(StrictModel):
     has_report: bool = False
     has_boot_log: bool = False
     has_screenshot: bool = False
+    screenshot_sha256: str | None = None
 
 
 class DeliveryAcceptance(StrictModel):

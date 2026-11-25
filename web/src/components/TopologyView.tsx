@@ -1,4 +1,5 @@
-import type { RunProjection } from "../api/types";
+import type { PostDagSummary, ProductVerificationView, RunProjection } from "../api/types";
+import { productArtifactUrl } from "../api/client";
 import { dagGraphProps } from "../lib/graphProps";
 import {
   currentStage,
@@ -6,6 +7,9 @@ import {
   formatTokens,
   NODE_LABELS,
   OUTPUT_ACTIONS,
+  POST_DAG_OUTCOME,
+  POST_DAG_PHASE,
+  POST_DAG_STATUS,
   progressText,
   statusMeta,
   taskDisplayStatus,
@@ -28,6 +32,16 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
   const outputs = projection.key_outputs || [];
   const latest = outputs[0];
   const budget = projection.budget;
+  const latestProductSeq =
+    projection.delivery_acceptance?.product_verification?.event_seq ?? null;
+  const isLatestProduct = (item: (typeof outputs)[number] | undefined): boolean =>
+    Boolean(
+      item &&
+        item.event_type === "product.verified" &&
+        latestProductSeq != null &&
+        item.event_seq === latestProductSeq,
+    );
+  const latestIsProduct = isLatestProduct(latest);
   return (
     <section className="stage-live-panel card" id="stage-live-panel" aria-labelledby="run-progress-title">
       <div className="card-head">
@@ -71,7 +85,13 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
           hidden={!latest}
           onClick={() => void workbench.openOutput(workbench.state.projection?.key_outputs?.[0])}
         >
-          {latest ? (latest.current || latest.detail_available ? OUTPUT_ACTIONS[latest.kind] : "查看版本记录") : ""}
+          {latest
+            ? latestIsProduct
+              ? "查看实机证据"
+              : latest.current || latest.detail_available
+                ? OUTPUT_ACTIONS[latest.kind]
+                : "查看版本记录"
+            : ""}
         </button>
       </div>
       <details id="run-output-history" className="run-detail" hidden={!outputs.length}>
@@ -79,6 +99,7 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
         <ol id="run-output-versions">
           {outputs.map((output) => {
             const detail = state.attemptDetails[output.key];
+            const isProductOutput = isLatestProduct(output);
             return (
               <li key={output.key} data-output-key={output.key} tabIndex={-1}>
                 <span>{output.summary}</span>
@@ -87,14 +108,14 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
                     ? `${output.artifact_id} · ${output.content_hash}`
                     : new Date(output.created_at).toLocaleString()}
                 </code>
-                {output.current || output.detail_available ? (
+                {isProductOutput || output.current || output.detail_available ? (
                   <button
                     type="button"
                     className="btn"
                     data-history-output={output.key}
                     onClick={() => void workbench.openOutput(output)}
                   >
-                    {OUTPUT_ACTIONS[output.kind]}
+                    {isProductOutput ? "查看实机证据" : OUTPUT_ACTIONS[output.kind]}
                   </button>
                 ) : null}
                 {detail ? (
@@ -132,9 +153,184 @@ function workflowBadge(projection: RunProjection | null): string {
   }`;
 }
 
+function ProductVerificationCard({
+  workbench,
+  runId,
+  verification,
+}: {
+  workbench: Workbench;
+  runId: string;
+  verification: ProductVerificationView;
+}) {
+  const checks = verification.checks || [];
+  const failures = verification.failures || [];
+  const screenshotSuppressed = checks.some(
+    (check) => check.name === "screenshot" && check.status !== "passed",
+  );
+  const shotUrl =
+    verification.has_screenshot && !screenshotSuppressed
+      ? productArtifactUrl(
+          runId,
+          "screenshot",
+          verification.event_seq,
+          verification.screenshot_sha256,
+        )
+      : null;
+  const bootLogUrl = verification.has_boot_log
+    ? productArtifactUrl(runId, "boot_log", verification.event_seq)
+    : null;
+  const reportUrl = verification.has_report
+    ? productArtifactUrl(runId, "report", verification.event_seq)
+    : null;
+  return (
+    <article
+      className="card product-e2e-card"
+      id="product-verification-card"
+      data-passed={verification.passed ? "true" : "false"}
+      aria-label="实机端到端验收"
+    >
+      <div className="card-head">
+        <div className="view-head-meta">
+          <h3 className="card-title">Product E2E 实机验收</h3>
+          <Badge variant={verification.passed ? "ok" : "bad"}>
+            {verification.passed ? "✓ 实机通过" : "✕ 实机未通过"}
+          </Badge>
+        </div>
+        <span className="card-note">
+          {`#${verification.event_seq} · ${new Date(verification.verified_at).toLocaleString("zh-CN")}`}
+        </span>
+      </div>
+      <div className="product-e2e-body">
+        <div className="product-e2e-copy">
+          {verification.summary ? <p>{verification.summary}</p> : null}
+          {failures.length ? (
+            <ul className="product-e2e-failures" aria-label="实机失败项">
+              {failures.map((item, idx) => (
+                <li key={idx}>{item}</li>
+              ))}
+            </ul>
+          ) : null}
+          {checks.length ? (
+            <div className="product-e2e-checks" aria-label="实机检查项">
+              {checks.map((check, idx) => {
+                const ok = check.status === "passed";
+                const skipped =
+                  check.status === "skipped" || check.status.startsWith("skipped_");
+                const variant = ok ? "ok" : skipped ? "muted" : "bad";
+                const glyph = ok ? "✓" : skipped ? "—" : "✕";
+                return (
+                  <Badge variant={variant} key={`${check.name}-${idx}`}>
+                    {`${glyph} ${check.name}${check.port ? `:${check.port}` : ""}`}
+                  </Badge>
+                );
+              })}
+            </div>
+          ) : null}
+          <div className="product-e2e-actions">
+            <button
+              type="button"
+              className="btn"
+              id="btn-inspect-product-e2e"
+              aria-controls="dock"
+              onClick={() => workbench.showProductEvidence()}
+            >
+              在检查器查看实机证据
+            </button>
+            {bootLogUrl ? (
+              <a className="btn btn-quiet" href={bootLogUrl} target="_blank" rel="noopener">
+                启动日志 (boot.log)
+              </a>
+            ) : null}
+            {reportUrl ? (
+              <a className="btn btn-quiet" href={reportUrl} target="_blank" rel="noopener">
+                验证报告 (report.json)
+              </a>
+            ) : null}
+          </div>
+        </div>
+        {shotUrl ? (
+          <button
+            type="button"
+            className="product-e2e-thumb"
+            aria-label="在检查器查看实机首页截图"
+            onClick={() => workbench.showProductEvidence()}
+          >
+            <img key={shotUrl} src={shotUrl} alt="实机首页截图" loading="lazy" />
+          </button>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function PostDagCard({ workbench, postDag }: { workbench: Workbench; postDag: PostDagSummary }) {
+  const [statusLabel, statusVariant] = POST_DAG_STATUS[postDag.status] || POST_DAG_STATUS.idle;
+  const rounds = postDag.rounds || [];
+  const verdict = postDag.latest_argus_verdict;
+  return (
+    <article className="card post-dag-card" id="post-dag-card" aria-label="Post-DAG 统一复核与修复轮次">
+      <div className="card-head">
+        <div className="view-head-meta">
+          <h3 className="card-title">Post-DAG 交付级复核与修复</h3>
+          <Badge variant={statusVariant}>{statusLabel}</Badge>
+          <Badge variant="muted">{`${postDag.total_rounds} 轮记录`}</Badge>
+        </div>
+        <button
+          type="button"
+          className="btn btn-quiet"
+          id="btn-inspect-post-dag"
+          aria-controls="dock"
+          onClick={() => workbench.showProductEvidence()}
+        >
+          查看完整复核详情
+        </button>
+      </div>
+      {verdict ? (
+        <p className="card-note">
+          {`Argus 全局复核：${verdict.passed ? "通过" : "未通过"} · ${verdict.summary || `${(verdict.findings || []).length} 条发现`}`}
+        </p>
+      ) : null}
+      {rounds.length ? (
+        <ol className="post-dag-rounds" id="post-dag-rounds">
+          {rounds.map((round) => {
+            const [outcomeLabel, outcomeVariant] =
+              POST_DAG_OUTCOME[round.outcome] || POST_DAG_OUTCOME.completed;
+            return (
+              <li className="post-dag-round" key={`${round.sequence}-${round.event_seq}`}>
+                <div className="post-dag-round-head">
+                  <Badge variant="muted">{`#${round.sequence}`}</Badge>
+                  <Badge variant="muted">{POST_DAG_PHASE[round.phase] || round.phase}</Badge>
+                  <Badge variant={outcomeVariant}>{outcomeLabel}</Badge>
+                  {round.reported_round > 0 ? (
+                    <span className="card-note">{`round ${round.reported_round}`}</span>
+                  ) : null}
+                  {round.repro_checked != null ? (
+                    <span className="card-note">
+                      {`复检 ${round.repro_checked} 条 · 失败 ${round.repro_failed ?? 0}`}
+                    </span>
+                  ) : null}
+                </div>
+                <p>{round.summary}</p>
+                {round.changed_paths && round.changed_paths.length ? (
+                  <p className="card-note mono">{round.changed_paths.join(", ")}</p>
+                ) : null}
+              </li>
+            );
+          })}
+        </ol>
+      ) : (
+        <p className="card-note">单任务审查已延后至交付级 Post-DAG 统一复核</p>
+      )}
+    </article>
+  );
+}
+
 function DeliveryAcceptanceSection({ workbench, projection }: { workbench: Workbench; projection: RunProjection | null }) {
   const review = projection?.delivery_acceptance;
-  const hidden = !review || !review.criteria.length;
+  const productVerification = review?.product_verification ?? null;
+  const postDag = projection?.post_dag ?? null;
+  const hasCriteria = Boolean(review && review.criteria.length);
+  const hidden = !projection || (!hasCriteria && !productVerification && !postDag);
   return (
     <section className="delivery-acceptance" id="delivery-acceptance" aria-labelledby="delivery-title" hidden={hidden}>
       <header className="view-head">
@@ -147,7 +343,7 @@ function DeliveryAcceptanceSection({ workbench, projection }: { workbench: Workb
           </span>
         </div>
         <div className="stage-pills" id="delivery-counts" aria-label="验收状态汇总">
-          {review && !hidden
+          {review && hasCriteria
             ? Object.entries(DELIVERY_STATUS).map(([status, [label, variant]]) => (
                 <Badge variant={variant} key={status}>
                   {`${label} ${review.counts[status as keyof typeof review.counts]}`}
@@ -156,38 +352,46 @@ function DeliveryAcceptanceSection({ workbench, projection }: { workbench: Workb
             : null}
         </div>
       </header>
-      <ul className="delivery-criteria card" id="delivery-criteria" aria-label="逐条验收条件">
-        {review && !hidden
-          ? review.criteria.map((row, index) => {
-              const [label, variant] = DELIVERY_STATUS[row.status] || DELIVERY_STATUS.unverified;
-              const ref = `${row.requirement_id} · 条件 ${row.criterion_index}`;
-              return (
-                <li className="delivery-criterion" key={`${ref}-${index}`}>
-                  <div>
-                    <span className="card-note">{ref}</span>
-                    <p>{row.text}</p>
-                    {row.reason ? <p className="card-note">{row.reason}</p> : null}
-                  </div>
-                  <div className="delivery-result">
-                    <Badge variant={row.risk_accepted ? "warn" : variant}>{label}</Badge>
-                    {row.evidence ? (
-                      <button
-                        type="button"
-                        className="btn btn-quiet"
-                        data-delivery-evidence={index}
-                        aria-controls="dock"
-                        aria-label={`查看证据 · ${ref}`}
-                        onClick={() => workbench.showDeliveryEvidence(index)}
-                      >
-                        查看证据
-                      </button>
-                    ) : null}
-                  </div>
-                </li>
-              );
-            })
-          : null}
-      </ul>
+      {projection && productVerification ? (
+        <ProductVerificationCard
+          workbench={workbench}
+          runId={projection.run_id}
+          verification={productVerification}
+        />
+      ) : null}
+      {postDag ? <PostDagCard workbench={workbench} postDag={postDag} /> : null}
+      {review && hasCriteria ? (
+        <ul className="delivery-criteria card" id="delivery-criteria" aria-label="逐条验收条件">
+          {review.criteria.map((row, index) => {
+            const [label, variant] = DELIVERY_STATUS[row.status] || DELIVERY_STATUS.unverified;
+            const ref = `${row.requirement_id} · 条件 ${row.criterion_index}`;
+            return (
+              <li className="delivery-criterion" key={`${ref}-${index}`}>
+                <div>
+                  <span className="card-note">{ref}</span>
+                  <p>{row.text}</p>
+                  {row.reason ? <p className="card-note">{row.reason}</p> : null}
+                </div>
+                <div className="delivery-result">
+                  <Badge variant={row.risk_accepted ? "warn" : variant}>{label}</Badge>
+                  {row.evidence ? (
+                    <button
+                      type="button"
+                      className="btn btn-quiet"
+                      data-delivery-evidence={index}
+                      aria-controls="dock"
+                      aria-label={`查看证据 · ${ref}`}
+                      onClick={() => workbench.showDeliveryEvidence(index)}
+                    >
+                      查看证据
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
     </section>
   );
 }
@@ -225,7 +429,10 @@ function Swimlanes({ workbench, state, projection }: { workbench: Workbench; sta
 }
 
 export function TopologyView({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
-  const projection = state.projection;
+  const projection =
+    state.projection && (!state.runId || state.projection.run_id === state.runId)
+      ? state.projection
+      : null;
   const hasDag = Boolean(projection?.dag.nodes.length);
   const awaitingPlanApproval = projection?.hitl_banner?.kind === "plan_gate";
   const dagHidden =
