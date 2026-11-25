@@ -34,6 +34,7 @@ from olympus.core.control import (
     is_design_bound_to_spec,
     is_plan_bound_to_upstream,
 )
+from olympus.core.dag import validate_goal_spec
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
@@ -62,6 +63,7 @@ from olympus.session.contracts import (
 )
 from olympus.session.policy import InteractiveMinimalPolicy
 from olympus.session.router import parse_reply
+from olympus.stages.align import AlignStage
 
 ProviderBuilder = Callable[..., LLMProvider]
 
@@ -82,6 +84,59 @@ def _parse_explicit_revision_directive(text: str) -> str | None:
         return None
     body = match.group(1).strip()
     return body or None
+
+
+def _normalize_clarification_text(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+_PURE_RETRY_TOKENS = frozenset(
+    {
+        "retry",
+        "try again",
+        "continue",
+        "proceed",
+        "resume",
+        "go ahead",
+        "重试",
+        "继续",
+        "恢复",
+        "再试一次",
+    }
+)
+
+
+def _is_pure_retry_message(text: str) -> bool:
+    normalized = _normalize_clarification_text(text).strip(".!。！？")
+    return normalized in _PURE_RETRY_TOKENS
+
+
+def _workflow_strict_canonical(definition: WorkflowDefinition) -> bool:
+    for node in definition.nodes:
+        if node.type == "align_goal":
+            return bool(node.params.get("strict_canonical", True))
+    return True
+
+
+def _needs_clarification_resynthesis(
+    spec: GoalSpec,
+    extra_notes: list[str],
+    *,
+    strict_canonical: bool = False,
+) -> bool:
+    """Return True when clarifications go beyond defaults or a strict spec still needs repair."""
+    if any(note.strip() for note in extra_notes):
+        return True
+    if strict_canonical and validate_goal_spec(spec):
+        return True
+    for amb in spec.open_ambiguities:
+        if not amb.blocking or not (amb.answer or "").strip():
+            continue
+        if _normalize_clarification_text(amb.answer).rstrip(".!。！？") != (
+            _normalize_clarification_text(amb.default_assumption).rstrip(".!。！？")
+        ):
+            return True
+    return any(note.severity.value == "blocking" and note.resolved for note in spec.minority_notes)
 
 
 @dataclass(frozen=True)
@@ -400,6 +455,7 @@ class SessionRunner:
                     run_id=run_id,
                     answers=intent.answers,
                     resolutions=intent.resolutions,
+                    clarification_note=intent.feedback.strip(),
                     actor="human",
                 )
             except (ValueError, ConcurrencyConflictError) as exc:
@@ -436,8 +492,22 @@ class SessionRunner:
                         "revision feedback."
                     ),
                 )
+            latest_snap = self.store.get_run(run_id)
+            if pending_gate == "spec" and self._has_pending_resynthesis(
+                run_id, latest_snap.get("spec"), definition=definition
+            ):
+                paused = self._ensure_clarified_spec_resynthesized(run_id, definition)
+                if paused is not None:
+                    return paused
+                return self._continue(run_id, definition)
             try:
-                self._approve_gate(run_id, pending_gate)
+                self._approve_gate(
+                    run_id,
+                    pending_gate,
+                    expected_revision=(
+                        int(latest_snap["state_revision"]) if pending_gate == "spec" else None
+                    ),
+                )
             except (ValueError, ConcurrencyConflictError) as exc:
                 return self._emit_pause(
                     run_id,
@@ -724,6 +794,9 @@ class SessionRunner:
         return self._completed_envelope(run_id, final)
 
     def _continue(self, run_id: str, definition: WorkflowDefinition) -> SessionEnvelope:
+        paused = self._ensure_clarified_spec_resynthesized(run_id, definition)
+        if paused is not None:
+            return paused
         snap = self.store.get_run(run_id)
         effective = self._effective_definition(definition)
         entry = resolve_resume_node(effective, snap, store=self.store)
@@ -805,6 +878,21 @@ class SessionRunner:
                 reason="Recovery hint was empty.",
                 message="Recovery hint was empty; describe the path, symbol, or correction.",
             )
+        spec: GoalSpec | None = snap.get("spec")
+        if spec is not None and self._has_pending_resynthesis(
+            run_id, spec, definition=definition
+        ):
+            existing_notes = self._clarification_notes(run_id, spec_id=spec.spec_id)
+            if not _is_pure_retry_message(clean) and _normalize_clarification_text(clean) not in {
+                _normalize_clarification_text(note) for note in existing_notes
+            }:
+                self.control.clarify_spec(
+                    run_id=run_id,
+                    answers={},
+                    clarification_note=clean,
+                    actor="human",
+                )
+            return self._continue(run_id, definition)
         blocked = self._execution_blocked_tasks(run_id, snap)
         if blocked:
             return self._recover_blocked_in_place(run_id, definition, snap, clean, blocked)
@@ -1196,9 +1284,17 @@ class SessionRunner:
             definition=definition,
         )
 
-    def _approve_gate(self, run_id: str, gate: str) -> None:
+    def _approve_gate(
+        self,
+        run_id: str,
+        gate: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> None:
         if gate == "spec":
-            self.control.confirm_spec(run_id=run_id, approver="human")
+            self.control.confirm_spec(
+                run_id=run_id, approver="human", expected_revision=expected_revision
+            )
         elif gate == "design":
             self.control.approve_design(run_id=run_id, approver="human")
         elif gate == "plan":
@@ -1509,6 +1605,172 @@ class SessionRunner:
             f"{task.task_id}: {task.last_error or 'blocked'}" for task in blocked
         )
         return f"Task execution blocked: {details}"
+
+    def _unconsumed_clarification_note_events(
+        self, run_id: str, *, spec_id: str
+    ) -> list[tuple[str, str]]:
+        """Return ``(event_id, feedback)`` pairs not yet consumed by ``spec.resynthesized``."""
+        window: list[Any] = []
+        for event in reversed(self.store.list_events(run_id)):
+            if event.event_type in ("session.started", "session.continued"):
+                break
+            window.append(event)
+        window.reverse()
+
+        consumed_ids: set[str] = set()
+        legacy_cutoff_seq = 0
+        for event in window:
+            if event.event_type != "spec.resynthesized":
+                continue
+            if event.payload.get("spec_id") not in (None, "", spec_id):
+                continue
+            ids = event.payload.get("consumed_note_ids")
+            if isinstance(ids, list):
+                consumed_ids.update(str(item) for item in ids if item)
+            else:
+                legacy_cutoff_seq = max(legacy_cutoff_seq, event.event_seq)
+
+        notes: list[tuple[str, str]] = []
+        for event in window:
+            if event.event_type != "spec.clarification_note":
+                continue
+            if event.payload.get("spec_id") not in (None, "", spec_id):
+                continue
+            if event.event_id in consumed_ids or event.event_seq <= legacy_cutoff_seq:
+                continue
+            feedback = str(event.payload.get("feedback") or "").strip()
+            if feedback:
+                notes.append((event.event_id, feedback))
+        return notes
+
+    def _has_pending_resynthesis(
+        self,
+        run_id: str,
+        spec: GoalSpec | None,
+        *,
+        definition: WorkflowDefinition | None = None,
+    ) -> bool:
+        """True when a clarified GoalSpec still needs body-level resynthesis before gate_spec."""
+        if spec is None or spec.unresolved_blockers():
+            return False
+        if self.store.is_approved(
+            run_id=run_id,
+            target=ApprovalTarget.GOAL_SPEC,
+            target_id=spec.spec_id,
+            target_hash=spec.content_hash,
+        ):
+            return False
+        unconsumed_notes = self._unconsumed_clarification_note_events(
+            run_id, spec_id=spec.spec_id
+        )
+        if unconsumed_notes:
+            return True
+        saw_clarification = False
+        for event in reversed(self.store.list_events(run_id)):
+            if event.event_type in ("session.started", "session.continued"):
+                break
+            if event.event_type == "spec.resynthesized":
+                if event.payload.get("spec_id") in (None, "", spec.spec_id):
+                    return False
+                continue
+            if event.event_type in ("spec.clarified", "spec.clarification_note") and (
+                event.payload.get("spec_id") in (None, "", spec.spec_id)
+            ):
+                saw_clarification = True
+        if not saw_clarification:
+            return False
+        strict_canonical = (
+            _workflow_strict_canonical(self._effective_definition(definition))
+            if definition is not None
+            else False
+        )
+        return _needs_clarification_resynthesis(spec, [], strict_canonical=strict_canonical)
+
+    def _ensure_clarified_spec_resynthesized(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+    ) -> SessionEnvelope | None:
+        """Complete any pending post-clarification resynthesis before entering gate_spec."""
+        for _ in range(2):
+            snap = self.store.get_run(run_id)
+            spec: GoalSpec | None = snap.get("spec")
+            if spec is None or not self._has_pending_resynthesis(
+                run_id, spec, definition=definition
+            ):
+                return None
+            note_events = self._unconsumed_clarification_note_events(run_id, spec_id=spec.spec_id)
+            extra_notes = [feedback for _, feedback in note_events]
+            consumed_ids = [event_id for event_id, _ in note_events]
+            try:
+                self._resynthesize_clarified_spec(
+                    run_id,
+                    definition,
+                    snap,
+                    extra_feedback="\n\n".join(extra_notes),
+                    consumed_note_ids=consumed_ids,
+                )
+            except Exception as exc:  # noqa: BLE001 -- preserve resumable pause on stage/validation error
+                latest = self.store.get_run(run_id)
+                reason = f"Spec resynthesis failed: {exc}"
+                self._mark_awaiting_human(run_id, latest, "align_resynthesize", reason)
+                return self._emit_pause(
+                    run_id,
+                    PauseKind.BLOCKED,
+                    node="align_resynthesize",
+                    reason=reason,
+                    message=(
+                        f"Spec resynthesis failed ({exc}). Reply 'retry' to try again in place, "
+                        "or add extra clarification guidance."
+                    ),
+                )
+        snap = self.store.get_run(run_id)
+        if self._has_pending_resynthesis(run_id, snap.get("spec"), definition=definition):
+            reason = "New clarification notes arrived during resynthesis; retry to fuse them."
+            self._mark_awaiting_human(run_id, snap, "align_resynthesize", reason)
+            return self._emit_pause(
+                run_id,
+                PauseKind.BLOCKED,
+                node="align_resynthesize",
+                reason=reason,
+                message=reason,
+            )
+        return None
+
+    def _clarification_notes(self, run_id: str, *, spec_id: str) -> list[str]:
+        """Collect unconsumed human clarification notes recorded for the active spec."""
+        return [
+            feedback
+            for _, feedback in self._unconsumed_clarification_note_events(run_id, spec_id=spec_id)
+        ]
+
+    def _resynthesize_clarified_spec(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        *,
+        extra_feedback: str,
+        consumed_note_ids: list[str] | None = None,
+    ) -> GoalSpec:
+        effective = self._effective_definition(definition)
+        runtime = self._runtime(run_id, effective)
+        stage = AlignStage(
+            store=runtime.store,
+            provider=runtime.provider,
+            workspace_root=runtime.workspace_root,
+            trace_dir=runtime.artifacts_root,
+            execution_drivers=runtime.execution_drivers,
+            driver_registry=runtime.driver_registry,
+        )
+        return stage.resynthesize_after_clarification(
+            run_id=run_id,
+            raw_goal=self._current_input(run_id, snap),
+            constraints=self._constraints(run_id),
+            extra_feedback=extra_feedback,
+            consumed_note_ids=consumed_note_ids,
+            strict_canonical=_workflow_strict_canonical(effective),
+        )
 
     def _current_input(self, run_id: str, snap: dict[str, Any]) -> str:
         for event in reversed(self.store.list_events(run_id)):

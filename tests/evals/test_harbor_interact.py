@@ -692,6 +692,11 @@ def respond(messages, tools):
                 content=json.dumps({"action": "clarify", "answers": answers})
             )
         return LLMResponse(content=json.dumps({"action": "approve", "message": "approved"}))
+    if "Fuse EVERY human clarification" in system:
+        updated = dict(SPEC)
+        answers = re.findall(r'"answer":\s*"([^"]+)"', user)
+        updated["constraints"] = [*SPEC.get("constraints", []), *answers]
+        return LLMResponse(content=json.dumps(updated))
     if "Requirements Alignment Architect" in system:
         return LLMResponse(content=json.dumps(SPEC))
     if "White-Box Solution Architect" in system:
