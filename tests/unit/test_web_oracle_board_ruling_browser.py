@@ -643,3 +643,113 @@ def test_stale_drawer_response_keeps_other_drawer_open_and_preserves_tabs_past_l
     stored = p2.evaluate('JSON.parse(localStorage.getItem("olympus-open-tabs"))')
     assert keep_id in stored
     p2.close()
+
+
+def test_clarify_panel_hides_after_spec_approval_even_with_unanswered_non_blocking_ambiguity(
+    board_server, browser
+):
+    store, _, url = board_server
+    run_id = store.create_run(
+        run_id="run-post-spec-nonblocking",
+        title="BlackNote Post-Approval Delivery",
+    )
+    spec = GoalSpec(
+        spec_id="spec-blacknote-v2",
+        version=2,
+        goal="Deliver BlackNote web app.",
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="Web app boots cleanly",
+                acceptance_criteria=["GET / returns 200"],
+            )
+        ],
+        open_ambiguities=[
+            AmbiguityItem(
+                id="A1-blocking",
+                question="Deliver web UI?",
+                impact="Scope",
+                options=["Full Web UI"],
+                default_assumption="Full Web UI",
+                blocking=True,
+                answer="Full Web UI",
+            ),
+            AmbiguityItem(
+                id="A2-nonblocking",
+                question="Allow anonymous read?",
+                impact="Auth policy",
+                options=["Allow anonymous", "Require login"],
+                default_assumption="Allow anonymous",
+                blocking=False,
+                answer=None,
+            ),
+        ],
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="align",
+        event_type="spec.clarification_note",
+        actor="human",
+        payload={"feedback": "Keep browser waterfall UI"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="align",
+        event_type="spec.resynthesized",
+        actor="align",
+        payload={"spec_version": 2},
+    )
+    store.save_spec(run_id, spec)
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN)
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+
+    # Before GoalSpec approval (Stage 1): ClarifyPanel is visible for optional clarification/notes.
+    page.goto(f"{url}/?run={run_id}#topology")
+    expect(page.locator("#clarify-panel")).to_be_visible()
+    expect(page.locator("#btn-clarify-submit")).to_be_visible()
+    expect(page.locator("#clarify-notes")).to_contain_text("Keep browser waterfall UI")
+
+    # Approve GoalSpec and advance to delivery review: ClarifyPanel must hide in Cockpit & Drawer.
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.GOAL_SPEC,
+            target_id=spec.spec_id,
+            target_hash=spec.content_hash,
+            approver="human",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="execute",
+        event_type="product.verified",
+        actor="verify_product",
+        payload={
+            "passed": False,
+            "summary": "Delivery check needs human review",
+            "failures": ["repro check failed"],
+            "checks": [],
+        },
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="execute",
+        event_type="session.paused",
+        actor="orchestrate",
+        payload={"pause_kind": "blocked", "reason": "Delivery check failed"},
+    )
+
+    page.goto(f"{url}/?run={run_id}#topology")
+    expect(page.locator("#hitl-banner")).to_be_visible()
+    expect(page.locator("#clarify-panel")).to_be_hidden()
+
+    page.goto(f"{url}/")
+    page.locator(f"[data-quick-rule='{run_id}']").click()
+    drawer = page.locator("#quick-ruling-drawer")
+    expect(drawer).to_be_visible()
+    expect(drawer.locator("#clarify-panel")).to_have_count(0)
+    expect(drawer.locator("#btn-clarify-submit")).to_have_count(0)
+    page.close()

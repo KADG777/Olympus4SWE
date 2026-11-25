@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 
 import type { AmbiguityItem, RunProjection } from "../api/types";
-import { localizeTriageReason, MATURITY_LABELS, pendingAmbiguities } from "../lib/labels";
+import { clarifyPanelVisibility, localizeTriageReason, MATURITY_LABELS } from "../lib/labels";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { Badge } from "./ui";
 
@@ -107,13 +107,8 @@ export function ClarifyPanel({
   const noteInput = useRef<HTMLTextAreaElement>(null);
   const projection = projectionOverride !== undefined ? projectionOverride : state?.projection ?? null;
   const generation = generationOverride ?? state?.clarifyGeneration ?? 0;
-  const pending = projection ? pendingAmbiguities(projection) : [];
-  const submittedNotes = projection?.clarification_notes || [];
-  const showForm =
-    pending.length > 0 ||
-    Boolean(projection?.spec && !projection.spec_approved && projection.resynthesis_error);
-  const showNotes = submittedNotes.length > 0;
-  const showPanel = showForm || showNotes;
+  const { pending, submittedNotes, showForm, showNotes, showPanel } =
+    clarifyPanelVisibility(projection);
   // Answers in progress survive live updates until the question set itself changes.
   const signature = projection
     ? `${projection.run_id}:${generation}:${pending.map((amb) => `${amb.id}:${amb.question || ""}`).join("|")}`
