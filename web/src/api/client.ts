@@ -53,11 +53,14 @@ export const productArtifactUrl = (
   runId: string,
   kind: ProductArtifactKind,
   version?: number | string | null,
+  sha?: string | null,
 ): string => {
   const base = `${runPath(runId)}/product-artifact/${kind}`;
-  return version != null && version !== ""
-    ? `${base}?v=${encodeURIComponent(String(version))}`
-    : base;
+  const params = new URLSearchParams();
+  if (version != null && version !== "") params.set("v", String(version));
+  if (sha) params.set("sha", sha);
+  const qs = params.toString();
+  return qs ? `${base}?${qs}` : base;
 };
 
 export async function fetchProductArtifactText(

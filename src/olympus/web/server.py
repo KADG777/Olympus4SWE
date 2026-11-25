@@ -1382,13 +1382,35 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         },
     )
     def get_product_artifact(
-        run_id: str, kind: Literal["report", "boot_log", "screenshot"]
+        run_id: str,
+        kind: Literal["report", "boot_log", "screenshot"],
+        v: int | None = None,
+        sha: str | None = None,
     ) -> Response:
         service.store.get_run(run_id)
+        expected_sha = sha.strip().lower() if isinstance(sha, str) and sha.strip() else None
+        if v is not None or kind == "screenshot":
+            events = service.store.list_events(run_id)
+            pv = delivery_review.latest_product_verification(
+                events,
+                service.artifacts_root / run_id,
+                artifacts_root=service.artifacts_root,
+            )
+            if v is not None and (pv is None or pv["event_seq"] != v):
+                raise NotFoundError("Product verification artifact does not match requested event")
+            if kind == "screenshot" and pv is not None:
+                if not pv["has_screenshot"]:
+                    raise NotFoundError("Product verification screenshot is not available")
+                recorded_sha = pv.get("screenshot_sha256")
+                if isinstance(recorded_sha, str) and recorded_sha:
+                    if expected_sha is not None and expected_sha != recorded_sha:
+                        raise NotFoundError("Product verification screenshot has changed")
+                    expected_sha = recorded_sha
         artifact = delivery_review.read_product_artifact(
             service.artifacts_root / run_id,
             kind,
             artifacts_root=service.artifacts_root,
+            expected_sha256=expected_sha,
         )
         if artifact is None:
             raise NotFoundError("Product verification artifact is not available")

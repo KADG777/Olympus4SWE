@@ -630,7 +630,7 @@ export function QuickRulingDrawer({
                 );
                 const shotUrl =
                   pv?.has_screenshot && !shotSuppressed
-                    ? productArtifactUrl(runId, "screenshot", pv.event_seq)
+                    ? productArtifactUrl(runId, "screenshot", pv.event_seq, pv.screenshot_sha256)
                     : null;
                 const bootLogUrl = pv?.has_boot_log
                   ? productArtifactUrl(runId, "boot_log", pv.event_seq)

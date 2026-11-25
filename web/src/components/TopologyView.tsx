@@ -169,7 +169,12 @@ function ProductVerificationCard({
   );
   const shotUrl =
     verification.has_screenshot && !screenshotSuppressed
-      ? productArtifactUrl(runId, "screenshot", verification.event_seq)
+      ? productArtifactUrl(
+          runId,
+          "screenshot",
+          verification.event_seq,
+          verification.screenshot_sha256,
+        )
       : null;
   const bootLogUrl = verification.has_boot_log
     ? productArtifactUrl(runId, "boot_log", verification.event_seq)

@@ -385,6 +385,35 @@ function ProductArtifactPreview({
   );
 }
 
+function ProductScreenshotCard({ shotUrl }: { shotUrl: string }) {
+  const [unavailable, setUnavailable] = useState(false);
+  useEffect(() => {
+    setUnavailable(false);
+  }, [shotUrl]);
+  return (
+    <Card title="实机首页截图 (home.png)">
+      {unavailable ? (
+        <Notice level="info">当前轮次截图已被新一轮验证更新，等待最新验收结果同步。</Notice>
+      ) : (
+        <a
+          className="product-dock-shot"
+          href={shotUrl}
+          target="_blank"
+          rel="noopener"
+          title="在新标签页打开原图"
+        >
+          <img
+            key={shotUrl}
+            src={shotUrl}
+            alt="实机首页截图"
+            onError={() => setUnavailable(true)}
+          />
+        </a>
+      )}
+    </Card>
+  );
+}
+
 function productDock(projection: RunProjection): DockContent {
   const verification = projection.delivery_acceptance?.product_verification ?? null;
   const postDag = projection.post_dag ?? null;
@@ -398,7 +427,12 @@ function productDock(projection: RunProjection): DockContent {
   );
   const shotUrl =
     verification?.has_screenshot && !screenshotSuppressed
-      ? productArtifactUrl(projection.run_id, "screenshot", verification.event_seq)
+      ? productArtifactUrl(
+          projection.run_id,
+          "screenshot",
+          verification.event_seq,
+          verification.screenshot_sha256,
+        )
       : null;
   const cacheKey = `${projection.state_revision}:${verification?.event_seq ?? 0}`;
   const verdict = postDag?.latest_argus_verdict ?? null;
@@ -433,19 +467,7 @@ function productDock(projection: RunProjection): DockContent {
                 <pre className="code-block scroller">{verification.failures.join("\n")}</pre>
               ) : null}
             </Card>
-            {shotUrl ? (
-              <Card title="实机首页截图 (home.png)">
-                <a
-                  className="product-dock-shot"
-                  href={shotUrl}
-                  target="_blank"
-                  rel="noopener"
-                  title="在新标签页打开原图"
-                >
-                  <img key={shotUrl} src={shotUrl} alt="实机首页截图" />
-                </a>
-              </Card>
-            ) : null}
+            {shotUrl ? <ProductScreenshotCard shotUrl={shotUrl} /> : null}
             {verification.has_boot_log ? (
               <ProductArtifactPreview
                 runId={projection.run_id}

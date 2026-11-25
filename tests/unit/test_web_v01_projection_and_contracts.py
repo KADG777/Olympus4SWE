@@ -622,3 +622,53 @@ def test_product_verification_hides_stale_screenshot_when_latest_round_skips_it(
     )
     second = build_run_projection(store, tmp_path, run_id)
     assert second["delivery_acceptance"]["product_verification"]["has_screenshot"] is False
+
+
+def test_product_screenshot_endpoint_binds_to_event_seq_and_sha256(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    run_id = _seed_approved_run(store, status=RunStatus.AWAITING_HUMAN)
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    art_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "verify_product"
+    art_dir.mkdir(parents=True, exist_ok=True)
+    png1 = b"\x89PNG\r\n\x1a\nround1"
+    png2 = b"\x89PNG\r\n\x1a\nround2"
+    (art_dir / "home.png").write_bytes(png1)
+    _append_product_verified(
+        store, run_id, passed=False, extra={"screenshot_path": str(art_dir / "home.png")}
+    )
+
+    with TestClient(create_fastapi_app(app)) as client:
+        pv1 = client.get(f"/api/runs/{run_id}").json()["projection"]["delivery_acceptance"][
+            "product_verification"
+        ]
+        seq1 = pv1["event_seq"]
+        sha1 = pv1["screenshot_sha256"]
+        assert sha1
+
+        ok1 = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}&sha={sha1}")
+        assert ok1.status_code == 200
+        assert ok1.content == png1
+
+        # Next round overwrites home.png on disk before emitting its product.verified event:
+        (art_dir / "home.png").write_bytes(png2)
+        stale_mid = client.get(
+            f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}&sha={sha1}"
+        )
+        assert stale_mid.status_code == 404
+
+        # Next round publishes product.verified event: old seq stays 404, new seq+sha returns png2.
+        _append_product_verified(
+            store, run_id, passed=True, extra={"screenshot_path": str(art_dir / "home.png")}
+        )
+        pv2 = client.get(f"/api/runs/{run_id}").json()["projection"]["delivery_acceptance"][
+            "product_verification"
+        ]
+        seq2 = pv2["event_seq"]
+        sha2 = pv2["screenshot_sha256"]
+        assert seq2 > seq1
+        assert sha2 != sha1
+        stale_after = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}")
+        assert stale_after.status_code == 404
+        ok2 = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq2}&sha={sha2}")
+        assert ok2.status_code == 200
+        assert ok2.content == png2

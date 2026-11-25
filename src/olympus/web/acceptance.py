@@ -14,6 +14,7 @@ from olympus.core.contracts import GoalSpec, RunEvent, TaskPlan
 from olympus.harness.delivery import DELIVERY_EVENT
 
 _VERSION = re.compile(r"sha256:[a-f0-9]{64}")
+_SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 _RECEIPT_ID = re.compile(r"delivery-[a-f0-9]{12}")
 
 _PRODUCT_ARTIFACTS: dict[str, tuple[str, str]] = {
@@ -87,7 +88,11 @@ def _safe_artifact_exists(trusted_root: Path, *parts: str) -> bool:
 
 
 def read_product_artifact(
-    run_dir: Path, kind: str, *, artifacts_root: Path | None = None
+    run_dir: Path,
+    kind: str,
+    *,
+    artifacts_root: Path | None = None,
+    expected_sha256: str | None = None,
 ) -> tuple[bytes, str] | None:
     """Read one allowlisted product verification artifact under ``artifacts_root``."""
     entry = _PRODUCT_ARTIFACTS.get(kind)
@@ -97,6 +102,8 @@ def read_product_artifact(
     root = artifacts_root if artifacts_root is not None else run_dir.parent
     content = open_safe_artifact_bytes(root, run_dir.name, "artifacts", "verify_product", filename)
     if content is None:
+        return None
+    if expected_sha256 is not None and sha256(content).hexdigest() != expected_sha256:
         return None
     return content, media_type
 
@@ -156,6 +163,26 @@ def latest_product_verification(
     ) or any(
         check["name"] == "screenshot" and check["status"] != "passed" for check in checks
     )
+    has_screenshot = False
+    screenshot_sha256: str | None = None
+    if not screenshot_declared_absent:
+        shot_bytes = open_safe_artifact_bytes(
+            root, run_name, "artifacts", "verify_product", "home.png"
+        )
+        disk_sha = sha256(shot_bytes).hexdigest() if shot_bytes is not None else None
+        raw_recorded_sha = payload.get("screenshot_sha256")
+        recorded_sha = (
+            raw_recorded_sha
+            if isinstance(raw_recorded_sha, str) and _SHA256_HEX.match(raw_recorded_sha)
+            else None
+        )
+        if recorded_sha is not None:
+            if disk_sha == recorded_sha:
+                has_screenshot = True
+                screenshot_sha256 = recorded_sha
+        elif disk_sha is not None:
+            has_screenshot = True
+            screenshot_sha256 = disk_sha
     return {
         "passed": passed,
         "summary": summary,
@@ -169,13 +196,8 @@ def latest_product_verification(
         "has_boot_log": _safe_artifact_exists(
             root, run_name, "artifacts", "verify_product", "boot.log"
         ),
-        "has_screenshot": (
-            False
-            if screenshot_declared_absent
-            else _safe_artifact_exists(
-                root, run_name, "artifacts", "verify_product", "home.png"
-            )
-        ),
+        "has_screenshot": has_screenshot,
+        "screenshot_sha256": screenshot_sha256,
     }
 
 
