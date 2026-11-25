@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from hashlib import file_digest, sha256
 from pathlib import Path
 from typing import Any
 
 from olympus.core.contracts import GoalSpec, RunEvent, TaskPlan
 from olympus.harness.delivery import DELIVERY_EVENT
+from olympus.stages.verify_product import PRODUCT_VERIFIED_EVENT
 
 _VERSION = re.compile(r"sha256:[a-f0-9]{64}")
 _RECEIPT_ID = re.compile(r"delivery-[a-f0-9]{12}")
@@ -161,4 +162,44 @@ def build_delivery_acceptance(
         "spec_hash": spec.content_hash,
         "counts": counts,
         "criteria": rows,
+    }
+
+
+def build_post_dag_verification(events: list[RunEvent]) -> dict[str, Any] | None:
+    """Keep the current plan's recent checks without reading mutable sandbox files."""
+    product_passed = None
+    last_recheck = None
+    attempts: deque[dict[str, Any]] = deque(maxlen=100)
+    for event in events:
+        payload = event.payload
+        if event.event_type == "plan.saved":
+            product_passed = None
+            last_recheck = None
+            attempts.clear()
+            continue
+        if event.event_type == PRODUCT_VERIFIED_EVENT:
+            product_passed = payload.get("passed")
+        if event.event_type == "post_dag.repro_rechecked":
+            last_recheck = {
+                "checked_count": payload["checked_count"],
+                "still_failing_count": payload["still_failing_count"],
+            }
+            round_number = payload["repair_round"] + 1
+        elif event.event_type == "review.verdict_recorded" and payload.get("mode") == "post_dag":
+            round_number = payload["review_cycle"]
+        else:
+            continue
+        for check in payload.get("checks", []):
+            attempts.append({
+                **check,
+                "event_seq": event.event_seq,
+                "round": round_number,
+                "candidate": payload.get("candidate"),
+            })
+    if product_passed is None and last_recheck is None and not attempts:
+        return None
+    return {
+        "product_passed": product_passed,
+        "last_recheck": last_recheck,
+        "attempts": list(attempts),
     }

@@ -1701,6 +1701,75 @@
         "title": "DeliveryCheck",
         "type": "object"
       },
+      "DeliveryCheckAttempt": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate"
+          },
+          "check_id": {
+            "title": "Check Id",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "log": {
+            "title": "Log",
+            "type": "string"
+          },
+          "round": {
+            "title": "Round",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "timed_out"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_id",
+          "status",
+          "log",
+          "event_seq",
+          "round"
+        ],
+        "title": "DeliveryCheckAttempt",
+        "type": "object"
+      },
+      "DeliveryCheckSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "checked_count": {
+            "title": "Checked Count",
+            "type": "integer"
+          },
+          "still_failing_count": {
+            "title": "Still Failing Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "checked_count",
+          "still_failing_count"
+        ],
+        "title": "DeliveryCheckSummary",
+        "type": "object"
+      },
       "DeliveryCounts": {
         "additionalProperties": false,
         "properties": {
@@ -2982,6 +3051,44 @@
           }
         },
         "title": "PauseInfo",
+        "type": "object"
+      },
+      "PostDagVerification": {
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryCheckAttempt"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "last_recheck": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryCheckSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "product_passed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Passed"
+          }
+        },
+        "required": [
+          "attempts"
+        ],
+        "title": "PostDagVerification",
         "type": "object"
       },
       "ProgressSummary": {
@@ -4444,6 +4551,16 @@
           "plan_approved": {
             "title": "Plan Approved",
             "type": "boolean"
+          },
+          "post_dag_verification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PostDagVerification"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "progress": {
             "$ref": "#/components/schemas/ProgressSummary"

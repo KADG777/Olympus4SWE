@@ -905,6 +905,31 @@ export interface components {
             /** Requirement Id */
             requirement_id: string;
         };
+        /** DeliveryCheckAttempt */
+        DeliveryCheckAttempt: {
+            /** Candidate */
+            candidate?: string | null;
+            /** Check Id */
+            check_id: string;
+            /** Event Seq */
+            event_seq: number;
+            /** Log */
+            log: string;
+            /** Round */
+            round: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "passed" | "failed" | "timed_out";
+        };
+        /** DeliveryCheckSummary */
+        DeliveryCheckSummary: {
+            /** Checked Count */
+            checked_count: number;
+            /** Still Failing Count */
+            still_failing_count: number;
+        };
         /** DeliveryCounts */
         DeliveryCounts: {
             /** Failed */
@@ -1377,6 +1402,14 @@ export interface components {
             node?: string | null;
             /** Reason */
             reason?: string | null;
+        };
+        /** PostDagVerification */
+        PostDagVerification: {
+            /** Attempts */
+            attempts: components["schemas"]["DeliveryCheckAttempt"][];
+            last_recheck?: components["schemas"]["DeliveryCheckSummary"] | null;
+            /** Product Passed */
+            product_passed?: boolean | null;
         };
         /** ProgressSummary */
         ProgressSummary: {
@@ -1883,6 +1916,7 @@ export interface components {
             plan?: components["schemas"]["TaskPlan"] | null;
             /** Plan Approved */
             plan_approved: boolean;
+            post_dag_verification?: components["schemas"]["PostDagVerification"] | null;
             progress: components["schemas"]["ProgressSummary"];
             /** Raw Input */
             raw_input: string;

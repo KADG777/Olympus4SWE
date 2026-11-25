@@ -192,6 +192,76 @@ function DeliveryAcceptanceSection({ workbench, projection }: { workbench: Workb
   );
 }
 
+const POST_DAG_STATUS = {
+  passed: ["通过", "good"],
+  failed: ["未通过", "bad"],
+  timed_out: ["超时", "warn"],
+} as const;
+
+function PostDagVerificationSection({ projection }: { projection: RunProjection | null }) {
+  const verification = projection?.post_dag_verification;
+  if (!verification) return null;
+  const { attempts, last_recheck: recheck, product_passed: productPassed } = verification;
+  const checks = new Map<string, typeof attempts>();
+  for (const attempt of attempts) {
+    const history = checks.get(attempt.check_id) || [];
+    history.push(attempt);
+    checks.set(attempt.check_id, history);
+  }
+
+  return (
+    <section className="delivery-acceptance" aria-labelledby="post-dag-checks-title">
+      <header className="view-head">
+        <h2 className="view-title" id="post-dag-checks-title">交付检查与复测</h2>
+        <div className="stage-pills">
+          {productPassed != null && (
+            <Badge variant={productPassed ? "good" : "bad"}>
+              {productPassed ? "产品检查通过" : "产品检查未通过"}
+            </Badge>
+          )}
+          {recheck && (
+            <Badge variant={recheck.still_failing_count ? "bad" : "good"}>
+              {`最近复测 · ${recheck.still_failing_count}/${recheck.checked_count} 项未通过`}
+            </Badge>
+          )}
+        </div>
+      </header>
+      {recheck && !checks.size && <p className="card-note">本次运行仅记录复测汇总。</p>}
+      {!!checks.size && (
+        <ul className="delivery-criteria card" aria-label="检查记录">
+          {[...checks].map(([id, history]) => {
+            const latest = history[history.length - 1];
+            const [label, variant] = POST_DAG_STATUS[latest.status];
+            return (
+              <li className="delivery-criterion" key={id}>
+                <details className="delivery-check-history">
+                  <summary>
+                    {`交付检查 ${id.slice(7, 15)} · `}
+                    <Badge variant={variant}>{label}</Badge>
+                  </summary>
+                  <ol>
+                    {history.map((attempt) => (
+                      <li key={attempt.event_seq}>
+                        <p>
+                          {`第 ${attempt.round} 轮 · ${POST_DAG_STATUS[attempt.status][0]} · 候选版本 `}
+                          <code title={attempt.candidate ?? undefined}>
+                            {attempt.candidate?.slice(7, 19) ?? "暂无版本记录"}
+                          </code>
+                        </p>
+                        {attempt.log && <pre>{attempt.log}</pre>}
+                      </li>
+                    ))}
+                  </ol>
+                </details>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function Swimlanes({ workbench, state, projection }: { workbench: Workbench; state: WorkbenchState; projection: RunProjection | null }) {
   const lanes = projection?.swimlanes || [];
   return (
@@ -311,6 +381,7 @@ export function TopologyView({ workbench, state }: { workbench: Workbench; state
       </section>
 
       <DeliveryAcceptanceSection workbench={workbench} projection={projection} />
+      <PostDagVerificationSection projection={projection} />
 
       <section className="lane-section" id="lane-section" aria-labelledby="lane-title" hidden={!hasDag || awaitingPlanApproval}>
         <div className="card-head">

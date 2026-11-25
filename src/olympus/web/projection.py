@@ -1612,6 +1612,7 @@ def build_run_projection(
             spec, tasks, design, delivery_acceptance=delivery_acceptance
         ),
         "delivery_acceptance": delivery_acceptance,
+        "post_dag_verification": delivery_review.build_post_dag_verification(events),
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }

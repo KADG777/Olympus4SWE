@@ -821,6 +821,26 @@ class DeliveryAcceptance(StrictModel):
     criteria: list[DeliveryCriterion]
 
 
+class DeliveryCheckAttempt(StrictModel):
+    check_id: str
+    status: Literal["passed", "failed", "timed_out"]
+    log: str
+    event_seq: int
+    round: int
+    candidate: str | None = None
+
+
+class DeliveryCheckSummary(StrictModel):
+    checked_count: int
+    still_failing_count: int
+
+
+class PostDagVerification(StrictModel):
+    product_passed: bool | None = None
+    last_recheck: DeliveryCheckSummary | None = None
+    attempts: list[DeliveryCheckAttempt]
+
+
 class RunProjection(StrictModel):
     run_id: str
     title: str
@@ -854,6 +874,7 @@ class RunProjection(StrictModel):
     waterfall_turns: list[WaterfallTurn]
     traceability_matrix: list[TraceabilityMatrix]
     delivery_acceptance: DeliveryAcceptance | None = None
+    post_dag_verification: PostDagVerification | None = None
     events: list[RunEvent]
     latest_event_seq: int
 

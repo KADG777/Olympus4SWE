@@ -198,3 +198,19 @@
   align-items: center;
   gap: var(--space-2);
 }
+
+.delivery-check-history {
+  min-inline-size: 0;
+  inline-size: 100%;
+}
+
+.delivery-check-history li {
+  margin-block-start: var(--space-2);
+}
+
+.delivery-check-history pre {
+  max-block-size: 12rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

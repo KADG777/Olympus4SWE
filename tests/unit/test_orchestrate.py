@@ -5656,6 +5656,13 @@ def test_post_dag_verified_blocker_triggers_repair_and_completes(tmp_path: Path)
     assert len(applied) == 1
     assert applied[0].payload["changed_paths"] == ["feature.py"]
     assert out["plan"].content_hash == plan.content_hash
+    evidence = build_run_projection(store, tmp_path, run_id)["post_dag_verification"]
+    first, second = evidence["attempts"]
+    assert (first["round"], second["round"]) == (1, 2)
+    assert first["check_id"] == second["check_id"]
+    assert (first["status"], second["status"]) == ("failed", "passed")
+    assert first["candidate"] and second["candidate"]
+    assert first["candidate"] != second["candidate"]
 
 
 def test_post_dag_repair_exhaustion_awaits_human(tmp_path: Path) -> None:
@@ -5723,6 +5730,10 @@ def test_post_dag_verified_repro_blocks_completion_even_if_next_review_passes(
     rechecked = [e for e in store.list_events(run_id) if e.event_type == "post_dag.repro_rechecked"]
     assert len(rechecked) == 1
     assert rechecked[0].payload["still_failing_count"] == 1
+    evidence = build_run_projection(store, tmp_path, run_id)["post_dag_verification"]
+    assert evidence["product_passed"] is True
+    assert evidence["last_recheck"]["still_failing_count"] == 1
+    assert evidence["attempts"][-1]["status"] == "failed"
 
     # Resuming from awaiting_human must still re-run persisted verified repros and block completion.
     resumed = stage.run_execution(run_id=run_id, max_repair_rounds=0)

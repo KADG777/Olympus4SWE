@@ -46,9 +46,10 @@ from olympus.core.dag import (
     scopes_overlap,
     validate_plan,
 )
+from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.harness.activity import LiveActivity, milestone_fields
-from olympus.harness.delivery import DELIVERY_EVENT, run_delivery_checks
+from olympus.harness.delivery import DELIVERY_EVENT, fingerprint_delivery, run_delivery_checks
 from olympus.harness.diff_gate import run_diff_gate
 from olympus.harness.driver import (
     ActiveTurnHandle,
@@ -857,6 +858,26 @@ def _redact_probe_output(text: str, env: Mapping[str, str]) -> str:
     if len(redacted) > _REPRO_OUTPUT_BUDGET:
         redacted = f"{redacted[:_REPRO_OUTPUT_BUDGET]}\n... (truncated)"
     return redacted
+
+
+def _post_dag_candidate(sandbox: SandboxHandle) -> str | None:
+    try:
+        return fingerprint_delivery(sandbox.workspace_path, sandbox.base_commit)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _post_dag_check(
+    command: str,
+    status: Literal["passed", "failed", "timed_out"],
+    output: str,
+) -> dict[str, Any]:
+    # The command itself can contain credentials or environment-specific paths.
+    return {
+        "check_id": content_hash(command),
+        "status": status,
+        "log": _redact_probe_output(output, os.environ),
+    }
 
 
 def _probe_is_broken(*, command: str, returncode: int | None, output: str) -> bool:
@@ -2946,6 +2967,7 @@ class OrchestrateStage:
         )
         failures: list[str] = []
         still_failing: list[str] = []
+        checks: list[dict[str, Any]] = []
         try:
             accepted_deletions = sorted(load_accepted_deletions(run_dir))
             if accepted_deletions:
@@ -2953,6 +2975,7 @@ class OrchestrateStage:
             _copy_matching_scope(
                 run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
             )
+            candidate = _post_dag_candidate(sandbox)
             env = build_sandbox_env(sandbox.workspace_path, host_root=self.workspace_root)
             env["OLYMPUS_SANDBOX_ROOT"] = str(sandbox.workspace_path.resolve())
             for index, raw_command in enumerate(repro_commands, start=1):
@@ -2980,7 +3003,14 @@ class OrchestrateStage:
                 except subprocess.TimeoutExpired:
                     still_failing.append(command)
                     failures.append(f"repro `{command}` timed out after 60s")
+                    checks.append(_post_dag_check(command, "timed_out", "Timed out after 60s"))
                     continue
+                output = _redact_probe_output(
+                    f"Exit code {proc.returncode}\n{proc.stdout}\n{proc.stderr}".strip(), env
+                )
+                checks.append(
+                    _post_dag_check(command, "passed" if proc.returncode == 0 else "failed", output)
+                )
                 (art_dir / f"repro-{index}.log").write_text(
                     f"command: {command}\nexit_code: {proc.returncode}\n"
                     f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n",
@@ -3002,6 +3032,8 @@ class OrchestrateStage:
                     "repair_round": repair_round,
                     "checked_count": len(repro_commands),
                     "still_failing_count": len(still_failing),
+                    "candidate": candidate,
+                    "checks": checks,
                 },
             )
             return failures, still_failing
@@ -3067,6 +3099,7 @@ class OrchestrateStage:
             _copy_matching_scope(
                 run_dir / "accepted_overlay", sandbox.workspace_path, write_scope=None
             )
+            candidate = _post_dag_candidate(sandbox)
             diff_text = capture_sandbox_diff(sandbox)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
@@ -3178,6 +3211,15 @@ class OrchestrateStage:
             )
             verdict_file = art_dir / "verdict.json"
             verdict_file.write_text(verified.model_dump_json(indent=2), encoding="utf-8")
+            checks = {
+                finding.repro_command: _post_dag_check(
+                    finding.repro_command, "failed", finding.verification_output or ""
+                )
+                for finding in verified.findings
+                if finding.severity == ReviewSeverity.IMPORTANT
+                and finding.verified is True
+                and finding.repro_command
+            }
             self.store.append_event(
                 run_id=run_id,
                 stage="verify",
@@ -3198,6 +3240,8 @@ class OrchestrateStage:
                         1 for f in verified.findings if f.severity == ReviewSeverity.NIT
                     ),
                     "dropped_unverified_count": verified.dropped_unverified_count,
+                    "candidate": candidate,
+                    "checks": list(checks.values()),
                 },
             )
             return verified, verdict_file

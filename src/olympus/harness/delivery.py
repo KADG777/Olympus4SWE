@@ -23,7 +23,7 @@ DELIVERY_EVENT = "delivery.checks_completed"
 _INTERNAL_DIRS = {".git", ".olympus"}
 
 
-def _delivery_version(workspace: Path, base_commit: str | None) -> str:
+def fingerprint_delivery(workspace: Path, base_commit: str | None) -> str:
     entries: dict[str, tuple[int, str]] = {}
 
     def raise_walk_error(error: OSError) -> None:
@@ -85,7 +85,7 @@ def run_delivery_checks(
                 remove_deleted_paths(workspace, accepted_deletions)
             if overlay_dir.is_dir():
                 shutil.copytree(overlay_dir, workspace, dirs_exist_ok=True)
-            version = _delivery_version(workspace, sandbox.base_commit)
+            version = fingerprint_delivery(workspace, sandbox.base_commit)
             if delivery_version is None:
                 delivery_version = version
             if version != delivery_version:
