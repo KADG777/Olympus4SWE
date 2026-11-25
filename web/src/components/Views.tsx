@@ -175,9 +175,15 @@ export function WaterfallView({ state }: { state: WorkbenchState }) {
                 <div className="wf-main">
                   <span className="wf-title">{turn.title}</span>
                   <span className="wf-summary">{turn.summary}</span>
-                  <span className="wf-track">
-                    <span className="wf-bar" style={barStyle} />
-                  </span>
+                  {timed ? (
+                    <span className="wf-track">
+                      <span className="wf-bar" style={barStyle} />
+                    </span>
+                  ) : (
+                    <span className="wf-track wf-track-untimed" aria-hidden="true">
+                      <span className="wf-marker" />
+                    </span>
+                  )}
                   <span className="wf-summary">{turn.receipt ? turn.receipt.one_line : ""}</span>
                   {turn.manifest_md ? (
                     <div className="tool-list">

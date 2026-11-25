@@ -185,7 +185,7 @@ export interface WorkbenchState {
   selectedTaskId: string | null;
   workflowNode: string | null;
   deliveryEvidence: DeliverySelection | null;
-  productInspection: boolean;
+  productInspectionRunId: string | null;
   activeTab: Tab;
   approvalSnapshot: ApprovalSnapshot | null;
   approvalOrigins: Partial<Record<ApprovalAction, ApprovalOrigin>>;
@@ -330,6 +330,8 @@ export class Workbench {
   private boardRequestSeq = 0;
   private userNavigated = false;
   private closedTabIds = new Set<string>();
+  private dockReturnFocus: HTMLElement | null = null;
+  private pendingDeliveryFocusRunId: string | null = null;
 
   constructor(location: Location = window.location) {
     this.params = new URLSearchParams(location.search);
@@ -363,7 +365,7 @@ export class Workbench {
       selectedTaskId: this.params.get("task") || null,
       workflowNode: null,
       deliveryEvidence: null,
-      productInspection: false,
+      productInspectionRunId: null,
       activeTab: isTab(queryTab) ? queryTab : "overview",
       approvalSnapshot: null,
       approvalOrigins: {},
@@ -559,6 +561,7 @@ export class Workbench {
 
   openBoard(options: { archived?: boolean } = {}): void {
     this.userNavigated = true;
+    this.pendingDeliveryFocusRunId = null;
     const s = this.state;
     const nextArchived = options.archived ?? false;
     const archivedChanged = s.showArchived !== nextArchived;
@@ -613,6 +616,34 @@ export class Workbench {
       s.dockOpen = s.userOpenedDock || s.projection.hitl_banner?.kind === "task_blocked";
       this.syncUrl();
       this.commit();
+    }
+  }
+
+  openDeliveryEvidence(runId: string): void {
+    if (!runId) return;
+    this.state.view = "topology";
+    this.pendingDeliveryFocusRunId = runId;
+    this.openOracleTab(runId);
+    const s = this.state;
+    if (s.runId === runId && s.projection?.run_id === runId) {
+      this.pendingDeliveryFocusRunId = null;
+      if (s.projection.delivery_acceptance?.product_verification || s.projection.post_dag) {
+        this.showProductEvidence();
+      }
+      this.focusDeliverySection();
+    }
+  }
+
+  private focusDeliverySection(): void {
+    const target =
+      byId<HTMLElement>("product-verification-card") ||
+      byId<HTMLElement>("delivery-acceptance") ||
+      byId<HTMLElement>("topology-title");
+    if (!target) return;
+    target.scrollIntoView({ block: "start" });
+    if (!this.state.dockOpen) {
+      if (!target.hasAttribute("tabindex")) target.tabIndex = -1;
+      target.focus();
     }
   }
 
@@ -761,7 +792,10 @@ export class Workbench {
     if (s.runId !== runId) {
       this.pendingAction = null;
       s.dialog = null;
-      s.productInspection = false;
+      s.productInspectionRunId = null;
+      if (this.pendingDeliveryFocusRunId && this.pendingDeliveryFocusRunId !== runId) {
+        this.pendingDeliveryFocusRunId = null;
+      }
       const hitlDialog = byId<HTMLDialogElement>("hitl-dialog");
       if (hitlDialog?.open) hitlDialog.close();
     }
@@ -837,10 +871,28 @@ export class Workbench {
       s.dockOpen = projection.hitl_banner?.kind === "task_blocked";
     }
     this.syncApprovals(projection);
+    const pendingDeliveryFocus = this.pendingDeliveryFocusRunId === projection.run_id;
+    if (pendingDeliveryFocus) {
+      this.pendingDeliveryFocusRunId = null;
+      s.view = "topology";
+      if (projection.delivery_acceptance?.product_verification || projection.post_dag) {
+        s.deliveryEvidence = null;
+        s.workflowNode = null;
+        s.productInspectionRunId = projection.run_id;
+        s.userOpenedDock = true;
+        s.dockOpen = true;
+      }
+      this.syncUrl();
+    }
     this.normalizeDock();
     this.commit();
     this.afterProjection(projection, previous);
-    restore?.();
+    if (pendingDeliveryFocus) {
+      this.focusDeliverySection();
+      if (s.dockOpen) byId("dock-title")?.focus();
+    } else {
+      restore?.();
+    }
   };
 
   private afterProjection(projection: RunProjection, previous: RunProjection | null): void {
@@ -889,13 +941,13 @@ export class Workbench {
       s.deliveryEvidence = null;
     }
     if (
-      s.productInspection &&
-      !projection.delivery_acceptance?.product_verification &&
-      !projection.post_dag
+      s.productInspectionRunId &&
+      (s.productInspectionRunId !== projection.run_id ||
+        (!projection.delivery_acceptance?.product_verification && !projection.post_dag))
     ) {
-      s.productInspection = false;
+      s.productInspectionRunId = null;
     }
-    if (!s.deliveryEvidence && !s.workflowNode && !s.productInspection) {
+    if (!s.deliveryEvidence && !s.workflowNode && !s.productInspectionRunId) {
       const task = this.currentTask();
       if (task) s.selectedTaskId = task.task_id;
     }
@@ -944,20 +996,37 @@ export class Workbench {
     this.commit();
   }
 
+  private rememberDockTrigger(): void {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && !active.closest("#dock") && active !== document.body) {
+      this.dockReturnFocus = active;
+    }
+  }
+
   setDockOpen(open: boolean, byUser: boolean): void {
+    if (open && byUser) this.rememberDockTrigger();
     this.state.userOpenedDock = byUser && open;
     this.state.dockOpen = open;
     this.commit();
   }
 
   closeDock(): void {
-    this.setDockOpen(false, false);
     const selection = this.state.deliveryEvidence;
-    if (selection) {
-      document
-        .querySelector<HTMLElement>(`#delivery-criteria [data-delivery-evidence="${selection.index}"]`)
-        ?.focus();
-    }
+    const returnEl = this.dockReturnFocus;
+    this.dockReturnFocus = null;
+    this.setDockOpen(false, false);
+    const deliveryTrigger = selection
+      ? document.querySelector<HTMLElement>(
+          `#delivery-criteria [data-delivery-evidence="${selection.index}"]`,
+        )
+      : null;
+    const isUsable = (el: HTMLElement | null): el is HTMLElement =>
+      Boolean(el && el.isConnected && !el.closest("#dock") && !el.hidden && el.getClientRects().length);
+    const target =
+      (isUsable(returnEl) ? returnEl : null) ||
+      (isUsable(deliveryTrigger) ? deliveryTrigger : null) ||
+      byId<HTMLElement>("btn-dock-open");
+    target?.focus();
   }
 
   toast(message: string): void {
@@ -973,8 +1042,9 @@ export class Workbench {
   selectTask = (taskId: string): void => {
     const s = this.state;
     if (!s.projection || !taskId) return;
+    this.rememberDockTrigger();
     s.deliveryEvidence = null;
-    s.productInspection = false;
+    s.productInspectionRunId = null;
     s.workflowNode = null;
     s.selectedTaskId = taskId;
     s.userOpenedDock = true;
@@ -986,8 +1056,9 @@ export class Workbench {
   selectWorkflowNode = (name: string): void => {
     const s = this.state;
     if (!s.projection || !name) return;
+    this.rememberDockTrigger();
     s.deliveryEvidence = null;
-    s.productInspection = false;
+    s.productInspectionRunId = null;
     s.workflowNode = name;
     s.userOpenedDock = true;
     s.dockOpen = true;
@@ -1002,8 +1073,9 @@ export class Workbench {
   showDeliveryEvidence(index: number): void {
     const s = this.state;
     const review = s.projection?.delivery_acceptance;
-    if (!s.projection || !review) return;
-    s.productInspection = false;
+    if (!s.projection || !s.runId || s.projection.run_id !== s.runId || !review) return;
+    this.rememberDockTrigger();
+    s.productInspectionRunId = null;
     s.workflowNode = null;
     s.deliveryEvidence = { index, specHash: review.spec_hash, runId: s.projection.run_id };
     s.userOpenedDock = true;
@@ -1017,13 +1089,16 @@ export class Workbench {
     const s = this.state;
     if (
       !s.projection ||
+      !s.runId ||
+      s.projection.run_id !== s.runId ||
       (!s.projection.delivery_acceptance?.product_verification && !s.projection.post_dag)
     ) {
       return;
     }
+    this.rememberDockTrigger();
     s.deliveryEvidence = null;
     s.workflowNode = null;
-    s.productInspection = true;
+    s.productInspectionRunId = s.projection.run_id;
     s.userOpenedDock = true;
     s.dockOpen = true;
     this.commit();
@@ -1075,7 +1150,7 @@ export class Workbench {
       this.openTaskGraph(s.projection.plan?.content_hash);
       return;
     }
-    if (output.artifact_id === "product") {
+    if (output.event_type === "product.verified") {
       this.showProductEvidence();
       return;
     }

@@ -340,12 +340,14 @@ function ProductArtifactPreview({
   title,
   linkLabel,
   cacheKey,
+  version,
 }: {
   runId: string;
   kind: "boot_log" | "report";
   title: string;
   linkLabel: string;
   cacheKey: string;
+  version?: number;
 }) {
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -353,7 +355,7 @@ function ProductArtifactPreview({
     let active = true;
     setContent(null);
     setError(null);
-    fetchProductArtifactText(runId, kind)
+    fetchProductArtifactText(runId, kind, version)
       .then((text) => {
         if (!active) return;
         setContent(text.length > 16000 ? `${text.slice(0, 16000)}\n…` : text);
@@ -365,8 +367,8 @@ function ProductArtifactPreview({
     return () => {
       active = false;
     };
-  }, [runId, kind, cacheKey]);
-  const url = productArtifactUrl(runId, kind);
+  }, [runId, kind, cacheKey, version]);
+  const url = productArtifactUrl(runId, kind, version);
   return (
     <Card title={title}>
       {error ? (
@@ -389,9 +391,15 @@ function productDock(projection: RunProjection): DockContent {
   const [postDagLabel, postDagVariant] = postDag
     ? POST_DAG_STATUS[postDag.status] || POST_DAG_STATUS.idle
     : POST_DAG_STATUS.idle;
-  const shotUrl = verification?.has_screenshot
-    ? productArtifactUrl(projection.run_id, "screenshot")
-    : null;
+  const screenshotSuppressed = Boolean(
+    verification?.checks?.some(
+      (check) => check.name === "screenshot" && check.status !== "passed",
+    ),
+  );
+  const shotUrl =
+    verification?.has_screenshot && !screenshotSuppressed
+      ? productArtifactUrl(projection.run_id, "screenshot", verification.event_seq)
+      : null;
   const cacheKey = `${projection.state_revision}:${verification?.event_seq ?? 0}`;
   const verdict = postDag?.latest_argus_verdict ?? null;
   return {
@@ -434,7 +442,7 @@ function productDock(projection: RunProjection): DockContent {
                   rel="noopener"
                   title="在新标签页打开原图"
                 >
-                  <img src={shotUrl} alt="实机首页截图" />
+                  <img key={shotUrl} src={shotUrl} alt="实机首页截图" />
                 </a>
               </Card>
             ) : null}
@@ -445,6 +453,7 @@ function productDock(projection: RunProjection): DockContent {
                 title="启动日志 (boot.log)"
                 linkLabel="打开完整启动日志"
                 cacheKey={cacheKey}
+                version={verification.event_seq}
               />
             ) : null}
             {verification.has_report ? (
@@ -454,6 +463,7 @@ function productDock(projection: RunProjection): DockContent {
                 title="验证报告 (report.json)"
                 linkLabel="打开完整验证报告"
                 cacheKey={cacheKey}
+                version={verification.event_seq}
               />
             ) : null}
           </>
@@ -514,7 +524,7 @@ function dockContent(workbench: Workbench, state: WorkbenchState): DockContent {
     };
   }
   if (
-    state.productInspection &&
+    state.productInspectionRunId === projection.run_id &&
     (projection.delivery_acceptance?.product_verification || projection.post_dag)
   ) {
     return productDock(projection);

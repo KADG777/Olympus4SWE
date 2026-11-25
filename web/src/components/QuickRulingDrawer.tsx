@@ -623,7 +623,19 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
-              {reviewDelivery ? (
+              {reviewDelivery ? (() => {
+                const pv = projection.delivery_acceptance?.product_verification ?? null;
+                const shotSuppressed = Boolean(
+                  pv?.checks?.some((check) => check.name === "screenshot" && check.status !== "passed"),
+                );
+                const shotUrl =
+                  pv?.has_screenshot && !shotSuppressed
+                    ? productArtifactUrl(runId, "screenshot", pv.event_seq)
+                    : null;
+                const bootLogUrl = pv?.has_boot_log
+                  ? productArtifactUrl(runId, "boot_log", pv.event_seq)
+                  : null;
+                return (
                 <section
                   className="hitl-banner"
                   id="quick-drawer-delivery"
@@ -636,15 +648,16 @@ export function QuickRulingDrawer({
                       <span>{gateBanner?.headline || "交付验收待人工决策"}</span>
                     </p>
                     {gateBanner?.detail ? <p className="hitl-detail">{gateBanner.detail}</p> : null}
-                    {projection.delivery_acceptance?.product_verification?.has_screenshot ? (
+                    {shotUrl ? (
                       <a
                         className="product-dock-shot"
-                        href={productArtifactUrl(runId, "screenshot")}
+                        href={shotUrl}
                         target="_blank"
                         rel="noopener"
                       >
                         <img
-                          src={productArtifactUrl(runId, "screenshot")}
+                          key={shotUrl}
+                          src={shotUrl}
                           alt="实机首页截图"
                           loading="lazy"
                         />
@@ -668,22 +681,27 @@ export function QuickRulingDrawer({
                         从断点重试
                       </button>
                     ) : null}
-                    {projection.delivery_acceptance?.product_verification?.has_boot_log ? (
+                    {bootLogUrl ? (
                       <a
                         className="btn btn-quiet"
-                        href={productArtifactUrl(runId, "boot_log")}
+                        href={bootLogUrl}
                         target="_blank"
                         rel="noopener"
                       >
                         查看启动日志
                       </a>
                     ) : null}
-                    <button type="button" className="btn" onClick={openCockpit}>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => workbench.openDeliveryEvidence(runId)}
+                    >
                       查看完整交付证据
                     </button>
                   </div>
                 </section>
-              ) : null}
+                );
+              })() : null}
 
               {!reviewDelivery && (canRetryWorkflow || runFailed) ? (
                 <section

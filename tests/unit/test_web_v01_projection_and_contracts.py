@@ -283,7 +283,12 @@ def test_product_artifact_endpoint_serves_allowlisted_files_only(tmp_path: Path)
 
     with TestClient(create_fastapi_app(app)) as client:
         proj = client.get(f"/api/runs/{run_id}").json()["projection"]
-        _append_product_verified(store, run_id, passed=True)
+        _append_product_verified(
+            store,
+            run_id,
+            passed=True,
+            extra={"screenshot_path": str(verify_dir / "home.png")},
+        )
         proj = client.get(f"/api/runs/{run_id}").json()["projection"]
         assert proj["delivery_acceptance"]["product_verification"]["has_screenshot"] is True
 
@@ -574,3 +579,46 @@ def test_waterfall_uses_latest_worker_receipt_and_clears_stale_review_deferred(
     t01_turn = next(t for t in proj["waterfall_turns"] if t["task_id"] == "T01")
     assert t01_turn["turn_id"] == "turn-t01-a2"
     assert t01_turn["duration_ms"] == 900
+
+
+def test_product_verification_hides_stale_screenshot_when_latest_round_skips_it(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    run_id = _seed_approved_run(store, status=RunStatus.COMPLETED)
+    art_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "verify_product"
+    art_dir.mkdir(parents=True, exist_ok=True)
+    (art_dir / "home.png").write_bytes(b"\x89PNG\r\n\x1a\nold")
+
+    store.append_event(
+        run_id=run_id,
+        stage="verify",
+        event_type="product.verified",
+        actor="verify_product",
+        payload={
+            "passed": False,
+            "summary": "Round 1 failed",
+            "screenshot_path": str(art_dir / "home.png"),
+            "checks": [{"name": "screenshot", "status": "passed", "detail": "ok"}],
+        },
+    )
+    first = build_run_projection(store, tmp_path, run_id)
+    assert first["delivery_acceptance"]["product_verification"]["has_screenshot"] is True
+
+    store.append_event(
+        run_id=run_id,
+        stage="verify",
+        event_type="product.verified",
+        actor="verify_product",
+        payload={
+            "passed": True,
+            "summary": "Round 2 passed without screenshot",
+            "screenshot_path": None,
+            "checks": [
+                {"name": "http_boot", "status": "skipped_non_http", "detail": "cli"},
+                {"name": "screenshot", "status": "skipped", "detail": "none"},
+            ],
+        },
+    )
+    second = build_run_projection(store, tmp_path, run_id)
+    assert second["delivery_acceptance"]["product_verification"]["has_screenshot"] is False

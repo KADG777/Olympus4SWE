@@ -138,3 +138,19 @@
   align-items: center;
   gap: var(--space-2);
 }
+
+@media (max-width: 640px) {
+  .product-e2e-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .product-e2e-thumb {
+    inline-size: 100%;
+    max-block-size: 200px;
+  }
+
+  .product-e2e-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

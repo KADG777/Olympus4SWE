@@ -49,14 +49,23 @@ export const deliveryLogUrl = (runId: string, eventSeq: number, position: number
 
 export type ProductArtifactKind = "report" | "boot_log" | "screenshot";
 
-export const productArtifactUrl = (runId: string, kind: ProductArtifactKind): string =>
-  `${runPath(runId)}/product-artifact/${kind}`;
+export const productArtifactUrl = (
+  runId: string,
+  kind: ProductArtifactKind,
+  version?: number | string | null,
+): string => {
+  const base = `${runPath(runId)}/product-artifact/${kind}`;
+  return version != null && version !== ""
+    ? `${base}?v=${encodeURIComponent(String(version))}`
+    : base;
+};
 
 export async function fetchProductArtifactText(
   runId: string,
   kind: "report" | "boot_log",
+  version?: number | string | null,
 ): Promise<string> {
-  const response = await fetch(productArtifactUrl(runId, kind), { cache: "no-store" });
+  const response = await fetch(productArtifactUrl(runId, kind, version), { cache: "no-store" });
   if (!response.ok) {
     throw new ApiError("读取实机验证产物失败", response.status);
   }

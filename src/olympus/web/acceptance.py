@@ -147,6 +147,15 @@ def latest_product_verification(
             )
     root = artifacts_root if artifacts_root is not None else run_dir.parent
     run_name = run_dir.name
+    screenshot_declared_absent = (
+        "screenshot_path" in payload
+        and not (
+            isinstance(payload.get("screenshot_path"), str)
+            and bool(payload["screenshot_path"].strip())
+        )
+    ) or any(
+        check["name"] == "screenshot" and check["status"] != "passed" for check in checks
+    )
     return {
         "passed": passed,
         "summary": summary,
@@ -160,8 +169,12 @@ def latest_product_verification(
         "has_boot_log": _safe_artifact_exists(
             root, run_name, "artifacts", "verify_product", "boot.log"
         ),
-        "has_screenshot": _safe_artifact_exists(
-            root, run_name, "artifacts", "verify_product", "home.png"
+        "has_screenshot": (
+            False
+            if screenshot_declared_absent
+            else _safe_artifact_exists(
+                root, run_name, "artifacts", "verify_product", "home.png"
+            )
         ),
     }
 

@@ -79,9 +79,35 @@
   background: var(--bad);
 }
 
-.wf-row[data-timed="false"] .wf-bar {
+.wf-track-untimed {
+  display: flex;
+  align-items: center;
+  background: transparent;
+  overflow: visible;
+}
+
+.wf-marker {
+  display: inline-block;
+  inline-size: 6px;
+  block-size: 6px;
+  border-radius: var(--shape-pill);
   background: var(--rule-hard);
-  opacity: 0.65;
+}
+
+.wf-row[data-status="accepted"] .wf-marker,
+.wf-row[data-status="done"] .wf-marker {
+  background: var(--ok);
+}
+
+.wf-row[data-status="running"] .wf-marker,
+.wf-row[data-status="verifying"] .wf-marker,
+.wf-row[data-status="active"] .wf-marker {
+  background: var(--live);
+}
+
+.wf-row[data-status="blocked"] .wf-marker,
+.wf-row[data-status="failed"] .wf-marker {
+  background: var(--bad);
 }
 
 .wf-meta {

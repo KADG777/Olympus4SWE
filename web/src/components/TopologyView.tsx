@@ -32,6 +32,10 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
   const outputs = projection.key_outputs || [];
   const latest = outputs[0];
   const budget = projection.budget;
+  const latestIsProduct = latest?.event_type === "product.verified";
+  const hasProductEvidence = Boolean(
+    projection.delivery_acceptance?.product_verification || projection.post_dag,
+  );
   return (
     <section className="stage-live-panel card" id="stage-live-panel" aria-labelledby="run-progress-title">
       <div className="card-head">
@@ -75,7 +79,13 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
           hidden={!latest}
           onClick={() => void workbench.openOutput(workbench.state.projection?.key_outputs?.[0])}
         >
-          {latest ? (latest.current || latest.detail_available ? OUTPUT_ACTIONS[latest.kind] : "查看版本记录") : ""}
+          {latest
+            ? latestIsProduct && hasProductEvidence
+              ? "查看实机证据"
+              : latest.current || latest.detail_available
+                ? OUTPUT_ACTIONS[latest.kind]
+                : "查看版本记录"
+            : ""}
         </button>
       </div>
       <details id="run-output-history" className="run-detail" hidden={!outputs.length}>
@@ -83,6 +93,7 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
         <ol id="run-output-versions">
           {outputs.map((output) => {
             const detail = state.attemptDetails[output.key];
+            const isProductOutput = output.event_type === "product.verified" && hasProductEvidence;
             return (
               <li key={output.key} data-output-key={output.key} tabIndex={-1}>
                 <span>{output.summary}</span>
@@ -91,14 +102,14 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
                     ? `${output.artifact_id} · ${output.content_hash}`
                     : new Date(output.created_at).toLocaleString()}
                 </code>
-                {output.current || output.detail_available ? (
+                {isProductOutput || output.current || output.detail_available ? (
                   <button
                     type="button"
                     className="btn"
                     data-history-output={output.key}
                     onClick={() => void workbench.openOutput(output)}
                   >
-                    {OUTPUT_ACTIONS[output.kind]}
+                    {isProductOutput ? "查看实机证据" : OUTPUT_ACTIONS[output.kind]}
                   </button>
                 ) : null}
                 {detail ? (
@@ -145,11 +156,21 @@ function ProductVerificationCard({
   runId: string;
   verification: ProductVerificationView;
 }) {
-  const shotUrl = verification.has_screenshot ? productArtifactUrl(runId, "screenshot") : null;
-  const bootLogUrl = verification.has_boot_log ? productArtifactUrl(runId, "boot_log") : null;
-  const reportUrl = verification.has_report ? productArtifactUrl(runId, "report") : null;
   const checks = verification.checks || [];
   const failures = verification.failures || [];
+  const screenshotSuppressed = checks.some(
+    (check) => check.name === "screenshot" && check.status !== "passed",
+  );
+  const shotUrl =
+    verification.has_screenshot && !screenshotSuppressed
+      ? productArtifactUrl(runId, "screenshot", verification.event_seq)
+      : null;
+  const bootLogUrl = verification.has_boot_log
+    ? productArtifactUrl(runId, "boot_log", verification.event_seq)
+    : null;
+  const reportUrl = verification.has_report
+    ? productArtifactUrl(runId, "report", verification.event_seq)
+    : null;
   return (
     <article
       className="card product-e2e-card"
@@ -182,8 +203,10 @@ function ProductVerificationCard({
             <div className="product-e2e-checks" aria-label="实机检查项">
               {checks.map((check, idx) => {
                 const ok = check.status === "passed";
-                const variant = ok ? "ok" : check.status === "skipped" ? "muted" : "bad";
-                const glyph = ok ? "✓" : check.status === "skipped" ? "—" : "✕";
+                const skipped =
+                  check.status === "skipped" || check.status.startsWith("skipped_");
+                const variant = ok ? "ok" : skipped ? "muted" : "bad";
+                const glyph = ok ? "✓" : skipped ? "—" : "✕";
                 return (
                   <Badge variant={variant} key={`${check.name}-${idx}`}>
                     {`${glyph} ${check.name}${check.port ? `:${check.port}` : ""}`}
@@ -221,7 +244,7 @@ function ProductVerificationCard({
             aria-label="在检查器查看实机首页截图"
             onClick={() => workbench.showProductEvidence()}
           >
-            <img src={shotUrl} alt="实机首页截图" loading="lazy" />
+            <img key={shotUrl} src={shotUrl} alt="实机首页截图" loading="lazy" />
           </button>
         ) : null}
       </div>

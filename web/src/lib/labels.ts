@@ -133,7 +133,7 @@ export const POST_DAG_OUTCOME: Record<string, [string, Variant]> = {
 
 export function formatDurationMs(durationMs: number | null | undefined): string {
   const value = Number(durationMs) || 0;
-  if (value <= 0) return "实时事件";
+  if (value <= 0) return "未记录耗时";
   if (value >= 1000) return `${(value / 1000).toFixed(1)} s`;
   return `${value} ms`;
 }
