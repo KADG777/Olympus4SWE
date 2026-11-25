@@ -309,6 +309,7 @@ class RunControl:
         answers: dict[str, str],
         resolutions: dict[str, str] | None = None,
         extra_out_of_scope: list[str] | None = None,
+        clarification_note: str = "",
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: None = None,
@@ -323,6 +324,7 @@ class RunControl:
         answers: dict[str, str],
         resolutions: dict[str, str] | None = None,
         extra_out_of_scope: list[str] | None = None,
+        clarification_note: str = "",
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: str,
@@ -336,6 +338,7 @@ class RunControl:
         answers: dict[str, str],
         resolutions: dict[str, str] | None = None,
         extra_out_of_scope: list[str] | None = None,
+        clarification_note: str = "",
         actor: str = "zeus",
         expected_revision: int | None = None,
         operation_id: str | None = None,
@@ -347,10 +350,11 @@ class RunControl:
         concurrent or retried HTTP requests replay cleanly without revision races.
         """
         res_map = resolutions or {}
+        clean_note = clarification_note.strip()
 
         def _build_next(
             snap: Mapping[str, Any],
-        ) -> tuple[GoalSpec, tuple[str, str, dict[str, Any]]]:
+        ) -> tuple[GoalSpec, list[tuple[str, str, dict[str, Any]]]]:
             spec: GoalSpec | None = snap["spec"]
             if spec is None:
                 raise ValueError(f"Run {run_id} has no GoalSpec to clarify")
@@ -374,29 +378,40 @@ class RunControl:
                     "status": SpecStatus.AWAITING_HUMAN,
                 }
             )
-            clarified_event = (
-                "align",
-                "spec.clarified",
-                {
-                    "version": next_spec.version,
-                    "spec_hash": next_spec.content_hash,
-                    "remaining_blockers": next_spec.unresolved_blockers(),
-                },
-            )
-            return next_spec, clarified_event
+            extra_events: list[tuple[str, str, dict[str, Any]]] = [
+                (
+                    "align",
+                    "spec.clarified",
+                    {
+                        "spec_id": next_spec.spec_id,
+                        "version": next_spec.version,
+                        "spec_hash": next_spec.content_hash,
+                        "remaining_blockers": next_spec.unresolved_blockers(),
+                    },
+                )
+            ]
+            if clean_note:
+                extra_events.append(
+                    (
+                        "align",
+                        "spec.clarification_note",
+                        {"spec_id": next_spec.spec_id, "feedback": clean_note},
+                    )
+                )
+            return next_spec, extra_events
 
         if operation_id is None:
             snap = self.store.get_run(run_id, expected_revision=expected_revision)
             cas_revision = (
                 expected_revision if expected_revision is not None else int(snap["state_revision"])
             )
-            next_spec, clarified_event = _build_next(snap)
+            next_spec, extra_events = _build_next(snap)
             self.store.save_spec(
                 run_id,
                 next_spec,
                 actor=actor,
                 expected_revision=cas_revision,
-                extra_events=[clarified_event],
+                extra_events=extra_events,
             )
             return next_spec
 
@@ -404,19 +419,20 @@ class RunControl:
             "answers": dict(answers),
             "resolutions": dict(res_map),
             "extra_out_of_scope": list(extra_out_of_scope or []),
+            **({"clarification_note": clean_note} if clean_note else {}),
             **(command_meta or {}),
         }
 
         def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
             snap = self.store.get_run_in_tx(conn, run_id)
-            next_spec, clarified_event = _build_next(snap)
+            next_spec, extra_events = _build_next(snap)
             self.store.save_spec_in_tx(
                 conn,
                 run_id=run_id,
                 spec=next_spec,
                 actor=actor,
                 cur_rev=cur_rev,
-                extra_events=[clarified_event],
+                extra_events=extra_events,
             )
             return {
                 "run_id": run_id,

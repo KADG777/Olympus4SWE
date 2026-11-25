@@ -36,6 +36,8 @@ Return ONLY one JSON object:
 
 Routing rules:
 - action=clarify only when the human answers one or more listed ambiguity/critique IDs.
+  When action=clarify, copy any extra requirements, constraints, or boundaries outside
+  the listed IDs verbatim into "feedback" (leave "" only when no extra context exists).
 - action=approve only when the human explicitly approves the pending artifact/gate.
 - action=revise when the human rejects, asks to change the current plan/spec, or supplies new
   concrete domain facts/constraints/requirements while paused on clarification without answering
@@ -367,29 +369,260 @@ def _negated_revision(text: str) -> bool:
 
 def _extract_explicit_clarifications(
     message: str, snapshot: dict[str, Any] | None
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
     if not snapshot:
-        return {}, {}
+        return {}, {}, []
     spec: GoalSpec | None = snapshot.get("spec")
     valid_answers = {item.casefold(): item for item in _blocking_ambiguity_ids(spec)}
     valid_resolutions = {item.casefold(): item for item in _blocking_critique_ids(spec)}
     if not valid_answers and not valid_resolutions:
-        return {}, {}
+        return {}, {}, []
     answers: dict[str, str] = {}
     resolutions: dict[str, str] = {}
+    extra_lines: list[str] = []
     for line in message.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
         match = _EXPLICIT_ANSWER_LINE.match(line)
-        if not match:
+        if match:
+            raw_id, value = match.group(1).strip(), match.group(2).strip()
+            key = raw_id.casefold()
+            if value and key in valid_answers:
+                answers[valid_answers[key]] = value
+                continue
+            if value and key in valid_resolutions:
+                resolutions[valid_resolutions[key]] = value
+                continue
+        extra_lines.append(stripped)
+    return answers, resolutions, extra_lines
+
+
+_PROSE_ASCII_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_PROSE_CJK_SEG_RE = re.compile(r"[\u3400-\u9fff]{2,}")
+_PROSE_GLUE_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "answer",
+        "answers",
+        "are",
+        "as",
+        "be",
+        "by",
+        "for",
+        "have",
+        "in",
+        "input",
+        "inputs",
+        "is",
+        "it",
+        "keep",
+        "make",
+        "of",
+        "ok",
+        "okay",
+        "on",
+        "or",
+        "output",
+        "outputs",
+        "please",
+        "set",
+        "should",
+        "that",
+        "the",
+        "this",
+        "to",
+        "use",
+        "using",
+        "when",
+        "with",
+        "yes",
+        "accept",
+        "allow",
+        "好的",
+        "采用",
+        "使用",
+        "选择",
+        "即可",
+        "并且",
+        "以及",
+    }
+)
+
+
+def _prose_tokens(text: str) -> set[str]:
+    lowered = text.casefold()
+    tokens = {
+        tok
+        for tok in _PROSE_ASCII_TOKEN_RE.findall(lowered)
+        if len(tok) >= 2 and tok not in _PROSE_GLUE_TOKENS
+    }
+    for segment in _PROSE_CJK_SEG_RE.findall(lowered):
+        if len(segment) == 2:
+            if segment not in _PROSE_GLUE_TOKENS:
+                tokens.add(segment)
+        else:
+            for idx in range(len(segment) - 1):
+                bigram = segment[idx : idx + 2]
+                if bigram not in _PROSE_GLUE_TOKENS:
+                    tokens.add(bigram)
+    return tokens
+
+
+def _spec_blocker_tokens(
+    snapshot: dict[str, Any] | None,
+    *,
+    answered_ids: set[str] | None = None,
+) -> set[str]:
+    spec: GoalSpec | None = snapshot.get("spec") if snapshot else None
+    if spec is None:
+        return set()
+    parts: list[str] = []
+    for amb in spec.open_ambiguities:
+        if amb.blocking and not amb.answer:
+            if answered_ids is not None and amb.id not in answered_ids:
+                continue
+            parts.extend([amb.id, amb.question])
+    for note in spec.minority_notes:
+        if note.severity == CritiqueSeverity.BLOCKING and not note.resolved:
+            if answered_ids is not None and note.id not in answered_ids:
+                continue
+            parts.extend([note.id, note.summary])
+    return _prose_tokens(" ".join(parts))
+
+
+_CLAUSE_SPLIT_RE = re.compile(r"(?:[;；，。！？\n]|,(?!\s*\d+\s*\))|\bbut\b|\band\s+also\b)")
+
+
+def _line_consumed_by_prose(
+    norm_line: str,
+    norm_prose: list[str],
+    blocker_tokens: set[str],
+) -> bool:
+    matched = [val for val in norm_prose if val in norm_line or norm_line in val]
+    if not matched:
+        return False
+    if any(norm_line in val for val in matched):
+        return True
+    sorted_prose = sorted(matched, key=len, reverse=True)
+    clauses = [part.strip() for part in _CLAUSE_SPLIT_RE.split(norm_line) if part.strip()]
+    for clause in clauses:
+        clause_hits = [val for val in sorted_prose if val in clause or clause in val]
+        if not clause_hits:
+            if _prose_tokens(clause):
+                return False
             continue
-        raw_id, value = match.group(1).strip(), match.group(2).strip()
-        if not value:
+        remainder = clause
+        for val in clause_hits:
+            remainder = remainder.replace(val, " ")
+        if _prose_tokens(remainder) - blocker_tokens:
+            return False
+    return True
+
+
+def _clarification_extra_feedback(
+    extra_lines: list[str],
+    *,
+    defaults_applied: bool,
+    existing_feedback: str = "",
+    prose_values: tuple[str, ...] = (),
+    blocker_tokens: set[str] | None = None,
+) -> str:
+    """Preserve non-ID clarification lines not already consumed by defaults or prose answers."""
+    norm_existing = _normalize_text(existing_feedback)
+    norm_prose = [val for raw in prose_values if len(val := _normalize_text(raw)) >= 3]
+    known_tokens = blocker_tokens or set()
+    kept: list[str] = []
+    seen: set[str] = set()
+    for line in extra_lines:
+        clean = line.strip()
+        if not clean:
             continue
-        key = raw_id.casefold()
-        if key in valid_answers:
-            answers[valid_answers[key]] = value
-        elif key in valid_resolutions:
-            resolutions[valid_resolutions[key]] = value
-    return answers, resolutions
+        if defaults_applied and _is_pure_default_delegation(clean):
+            continue
+        norm_line = _normalize_text(clean)
+        if not norm_line or norm_line in seen:
+            continue
+        if norm_existing and norm_line in norm_existing:
+            continue
+        if norm_prose and _line_consumed_by_prose(norm_line, norm_prose, known_tokens):
+            continue
+        seen.add(norm_line)
+        kept.append(clean)
+    if existing_feedback.strip():
+        if not kept:
+            return existing_feedback.strip()
+        return "\n".join([*kept, existing_feedback.strip()])
+    return "\n".join(kept)
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+_PURE_DEFAULT_FILLER_RE = re.compile(
+    r"\b(?:please|and|then|just|ok|okay|fine|sure|yes|yeah|yep|thanks|thank\s+you|"
+    r"go\s+ahead|go\s+on|proceed|continue|carry\s+on|keep\s+going|"
+    r"for\s+all(?:\s+of\s+them)?|for\s+everything|for\s+now|as\s+is|with\s+that|"
+    r"on\s+all(?:\s+of\s+them)?|all\s+of\s+them)\b",
+    re.IGNORECASE,
+)
+_PURE_DEFAULT_FILLER_CJK = (
+    "请",
+    "好的",
+    "可以",
+    "没问题",
+    "方案",
+    "继续",
+    "推进",
+    "直接",
+    "就行",
+    "就好了",
+    "即可",
+    "然后",
+    "并且",
+    "并",
+    "好",
+    "行",
+    "吧",
+)
+
+
+_DEFAULT_CLAUSE_RE = re.compile(
+    r"\b(?:please\s+)?(?:use|using|accept|accepting|apply|applying|take|taking|adopt|adopting|"
+    r"go\s+with|going\s+with|proceed\s+with|proceeding\s+with|follow|following|"
+    r"stick\s+with|sticking\s+with|ok\s+with|okay\s+with|fine\s+with)\s+"
+    r"(?:all\s+of\s+)?(?:the\s+|your\s+)?(?:best\s+)?"
+    r"(?:default\s+(?:assumptions?|answers?|choices?|options?)|"
+    r"recommended\s+(?:answers?|options?|choices?|defaults?|assumptions?)|"
+    r"defaults?|recommendations?|assumptions?)\b",
+    re.IGNORECASE,
+)
+_STANDALONE_DEFAULT_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:the\s+|your\s+)?(?:defaults?|"
+    r"default\s+(?:assumptions?|answers?|choices?)|recommendations?)|"
+    r"go\s+on|go\s+ahead|continue|proceed|carry\s+on|keep\s+going)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_default_delegation(line: str) -> bool:
+    """True only when the entire line delegates to defaults with no extra constraints."""
+    if not _is_default_delegation(line):
+        return False
+    lowered = line.casefold()
+    if _STANDALONE_DEFAULT_RE.match(lowered):
+        return True
+    remainder = _DEFAULT_CLAUSE_RE.sub(" ", lowered, count=1)
+    for token in _DEFAULT_ACCEPTANCE_CJK:
+        if token in remainder:
+            remainder = remainder.replace(token, " ", 1)
+    remainder = _PURE_DEFAULT_FILLER_RE.sub(" ", remainder)
+    for token in _PURE_DEFAULT_FILLER_CJK:
+        remainder = remainder.replace(token, " ")
+    return not _has_actionable_text(remainder)
 
 
 def _merge_default_and_explicit(
@@ -431,7 +664,7 @@ def _keyword_fallback(
     text = message.casefold().strip()
     if not text:
         return ReplyIntent(action="unknown", message="Empty reply")
-    answers, resolutions = _extract_explicit_clarifications(message, snapshot)
+    answers, resolutions, extra_lines = _extract_explicit_clarifications(message, snapshot)
     defaults = _default_acceptance(text, snapshot=snapshot, message=message)
     if defaults is not None:
         answers, resolutions = _merge_default_and_explicit(defaults, answers, resolutions)
@@ -440,6 +673,9 @@ def _keyword_fallback(
             action="clarify",
             answers=answers,
             resolutions=resolutions,
+            feedback=_clarification_extra_feedback(
+                extra_lines, defaults_applied=defaults is not None
+            ),
             message="Keyword fallback: explicit blocker answers",
         )
     revise = (
@@ -507,7 +743,9 @@ def _sanitize(
         for key, value in raw.resolutions.items()
         if key.strip() in valid_resolutions and value.strip()
     }
-    explicit_answers, explicit_resolutions = _extract_explicit_clarifications(message, snapshot)
+    explicit_answers, explicit_resolutions, extra_lines = _extract_explicit_clarifications(
+        message, snapshot
+    )
     lowered = message.casefold()
     asks_about_defaults = _is_question(message) and any(
         token in lowered for token in ("default", "assumption", "recommend", "默认", "推荐")
@@ -537,6 +775,25 @@ def _sanitize(
     if answers or resolutions:
         # Human answers always win: never approve/revise while silently dropping them.
         action = "clarify"
+        prose_values = (
+            ()
+            if defaults is not None
+            else tuple(
+                [
+                    *(val for key, val in answers.items() if key not in explicit_answers),
+                    *(val for key, val in resolutions.items() if key not in explicit_resolutions),
+                ]
+            )
+        )
+        feedback = _clarification_extra_feedback(
+            extra_lines,
+            defaults_applied=defaults is not None,
+            existing_feedback=feedback,
+            prose_values=prose_values,
+            blocker_tokens=_spec_blocker_tokens(
+                snapshot, answered_ids=set(answers) | set(resolutions)
+            ),
+        )
     elif action == "clarify":
         action = "unknown"
     if action == "approve" and (
@@ -606,7 +863,7 @@ def _fast_path_intent(
     if not lowered:
         return None
     if _pending_blockers(snapshot):
-        explicit_answers, explicit_resolutions = _extract_explicit_clarifications(
+        explicit_answers, explicit_resolutions, extra_lines = _extract_explicit_clarifications(
             message, snapshot
         )
         defaults = _default_acceptance(lowered, snapshot=snapshot, message=message)
@@ -619,6 +876,7 @@ def _fast_path_intent(
                     action="clarify",
                     answers=merged_answers,
                     resolutions=merged_resolutions,
+                    feedback=_clarification_extra_feedback(extra_lines, defaults_applied=True),
                     message="Deterministic fast-path: default assumptions accepted",
                 )
         spec: GoalSpec | None = snapshot.get("spec")
@@ -633,6 +891,7 @@ def _fast_path_intent(
                 action="clarify",
                 answers=explicit_answers,
                 resolutions=explicit_resolutions,
+                feedback=_clarification_extra_feedback(extra_lines, defaults_applied=False),
                 message="Deterministic fast-path: all pending blockers answered",
             )
         if explicit_answers or explicit_resolutions:
