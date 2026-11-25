@@ -32,10 +32,16 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
   const outputs = projection.key_outputs || [];
   const latest = outputs[0];
   const budget = projection.budget;
-  const latestIsProduct = latest?.event_type === "product.verified";
-  const hasProductEvidence = Boolean(
-    projection.delivery_acceptance?.product_verification || projection.post_dag,
-  );
+  const latestProductSeq =
+    projection.delivery_acceptance?.product_verification?.event_seq ?? null;
+  const isLatestProduct = (item: (typeof outputs)[number] | undefined): boolean =>
+    Boolean(
+      item &&
+        item.event_type === "product.verified" &&
+        latestProductSeq != null &&
+        item.event_seq === latestProductSeq,
+    );
+  const latestIsProduct = isLatestProduct(latest);
   return (
     <section className="stage-live-panel card" id="stage-live-panel" aria-labelledby="run-progress-title">
       <div className="card-head">
@@ -80,7 +86,7 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
           onClick={() => void workbench.openOutput(workbench.state.projection?.key_outputs?.[0])}
         >
           {latest
-            ? latestIsProduct && hasProductEvidence
+            ? latestIsProduct
               ? "查看实机证据"
               : latest.current || latest.detail_available
                 ? OUTPUT_ACTIONS[latest.kind]
@@ -93,7 +99,7 @@ function StageLivePanel({ workbench, state, projection }: { workbench: Workbench
         <ol id="run-output-versions">
           {outputs.map((output) => {
             const detail = state.attemptDetails[output.key];
-            const isProductOutput = output.event_type === "product.verified" && hasProductEvidence;
+            const isProductOutput = isLatestProduct(output);
             return (
               <li key={output.key} data-output-key={output.key} tabIndex={-1}>
                 <span>{output.summary}</span>
@@ -418,7 +424,10 @@ function Swimlanes({ workbench, state, projection }: { workbench: Workbench; sta
 }
 
 export function TopologyView({ workbench, state }: { workbench: Workbench; state: WorkbenchState }) {
-  const projection = state.projection;
+  const projection =
+    state.projection && (!state.runId || state.projection.run_id === state.runId)
+      ? state.projection
+      : null;
   const hasDag = Boolean(projection?.dag.nodes.length);
   const awaitingPlanApproval = projection?.hitl_banner?.kind === "plan_gate";
   const dagHidden =

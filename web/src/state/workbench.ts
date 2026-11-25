@@ -1136,7 +1136,7 @@ export class Workbench {
 
   async openOutput(output: KeyOutputItem | undefined): Promise<void> {
     const s = this.state;
-    if (!output || !s.projection) return;
+    if (!output || !s.projection || (s.runId && s.projection.run_id !== s.runId)) return;
     if (output.current && (output.kind === "spec" || output.kind === "design")) {
       this.setView("design");
       const detail = byId(`run-${output.kind}-detail`);
@@ -1150,7 +1150,13 @@ export class Workbench {
       this.openTaskGraph(s.projection.plan?.content_hash);
       return;
     }
-    if (output.event_type === "product.verified") {
+    const latestProductSeq =
+      s.projection.delivery_acceptance?.product_verification?.event_seq ?? null;
+    if (
+      output.event_type === "product.verified" &&
+      latestProductSeq != null &&
+      output.event_seq === latestProductSeq
+    ) {
       this.showProductEvidence();
       return;
     }
