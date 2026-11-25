@@ -226,6 +226,7 @@ export function progressText(event: RunProgressItem | null | undefined): string 
     "task.accepted_with_risk": `${event.task_id} 保留未验证状态，已人工接受风险`,
     "spec.clarification_note": "已补充澄清说明",
     "spec.resynthesized": "已按澄清重新合成需求规格",
+    "spec.resynthesis_failed": "需求融合失败，可原地重试",
     "run.revision_requested": "已请求修订当前交付",
     "run.reopened": "运行已重新打开",
     "task.ephemeral_artifacts_cleaned": `${event.task_id} 临时产物已清理`,

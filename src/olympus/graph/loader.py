@@ -81,6 +81,13 @@ class WorkflowDefinition(StrictModel):
     def node(self, name: str) -> WorkflowNodeDef | None:
         return next((n for n in self.nodes if n.name == name), None)
 
+    def align_strict_canonical(self) -> bool:
+        """Return the ``align_goal`` node's canonical-contract switch."""
+        for node in self.nodes:
+            if node.type == "align_goal":
+                return bool(node.params.get("strict_canonical", True))
+        return True
+
 
 @dataclass
 class WorkflowRuntime:

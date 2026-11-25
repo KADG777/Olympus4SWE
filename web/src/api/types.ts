@@ -29,6 +29,7 @@ export type GoalSpec = Schemas["GoalSpec"];
 export type DesignSpec = Schemas["DesignSpec"];
 export type TaskPlan = Schemas["TaskPlan"];
 export type AmbiguityItem = Schemas["AmbiguityItem"];
+export type ClarificationNoteView = Schemas["ClarificationNoteView"];
 export type ApprovalReview = Schemas["ApprovalReview"];
 export type ReviewSection = Schemas["ReviewSection"];
 export type ReviewEntry = Schemas["ReviewEntry"];
@@ -74,7 +75,9 @@ export type CommandBody =
   | Loose<Schemas["PauseCommand"], Defaults>
   | Loose<Schemas["ResumeCommand"], Defaults>
   | Loose<Schemas["RetryWorkflowCommand"], Defaults>
-  | Loose<Schemas["PromoteToExecuteCommand"], Defaults>;
+  | Loose<Schemas["PromoteToExecuteCommand"], Defaults>
+  | Loose<Schemas["RequestRevisionCommand"], Defaults>
+  | Loose<Schemas["ReopenRunCommand"], Defaults>;
 
 export type ApprovalAction = "approve_spec" | "approve_design" | "approve_plan";
 

@@ -1190,6 +1190,34 @@ export class Workbench {
     return this.sendCommand({ action: "retry_workflow" }, "已从断点重新启动工作流");
   }
 
+  requestRevision(feedback: string): Promise<void> {
+    return this.sendCommand(
+      { action: "request_revision", feedback: feedback.trim() },
+      "已提交修订请求，工作流从需求对齐阶段重新启动",
+    );
+  }
+
+  openReopenRun(): void {
+    const projection = this.state.projection;
+    if (!projection) return;
+    const targetRunId = projection.run_id;
+    this.openDialog({
+      title: "追加工单",
+      description:
+        "在已完成的运行上追加后续需求或修复反馈；工作流会从需求对齐阶段重新开始，并保留原有约束与工作区范围。",
+      label: "追加需求或修复反馈（必填）",
+      defaultValue: "",
+      placeholder: "例如：补充导出 Excel 的功能，并保持现有 API 兼容。",
+      requireNonEmpty: true,
+      onConfirm: (feedback) =>
+        this.sendCommand(
+          { action: "reopen_run", feedback: feedback.trim() },
+          "已追加工单，工作流从需求对齐阶段重新启动",
+          targetRunId,
+        ),
+    });
+  }
+
   async retryBannerTask(): Promise<void> {
     const projection = this.state.projection;
     const taskId = this.bannerTaskId();
@@ -1290,20 +1318,24 @@ export class Workbench {
     });
   }
 
-  async submitClarify(answers: Record<string, string>): Promise<void> {
+  async submitClarify(answers: Record<string, string>, clarificationNote = ""): Promise<void> {
     const projection = this.state.projection;
     if (!projection) return;
+    const note = clarificationNote.trim();
     const missing = pendingAmbiguities(projection).filter((amb) => amb.blocking && !answers[amb.id]);
     if (missing.length) {
       this.toast(`还有 ${missing.length} 个阻断歧义未回答`);
       return;
     }
-    if (!Object.keys(answers).length) {
-      this.toast("请先回答至少一个澄清问题");
+    if (!Object.keys(answers).length && !note) {
+      this.toast("请先回答澄清问题或填写补充说明");
       return;
     }
     this.state.clarifyGeneration += 1;
-    await this.sendCommand({ action: "clarify", answers }, "已提交澄清并生成新的 GoalSpec 版本");
+    await this.sendCommand(
+      { action: "clarify", answers, clarification_note: note },
+      "已提交澄清并生成新的 GoalSpec 版本",
+    );
   }
 
   openDialog(config: DialogConfig): void {

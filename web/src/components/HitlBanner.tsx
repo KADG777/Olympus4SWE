@@ -1,6 +1,15 @@
-import type { ApprovalReview, DesignSpec, ReviewArtifact, ReviewEntry, ReviewSection } from "../api/types";
+import { useState } from "react";
+
+import type {
+  ApprovalAction,
+  ApprovalReview,
+  DesignSpec,
+  ReviewArtifact,
+  ReviewEntry,
+  ReviewSection,
+  RunProjection,
+} from "../api/types";
 import { APPROVAL_BUTTONS, APPROVAL_LABELS, localizeError, taskBlocker, type Variant } from "../lib/labels";
-import type { ApprovalAction } from "../api/types";
 import type { ApprovalOrigin, Workbench, WorkbenchState } from "../state/workbench";
 import { DesignStructure, DesignTradeoff } from "./spec";
 import { Badge } from "./ui";
@@ -137,9 +146,11 @@ export function ApprovalReviewCard({
   review,
   artifact,
   origin,
+  projection,
   onLocate: onLocateOverride,
   onOpenTaskGraph: onOpenTaskGraphOverride,
   onApprove: onApproveOverride,
+  onRequestRevision: onRequestRevisionOverride,
   disabled = false,
 }: {
   workbench?: Workbench;
@@ -147,11 +158,15 @@ export function ApprovalReviewCard({
   review: ApprovalReview;
   artifact: ReviewArtifact;
   origin: ApprovalOrigin | undefined;
+  projection?: RunProjection | null;
   onLocate?: (ref: string, baseline: boolean) => void;
   onOpenTaskGraph?: (targetHash: string) => void;
   onApprove?: (action: ApprovalAction) => void;
+  onRequestRevision?: (action: ApprovalAction, feedback: string) => Promise<void> | void;
   disabled?: boolean;
 }) {
+  const [revisionOpen, setRevisionOpen] = useState(false);
+  const [revisionFeedback, setRevisionFeedback] = useState("");
   const title = APPROVAL_LABELS[action];
   const visible = (sections: ReviewSection[]) =>
     sections.filter((section) => section.entries.length || section.empty_text);
@@ -170,6 +185,16 @@ export function ApprovalReviewCard({
   const onApprove = () => {
     if (onApproveOverride) onApproveOverride(action);
     else void workbench?.approve(action);
+  };
+  const awaitingResynthesis = action === "approve_spec" && Boolean(projection?.pending_resynthesis);
+  const approveDisabled = disabled || awaitingResynthesis;
+  const submitRevision = () => {
+    const feedback = revisionFeedback.trim();
+    if (!feedback) return;
+    setRevisionOpen(false);
+    setRevisionFeedback("");
+    if (onRequestRevisionOverride) void onRequestRevisionOverride(action, feedback);
+    else void workbench?.requestRevision(feedback);
   };
   return (
     <article className="approval-review" data-review-action={action} aria-labelledby={`review-${action}`}>
@@ -223,14 +248,44 @@ export function ApprovalReviewCard({
         ) : null}
         <button
           type="button"
+          className="btn"
+          data-revise-toggle={action}
+          disabled={disabled}
+          onClick={() => setRevisionOpen((open) => !open)}
+        >
+          要求修订
+        </button>
+        <button
+          type="button"
           className="btn btn-primary"
           id={button.id}
           data-approve={action}
-          disabled={disabled}
+          disabled={approveDisabled}
           onClick={onApprove}
         >
-          {button.label}
+          {awaitingResynthesis ? "等待需求融合完成…" : button.label}
         </button>
+        {revisionOpen ? (
+          <div className="approval-revise" data-revise-panel={action}>
+            <textarea
+              className="field"
+              id={`revision-feedback-${action}`}
+              rows={3}
+              value={revisionFeedback}
+              placeholder="描述需要修订的需求、边界或验收标准…"
+              onChange={(event) => setRevisionFeedback(event.target.value)}
+            />
+            <button
+              type="button"
+              className="btn"
+              data-revise-submit={action}
+              disabled={disabled || !revisionFeedback.trim()}
+              onClick={submitRevision}
+            >
+              提交修订意见
+            </button>
+          </div>
+        ) : null}
       </div>
     </article>
   );
@@ -275,7 +330,14 @@ export function HitlBanner({ workbench, state }: { workbench: Workbench; state: 
   const localized = blocker ? cleanDetail : localizeError(cleanDetail);
 
   return (
-    <section className="hitl-banner" id="hitl-banner" data-tone={tone} aria-live="polite" hidden={hidden}>
+    <section
+      className="hitl-banner"
+      id="hitl-banner"
+      data-tone={tone}
+      data-kind={banner && "kind" in banner ? banner.kind : undefined}
+      aria-live="polite"
+      hidden={hidden}
+    >
       <div className="hitl-copy">
         <p className="hitl-headline" id="hitl-headline">
           <span aria-hidden="true">{glyph}</span>
@@ -354,6 +416,7 @@ export function HitlBanner({ workbench, state }: { workbench: Workbench; state: 
               review={review}
               artifact={binding.artifact}
               origin={state.approvalOrigins[action]}
+              projection={projection}
             />
           );
         })}

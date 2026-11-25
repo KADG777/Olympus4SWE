@@ -14,6 +14,7 @@ from olympus.core.contracts import (
     CritiqueNote,
     CritiquePerspective,
     GoalSpec,
+    RunEvent,
     RunStatus,
     SpecStatus,
     StrictModel,
@@ -511,6 +512,126 @@ def _blocking_discipline_violations(spec: GoalSpec) -> list[str]:
                 "`default_assumption` (the recommended answer)"
             )
     return violations
+
+
+_CLARIFICATION_WINDOW_RESETS = frozenset(
+    {"session.started", "session.continued", "run.revision_requested", "run.reopened"}
+)
+
+
+def _normalize_clarification_text(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _needs_clarification_resynthesis(
+    spec: GoalSpec,
+    extra_notes: list[str],
+    *,
+    strict_canonical: bool = False,
+) -> bool:
+    """Return True when clarifications go beyond defaults or a strict spec still needs repair."""
+    if any(note.strip() for note in extra_notes):
+        return True
+    if strict_canonical and validate_goal_spec(spec):
+        return True
+    for amb in spec.open_ambiguities:
+        if not amb.blocking or not (amb.answer or "").strip():
+            continue
+        if _normalize_clarification_text(amb.answer).rstrip(".!。！？") != (
+            _normalize_clarification_text(amb.default_assumption).rstrip(".!。！？")
+        ):
+            return True
+    return any(note.severity.value == "blocking" and note.resolved for note in spec.minority_notes)
+
+
+def _clarification_window(events: Sequence[RunEvent]) -> list[RunEvent]:
+    """Return events since the last session/revision boundary in chronological order."""
+    window: list[RunEvent] = []
+    for event in reversed(list(events)):
+        if event.event_type in _CLARIFICATION_WINDOW_RESETS:
+            break
+        window.append(event)
+    window.reverse()
+    return window
+
+
+def _consumed_note_state(window: Sequence[RunEvent], *, spec_id: str) -> tuple[set[str], int]:
+    consumed_ids: set[str] = set()
+    legacy_cutoff_seq = 0
+    for event in window:
+        if event.event_type != "spec.resynthesized":
+            continue
+        if event.payload.get("spec_id") not in (None, "", spec_id):
+            continue
+        ids = event.payload.get("consumed_note_ids")
+        if isinstance(ids, list):
+            consumed_ids.update(str(item) for item in ids if item)
+        else:
+            legacy_cutoff_seq = max(legacy_cutoff_seq, event.event_seq)
+    return consumed_ids, legacy_cutoff_seq
+
+
+def clarification_note_states(
+    events: Sequence[RunEvent], *, spec_id: str
+) -> list[tuple[RunEvent, bool]]:
+    """Return every clarification note for ``spec_id`` with its consumed-by-resynthesis flag."""
+    window = _clarification_window(events)
+    consumed_ids, legacy_cutoff_seq = _consumed_note_state(window, spec_id=spec_id)
+    notes: list[tuple[RunEvent, bool]] = []
+    for event in window:
+        if event.event_type != "spec.clarification_note":
+            continue
+        if event.payload.get("spec_id") not in (None, "", spec_id):
+            continue
+        if not str(event.payload.get("feedback") or "").strip():
+            continue
+        consumed = event.event_id in consumed_ids or event.event_seq <= legacy_cutoff_seq
+        notes.append((event, consumed))
+    return notes
+
+
+def unconsumed_clarification_notes(
+    events: Sequence[RunEvent], *, spec_id: str
+) -> list[tuple[str, str]]:
+    """Return ``(event_id, feedback)`` note pairs not yet consumed by ``spec.resynthesized``."""
+    return [
+        (event.event_id, str(event.payload.get("feedback")).strip())
+        for event, consumed in clarification_note_states(events, spec_id=spec_id)
+        if not consumed
+    ]
+
+
+def has_pending_resynthesis(
+    events: Sequence[RunEvent],
+    spec: GoalSpec | None,
+    *,
+    spec_approved: bool,
+    strict_canonical: bool = False,
+) -> bool:
+    """True when an unapproved, unblocked GoalSpec still needs body-level resynthesis."""
+    if spec is None or spec_approved or spec.unresolved_blockers():
+        return False
+    if unconsumed_clarification_notes(events, spec_id=spec.spec_id):
+        return True
+    saw_clarification = False
+    for event in reversed(list(events)):
+        if event.event_type in _CLARIFICATION_WINDOW_RESETS:
+            break
+        if event.event_type == "spec.resynthesized":
+            if event.payload.get("spec_id") in (None, "", spec.spec_id):
+                return False
+            continue
+        if event.event_type in ("spec.clarified", "spec.clarification_note") and (
+            event.payload.get("spec_id") in (None, "", spec.spec_id)
+        ):
+            saw_clarification = True
+    if not saw_clarification:
+        return False
+    # A bare ``spec.clarified`` event (empty answers, defaults only) is not a body change.
+    # Strict-canonical repair only applies once a real human answer landed.
+    if not _needs_clarification_resynthesis(spec, [], strict_canonical=False):
+        return False
+    return _needs_clarification_resynthesis(spec, [], strict_canonical=strict_canonical)
 
 
 class AlignStage:

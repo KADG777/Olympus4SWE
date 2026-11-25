@@ -100,13 +100,18 @@ export function ClarifyPanel({
   state?: WorkbenchState;
   projection?: RunProjection | null;
   generation?: number;
-  onSubmit?: (answers: Record<string, string>) => Promise<void> | void;
+  onSubmit?: (answers: Record<string, string>, clarificationNote: string) => Promise<void> | void;
   submitting?: boolean;
 }) {
   const items = useRef<HTMLDivElement>(null);
+  const noteInput = useRef<HTMLTextAreaElement>(null);
   const projection = projectionOverride !== undefined ? projectionOverride : state?.projection ?? null;
   const generation = generationOverride ?? state?.clarifyGeneration ?? 0;
   const pending = projection ? pendingAmbiguities(projection) : [];
+  const submittedNotes = projection?.clarification_notes || [];
+  const showPanel =
+    pending.length > 0 ||
+    Boolean(projection?.spec && !projection.spec_approved && projection.resynthesis_error);
   // Answers in progress survive live updates until the question set itself changes.
   const signature = projection
     ? `${projection.run_id}:${generation}:${pending.map((amb) => `${amb.id}:${amb.question || ""}`).join("|")}`
@@ -117,14 +122,15 @@ export function ClarifyPanel({
       const value = field.value.trim();
       if (value && field.dataset.ambInput) answers[field.dataset.ambInput] = value;
     });
+    const clarificationNote = (noteInput.current?.value || "").trim();
     if (onSubmit) {
-      void onSubmit(answers);
+      void onSubmit(answers, clarificationNote);
     } else if (workbench) {
-      void workbench.submitClarify(answers);
+      void workbench.submitClarify(answers, clarificationNote);
     }
   };
   return (
-    <section className="clarify-panel" id="clarify-panel" hidden={!pending.length} aria-labelledby="clarify-title">
+    <section className="clarify-panel" id="clarify-panel" hidden={!showPanel} aria-labelledby="clarify-title">
       <div className="card-head">
         <h2 className="card-title" id="clarify-title">
           待澄清问题
@@ -136,6 +142,25 @@ export function ClarifyPanel({
           <ClarifyItem amb={amb} key={amb.id} />
         ))}
       </div>
+      <textarea
+        ref={noteInput}
+        id="clarify-note-input"
+        className="field clarify-note-input"
+        rows={3}
+        placeholder="可选：补充产品边界、固定分类、排除项或额外约束…"
+      />
+      {submittedNotes.length ? (
+        <div className="clarify-notes" id="clarify-notes" aria-label="已提交的补充说明">
+          {submittedNotes.map((note) => (
+            <span className="clarify-note-pill" data-consumed={note.consumed ? "true" : "false"} key={note.event_seq}>
+              <Badge variant={note.consumed ? "ok" : "warn"}>
+                {note.consumed ? "已融合" : "待融合"}
+              </Badge>
+              <span>{note.feedback}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div className="clarify-actions">
         <button
           type="button"

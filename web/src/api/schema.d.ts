@@ -569,6 +569,17 @@ export interface components {
          * @enum {string}
          */
         CheckKind: "command" | "independent_review" | "human";
+        /** ClarificationNoteView */
+        ClarificationNoteView: {
+            /** Consumed */
+            consumed: boolean;
+            /** Created At */
+            created_at: string;
+            /** Event Seq */
+            event_seq: number;
+            /** Feedback */
+            feedback: string;
+        };
         /** ClarifyCommand */
         ClarifyCommand: {
             /**
@@ -587,6 +598,11 @@ export interface components {
              * @default true
              */
             auto_advance: boolean;
+            /**
+             * Clarification Note
+             * @default
+             */
+            clarification_note: string;
             /** Expected State Revision */
             expected_state_revision?: number | null;
             /** Operation Id */
@@ -1713,6 +1729,62 @@ export interface components {
             /** Verdicts */
             verdicts: components["schemas"]["ReviewVerdict"][];
         };
+        /** ReopenRunCommand */
+        ReopenRunCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            action: "reopen_run";
+            /** Actor */
+            actor?: string | null;
+            /**
+             * Auto Advance
+             * @default true
+             */
+            auto_advance: boolean;
+            /** Expected State Revision */
+            expected_state_revision?: number | null;
+            /** Feedback */
+            feedback: string;
+            /** Operation Id */
+            operation_id?: string | null;
+            /**
+             * Sync
+             * @default false
+             */
+            sync: boolean;
+            /** Target Hash */
+            target_hash?: string | null;
+        };
+        /** RequestRevisionCommand */
+        RequestRevisionCommand: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            action: "request_revision";
+            /** Actor */
+            actor?: string | null;
+            /**
+             * Auto Advance
+             * @default true
+             */
+            auto_advance: boolean;
+            /** Expected State Revision */
+            expected_state_revision?: number | null;
+            /** Feedback */
+            feedback: string;
+            /** Operation Id */
+            operation_id?: string | null;
+            /**
+             * Sync
+             * @default false
+             */
+            sync: boolean;
+            /** Target Hash */
+            target_hash?: string | null;
+        };
         /** RequirementItem */
         RequirementItem: {
             /** Acceptance Criteria */
@@ -1974,6 +2046,8 @@ export interface components {
             /** Blueprint Completed */
             blueprint_completed: boolean;
             budget: components["schemas"]["BudgetSummary"];
+            /** Clarification Notes */
+            clarification_notes?: components["schemas"]["ClarificationNoteView"][];
             /** Created At */
             created_at: string;
             dag: components["schemas"]["DagView"];
@@ -1990,6 +2064,11 @@ export interface components {
             latest_event_seq: number;
             /** Mode */
             mode: string;
+            /**
+             * Pending Resynthesis
+             * @default false
+             */
+            pending_resynthesis: boolean;
             plan?: components["schemas"]["TaskPlan"] | null;
             /** Plan Approved */
             plan_approved: boolean;
@@ -1998,6 +2077,8 @@ export interface components {
             /** Raw Input */
             raw_input: string;
             recent_progress?: components["schemas"]["RunProgressItem"] | null;
+            /** Resynthesis Error */
+            resynthesis_error?: string | null;
             /** Run Id */
             run_id: string;
             spec?: components["schemas"]["GoalSpec"] | null;
@@ -2864,7 +2945,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["PauseCommand"] | components["schemas"]["ResumeCommand"] | components["schemas"]["ApproveSpecCommand"] | components["schemas"]["ApproveDesignCommand"] | components["schemas"]["ApprovePlanCommand"] | components["schemas"]["ClarifyCommand"] | components["schemas"]["RetryTaskCommand"] | components["schemas"]["AcceptRiskCommand"] | components["schemas"]["ReassignHumanCommand"] | components["schemas"]["RetryWorkflowCommand"] | components["schemas"]["PromoteToExecuteCommand"];
+                "application/json": components["schemas"]["PauseCommand"] | components["schemas"]["ResumeCommand"] | components["schemas"]["ApproveSpecCommand"] | components["schemas"]["ApproveDesignCommand"] | components["schemas"]["ApprovePlanCommand"] | components["schemas"]["ClarifyCommand"] | components["schemas"]["RetryTaskCommand"] | components["schemas"]["AcceptRiskCommand"] | components["schemas"]["ReassignHumanCommand"] | components["schemas"]["RetryWorkflowCommand"] | components["schemas"]["PromoteToExecuteCommand"] | components["schemas"]["RequestRevisionCommand"] | components["schemas"]["ReopenRunCommand"];
             };
         };
         responses: {

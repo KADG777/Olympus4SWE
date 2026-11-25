@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import olympus.harness.activity as activity
-from olympus.core.contracts import RunStatus
+from olympus.core.contracts import ApprovalTarget, GoalSpec, RunStatus
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph import (
     GraphPaused,
@@ -33,6 +33,11 @@ from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
 from olympus.providers.registry import ProviderRegistry, ProviderSpec
+from olympus.stages.align import (
+    AlignStage,
+    has_pending_resynthesis,
+    unconsumed_clarification_notes,
+)
 
 ProviderBuilder = Callable[..., LLMProvider]
 
@@ -352,6 +357,34 @@ class RunSupervisor:
             )
             provider_config = snap.get("provider_config") or {"provider": "mock"}
             active_provider = self.resolve_provider(run_id)
+            resynth_spec = snap["spec"]
+            entry_node = definition.node(effective_start) if effective_start else None
+            if (
+                resynth_spec is not None
+                and not (entry_node is not None and entry_node.type == "align_goal")
+                and has_pending_resynthesis(
+                    self.store.list_events(run_id),
+                    resynth_spec,
+                    spec_approved=self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.GOAL_SPEC,
+                        target_id=resynth_spec.spec_id,
+                        target_hash=resynth_spec.content_hash,
+                    ),
+                    strict_canonical=definition.align_strict_canonical(),
+                )
+            ):
+                resynth_failed = self._resynthesize_clarified_spec(
+                    run_id,
+                    definition,
+                    snap,
+                    provider=active_provider,
+                    driver_config=driver_config,
+                    workspace_root=ws,
+                )
+                if resynth_failed is not None:
+                    return resynth_failed
+                snap = self.store.get_run(run_id)
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
@@ -466,6 +499,98 @@ class RunSupervisor:
                     else None
                 ),
             }
+
+    def _resynthesize_clarified_spec(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        *,
+        provider: LLMProvider,
+        driver_config: ExecutionDriversConfig,
+        workspace_root: Path,
+    ) -> dict[str, Any] | None:
+        """Fuse pending clarifications into the GoalSpec; return a paused result on failure."""
+        spec = snap["spec"]
+        if spec is None:
+            return None
+        notes = unconsumed_clarification_notes(
+            self.store.list_events(run_id), spec_id=spec.spec_id
+        )
+        stage = AlignStage(
+            store=self.store,
+            provider=provider,
+            workspace_root=workspace_root,
+            trace_dir=self.artifacts_root,
+            execution_drivers=driver_config,
+            driver_registry=self.driver_registry.with_factories(
+                default_driver_factories(
+                    store=self.store,
+                    run_id=run_id,
+                    provider=provider,
+                    execution_drivers=driver_config,
+                )
+            ),
+        )
+        try:
+            stage.resynthesize_after_clarification(
+                run_id=run_id,
+                raw_goal=self._recorded_raw_input(run_id, str(snap["title"])),
+                constraints=self._recorded_constraints(run_id),
+                extra_feedback="\n\n".join(feedback for _, feedback in notes),
+                consumed_note_ids=[event_id for event_id, _ in notes],
+                strict_canonical=definition.align_strict_canonical(),
+            )
+        except Exception as exc:  # noqa: BLE001 - pause in place, never drop human answers
+            return self._pause_after_resynthesis_failure(run_id, definition, spec, exc)
+        return None
+
+    def _pause_after_resynthesis_failure(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        spec: GoalSpec,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        reason = str(exc)
+        self.store.append_event(
+            run_id=run_id,
+            stage="align",
+            event_type="spec.resynthesis_failed",
+            actor="supervisor",
+            payload={"spec_id": spec.spec_id, "error": reason},
+        )
+        while True:
+            latest = self.store.get_run(run_id)
+            if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                break
+            try:
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.AWAITING_HUMAN,
+                    expected_revision=int(latest["state_revision"]),
+                    actor="supervisor",
+                    stage="align",
+                    detail={
+                        "paused_node": "align_resynthesize",
+                        "pause_reason": reason,
+                        "error": reason,
+                    },
+                )
+                break
+            except ConcurrencyConflictError:
+                continue
+        final = self.store.get_run(run_id)
+        return {
+            "run_id": run_id,
+            "workflow": definition.name,
+            "topology": definition.topology,
+            "stop_after": definition.stop_after,
+            "status": final["status"].value,
+            "state_revision": final["state_revision"],
+            "paused": {"node": "align_resynthesize", "reason": reason},
+            "error": reason,
+        }
 
     def _release_token(self, run_id: str, token: int, *, clear_pending: bool = False) -> None:
         """Release active ownership only if ``token`` still owns ``run_id``."""
@@ -836,6 +961,48 @@ class RunSupervisor:
             auto_approve=False,
             sync=effective_sync,
             recompute_entry=True,
+        )
+
+    def revise_run(
+        self, run_id: str, *, feedback: str, sync: bool = False
+    ) -> dict[str, Any]:
+        """Re-align a revised/reopened run from the align stage with augmented input."""
+        clean = feedback.strip()
+        if not clean:
+            raise ValueError("revise_run requires non-empty feedback")
+        snap = self.store.get_run(run_id)
+        augmented = (
+            f"{self._recorded_raw_input(run_id, str(snap['title']))}"
+            f"\n\n[User revision feedback]\n{clean}"
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type="graph.input_recorded",
+            actor="human",
+            payload={
+                "raw_input": augmented,
+                "constraints": self._recorded_constraints(run_id),
+                "feedback": clean,
+                "workspace_id": snap.get("workspace_id"),
+                "workspace_mode": snap.get("workspace_mode") or "brownfield",
+                "task_type": snap.get("task_type") or "feature",
+                "base_ref": snap.get("base_ref"),
+                "scope_paths": list(snap.get("scope_paths") or []),
+            },
+        )
+        definition = load_workflow(snap["workflow_name"])
+        align_node = next(
+            (node.name for node in definition.nodes if node.type == "align_goal"), None
+        )
+        if align_node is None:
+            raise ValueError(f"Workflow {definition.name} has no align stage node")
+        return self._launch(
+            run_id,
+            raw_input=augmented,
+            start_from=align_node,
+            auto_approve=False,
+            sync=sync,
         )
 
     def wait(self, run_id: str, *, timeout: float | None = None) -> dict[str, Any] | None:

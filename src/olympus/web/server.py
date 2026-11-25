@@ -24,10 +24,11 @@ from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import olympus.web.acceptance as delivery_review
-from olympus.core.contracts import new_id
+from olympus.core.contracts import ApprovalTarget, new_id
 from olympus.core.control import RunControl
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
+from olympus.stages.align import has_pending_resynthesis
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
 from olympus.web.projection import (
     build_board_payload,
@@ -794,6 +795,27 @@ class AriadneApp:
             if action == "pause" and not cmd_result.get("deduplicated"):
                 self.supervisor.cancel_active_turns(run_id, reason="human_paused")
         elif action == "approve_spec":
+            if self.supervisor.is_supervised(run_id):
+                current = self.store.get_run(run_id)
+                pending_spec = current["spec"]
+                if pending_spec is not None:
+                    spec_approved = self.store.is_approved(
+                        run_id=run_id,
+                        target=ApprovalTarget.GOAL_SPEC,
+                        target_id=pending_spec.spec_id,
+                        target_hash=pending_spec.content_hash,
+                    )
+                    if has_pending_resynthesis(
+                        self.store.list_events(run_id),
+                        pending_spec,
+                        spec_approved=spec_approved,
+                        strict_canonical=load_workflow(
+                            current["workflow_name"]
+                        ).align_strict_canonical(),
+                    ):
+                        raise ValueError(
+                            "GoalSpec is awaiting clarification resynthesis before approval"
+                        )
             spec_result = self.control.confirm_spec(
                 run_id=run_id,
                 approver=actor,
@@ -850,6 +872,7 @@ class AriadneApp:
                 answers=dict(body.get("answers") or {}),
                 resolutions=dict(body.get("resolutions") or {}),
                 extra_out_of_scope=list(body.get("out_of_scope") or []),
+                clarification_note=str(body.get("clarification_note") or ""),
                 actor=actor,
                 expected_revision=expected_rev,
                 operation_id=operation_id,
@@ -904,6 +927,52 @@ class AriadneApp:
                 note=str(body.get("note", "")).strip(),
                 actor=actor,
             )
+        elif action == "request_revision":
+            feedback = str(body.get("feedback", "")).strip()
+            if not feedback:
+                raise ValueError("request_revision requires non-empty 'feedback'")
+            cmd_result = self.control.request_revision(
+                run_id,
+                feedback=feedback,
+                expected_revision=expected_rev,
+                operation_id=operation_id,
+                actor=actor,
+                command_meta=dispatch_meta,
+            )
+            if (
+                auto_advance
+                and not cmd_result.get("deduplicated")
+                and self.supervisor.is_supervised(run_id)
+            ):
+                cmd_result = {
+                    **cmd_result,
+                    "workflow": self.supervisor.revise_run(
+                        run_id, feedback=feedback, sync=sync_flag
+                    ),
+                }
+        elif action == "reopen_run":
+            feedback = str(body.get("feedback", "")).strip()
+            if not feedback:
+                raise ValueError("reopen_run requires non-empty 'feedback'")
+            cmd_result = self.control.reopen_run(
+                run_id,
+                feedback=feedback,
+                expected_revision=expected_rev,
+                operation_id=operation_id,
+                actor=actor,
+                command_meta=dispatch_meta,
+            )
+            if (
+                auto_advance
+                and not cmd_result.get("deduplicated")
+                and self.supervisor.is_supervised(run_id)
+            ):
+                cmd_result = {
+                    **cmd_result,
+                    "workflow": self.supervisor.revise_run(
+                        run_id, feedback=feedback, sync=sync_flag
+                    ),
+                }
         elif action == "retry_workflow":
             retry_payload: dict[str, Any] = {"action": "retry_workflow"}
             if sync_flag:

@@ -999,44 +999,95 @@ class RunControl:
         feedback: str,
         actor: str = "human",
         expected_revision: int | None = None,
+        operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a human revision request and reopen the workflow for re-alignment."""
         clean = feedback.strip()
         if not clean:
             raise ValueError("request_revision requires non-empty feedback")
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        status: RunStatus = snap["status"]
-        if status in _ACTIVE_STATUSES:
-            raise ValueError(f"Run {run_id} is currently active ({status.value})")
-        if status not in (
+        allowed = (
             RunStatus.AWAITING_HUMAN,
             RunStatus.PAUSED,
             RunStatus.FAILED,
             RunStatus.COMPLETED,
-        ):
-            raise ValueError(f"Run {run_id} cannot be revised from status {status.value}")
-        cas_revision = int(snap["state_revision"])
-        new_rev = self.store.set_run_status(
-            run_id,
-            RunStatus.RUNNING,
-            expected_revision=cas_revision,
-            actor=actor,
-            stage="align",
-            detail={"action": "revision_requested", "feedback": clean},
         )
-        self.store.append_event(
+
+        def _result(new_rev: int) -> dict[str, Any]:
+            return {
+                "run_id": run_id,
+                "status": RunStatus.RUNNING.value,
+                "state_revision": new_rev,
+                "feedback": clean,
+            }
+
+        def _validate(snap: Mapping[str, Any]) -> RunStatus:
+            status: RunStatus = snap["status"]
+            if status in _ACTIVE_STATUSES:
+                raise ValueError(f"Run {run_id} is currently active ({status.value})")
+            if status not in allowed:
+                raise ValueError(f"Run {run_id} cannot be revised from status {status.value}")
+            return status
+
+        if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            status = _validate(snap)
+            cas_revision = int(snap["state_revision"])
+            new_rev = self.store.set_run_status(
+                run_id,
+                RunStatus.RUNNING,
+                expected_revision=cas_revision,
+                actor=actor,
+                stage="align",
+                detail={"action": "revision_requested", "feedback": clean},
+            )
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="run.revision_requested",
+                actor=actor,
+                payload={"feedback": clean, "from_status": status.value},
+            )
+            return _result(new_rev)
+
+        def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            status = _validate(snap)
+            new_rev = self.store.update_status_in_tx(
+                conn,
+                run_id=run_id,
+                cur_rev=cur_rev,
+                status=RunStatus.RUNNING,
+                stage="align",
+                event_type="run.status_changed",
+                actor=actor,
+                payload={
+                    "from": status.value,
+                    "to": RunStatus.RUNNING.value,
+                    "action": "revision_requested",
+                    "feedback": clean,
+                },
+            )
+            self.store.append_event_in_tx(
+                conn,
+                run_id=run_id,
+                stage="align",
+                event_type="run.revision_requested",
+                actor=actor,
+                payload={"feedback": clean, "from_status": status.value},
+                state_revision=new_rev,
+            )
+            return _result(new_rev)
+
+        return self.store.apply_idempotent_command(
+            operation_id=operation_id,
             run_id=run_id,
-            stage="align",
-            event_type="run.revision_requested",
             actor=actor,
-            payload={"feedback": clean, "from_status": status.value},
+            action="request_revision",
+            expected_state_revision=expected_revision,
+            payload={"feedback": clean, **(command_meta or {})},
+            handler=handler,
         )
-        return {
-            "run_id": run_id,
-            "status": RunStatus.RUNNING.value,
-            "state_revision": new_rev,
-            "feedback": clean,
-        }
 
     def reopen_run(
         self,
@@ -1045,38 +1096,88 @@ class RunControl:
         feedback: str,
         actor: str = "human",
         expected_revision: int | None = None,
+        operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record post-completion follow-up work and re-enter the workflow incrementally."""
         clean = feedback.strip()
         if not clean:
             raise ValueError("reopen_run requires non-empty feedback")
-        snap = self.store.get_run(run_id, expected_revision=expected_revision)
-        if snap["status"] != RunStatus.COMPLETED:
-            raise ValueError(
-                f"Run {run_id} is {snap['status'].value}; incremental reopen requires completed"
+
+        def _result(new_rev: int) -> dict[str, Any]:
+            return {
+                "run_id": run_id,
+                "status": RunStatus.RUNNING.value,
+                "state_revision": new_rev,
+                "feedback": clean,
+            }
+
+        def _validate(snap: Mapping[str, Any]) -> None:
+            if snap["status"] != RunStatus.COMPLETED:
+                raise ValueError(
+                    f"Run {run_id} is {snap['status'].value}; "
+                    "incremental reopen requires completed"
+                )
+
+        if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            _validate(snap)
+            cas_revision = int(snap["state_revision"])
+            new_rev = self.store.set_run_status(
+                run_id,
+                RunStatus.RUNNING,
+                expected_revision=cas_revision,
+                actor=actor,
+                stage="align",
+                detail={"action": "reopened", "feedback": clean},
             )
-        cas_revision = int(snap["state_revision"])
-        new_rev = self.store.set_run_status(
-            run_id,
-            RunStatus.RUNNING,
-            expected_revision=cas_revision,
-            actor=actor,
-            stage="align",
-            detail={"action": "reopened", "feedback": clean},
-        )
-        self.store.append_event(
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="run.reopened",
+                actor=actor,
+                payload={"feedback": clean},
+            )
+            return _result(new_rev)
+
+        def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            snap = self.store.get_run_in_tx(conn, run_id)
+            _validate(snap)
+            new_rev = self.store.update_status_in_tx(
+                conn,
+                run_id=run_id,
+                cur_rev=cur_rev,
+                status=RunStatus.RUNNING,
+                stage="align",
+                event_type="run.status_changed",
+                actor=actor,
+                payload={
+                    "from": RunStatus.COMPLETED.value,
+                    "to": RunStatus.RUNNING.value,
+                    "action": "reopened",
+                    "feedback": clean,
+                },
+            )
+            self.store.append_event_in_tx(
+                conn,
+                run_id=run_id,
+                stage="align",
+                event_type="run.reopened",
+                actor=actor,
+                payload={"feedback": clean},
+                state_revision=new_rev,
+            )
+            return _result(new_rev)
+
+        return self.store.apply_idempotent_command(
+            operation_id=operation_id,
             run_id=run_id,
-            stage="align",
-            event_type="run.reopened",
             actor=actor,
-            payload={"feedback": clean},
+            action="reopen_run",
+            expected_state_revision=expected_revision,
+            payload={"feedback": clean, **(command_meta or {})},
+            handler=handler,
         )
-        return {
-            "run_id": run_id,
-            "status": RunStatus.RUNNING.value,
-            "state_revision": new_rev,
-            "feedback": clean,
-        }
 
     def promote_to_execute(
         self,

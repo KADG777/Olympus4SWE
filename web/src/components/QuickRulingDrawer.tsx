@@ -182,9 +182,10 @@ export function QuickRulingDrawer({
     }
   };
 
-  const handleClarify = async (answers: Record<string, string>) => {
+  const handleClarify = async (answers: Record<string, string>, clarificationNote = "") => {
     const current = projectionRef.current;
     if (!current) return;
+    const note = clarificationNote.trim();
     const missing = pendingAmbiguities(current).filter((amb) => amb.blocking && !answers[amb.id]);
     if (missing.length) {
       const msg = `还有 ${missing.length} 个阻断歧义未回答`;
@@ -192,14 +193,17 @@ export function QuickRulingDrawer({
       workbench.toast(msg);
       return;
     }
-    if (!Object.keys(answers).length) {
-      const msg = "请先回答至少一个澄清问题";
+    if (!Object.keys(answers).length && !note) {
+      const msg = "请先回答澄清问题或填写补充说明";
       setNotice({ tone: "warn", text: msg });
       workbench.toast(msg);
       return;
     }
     setClarifyGen((value) => value + 1);
-    await sendDrawerCommand({ action: "clarify", answers }, "已提交澄清并生成新的 GoalSpec 版本");
+    await sendDrawerCommand(
+      { action: "clarify", answers, clarification_note: note },
+      "已提交澄清并生成新的 GoalSpec 版本",
+    );
   };
 
   const handleApprove = (action: ApprovalAction) => {
@@ -296,6 +300,7 @@ export function QuickRulingDrawer({
     gateBanner && Array.isArray(gateBanner.actions) && gateBanner.actions.includes("retry_workflow"),
   );
   const runFailed = gateBanner?.kind === "run_failed" || projection?.status === "failed";
+  const resynthesizing = gateBanner?.kind === "resynthesizing";
   const hasAnyRuling =
     pendingClarifications.length > 0 ||
     reviews.size > 0 ||
@@ -303,7 +308,8 @@ export function QuickRulingDrawer({
     isPaused ||
     promoteGate ||
     canRetryWorkflow ||
-    runFailed;
+    runFailed ||
+    resynthesizing;
 
   const openBlockerHint = () => {
     const current = projectionRef.current;
@@ -494,9 +500,16 @@ export function QuickRulingDrawer({
                         review={review}
                         artifact={binding.artifact}
                         origin={approvalOrigins[action]}
+                        projection={projection}
                         onLocate={(ref, old) => handleLocateOrigin(action, ref, old)}
                         onOpenTaskGraph={openTaskGraph}
                         onApprove={handleApprove}
+                        onRequestRevision={(_action, feedback) =>
+                          sendDrawerCommand(
+                            { action: "request_revision", feedback },
+                            "已提交修订请求，工作流从需求对齐阶段重新启动",
+                          )
+                        }
                         disabled={busy}
                       />
                     );
@@ -587,8 +600,30 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
+              {resynthesizing ? (
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-resynthesis"
+                  data-tone="info"
+                  data-kind="resynthesizing"
+                >
+                  <div className="hitl-copy">
+                    <p className="hitl-headline">
+                      <span aria-hidden="true">◷</span>
+                      <span>{gateBanner?.headline || "正在将澄清与补充约束融合进 GoalSpec…"}</span>
+                    </p>
+                    {gateBanner?.detail ? <p className="hitl-detail">{gateBanner.detail}</p> : null}
+                  </div>
+                </section>
+              ) : null}
+
               {canRetryWorkflow || runFailed ? (
-                <section className="hitl-banner" id="quick-drawer-failed" data-tone="danger">
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-failed"
+                  data-tone="danger"
+                  data-kind={gateBanner?.kind || "run_failed"}
+                >
                   <div className="hitl-copy">
                     <p className="hitl-headline">
                       <span aria-hidden="true">✕</span>
