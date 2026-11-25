@@ -600,6 +600,24 @@ class RunSupervisor:
                 if clear_pending:
                     self._pending_resume.pop(run_id, None)
 
+    def _spec_needs_resynthesis(
+        self, run_id: str, definition: WorkflowDefinition, snap: dict[str, Any]
+    ) -> bool:
+        spec = snap["spec"]
+        if spec is None:
+            return False
+        return has_pending_resynthesis(
+            self.store.list_events(run_id),
+            spec,
+            spec_approved=self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            ),
+            strict_canonical=definition.align_strict_canonical(),
+        )
+
     def _drain_advance_loop(
         self,
         run_id: str,
@@ -643,6 +661,7 @@ class RunSupervisor:
                 and entry_node.type == "human_gate"
                 and paused_node == entry
                 and int(snap["state_revision"]) <= int(result["state_revision"])
+                and not self._spec_needs_resynthesis(run_id, definition, snap)
             )
             still_completed = snap["status"] == RunStatus.COMPLETED and entry in (
                 None,
@@ -953,7 +972,12 @@ class RunSupervisor:
                 "complete": latest["status"] == RunStatus.COMPLETED,
             }
         entry_node = definition.node(entry)
-        effective_sync = sync or (entry_node is not None and entry_node.type == "human_gate")
+        pending_resynth = self._spec_needs_resynthesis(run_id, definition, snap)
+        effective_sync = sync or (
+            entry_node is not None
+            and entry_node.type == "human_gate"
+            and not pending_resynth
+        )
         return self._launch(
             run_id,
             raw_input=self._recorded_raw_input(run_id, str(snap["title"])),

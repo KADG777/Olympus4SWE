@@ -1672,11 +1672,15 @@ def build_run_projection(
         stop_after=workflow_view.get("stop_after"),
     )
 
+    try:
+        strict_canonical = load_workflow(workflow_name).align_strict_canonical()
+    except Exception:  # noqa: BLE001 - fallback for legacy/unknown workflows
+        strict_canonical = True
     pending_resynthesis = has_pending_resynthesis(
         events,
         spec,
         spec_approved=spec_approved,
-        strict_canonical=load_workflow(workflow_name).align_strict_canonical(),
+        strict_canonical=strict_canonical,
     )
     clarification_notes: list[dict[str, Any]] = []
     resynthesis_error: str | None = None

@@ -143,6 +143,7 @@ export function ClarifyPanel({
         ))}
       </div>
       <textarea
+        key={generation}
         ref={noteInput}
         id="clarify-note-input"
         className="field clarify-note-input"

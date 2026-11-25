@@ -931,6 +931,10 @@ class AriadneApp:
             feedback = str(body.get("feedback", "")).strip()
             if not feedback:
                 raise ValueError("request_revision requires non-empty 'feedback'")
+            if auto_advance and self.supervisor.is_supervised(run_id):
+                wf_def = load_workflow(snap["workflow_name"])
+                if not any(node.type == "align_goal" for node in wf_def.nodes):
+                    raise ValueError(f"Workflow {wf_def.name} has no align stage node")
             cmd_result = self.control.request_revision(
                 run_id,
                 feedback=feedback,
@@ -954,6 +958,10 @@ class AriadneApp:
             feedback = str(body.get("feedback", "")).strip()
             if not feedback:
                 raise ValueError("reopen_run requires non-empty 'feedback'")
+            if auto_advance and self.supervisor.is_supervised(run_id):
+                wf_def = load_workflow(snap["workflow_name"])
+                if not any(node.type == "align_goal" for node in wf_def.nodes):
+                    raise ValueError(f"Workflow {wf_def.name} has no align stage node")
             cmd_result = self.control.reopen_run(
                 run_id,
                 feedback=feedback,

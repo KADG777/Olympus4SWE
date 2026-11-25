@@ -176,7 +176,9 @@ export function QuickRulingDrawer({
     await workbench.refreshRuns().catch(() => undefined);
     if (
       activeRunIdRef.current === targetRunId &&
-      workbench.state.quickDrawerRunId === targetRunId
+      workbench.state.quickDrawerRunId === targetRunId &&
+      !result.projection.pending_resynthesis &&
+      !result.projection.resynthesis_error
     ) {
       workbench.closeQuickDrawer();
     }
@@ -474,7 +476,8 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
-              {pendingClarifications.length > 0 ? (
+              {pendingClarifications.length > 0 ||
+              Boolean(projection.spec && !projection.spec_approved && projection.resynthesis_error) ? (
                 <ClarifyPanel
                   projection={projection}
                   generation={clarifyGen}
