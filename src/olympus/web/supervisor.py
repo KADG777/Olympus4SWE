@@ -11,6 +11,7 @@ from typing import Any
 
 import olympus.harness.activity as activity
 from olympus.core.contracts import ApprovalTarget, GoalSpec, RunStatus
+from olympus.core.control import has_unfulfilled_revision, latest_revision_event_seq
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.graph import (
     GraphPaused,
@@ -36,7 +37,6 @@ from olympus.providers.registry import ProviderRegistry, ProviderSpec
 from olympus.stages.align import (
     AlignStage,
     has_pending_resynthesis,
-    has_unfulfilled_revision,
     unconsumed_clarification_notes,
 )
 
@@ -247,26 +247,25 @@ class RunSupervisor:
         return supervised
 
     def _observer(
-        self, run_id: str, *, abort_on_unfulfilled_revision: bool = False
+        self,
+        run_id: str,
+        *,
+        is_align_pass: bool = False,
+        entry_restart_seq: int = 0,
     ) -> Callable[[str, dict[str, Any]], None]:
         def _observe(event: str, payload: dict[str, Any]) -> None:
             event_type = _ENGINE_EVENT_TO_STORE.get(event)
             if event_type is None:
                 return
-            if not abort_on_unfulfilled_revision:
-                self.store.append_event(
-                    run_id=run_id,
-                    stage="graph",
-                    event_type=event_type,
-                    actor="supervisor",
-                    payload=dict(payload),
-                )
-                return
             while True:
                 pre = self.store.get_run(run_id)
-                if self._has_pending_restart(run_id) or has_unfulfilled_revision(
-                    self.store.list_events(run_id)
-                ):
+                cur_events = self.store.list_events(run_id)
+                superseded = self._has_pending_restart(run_id) or (
+                    latest_revision_event_seq(cur_events) > entry_restart_seq
+                    if is_align_pass
+                    else has_unfulfilled_revision(cur_events)
+                )
+                if superseded:
                     raise ConcurrencyConflictError(
                         f"Run {run_id} was superseded by a pending revision"
                     )
@@ -398,7 +397,6 @@ class RunSupervisor:
                     "status": latest_snap["status"].value,
                     "state_revision": latest_snap["state_revision"],
                     "paused": None,
-                    "superseded": True,
                 }
             if (
                 resynth_spec is not None
@@ -439,7 +437,6 @@ class RunSupervisor:
                         "status": latest_after_resynth["status"].value,
                         "state_revision": latest_after_resynth["state_revision"],
                         "paused": None,
-                        "superseded": revised_mid_flight,
                     }
                 if resynth_failed is not None:
                     return resynth_failed
@@ -485,13 +482,16 @@ class RunSupervisor:
             if snap["plan"] is not None:
                 state["plan"] = snap["plan"].model_dump(mode="json")
 
-            abort_on_unfulfilled = entry_node is None or entry_node.type != "align_goal"
+            is_align_pass = entry_node is not None and entry_node.type == "align_goal"
+            entry_restart_seq = latest_revision_event_seq(self.store.list_events(run_id))
             try:
                 result = run_graph(
                     graph,
                     state,
                     observer=self._observer(
-                        run_id, abort_on_unfulfilled_revision=abort_on_unfulfilled
+                        run_id,
+                        is_align_pass=is_align_pass,
+                        entry_restart_seq=entry_restart_seq,
                     ),
                     max_steps=runtime.max_steps * 2,
                     start_from=effective_start,
@@ -499,7 +499,6 @@ class RunSupervisor:
             except Exception as exc:
                 if self._has_pending_restart(run_id) or (
                     isinstance(exc, ConcurrencyConflictError)
-                    and abort_on_unfulfilled
                     and has_unfulfilled_revision(self.store.list_events(run_id))
                 ):
                     latest_snap = self.store.get_run(run_id)
@@ -511,7 +510,6 @@ class RunSupervisor:
                         "status": latest_snap["status"].value,
                         "state_revision": latest_snap["state_revision"],
                         "paused": None,
-                        "superseded": True,
                     }
                 raise
             finally:
@@ -529,7 +527,6 @@ class RunSupervisor:
                     "status": latest_snap["status"].value,
                     "state_revision": latest_snap["state_revision"],
                     "paused": None,
-                    "superseded": True,
                 }
             paused_node = result.get("_paused_node")
             while True:
@@ -674,7 +671,6 @@ class RunSupervisor:
                     "status": pre["status"].value,
                     "state_revision": pre["state_revision"],
                     "paused": None,
-                    "superseded": True,
                 }
             try:
                 self.store.append_event(

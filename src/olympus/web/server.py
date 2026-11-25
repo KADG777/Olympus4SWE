@@ -26,10 +26,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import olympus.web.acceptance as delivery_review
 from olympus.core.contracts import ApprovalTarget, new_id
-from olympus.core.control import RunControl
+from olympus.core.control import RunControl, has_unfulfilled_revision
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
-from olympus.stages.align import has_pending_resynthesis, has_unfulfilled_revision
+from olympus.stages.align import has_pending_resynthesis
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
 from olympus.web.projection import (
     build_board_payload,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, overload
 
 from olympus.core.contracts import (
@@ -21,6 +21,7 @@ from olympus.core.contracts import (
     BudgetPolicy,
     DesignSpec,
     GoalSpec,
+    RunEvent,
     RunStatus,
     SpecStatus,
     TaskNode,
@@ -38,6 +39,40 @@ _ACTIVE_STATUSES = (
     RunStatus.PLANNING,
 )
 _DEFAULT_HUMAN_ASSIGNMENT_NOTE = "已改派给人工工程师处理（提交后仍须经独立验收）"
+
+
+def latest_revision_event_seq(events: Sequence[RunEvent]) -> int:
+    """Return the highest event_seq for ``run.revision_requested`` or ``run.reopened``."""
+    latest = 0
+    for ev in events:
+        if ev.event_type in ("run.revision_requested", "run.reopened"):
+            latest = max(latest, ev.event_seq)
+    return latest
+
+
+def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
+    """True when a persisted revision/reopen has not yet been re-aligned by AlignStage."""
+    latest_restart_seq = latest_revision_event_seq(events)
+    if latest_restart_seq == 0:
+        return False
+    non_align_revs = {
+        ev.state_revision
+        for ev in events
+        if ev.event_seq > latest_restart_seq
+        and ev.event_type in ("spec.clarified", "approval.recorded", "spec.resynthesized")
+    }
+    return not any(
+        ev.event_seq > latest_restart_seq
+        and (
+            ev.event_type == "spec.aligned"
+            or (
+                ev.event_type == "spec.saved"
+                and ev.actor == "align"
+                and ev.state_revision not in non_align_revs
+            )
+        )
+        for ev in events
+    )
 
 
 def is_design_bound_to_spec(
@@ -1302,4 +1337,10 @@ class RunControl:
         )
 
 
-__all__ = ["RunControl", "is_design_bound_to_spec", "is_plan_bound_to_upstream"]
+__all__ = [
+    "RunControl",
+    "has_unfulfilled_revision",
+    "is_design_bound_to_spec",
+    "is_plan_bound_to_upstream",
+    "latest_revision_event_seq",
+]

@@ -21,7 +21,11 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
+from olympus.core.control import (
+    has_unfulfilled_revision,
+    is_design_bound_to_spec,
+    is_plan_bound_to_upstream,
+)
 from olympus.core.dag import validate_plan_topology
 from olympus.core.store import RunStore
 
@@ -96,28 +100,8 @@ def resolve_resume_node(
     align_node = next(
         (node.name for node in definition.nodes if node.type == "align_goal"), None
     )
-    if align_node is not None:
-        events = store.list_events(run_id)
-        latest_restart_seq = 0
-        for ev in events:
-            if ev.event_type in ("run.revision_requested", "run.reopened"):
-                latest_restart_seq = max(latest_restart_seq, ev.event_seq)
-        if latest_restart_seq > 0:
-            has_graph = any(ev.stage == "graph" for ev in events)
-            realigned = any(
-                ev.event_seq > latest_restart_seq
-                and (
-                    (
-                        ev.event_type == "graph.node_finished"
-                        and ev.payload.get("node") == align_node
-                    )
-                    if has_graph
-                    else ev.event_type == "spec.aligned"
-                )
-                for ev in events
-            )
-            if not realigned:
-                return align_node
+    if align_node is not None and has_unfulfilled_revision(store.list_events(run_id)):
+        return align_node
 
     spec = snap.get("spec")
     if spec is not None and not is_artifact_approved(store, run_id, "spec", snap):

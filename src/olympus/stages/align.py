@@ -19,7 +19,12 @@ from olympus.core.contracts import (
     SpecStatus,
     StrictModel,
 )
-from olympus.core.control import RunControl
+from olympus.core.control import (
+    RunControl,
+)
+from olympus.core.control import (
+    has_unfulfilled_revision as has_unfulfilled_revision,
+)
 from olympus.core.dag import validate_goal_spec
 from olympus.core.store import ConcurrencyConflictError, RunStore
 from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
@@ -600,20 +605,6 @@ def unconsumed_clarification_notes(
         for event, consumed in clarification_note_states(events, spec_id=spec_id)
         if not consumed
     ]
-
-
-def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
-    """True when a persisted revision/reopen has not yet been re-aligned into a saved spec."""
-    latest_restart_seq = 0
-    for ev in events:
-        if ev.event_type in ("run.revision_requested", "run.reopened"):
-            latest_restart_seq = max(latest_restart_seq, ev.event_seq)
-    if latest_restart_seq == 0:
-        return False
-    return not any(
-        ev.event_seq > latest_restart_seq and ev.event_type == "spec.aligned"
-        for ev in events
-    )
 
 
 def _clarify_event_has_input(payload: dict[str, object]) -> bool:

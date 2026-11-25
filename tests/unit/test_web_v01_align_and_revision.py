@@ -1223,3 +1223,121 @@ def test_late_revision_after_graph_return_not_overwritten_by_status_cas_retry(
         assert app.store.get_run(run_id)["status"] == RunStatus.RUNNING
     finally:
         supervisor.shutdown()
+
+
+def test_legacy_realigned_run_without_spec_aligned_event_remains_approvable(
+    tmp_path: Path,
+) -> None:
+    """Runs realigned prior to spec.aligned (standalone spec.saved by align) remain approvable."""
+    responder = _BlueprintResponder(answers={}, blocking=False)
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        rev = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "改成按周汇总",
+                "auto_advance": False,
+            },
+        )
+        assert rev.status_code == 200, rev.text
+
+        # Simulate a legacy database where AlignStage.propose_spec wrote spec.saved(actor="align")
+        # without the newer spec.aligned audit event.
+        legacy_realigned = _draft_spec().model_copy(
+            update={"version": 2, "open_ambiguities": [], "status": SpecStatus.AWAITING_HUMAN}
+        )
+        app.store.save_spec(run_id, legacy_realigned, actor="align")
+        app.store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="align", stage="align")
+
+        proj = _projection(client, run_id)
+        approved = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": proj["spec"]["content_hash"],
+                "expected_state_revision": proj["state_revision"],
+                "auto_advance": False,
+            },
+        )
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["projection"]["spec_approved"] is True
+    finally:
+        supervisor.shutdown()
+
+
+def test_second_revision_during_align_aborts_stale_graph_events_and_retries_align(
+    tmp_path: Path,
+) -> None:
+    """Second revision arriving right after align saves spec must not emit stale graph events."""
+    from unittest.mock import patch
+
+    align_prompts: list[str] = []
+    draft = _draft_spec().model_copy(update={"open_ambiguities": []})
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        if "Requirements Alignment Architect" in messages[0].content:
+            align_prompts.append(messages[1].content)
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {messages[0].content[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        orig_append = app.store.append_event
+        injected = False
+
+        def inject_rev2_before_align_finished(*args: object, **kwargs: object):
+            nonlocal injected
+            if (
+                kwargs.get("event_type") == "graph.node_finished"
+                and (kwargs.get("payload") or {}).get("node") == "align"
+                and len(align_prompts) == 2
+                and not injected
+            ):
+                injected = True
+                res = client.post(
+                    f"/api/runs/{run_id}/command",
+                    json={
+                        "action": "request_revision",
+                        "feedback": "第二轮修订反馈",
+                        "auto_advance": False,
+                    },
+                )
+                assert res.status_code == 200, res.text
+            return orig_append(*args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(app.store, "append_event", inject_rev2_before_align_finished):
+            rev1 = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "action": "request_revision",
+                    "feedback": "第一轮修订反馈",
+                    "sync": True,
+                },
+            )
+            assert rev1.status_code == 200, rev1.text
+            supervisor.wait(run_id, timeout=30)
+
+        assert injected is True
+        events = app.store.list_events(run_id)
+        rev2_seq = [ev.event_seq for ev in events if ev.event_type == "run.revision_requested"][-1]
+        assert not any(
+            ev.event_seq > rev2_seq
+            and ev.event_type in ("graph.node_finished", "graph.paused")
+            for ev in events
+        )
+
+        retry = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        )
+        assert retry.status_code == 200, retry.text
+        supervisor.wait(run_id, timeout=30)
+        assert len(align_prompts) == 3
+        assert "第二轮修订反馈" in align_prompts[-1]
+        assert _projection(client, run_id)["status"] == "awaiting_human"
+    finally:
+        supervisor.shutdown()
