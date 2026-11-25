@@ -138,7 +138,7 @@ export function localizeError(text: string | null | undefined): string {
   const raw = String(text || "").trim();
   if (!raw) return "";
   if (/read operation timed out|ReadTimeout/i.test(raw)) {
-    return `模型接口读取超时（已将默认超时阈值提升至 180s，可直接点击“从断点重试”继续）· ${raw}`;
+    return `模型接口读取超时（已将默认超时阈值提升至 300s，可直接点击“从断点重试”继续）· ${raw}`;
   }
   if (/provider_error/i.test(raw)) {
     return `模型调用异常（可检查提供方配置后点击“从断点重试”）· ${raw}`;
@@ -224,6 +224,23 @@ export function progressText(event: RunProgressItem | null | undefined): string 
     "task.blocked": `${event.task_id} 受阻`,
     "task.accepted": `${event.task_id} 已验收`,
     "task.accepted_with_risk": `${event.task_id} 保留未验证状态，已人工接受风险`,
+    "spec.clarification_note": "已补充澄清说明",
+    "spec.resynthesized": "已按澄清重新合成需求规格",
+    "run.revision_requested": "已请求修订当前交付",
+    "run.reopened": "运行已重新打开",
+    "task.ephemeral_artifacts_cleaned": `${event.task_id} 临时产物已清理`,
+    "task.diff_gate_rejected": `${event.task_id} 变更越界被拦截`,
+    "task.escape_hatch_rejected": `${event.task_id} 逃逸语句被拦截`,
+    "task.review_deferred": `${event.task_id} 独立复核延后至交付验收`,
+    "task.deferred_review_passed": `${event.task_id} 延后复核已通过`,
+    "review.verdict_verified": `${event.task_id} 审查结论已核验`,
+    "review.repro_rechecked": `${event.task_id} 复现命令已复检`,
+    "review.repro_commands_cleared": `${event.task_id} 复现命令已清除`,
+    "product.verified": "产品端到端验证完成",
+    "post_dag.repro_rechecked": "交付后复现命令已复检",
+    "post_dag.repair_turn_completed": "交付修复轮次完成",
+    "post_dag.repair_applied": "交付修复已应用",
+    "post_dag.repair_rejected": "交付修复被拒绝",
   };
   return labels[event.event_type] || "已记录运行更新";
 }

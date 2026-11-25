@@ -215,7 +215,6 @@ class CreateRunRequest(StrictModel):
     provider_config: ProviderConfig = Field(default_factory=ProviderConfig)
     worker_driver: str | None = None
     reviewer_driver: str | None = None
-    monitor_model: str | None = None
     auto_approve: bool = False
     sync: bool = False
     constraints: list[str] | None = None
@@ -497,14 +496,6 @@ class TriageView(StrictModel):
     has_design: bool = False
 
 
-class StageActivityItem(StrictModel):
-    event_seq: int
-    stage: str
-    event_type: str
-    actor: str
-    summary: str
-
-
 class RunProgressItem(StrictModel):
     event_seq: int
     created_at: str
@@ -604,8 +595,6 @@ class LiveProgress(StrictModel):
     last_event_at: str | None = None
     recent_tools: list[RecentTool]
     steer_count: int
-    watchdog_verdict: str | None = None
-    watchdog_summary: str | None = None
     preview: str | None = Field(default=None, exclude_if=_omit_none)
 
 
@@ -723,6 +712,9 @@ class DagNode(StrictModel):
     receipt: TurnReceipt
     manifest_md: str
     artifacts: TaskArtifacts
+    review_deferred: bool = False
+    escape_hatch_rejections: int = 0
+    escape_hatch_findings: list[str] = Field(default_factory=list)
 
 
 class DagEdge(StrictModel):
@@ -765,7 +757,7 @@ class WaterfallTurn(StrictModel):
     steps: int
     offset_pct: float
     width_pct: float
-    receipt: TurnReceipt
+    receipt: TurnReceipt | None = None
     manifest_md: str
 
 
@@ -813,12 +805,54 @@ class DeliveryCounts(StrictModel):
     unverified: int
 
 
+class ProductCheckItem(StrictModel):
+    name: str
+    status: str
+    detail: str = ""
+    port: int | None = None
+
+
+class ProductVerificationView(StrictModel):
+    passed: bool
+    summary: str
+    failures: list[str] = Field(default_factory=list)
+    event_seq: int
+    verified_at: str
+    checks: list[ProductCheckItem] = Field(default_factory=list)
+    has_report: bool = False
+    has_boot_log: bool = False
+    has_screenshot: bool = False
+
+
 class DeliveryAcceptance(StrictModel):
     spec_id: str
     spec_version: int
     spec_hash: str
     counts: DeliveryCounts
     criteria: list[DeliveryCriterion]
+    product_verification: ProductVerificationView | None = None
+
+
+class PostDagRoundItem(StrictModel):
+    sequence: int
+    reported_round: int
+    event_seq: int
+    created_at: str
+    phase: Literal["verify", "recheck", "review", "repair"]
+    outcome: Literal["passed", "failed", "applied", "rejected", "completed"]
+    summary: str
+    changed_paths: list[str] = Field(default_factory=list)
+    repro_checked: int | None = None
+    repro_failed: int | None = None
+
+
+class PostDagSummary(StrictModel):
+    status: Literal[
+        "idle", "verifying", "repairing", "passed", "paused", "failed", "awaiting_human"
+    ]
+    total_rounds: int
+    rounds: list[PostDagRoundItem] = Field(default_factory=list)
+    latest_argus_verdict: ReviewVerdict | None = None
 
 
 class RunProjection(StrictModel):
@@ -835,7 +869,6 @@ class RunProjection(StrictModel):
     workflow: WorkflowView
     blueprint_completed: bool
     triage: TriageView | None = None
-    stage_activity: list[StageActivityItem]
     recent_progress: RunProgressItem | None = None
     key_outputs: list[KeyOutputItem]
     spec_approved: bool
@@ -854,6 +887,7 @@ class RunProjection(StrictModel):
     waterfall_turns: list[WaterfallTurn]
     traceability_matrix: list[TraceabilityMatrix]
     delivery_acceptance: DeliveryAcceptance | None = None
+    post_dag: PostDagSummary | None = None
     events: list[RunEvent]
     latest_event_seq: int
 
@@ -970,6 +1004,10 @@ __all__ = [
     "PauseCommand",
     "PauseInfo",
     "PendingAction",
+    "PostDagRoundItem",
+    "PostDagSummary",
+    "ProductCheckItem",
+    "ProductVerificationView",
     "PromoteToExecuteCommand",
     "ProviderConfig",
     "ProviderStatus",
@@ -985,7 +1023,6 @@ __all__ = [
     "RunSummary",
     "SeatState",
     "SeedDemoResponse",
-    "StageActivityItem",
     "StagePipelineItem",
     "SwimlaneRow",
     "TaskType",

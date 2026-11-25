@@ -62,13 +62,6 @@ function EventRows({ events }: { events: RunProjection["events"] }) {
   );
 }
 
-const WATCHDOG_LABELS: Record<string, [string, "ok" | "warn" | "bad"]> = {
-  HEALTHY: ["进展正常", "ok"],
-  STUCK_LOOP: ["疑似循环", "warn"],
-  SCOPE_DRIFT: ["偏离范围", "warn"],
-  BLOCKED_EXTERNAL: ["外部阻塞", "bad"],
-};
-
 const TOOL_STATUS_LABELS: Record<string, string> = { ok: "成功", error: "出错", denied: "已拦截" };
 
 function activityPreview(state: WorkbenchState, task: DagNode): string {
@@ -83,8 +76,6 @@ function LiveProgressCard({ state, task }: { state: WorkbenchState; task: DagNod
   const progress = task.live_progress;
   if (!progress?.driver_name && !progress?.last_event_at) return null;
   const current = progress.current_tool;
-  const verdict = progress.watchdog_verdict ? WATCHDOG_LABELS[progress.watchdog_verdict] : undefined;
-  const hasDiagnosis = Boolean(verdict || progress.watchdog_summary);
   const preview = activityPreview(state, task);
   return (
     <Card title={task.status === "running" ? "实时执行" : "最近执行"}>
@@ -107,13 +98,6 @@ function LiveProgressCard({ state, task }: { state: WorkbenchState; task: DagNod
               {`${TOOL_STATUS_LABELS[entry.status]} · ${entry.duration_ms} ms`}
             </Row>
           ))}
-        {hasDiagnosis ? (
-          <Row label="Watchdog">
-            {verdict ? <Badge variant={verdict[1]}>{verdict[0]}</Badge> : null}
-            {verdict && progress.watchdog_summary ? " " : null}
-            {progress.watchdog_summary ? <span>{progress.watchdog_summary}</span> : null}
-          </Row>
-        ) : null}
       </KeyValues>
       <p className="card-note" data-live-preview="" hidden={!preview}>
         {preview}

@@ -2711,8 +2711,6 @@ def test_live_worker_milestones_reach_ariadne_before_receipt(tmp_path: Path) -> 
             assert progress["current_tool"] is None
             assert progress["recent_tools"][0]["status"] == "ok"
             assert progress["steer_count"] == 1
-            assert progress["watchdog_verdict"] is None
-            assert progress["watchdog_summary"] is None
             reopened = RunStore(store.db_path)
             durable = build_run_projection(reopened, tmp_path, run_id)["dag"]["nodes"][0][
                 "live_progress"

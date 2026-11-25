@@ -101,7 +101,6 @@ const EMPTY_FORM: NewRunForm = {
   model: "",
   workerDriver: "",
   reviewerDriver: "",
-  monitorModel: "",
   input: "",
 };
 
@@ -695,19 +694,6 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
                     placeholder="留空使用环境配置"
                     value={form.reviewerDriver}
                     onChange={(event) => set({ reviewerDriver: event.target.value })}
-                  />
-                </div>
-                <div className="form-field">
-                  <label className="dialog-label" htmlFor="new-run-monitor-model">
-                    监控模型（可选）
-                  </label>
-                  <input
-                    id="new-run-monitor-model"
-                    className="field"
-                    type="text"
-                    placeholder="留空使用环境配置"
-                    value={form.monitorModel}
-                    onChange={(event) => set({ monitorModel: event.target.value })}
                   />
                 </div>
               </div>

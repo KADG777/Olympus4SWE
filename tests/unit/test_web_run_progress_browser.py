@@ -1735,34 +1735,6 @@ def test_task_dag_handles_arrow_ids_and_high_fanin_port_spacing(workbench, brows
     page.close()
 
 
-def test_watchdog_diagnosis_surfaces_live_and_after_refresh(workbench, browser):
-    store, run_id, url = workbench
-    task = store.get_run(run_id)["plan"].tasks[0]
-    page = browser.new_page()
-    page.goto(f"{url}/?run={run_id}")
-    target = page.locator(f"#dag-graph [data-task-id='{task.task_id}']")
-    target.click()
-    store.append_event(
-        run_id=run_id, stage="orchestrate", event_type="watchdog.checked", actor="watchdog",
-        payload={"task_id": task.task_id, "attempt": task.attempt,
-                 "verdict": "STUCK_LOOP", "summary": "Repeated file errors."},
-    )
-    dock = page.locator("#dock")
-    playwright.expect(dock.get_by_text("疑似循环", exact=True)).to_be_visible()
-    playwright.expect(dock.get_by_text("Repeated file errors.", exact=True)).to_be_visible()
-
-    store.append_event(
-        run_id=run_id, stage="orchestrate", event_type="watchdog.paused", actor="watchdog",
-        payload={"task_id": task.task_id, "attempt": task.attempt,
-                 "verdict": "BLOCKED_EXTERNAL", "summary": "Credentials are missing."},
-    )
-    page.reload()
-    target.click()
-    playwright.expect(dock.get_by_text("外部阻塞", exact=True)).to_be_visible()
-    playwright.expect(dock.get_by_text("Credentials are missing.", exact=True)).to_be_visible()
-    page.close()
-
-
 # ---------------------------------------------------------------------------
 # Oracle Board (L1), Two-Tier Sidebar, Workspace Switcher & Open Ariadne Tabs
 # ---------------------------------------------------------------------------

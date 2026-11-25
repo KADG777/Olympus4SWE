@@ -156,7 +156,6 @@ export interface NewRunForm {
   model: string;
   workerDriver: string;
   reviewerDriver: string;
-  monitorModel: string;
   input: string;
 }
 
@@ -1402,7 +1401,6 @@ export class Workbench {
     const overrides = [
       ["worker_driver", form.workerDriver],
       ["reviewer_driver", form.reviewerDriver],
-      ["monitor_model", form.monitorModel],
     ] as const;
     for (const [name, raw] of overrides) {
       const value = raw.trim();

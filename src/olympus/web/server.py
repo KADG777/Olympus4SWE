@@ -1264,6 +1264,41 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
                     )
         raise NotFoundError("No matching current delivery evidence")
 
+    @api.get(
+        "/api/runs/{run_id}/product-artifact/{kind}",
+        response_class=Response,
+        responses={
+            **read_responses,
+            200: {
+                "description": "Allowlisted product verification artifact",
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object", "additionalProperties": True}
+                    },
+                    "text/plain": {"schema": {"type": "string"}},
+                    "image/png": {"schema": {"type": "string", "format": "binary"}},
+                },
+            },
+        },
+    )
+    def get_product_artifact(
+        run_id: str, kind: Literal["report", "boot_log", "screenshot"]
+    ) -> Response:
+        service.store.get_run(run_id)
+        artifact = delivery_review.read_product_artifact(
+            service.artifacts_root / run_id,
+            kind,
+            artifacts_root=service.artifacts_root,
+        )
+        if artifact is None:
+            raise NotFoundError("Product verification artifact is not available")
+        content, media_type = artifact
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @api.get("/api/workspaces", response_model=WorkspaceListResponse, responses=error_responses)
     def list_workspaces() -> dict[str, Any]:
         return service.list_workspaces_payload()
@@ -1378,7 +1413,6 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             provider_config=payload.provider_config.model_dump(exclude_none=True),
             worker_driver=payload.worker_driver,
             reviewer_driver=payload.reviewer_driver,
-            monitor_model=payload.monitor_model,
             auto_approve=payload.auto_approve,
             sync=payload.sync,
             constraints=constraints,

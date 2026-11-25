@@ -888,17 +888,6 @@
             "title": "Init Git",
             "type": "boolean"
           },
-          "monitor_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Monitor Model"
-          },
           "provider_config": {
             "$ref": "#/components/schemas/ProviderConfig"
           },
@@ -1391,6 +1380,18 @@
             "title": "Diagnostic Tool",
             "type": "string"
           },
+          "escape_hatch_findings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Escape Hatch Findings",
+            "type": "array"
+          },
+          "escape_hatch_rejections": {
+            "default": 0,
+            "title": "Escape Hatch Rejections",
+            "type": "integer"
+          },
           "executor": {
             "title": "Executor",
             "type": "string"
@@ -1466,6 +1467,11 @@
           "review_cycle": {
             "title": "Review Cycle",
             "type": "integer"
+          },
+          "review_deferred": {
+            "default": false,
+            "title": "Review Deferred",
+            "type": "boolean"
           },
           "role": {
             "title": "Role",
@@ -1649,6 +1655,16 @@
             },
             "title": "Criteria",
             "type": "array"
+          },
+          "product_verification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductVerificationView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "spec_hash": {
             "title": "Spec Hash",
@@ -2801,28 +2817,6 @@
           "steer_count": {
             "title": "Steer Count",
             "type": "integer"
-          },
-          "watchdog_summary": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Watchdog Summary"
-          },
-          "watchdog_verdict": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Watchdog Verdict"
           }
         },
         "required": [
@@ -2982,6 +2976,230 @@
           }
         },
         "title": "PauseInfo",
+        "type": "object"
+      },
+      "PostDagRoundItem": {
+        "additionalProperties": false,
+        "properties": {
+          "changed_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "applied",
+              "rejected",
+              "completed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "verify",
+              "recheck",
+              "review",
+              "repair"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "reported_round": {
+            "title": "Reported Round",
+            "type": "integer"
+          },
+          "repro_checked": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repro Checked"
+          },
+          "repro_failed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repro Failed"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "reported_round",
+          "event_seq",
+          "created_at",
+          "phase",
+          "outcome",
+          "summary"
+        ],
+        "title": "PostDagRoundItem",
+        "type": "object"
+      },
+      "PostDagSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "latest_argus_verdict": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewVerdict"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rounds": {
+            "items": {
+              "$ref": "#/components/schemas/PostDagRoundItem"
+            },
+            "title": "Rounds",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "verifying",
+              "repairing",
+              "passed",
+              "paused",
+              "failed",
+              "awaiting_human"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "total_rounds": {
+            "title": "Total Rounds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "total_rounds"
+        ],
+        "title": "PostDagSummary",
+        "type": "object"
+      },
+      "ProductCheckItem": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "default": "",
+            "title": "Detail",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "ProductCheckItem",
+        "type": "object"
+      },
+      "ProductVerificationView": {
+        "additionalProperties": false,
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ProductCheckItem"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "failures": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Failures",
+            "type": "array"
+          },
+          "has_boot_log": {
+            "default": false,
+            "title": "Has Boot Log",
+            "type": "boolean"
+          },
+          "has_report": {
+            "default": false,
+            "title": "Has Report",
+            "type": "boolean"
+          },
+          "has_screenshot": {
+            "default": false,
+            "title": "Has Screenshot",
+            "type": "boolean"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "boolean"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "verified_at": {
+            "title": "Verified At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "passed",
+          "summary",
+          "event_seq",
+          "verified_at"
+        ],
+        "title": "ProductVerificationView",
         "type": "object"
       },
       "ProgressSummary": {
@@ -4445,6 +4663,16 @@
             "title": "Plan Approved",
             "type": "boolean"
           },
+          "post_dag": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PostDagSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "progress": {
             "$ref": "#/components/schemas/ProgressSummary"
           },
@@ -4479,13 +4707,6 @@
           "spec_approved": {
             "title": "Spec Approved",
             "type": "boolean"
-          },
-          "stage_activity": {
-            "items": {
-              "$ref": "#/components/schemas/StageActivityItem"
-            },
-            "title": "Stage Activity",
-            "type": "array"
           },
           "stage_pipeline": {
             "items": {
@@ -4566,7 +4787,6 @@
           "workflow_name",
           "workflow",
           "blueprint_completed",
-          "stage_activity",
           "key_outputs",
           "spec_approved",
           "design_approved",
@@ -4859,40 +5079,6 @@
         ],
         "title": "SpecStatus",
         "type": "string"
-      },
-      "StageActivityItem": {
-        "additionalProperties": false,
-        "properties": {
-          "actor": {
-            "title": "Actor",
-            "type": "string"
-          },
-          "event_seq": {
-            "title": "Event Seq",
-            "type": "integer"
-          },
-          "event_type": {
-            "title": "Event Type",
-            "type": "string"
-          },
-          "stage": {
-            "title": "Stage",
-            "type": "string"
-          },
-          "summary": {
-            "title": "Summary",
-            "type": "string"
-          }
-        },
-        "required": [
-          "event_seq",
-          "stage",
-          "event_type",
-          "actor",
-          "summary"
-        ],
-        "title": "StageActivityItem",
-        "type": "object"
       },
       "StagePipelineItem": {
         "additionalProperties": false,
@@ -5634,7 +5820,14 @@
             "type": "number"
           },
           "receipt": {
-            "$ref": "#/components/schemas/TurnReceipt"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "status": {
             "title": "Status",
@@ -5682,7 +5875,6 @@
           "steps",
           "offset_pct",
           "width_pct",
-          "receipt",
           "manifest_md"
         ],
         "title": "WaterfallTurn",
@@ -6919,6 +7111,81 @@
           }
         },
         "summary": "Get Run Events"
+      }
+    },
+    "/api/runs/{run_id}/product-artifact/{kind}": {
+      "get": {
+        "operationId": "get_product_artifact_api_runs__run_id__product_artifact__kind__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "report",
+                "boot_log",
+                "screenshot"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Allowlisted product verification artifact"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "summary": "Get Product Artifact"
       }
     },
     "/api/runs/{run_id}/stream": {

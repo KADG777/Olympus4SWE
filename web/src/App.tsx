@@ -118,7 +118,7 @@ export function App({ workbench }: { workbench: Workbench }) {
               <span id="foot-note">
                 {state.projection
                   ? `${state.projection.run_id} · 最近事件 #${state.projection.latest_event_seq}`
-                  : "Ariadne M4"}
+                  : "Ariadne v0.1"}
               </span>
             </footer>
           </main>

@@ -158,6 +158,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runs/{run_id}/product-artifact/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Product Artifact */
+        get: operations["get_product_artifact_api_runs__run_id__product_artifact__kind__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runs/{run_id}/stream": {
         parameters: {
             query?: never;
@@ -651,8 +668,6 @@ export interface components {
              * @default false
              */
             init_git: boolean;
-            /** Monitor Model */
-            monitor_model?: string | null;
             provider_config?: components["schemas"]["ProviderConfig"];
             /** Raw Input */
             raw_input?: string | null;
@@ -799,6 +814,13 @@ export interface components {
             diagnostic_output: string;
             /** Diagnostic Tool */
             diagnostic_tool: string;
+            /** Escape Hatch Findings */
+            escape_hatch_findings?: string[];
+            /**
+             * Escape Hatch Rejections
+             * @default 0
+             */
+            escape_hatch_rejections: number;
             /** Executor */
             executor: string;
             /** Kind */
@@ -824,6 +846,11 @@ export interface components {
             requirement_refs: string[];
             /** Review Cycle */
             review_cycle: number;
+            /**
+             * Review Deferred
+             * @default false
+             */
+            review_deferred: boolean;
             /** Role */
             role: string;
             /** Status */
@@ -886,6 +913,7 @@ export interface components {
             counts: components["schemas"]["DeliveryCounts"];
             /** Criteria */
             criteria: components["schemas"]["DeliveryCriterion"][];
+            product_verification?: components["schemas"]["ProductVerificationView"] | null;
             /** Spec Hash */
             spec_hash: string;
             /** Spec Id */
@@ -1319,10 +1347,6 @@ export interface components {
             recent_tools: components["schemas"]["RecentTool"][];
             /** Steer Count */
             steer_count: number;
-            /** Watchdog Summary */
-            watchdog_summary?: string | null;
-            /** Watchdog Verdict */
-            watchdog_verdict?: string | null;
         };
         /** PantheonSeatSummary */
         PantheonSeatSummary: {
@@ -1377,6 +1401,92 @@ export interface components {
             node?: string | null;
             /** Reason */
             reason?: string | null;
+        };
+        /** PostDagRoundItem */
+        PostDagRoundItem: {
+            /** Changed Paths */
+            changed_paths?: string[];
+            /** Created At */
+            created_at: string;
+            /** Event Seq */
+            event_seq: number;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "passed" | "failed" | "applied" | "rejected" | "completed";
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "verify" | "recheck" | "review" | "repair";
+            /** Reported Round */
+            reported_round: number;
+            /** Repro Checked */
+            repro_checked?: number | null;
+            /** Repro Failed */
+            repro_failed?: number | null;
+            /** Sequence */
+            sequence: number;
+            /** Summary */
+            summary: string;
+        };
+        /** PostDagSummary */
+        PostDagSummary: {
+            latest_argus_verdict?: components["schemas"]["ReviewVerdict"] | null;
+            /** Rounds */
+            rounds?: components["schemas"]["PostDagRoundItem"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "idle" | "verifying" | "repairing" | "passed" | "paused" | "failed" | "awaiting_human";
+            /** Total Rounds */
+            total_rounds: number;
+        };
+        /** ProductCheckItem */
+        ProductCheckItem: {
+            /**
+             * Detail
+             * @default
+             */
+            detail: string;
+            /** Name */
+            name: string;
+            /** Port */
+            port?: number | null;
+            /** Status */
+            status: string;
+        };
+        /** ProductVerificationView */
+        ProductVerificationView: {
+            /** Checks */
+            checks?: components["schemas"]["ProductCheckItem"][];
+            /** Event Seq */
+            event_seq: number;
+            /** Failures */
+            failures?: string[];
+            /**
+             * Has Boot Log
+             * @default false
+             */
+            has_boot_log: boolean;
+            /**
+             * Has Report
+             * @default false
+             */
+            has_report: boolean;
+            /**
+             * Has Screenshot
+             * @default false
+             */
+            has_screenshot: boolean;
+            /** Passed */
+            passed: boolean;
+            /** Summary */
+            summary: string;
+            /** Verified At */
+            verified_at: string;
         };
         /** ProgressSummary */
         ProgressSummary: {
@@ -1883,6 +1993,7 @@ export interface components {
             plan?: components["schemas"]["TaskPlan"] | null;
             /** Plan Approved */
             plan_approved: boolean;
+            post_dag?: components["schemas"]["PostDagSummary"] | null;
             progress: components["schemas"]["ProgressSummary"];
             /** Raw Input */
             raw_input: string;
@@ -1892,8 +2003,6 @@ export interface components {
             spec?: components["schemas"]["GoalSpec"] | null;
             /** Spec Approved */
             spec_approved: boolean;
-            /** Stage Activity */
-            stage_activity: components["schemas"]["StageActivityItem"][];
             /** Stage Pipeline */
             stage_pipeline: components["schemas"]["StagePipelineItem"][];
             /** State Revision */
@@ -2024,19 +2133,6 @@ export interface components {
          * @enum {string}
          */
         SpecStatus: "draft" | "awaiting_human" | "confirmed" | "superseded";
-        /** StageActivityItem */
-        StageActivityItem: {
-            /** Actor */
-            actor: string;
-            /** Event Seq */
-            event_seq: number;
-            /** Event Type */
-            event_type: string;
-            /** Stage */
-            stage: string;
-            /** Summary */
-            summary: string;
-        };
         /** StagePipelineItem */
         StagePipelineItem: {
             /** Id */
@@ -2304,7 +2400,7 @@ export interface components {
             manifest_md: string;
             /** Offset Pct */
             offset_pct: number;
-            receipt: components["schemas"]["TurnReceipt"];
+            receipt?: components["schemas"]["TurnReceipt"] | null;
             /** Status */
             status: string;
             /** Steps */
@@ -2872,6 +2968,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EventsResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    get_product_artifact_api_runs__run_id__product_artifact__kind__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+                kind: "report" | "boot_log" | "screenshot";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Allowlisted product verification artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "image/png": string;
+                    "text/plain": string;
                 };
             };
             /** @description Bad Request */

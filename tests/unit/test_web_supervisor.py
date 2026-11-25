@@ -921,7 +921,6 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
             client,
             "new-run-worker-driver",
             "new-run-reviewer-driver",
-            "new-run-monitor-model",
         )
         response = client.post(
             "/api/runs",
