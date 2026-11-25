@@ -205,6 +205,7 @@ def test_openapi_covers_v01_projection_and_product_artifact_contracts() -> None:
         "has_report",
         "has_boot_log",
         "has_screenshot",
+        "screenshot_sha256",
     }
     assert product["properties"]["checks"]["items"]["$ref"].endswith("ProductCheckItem")
 
