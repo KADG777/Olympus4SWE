@@ -37,6 +37,7 @@ from olympus.graph.progress import (
 )
 from olympus.harness.activity import tool_output_status
 from olympus.harness.receipt import build_turn_receipt
+from olympus.stages.align import clarification_note_states, has_pending_resynthesis
 from olympus.web.approval_review import (
     APPROVAL_ARTIFACTS,
     ApprovalReview,
@@ -1053,7 +1054,8 @@ def _build_run_progress(
         "graph.node_started", "graph.node_finished", "graph.paused", "graph.failed",
         "graph.finished", "run.status_changed", "run.workflow_promoted", "task.requeued",
         "task.blocked", "task.accepted", "task.accepted_with_risk",
-        "spec.clarification_note", "spec.resynthesized", "run.revision_requested",
+        "spec.clarification_note", "spec.resynthesized", "spec.resynthesis_failed",
+        "run.revision_requested",
         "run.reopened", "task.ephemeral_artifacts_cleaned", "task.diff_gate_rejected",
         "task.escape_hatch_rejected", "task.review_deferred",
         "task.deferred_review_passed", "review.verdict_verified",
@@ -1528,6 +1530,7 @@ def build_run_projection(
     run_id: str,
     *,
     artifacts_root: Path | None = None,
+    supervised: bool | None = None,
 ) -> dict[str, Any]:
     """Derive a complete read-only Ariadne console view from SQLite events and run artifacts."""
     snap = store.get_run(run_id, include_approval_baselines=True)
@@ -1669,6 +1672,42 @@ def build_run_projection(
         run_status=snap["status"],
         stop_after=workflow_view.get("stop_after"),
     )
+
+    is_supervised = (
+        any(ev.stage == "graph" for ev in events) if supervised is None else supervised
+    )
+    try:
+        strict_canonical = load_workflow(workflow_name).align_strict_canonical()
+    except Exception:  # noqa: BLE001 - fallback for legacy/unknown workflows
+        strict_canonical = True
+    pending_resynthesis = is_supervised and has_pending_resynthesis(
+        events,
+        spec,
+        spec_approved=spec_approved,
+        strict_canonical=strict_canonical,
+    )
+    clarification_notes: list[dict[str, Any]] = []
+    resynthesis_error: str | None = None
+    if spec is not None:
+        clarification_notes = [
+            {
+                "event_seq": event.event_seq,
+                "created_at": event.created_at.isoformat(),
+                "feedback": str(event.payload.get("feedback") or "").strip(),
+                "consumed": consumed,
+            }
+            for event, consumed in clarification_note_states(events, spec_id=spec.spec_id)
+        ]
+        for event in reversed(events):
+            if event.event_type == "spec.resynthesis_failed":
+                if event.payload.get("spec_id") in (None, "", spec.spec_id):
+                    resynthesis_error = str(event.payload.get("error") or "").strip() or None
+                    break
+                continue
+            if event.event_type in ("spec.resynthesized", "spec.saved") and (
+                event.payload.get("spec_id") in (None, "", spec.spec_id)
+            ):
+                break
 
     live_progress = _live_task_progress(tasks, events)
     review_deferred, escape_rejections, escape_findings = _task_review_flags(tasks, events)
@@ -1830,6 +1869,24 @@ def build_run_projection(
             "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
             "detail": "点击右上角「恢复运行」继续调度就绪任务",
             "actions": ["resume"],
+        }
+    elif pending_resynthesis and resynthesis_error:
+        hitl_banner = {
+            "kind": "resynthesis_failed",
+            "tone": "danger",
+            "task_id": None,
+            "headline": "需求融合（Resynthesize）失败，可原地重试或补充说明",
+            "detail": resynthesis_error,
+            "actions": ["retry_workflow"],
+        }
+    elif pending_resynthesis:
+        hitl_banner = {
+            "kind": "resynthesizing",
+            "tone": "info",
+            "task_id": None,
+            "headline": "正在将澄清与补充约束融合进 GoalSpec…",
+            "detail": "融合完成后将生成新版本供您确认，期间暂不可批准旧版规格。",
+            "actions": [],
         }
     elif spec is not None and not spec_approved:
         blockers = spec.unresolved_blockers()
@@ -2036,6 +2093,9 @@ def build_run_projection(
         },
         "hitl_banner": hitl_banner,
         "approval_reviews": approval_reviews,
+        "pending_resynthesis": pending_resynthesis,
+        "resynthesis_error": resynthesis_error,
+        "clarification_notes": clarification_notes,
         "spec": spec.model_dump(mode="json") if spec else None,
         "design": design.model_dump(mode="json") if design else None,
         "plan": plan.model_dump(mode="json") if plan else None,

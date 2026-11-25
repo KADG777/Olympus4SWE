@@ -632,6 +632,35 @@
         "title": "CheckKind",
         "type": "string"
       },
+      "ClarificationNoteView": {
+        "additionalProperties": false,
+        "properties": {
+          "consumed": {
+            "title": "Consumed",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "feedback": {
+            "title": "Feedback",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_seq",
+          "created_at",
+          "feedback",
+          "consumed"
+        ],
+        "title": "ClarificationNoteView",
+        "type": "object"
+      },
       "ClarifyCommand": {
         "additionalProperties": false,
         "properties": {
@@ -662,6 +691,11 @@
             "default": true,
             "title": "Auto Advance",
             "type": "boolean"
+          },
+          "clarification_note": {
+            "default": "",
+            "title": "Clarification Note",
+            "type": "string"
           },
           "expected_state_revision": {
             "anyOf": [
@@ -3184,6 +3218,17 @@
             "title": "Passed",
             "type": "boolean"
           },
+          "screenshot_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot Sha256"
+          },
           "summary": {
             "title": "Summary",
             "type": "string"
@@ -3794,6 +3839,156 @@
           "verdicts"
         ],
         "title": "RecordedAttemptArtifacts",
+        "type": "object"
+      },
+      "ReopenRunCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "reopen_run",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "feedback": {
+            "minLength": 1,
+            "title": "Feedback",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action",
+          "feedback"
+        ],
+        "title": "ReopenRunCommand",
+        "type": "object"
+      },
+      "RequestRevisionCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "request_revision",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "feedback": {
+            "minLength": 1,
+            "title": "Feedback",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action",
+          "feedback"
+        ],
+        "title": "RequestRevisionCommand",
         "type": "object"
       },
       "RequirementItem": {
@@ -4586,6 +4781,13 @@
           "budget": {
             "$ref": "#/components/schemas/BudgetSummary"
           },
+          "clarification_notes": {
+            "items": {
+              "$ref": "#/components/schemas/ClarificationNoteView"
+            },
+            "title": "Clarification Notes",
+            "type": "array"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -4649,6 +4851,11 @@
             "title": "Mode",
             "type": "string"
           },
+          "pending_resynthesis": {
+            "default": false,
+            "title": "Pending Resynthesis",
+            "type": "boolean"
+          },
           "plan": {
             "anyOf": [
               {
@@ -4689,6 +4896,17 @@
                 "type": "null"
               }
             ]
+          },
+          "resynthesis_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resynthesis Error"
           },
           "run_id": {
             "title": "Run Id",
@@ -6895,6 +7113,8 @@
                     "pause": "#/components/schemas/PauseCommand",
                     "promote_to_execute": "#/components/schemas/PromoteToExecuteCommand",
                     "reassign_human": "#/components/schemas/ReassignHumanCommand",
+                    "reopen_run": "#/components/schemas/ReopenRunCommand",
+                    "request_revision": "#/components/schemas/RequestRevisionCommand",
                     "resume": "#/components/schemas/ResumeCommand",
                     "retry_task": "#/components/schemas/RetryTaskCommand",
                     "retry_workflow": "#/components/schemas/RetryWorkflowCommand"
@@ -6934,6 +7154,12 @@
                   },
                   {
                     "$ref": "#/components/schemas/PromoteToExecuteCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RequestRevisionCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReopenRunCommand"
                   }
                 ],
                 "title": "Payload"
@@ -7138,6 +7364,38 @@
               ],
               "title": "Kind",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "v",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "V"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sha"
             }
           }
         ],

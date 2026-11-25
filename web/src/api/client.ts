@@ -47,6 +47,34 @@ export const boardStreamUrl = (workspaceId?: string | null): string =>
 export const deliveryLogUrl = (runId: string, eventSeq: number, position: number): string =>
   `${runPath(runId)}/delivery-log/${eventSeq}/${position}`;
 
+export type ProductArtifactKind = "report" | "boot_log" | "screenshot";
+
+export const productArtifactUrl = (
+  runId: string,
+  kind: ProductArtifactKind,
+  version?: number | string | null,
+  sha?: string | null,
+): string => {
+  const base = `${runPath(runId)}/product-artifact/${kind}`;
+  const params = new URLSearchParams();
+  if (version != null && version !== "") params.set("v", String(version));
+  if (sha) params.set("sha", sha);
+  const qs = params.toString();
+  return qs ? `${base}?${qs}` : base;
+};
+
+export async function fetchProductArtifactText(
+  runId: string,
+  kind: "report" | "boot_log",
+  version?: number | string | null,
+): Promise<string> {
+  const response = await fetch(productArtifactUrl(runId, kind, version), { cache: "no-store" });
+  if (!response.ok) {
+    throw new ApiError("读取实机验证产物失败", response.status);
+  }
+  return response.text();
+}
+
 async function json<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }

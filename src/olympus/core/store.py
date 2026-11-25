@@ -1591,30 +1591,35 @@ class RunStore:
             )
             return {**result, "deduplicated": False}
 
+    def list_events_in_tx(
+        self, conn: sqlite3.Connection, run_id: str, *, after_seq: int = 0
+    ) -> list[RunEvent]:
+        rows = conn.execute(
+            """
+            SELECT * FROM events
+            WHERE run_id = ? AND event_seq > ?
+            ORDER BY event_seq ASC
+            """,
+            (run_id, after_seq),
+        ).fetchall()
+        return [
+            RunEvent(
+                event_seq=int(r["event_seq"]),
+                event_id=r["event_id"],
+                run_id=r["run_id"],
+                stage=r["stage"],
+                event_type=r["event_type"],
+                actor=r["actor"],
+                payload=json.loads(r["payload_json"]),
+                state_revision=int(r["state_revision"]),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
     def list_events(self, run_id: str, *, after_seq: int = 0) -> list[RunEvent]:
         conn = self._connect()
         try:
-            rows = conn.execute(
-                """
-                SELECT * FROM events
-                WHERE run_id = ? AND event_seq > ?
-                ORDER BY event_seq ASC
-                """,
-                (run_id, after_seq),
-            ).fetchall()
-            return [
-                RunEvent(
-                    event_seq=int(r["event_seq"]),
-                    event_id=r["event_id"],
-                    run_id=r["run_id"],
-                    stage=r["stage"],
-                    event_type=r["event_type"],
-                    actor=r["actor"],
-                    payload=json.loads(r["payload_json"]),
-                    state_revision=int(r["state_revision"]),
-                    created_at=r["created_at"],
-                )
-                for r in rows
-            ]
+            return self.list_events_in_tx(conn, run_id, after_seq=after_seq)
         finally:
             conn.close()

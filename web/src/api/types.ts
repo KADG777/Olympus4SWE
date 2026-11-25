@@ -29,12 +29,17 @@ export type GoalSpec = Schemas["GoalSpec"];
 export type DesignSpec = Schemas["DesignSpec"];
 export type TaskPlan = Schemas["TaskPlan"];
 export type AmbiguityItem = Schemas["AmbiguityItem"];
+export type ClarificationNoteView = Schemas["ClarificationNoteView"];
 export type ApprovalReview = Schemas["ApprovalReview"];
 export type ReviewSection = Schemas["ReviewSection"];
 export type ReviewEntry = Schemas["ReviewEntry"];
 export type KeyOutputItem = Schemas["KeyOutputItem"];
 export type DeliveryAcceptance = Schemas["DeliveryAcceptance"];
 export type DeliveryCriterion = Schemas["DeliveryCriterion"];
+export type ProductVerificationView = Schemas["ProductVerificationView"];
+export type ProductCheckItem = Schemas["ProductCheckItem"];
+export type PostDagSummary = Schemas["PostDagSummary"];
+export type PostDagRoundItem = Schemas["PostDagRoundItem"];
 export type TaskArtifacts = Schemas["TaskArtifacts"];
 export type RecordedAttemptArtifacts = Schemas["RecordedAttemptArtifacts"];
 export type AttemptArtifactsResponse = Schemas["AttemptArtifactsResponse"];
@@ -74,7 +79,9 @@ export type CommandBody =
   | Loose<Schemas["PauseCommand"], Defaults>
   | Loose<Schemas["ResumeCommand"], Defaults>
   | Loose<Schemas["RetryWorkflowCommand"], Defaults>
-  | Loose<Schemas["PromoteToExecuteCommand"], Defaults>;
+  | Loose<Schemas["PromoteToExecuteCommand"], Defaults>
+  | Loose<Schemas["RequestRevisionCommand"], Defaults>
+  | Loose<Schemas["ReopenRunCommand"], Defaults>;
 
 export type ApprovalAction = "approve_spec" | "approve_design" | "approve_plan";
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ApprovalAction, CommandBody, GoalSpec, RunProjection } from "../api/types";
+import { productArtifactUrl } from "../api/client";
 import { useRunStream, type StreamPhase } from "../api/useRunStream";
 import {
   APPROVAL_LABELS,
@@ -176,30 +177,35 @@ export function QuickRulingDrawer({
     await workbench.refreshRuns().catch(() => undefined);
     if (
       activeRunIdRef.current === targetRunId &&
-      workbench.state.quickDrawerRunId === targetRunId
+      workbench.state.quickDrawerRunId === targetRunId &&
+      !result.projection.pending_resynthesis &&
+      !result.projection.resynthesis_error &&
+      !(body.action === "clarify" && pendingAmbiguities(result.projection).length > 0)
     ) {
       workbench.closeQuickDrawer();
     }
   };
 
-  const handleClarify = async (answers: Record<string, string>) => {
+  const handleClarify = async (answers: Record<string, string>, clarificationNote = "") => {
     const current = projectionRef.current;
     if (!current) return;
-    const missing = pendingAmbiguities(current).filter((amb) => amb.blocking && !answers[amb.id]);
-    if (missing.length) {
-      const msg = `还有 ${missing.length} 个阻断歧义未回答`;
+    const note = clarificationNote.trim();
+    if (!Object.keys(answers).length && !note) {
+      const msg = "请先回答至少一项澄清问题或填写补充说明";
       setNotice({ tone: "warn", text: msg });
       workbench.toast(msg);
       return;
     }
-    if (!Object.keys(answers).length) {
-      const msg = "请先回答至少一个澄清问题";
-      setNotice({ tone: "warn", text: msg });
-      workbench.toast(msg);
-      return;
-    }
+    const remaining = pendingAmbiguities(current).filter(
+      (amb) => amb.blocking && !answers[amb.id],
+    );
     setClarifyGen((value) => value + 1);
-    await sendDrawerCommand({ action: "clarify", answers }, "已提交澄清并生成新的 GoalSpec 版本");
+    await sendDrawerCommand(
+      { action: "clarify", answers, clarification_note: note },
+      remaining.length
+        ? "已保存澄清进度，仍可继续回答剩余阻断项"
+        : "已提交澄清并生成新的 GoalSpec 版本",
+    );
   };
 
   const handleApprove = (action: ApprovalAction) => {
@@ -296,6 +302,8 @@ export function QuickRulingDrawer({
     gateBanner && Array.isArray(gateBanner.actions) && gateBanner.actions.includes("retry_workflow"),
   );
   const runFailed = gateBanner?.kind === "run_failed" || projection?.status === "failed";
+  const resynthesizing = gateBanner?.kind === "resynthesizing";
+  const reviewDelivery = gateBanner?.kind === "review_delivery";
   const hasAnyRuling =
     pendingClarifications.length > 0 ||
     reviews.size > 0 ||
@@ -303,7 +311,9 @@ export function QuickRulingDrawer({
     isPaused ||
     promoteGate ||
     canRetryWorkflow ||
-    runFailed;
+    runFailed ||
+    resynthesizing ||
+    reviewDelivery;
 
   const openBlockerHint = () => {
     const current = projectionRef.current;
@@ -468,7 +478,9 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
-              {pendingClarifications.length > 0 ? (
+              {pendingClarifications.length > 0 ||
+              Boolean(projection.spec && !projection.spec_approved && projection.resynthesis_error) ||
+              (projection.clarification_notes?.length ?? 0) > 0 ? (
                 <ClarifyPanel
                   projection={projection}
                   generation={clarifyGen}
@@ -494,9 +506,16 @@ export function QuickRulingDrawer({
                         review={review}
                         artifact={binding.artifact}
                         origin={approvalOrigins[action]}
+                        projection={projection}
                         onLocate={(ref, old) => handleLocateOrigin(action, ref, old)}
                         onOpenTaskGraph={openTaskGraph}
                         onApprove={handleApprove}
+                        onRequestRevision={(_action, feedback) =>
+                          sendDrawerCommand(
+                            { action: "request_revision", feedback },
+                            "已提交修订请求，工作流从需求对齐阶段重新启动",
+                          )
+                        }
                         disabled={busy}
                       />
                     );
@@ -587,8 +606,110 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
-              {canRetryWorkflow || runFailed ? (
-                <section className="hitl-banner" id="quick-drawer-failed" data-tone="danger">
+              {resynthesizing ? (
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-resynthesis"
+                  data-tone="info"
+                  data-kind="resynthesizing"
+                >
+                  <div className="hitl-copy">
+                    <p className="hitl-headline">
+                      <span aria-hidden="true">◷</span>
+                      <span>{gateBanner?.headline || "正在将澄清与补充约束融合进 GoalSpec…"}</span>
+                    </p>
+                    {gateBanner?.detail ? <p className="hitl-detail">{gateBanner.detail}</p> : null}
+                  </div>
+                </section>
+              ) : null}
+
+              {reviewDelivery ? (() => {
+                const pv = projection.delivery_acceptance?.product_verification ?? null;
+                const shotSuppressed = Boolean(
+                  pv?.checks?.some((check) => check.name === "screenshot" && check.status !== "passed"),
+                );
+                const shotUrl =
+                  pv?.has_screenshot && !shotSuppressed
+                    ? productArtifactUrl(runId, "screenshot", pv.event_seq, pv.screenshot_sha256)
+                    : null;
+                const bootLogUrl = pv?.has_boot_log
+                  ? productArtifactUrl(runId, "boot_log", pv.event_seq)
+                  : null;
+                return (
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-delivery"
+                  data-tone={gateBanner?.tone === "danger" ? "danger" : "warn"}
+                  data-kind="review_delivery"
+                >
+                  <div className="hitl-copy">
+                    <p className="hitl-headline">
+                      <span aria-hidden="true">{gateBanner?.tone === "danger" ? "✕" : "⚠"}</span>
+                      <span>{gateBanner?.headline || "交付验收待人工决策"}</span>
+                    </p>
+                    {gateBanner?.detail ? <p className="hitl-detail">{gateBanner.detail}</p> : null}
+                    {shotUrl ? (
+                      <a
+                        className="product-dock-shot"
+                        href={shotUrl}
+                        target="_blank"
+                        rel="noopener"
+                      >
+                        <img
+                          key={shotUrl}
+                          src={shotUrl}
+                          alt="实机首页截图"
+                          loading="lazy"
+                        />
+                      </a>
+                    ) : null}
+                  </div>
+                  <div className="hitl-actions">
+                    {canRetryWorkflow ? (
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        id="btn-drawer-delivery-retry"
+                        disabled={busy}
+                        onClick={() =>
+                          void sendDrawerCommand(
+                            { action: "retry_workflow" },
+                            "已重新启动交付验证与修复工作流",
+                          )
+                        }
+                      >
+                        从断点重试
+                      </button>
+                    ) : null}
+                    {bootLogUrl ? (
+                      <a
+                        className="btn btn-quiet"
+                        href={bootLogUrl}
+                        target="_blank"
+                        rel="noopener"
+                      >
+                        查看启动日志
+                      </a>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => workbench.openDeliveryEvidence(runId)}
+                    >
+                      查看完整交付证据
+                    </button>
+                  </div>
+                </section>
+                );
+              })() : null}
+
+              {!reviewDelivery && (canRetryWorkflow || runFailed) ? (
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-failed"
+                  data-tone="danger"
+                  data-kind={gateBanner?.kind || "run_failed"}
+                >
                   <div className="hitl-copy">
                     <p className="hitl-headline">
                       <span aria-hidden="true">✕</span>

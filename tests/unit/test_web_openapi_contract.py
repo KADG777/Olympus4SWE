@@ -24,6 +24,8 @@ EXPECTED_COMMANDS = {
     "reassign_human",
     "retry_workflow",
     "promote_to_execute",
+    "request_revision",
+    "reopen_run",
 }
 
 
@@ -40,9 +42,18 @@ def test_openapi_projection_and_command_contracts_are_concrete() -> None:
 
     projection = components["RunProjection"]
     assert projection["additionalProperties"] is False
-    assert {"dag", "workflow", "approval_reviews", "events", "budget", "progress"} <= set(
-        projection["properties"]
-    )
+    assert {
+        "dag",
+        "workflow",
+        "approval_reviews",
+        "events",
+        "budget",
+        "progress",
+        "pending_resynthesis",
+        "resynthesis_error",
+        "clarification_notes",
+    } <= set(projection["properties"])
+    assert "ClarificationNoteView" in components
 
     command = schema["paths"]["/api/runs/{run_id}/command"]["post"]
     body = command["requestBody"]["content"]["application/json"]["schema"]

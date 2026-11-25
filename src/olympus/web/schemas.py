@@ -324,6 +324,27 @@ class ClarifyCommand(_CommandBase):
     answers: dict[str, str] = Field(default_factory=dict)
     resolutions: dict[str, str] = Field(default_factory=dict)
     out_of_scope: list[str] = Field(default_factory=list)
+    clarification_note: str = ""
+
+
+class RequestRevisionCommand(_CommandBase):
+    action: Literal["request_revision"]
+    feedback: str = Field(min_length=1)
+
+    @field_validator("feedback")
+    @classmethod
+    def _validate_feedback(cls, value: str) -> str:
+        return _strip_non_empty(value)
+
+
+class ReopenRunCommand(_CommandBase):
+    action: Literal["reopen_run"]
+    feedback: str = Field(min_length=1)
+
+    @field_validator("feedback")
+    @classmethod
+    def _validate_feedback(cls, value: str) -> str:
+        return _strip_non_empty(value)
 
 
 class RetryTaskCommand(_CommandBase):
@@ -380,7 +401,9 @@ CommandRequest = Annotated[
     | AcceptRiskCommand
     | ReassignHumanCommand
     | RetryWorkflowCommand
-    | PromoteToExecuteCommand,
+    | PromoteToExecuteCommand
+    | RequestRevisionCommand
+    | ReopenRunCommand,
     Field(discriminator="action"),
 ]
 
@@ -822,6 +845,7 @@ class ProductVerificationView(StrictModel):
     has_report: bool = False
     has_boot_log: bool = False
     has_screenshot: bool = False
+    screenshot_sha256: str | None = None
 
 
 class DeliveryAcceptance(StrictModel):
@@ -855,6 +879,13 @@ class PostDagSummary(StrictModel):
     latest_argus_verdict: ReviewVerdict | None = None
 
 
+class ClarificationNoteView(StrictModel):
+    event_seq: int
+    created_at: str
+    feedback: str
+    consumed: bool
+
+
 class RunProjection(StrictModel):
     run_id: str
     title: str
@@ -879,6 +910,9 @@ class RunProjection(StrictModel):
     progress: ProgressSummary
     hitl_banner: HitlBanner | None = None
     approval_reviews: dict[str, ApprovalReview]
+    pending_resynthesis: bool = False
+    resynthesis_error: str | None = None
+    clarification_notes: list[ClarificationNoteView] = Field(default_factory=list)
     spec: GoalSpec | None = None
     design: DesignSpec | None = None
     plan: TaskPlan | None = None
@@ -975,6 +1009,7 @@ __all__ = [
     "AttemptArtifactsResponse",
     "BallHolder",
     "BudgetSummary",
+    "ClarificationNoteView",
     "ClarifyCommand",
     "CommandRequest",
     "CommandResponse",
@@ -1013,6 +1048,8 @@ __all__ = [
     "ProviderStatus",
     "ProvidersResponse",
     "ReassignHumanCommand",
+    "ReopenRunCommand",
+    "RequestRevisionCommand",
     "ResumeCommand",
     "RetryTaskCommand",
     "RetryWorkflowCommand",

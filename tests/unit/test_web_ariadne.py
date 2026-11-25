@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from olympus.core.contracts import (
     AcceptanceCheck,
+    AcceptanceCriterion,
     AmbiguityItem,
     ApprovalDecision,
     ApprovalRecord,
@@ -1611,11 +1612,23 @@ def test_clarify_settles_gate_sync_and_409_returns_projection(tmp_path: Path) ->
         spec_id="spec-clarify-sync",
         version=1,
         goal="构建社区笔记分享核心能力并验证澄清到关口的状态修订一致性。",
+        deliverable_kind=DeliverableKind.WEB_APP,
+        observable_surfaces=["HTTP API", "Web 页面"],
+        actors=["社区作者"],
+        test_seams=["POST /notes", "GET /notes"],
         requirements=[
             RequirementItem(
                 id="FR-101",
+                actor="社区作者",
                 description="支持发布与浏览图文笔记",
-                acceptance_criteria=["POST /notes 创建笔记并可在 GET /notes 列表中查到"],
+                ears_criteria=[
+                    AcceptanceCriterion(
+                        id="AC-101",
+                        pattern=EarsPattern.EVENT_DRIVEN,
+                        condition="社区作者提交 POST /notes",
+                        outcome="创建笔记并可在 GET /notes 列表中查到",
+                    )
+                ],
                 source_ref="REQ-101",
             )
         ],

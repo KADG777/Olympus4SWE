@@ -8,9 +8,10 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -24,10 +25,11 @@ from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import olympus.web.acceptance as delivery_review
-from olympus.core.contracts import new_id
-from olympus.core.control import RunControl
+from olympus.core.contracts import ApprovalTarget, new_id
+from olympus.core.control import RunControl, has_unfulfilled_revision
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
+from olympus.stages.align import has_pending_resynthesis
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
 from olympus.web.projection import (
     build_board_payload,
@@ -723,6 +725,7 @@ class AriadneApp:
             self._workspace_for(run_id),
             run_id,
             artifacts_root=self.artifacts_root,
+            supervised=self.supervisor.is_supervised(run_id),
         )
         return RunProjection.model_validate(proj).model_dump(mode="json", by_alias=True)
 
@@ -794,6 +797,47 @@ class AriadneApp:
             if action == "pause" and not cmd_result.get("deduplicated"):
                 self.supervisor.cancel_active_turns(run_id, reason="human_paused")
         elif action == "approve_spec":
+            supervised_run = self.supervisor.is_supervised(run_id)
+
+            def _check_spec_ready_for_approval(
+                current: Mapping[str, Any], conn: sqlite3.Connection | None
+            ) -> None:
+                pending_spec = current["spec"]
+                if pending_spec is None:
+                    return
+                events = (
+                    self.store.list_events_in_tx(conn, run_id)
+                    if conn is not None
+                    else self.store.list_events(run_id)
+                )
+                if has_unfulfilled_revision(events):
+                    raise ValueError(
+                        "GoalSpec is awaiting revision realignment before approval"
+                    )
+                if not supervised_run:
+                    return
+                spec_approved = self.store.is_approved(
+                    run_id=run_id,
+                    target=ApprovalTarget.GOAL_SPEC,
+                    target_id=pending_spec.spec_id,
+                    target_hash=pending_spec.content_hash,
+                )
+                try:
+                    strict = load_workflow(
+                        str(current["workflow_name"])
+                    ).align_strict_canonical()
+                except Exception:  # noqa: BLE001 - fallback for legacy workflows
+                    strict = True
+                if has_pending_resynthesis(
+                    events,
+                    pending_spec,
+                    spec_approved=spec_approved,
+                    strict_canonical=strict,
+                ):
+                    raise ValueError(
+                        "GoalSpec is awaiting clarification resynthesis before approval"
+                    )
+
             spec_result = self.control.confirm_spec(
                 run_id=run_id,
                 approver=actor,
@@ -803,6 +847,7 @@ class AriadneApp:
                 expected_target_hash=target_hash,
                 operation_id=operation_id,
                 command_meta=dispatch_meta,
+                pre_confirm_check=_check_spec_ready_for_approval,
             )
             cmd_result = (
                 spec_result
@@ -850,6 +895,7 @@ class AriadneApp:
                 answers=dict(body.get("answers") or {}),
                 resolutions=dict(body.get("resolutions") or {}),
                 extra_out_of_scope=list(body.get("out_of_scope") or []),
+                clarification_note=str(body.get("clarification_note") or ""),
                 actor=actor,
                 expected_revision=expected_rev,
                 operation_id=operation_id,
@@ -904,6 +950,60 @@ class AriadneApp:
                 note=str(body.get("note", "")).strip(),
                 actor=actor,
             )
+        elif action == "request_revision":
+            feedback = str(body.get("feedback", "")).strip()
+            if not feedback:
+                raise ValueError("request_revision requires non-empty 'feedback'")
+            if auto_advance and self.supervisor.is_supervised(run_id):
+                wf_def = load_workflow(snap["workflow_name"])
+                if not any(node.type == "align_goal" for node in wf_def.nodes):
+                    raise ValueError(f"Workflow {wf_def.name} has no align stage node")
+            cmd_result = self.control.request_revision(
+                run_id,
+                feedback=feedback,
+                expected_revision=expected_rev,
+                operation_id=operation_id,
+                actor=actor,
+                command_meta=dispatch_meta,
+            )
+            if (
+                auto_advance
+                and not cmd_result.get("deduplicated")
+                and self.supervisor.is_supervised(run_id)
+            ):
+                cmd_result = {
+                    **cmd_result,
+                    "workflow": self.supervisor.revise_run(
+                        run_id, feedback=feedback, sync=sync_flag
+                    ),
+                }
+        elif action == "reopen_run":
+            feedback = str(body.get("feedback", "")).strip()
+            if not feedback:
+                raise ValueError("reopen_run requires non-empty 'feedback'")
+            if auto_advance and self.supervisor.is_supervised(run_id):
+                wf_def = load_workflow(snap["workflow_name"])
+                if not any(node.type == "align_goal" for node in wf_def.nodes):
+                    raise ValueError(f"Workflow {wf_def.name} has no align stage node")
+            cmd_result = self.control.reopen_run(
+                run_id,
+                feedback=feedback,
+                expected_revision=expected_rev,
+                operation_id=operation_id,
+                actor=actor,
+                command_meta=dispatch_meta,
+            )
+            if (
+                auto_advance
+                and not cmd_result.get("deduplicated")
+                and self.supervisor.is_supervised(run_id)
+            ):
+                cmd_result = {
+                    **cmd_result,
+                    "workflow": self.supervisor.revise_run(
+                        run_id, feedback=feedback, sync=sync_flag
+                    ),
+                }
         elif action == "retry_workflow":
             retry_payload: dict[str, Any] = {"action": "retry_workflow"}
             if sync_flag:
@@ -1282,13 +1382,35 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         },
     )
     def get_product_artifact(
-        run_id: str, kind: Literal["report", "boot_log", "screenshot"]
+        run_id: str,
+        kind: Literal["report", "boot_log", "screenshot"],
+        v: int | None = None,
+        sha: str | None = None,
     ) -> Response:
         service.store.get_run(run_id)
+        expected_sha = sha.strip().lower() if isinstance(sha, str) and sha.strip() else None
+        if v is not None or kind == "screenshot":
+            events = service.store.list_events(run_id)
+            pv = delivery_review.latest_product_verification(
+                events,
+                service.artifacts_root / run_id,
+                artifacts_root=service.artifacts_root,
+            )
+            if v is not None and (pv is None or pv["event_seq"] != v):
+                raise NotFoundError("Product verification artifact does not match requested event")
+            if kind == "screenshot" and pv is not None:
+                if not pv["has_screenshot"]:
+                    raise NotFoundError("Product verification screenshot is not available")
+                recorded_sha = pv.get("screenshot_sha256")
+                if isinstance(recorded_sha, str) and recorded_sha:
+                    if expected_sha is not None and expected_sha != recorded_sha:
+                        raise NotFoundError("Product verification screenshot has changed")
+                    expected_sha = recorded_sha
         artifact = delivery_review.read_product_artifact(
             service.artifacts_root / run_id,
             kind,
             artifacts_root=service.artifacts_root,
+            expected_sha256=expected_sha,
         )
         if artifact is None:
             raise NotFoundError("Product verification artifact is not available")
