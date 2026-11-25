@@ -21,7 +21,11 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
-from olympus.core.control import is_design_bound_to_spec, is_plan_bound_to_upstream
+from olympus.core.control import (
+    has_unfulfilled_revision,
+    is_design_bound_to_spec,
+    is_plan_bound_to_upstream,
+)
 from olympus.core.dag import validate_plan_topology
 from olympus.core.store import RunStore
 
@@ -92,6 +96,12 @@ def resolve_resume_node(
     """Pick the graph entry point implied by the run's confirmed artifacts."""
     names = {node.name for node in definition.nodes}
     run_id = str(snap["run_id"])
+
+    align_node = next(
+        (node.name for node in definition.nodes if node.type == "align_goal"), None
+    )
+    if align_node is not None and has_unfulfilled_revision(store.list_events(run_id)):
+        return align_node
 
     spec = snap.get("spec")
     if spec is not None and not is_artifact_approved(store, run_id, "spec", snap):

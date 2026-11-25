@@ -34,7 +34,6 @@ from olympus.core.control import (
     is_design_bound_to_spec,
     is_plan_bound_to_upstream,
 )
-from olympus.core.dag import validate_goal_spec
 from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
@@ -63,7 +62,12 @@ from olympus.session.contracts import (
 )
 from olympus.session.policy import InteractiveMinimalPolicy
 from olympus.session.router import parse_reply
-from olympus.stages.align import AlignStage
+from olympus.stages.align import (
+    AlignStage,
+    _normalize_clarification_text,
+    has_pending_resynthesis,
+    unconsumed_clarification_notes,
+)
 
 ProviderBuilder = Callable[..., LLMProvider]
 
@@ -84,10 +88,6 @@ def _parse_explicit_revision_directive(text: str) -> str | None:
         return None
     body = match.group(1).strip()
     return body or None
-
-
-def _normalize_clarification_text(value: str | None) -> str:
-    return " ".join((value or "").casefold().split())
 
 
 _PURE_RETRY_TOKENS = frozenset(
@@ -112,31 +112,7 @@ def _is_pure_retry_message(text: str) -> bool:
 
 
 def _workflow_strict_canonical(definition: WorkflowDefinition) -> bool:
-    for node in definition.nodes:
-        if node.type == "align_goal":
-            return bool(node.params.get("strict_canonical", True))
-    return True
-
-
-def _needs_clarification_resynthesis(
-    spec: GoalSpec,
-    extra_notes: list[str],
-    *,
-    strict_canonical: bool = False,
-) -> bool:
-    """Return True when clarifications go beyond defaults or a strict spec still needs repair."""
-    if any(note.strip() for note in extra_notes):
-        return True
-    if strict_canonical and validate_goal_spec(spec):
-        return True
-    for amb in spec.open_ambiguities:
-        if not amb.blocking or not (amb.answer or "").strip():
-            continue
-        if _normalize_clarification_text(amb.answer).rstrip(".!。！？") != (
-            _normalize_clarification_text(amb.default_assumption).rstrip(".!。！？")
-        ):
-            return True
-    return any(note.severity.value == "blocking" and note.resolved for note in spec.minority_notes)
+    return definition.align_strict_canonical()
 
 
 @dataclass(frozen=True)
@@ -1610,38 +1586,7 @@ class SessionRunner:
         self, run_id: str, *, spec_id: str
     ) -> list[tuple[str, str]]:
         """Return ``(event_id, feedback)`` pairs not yet consumed by ``spec.resynthesized``."""
-        window: list[Any] = []
-        for event in reversed(self.store.list_events(run_id)):
-            if event.event_type in ("session.started", "session.continued"):
-                break
-            window.append(event)
-        window.reverse()
-
-        consumed_ids: set[str] = set()
-        legacy_cutoff_seq = 0
-        for event in window:
-            if event.event_type != "spec.resynthesized":
-                continue
-            if event.payload.get("spec_id") not in (None, "", spec_id):
-                continue
-            ids = event.payload.get("consumed_note_ids")
-            if isinstance(ids, list):
-                consumed_ids.update(str(item) for item in ids if item)
-            else:
-                legacy_cutoff_seq = max(legacy_cutoff_seq, event.event_seq)
-
-        notes: list[tuple[str, str]] = []
-        for event in window:
-            if event.event_type != "spec.clarification_note":
-                continue
-            if event.payload.get("spec_id") not in (None, "", spec_id):
-                continue
-            if event.event_id in consumed_ids or event.event_seq <= legacy_cutoff_seq:
-                continue
-            feedback = str(event.payload.get("feedback") or "").strip()
-            if feedback:
-                notes.append((event.event_id, feedback))
-        return notes
+        return unconsumed_clarification_notes(self.store.list_events(run_id), spec_id=spec_id)
 
     def _has_pending_resynthesis(
         self,
@@ -1651,40 +1596,24 @@ class SessionRunner:
         definition: WorkflowDefinition | None = None,
     ) -> bool:
         """True when a clarified GoalSpec still needs body-level resynthesis before gate_spec."""
-        if spec is None or spec.unresolved_blockers():
-            return False
-        if self.store.is_approved(
-            run_id=run_id,
-            target=ApprovalTarget.GOAL_SPEC,
-            target_id=spec.spec_id,
-            target_hash=spec.content_hash,
-        ):
-            return False
-        unconsumed_notes = self._unconsumed_clarification_note_events(
-            run_id, spec_id=spec.spec_id
-        )
-        if unconsumed_notes:
-            return True
-        saw_clarification = False
-        for event in reversed(self.store.list_events(run_id)):
-            if event.event_type in ("session.started", "session.continued"):
-                break
-            if event.event_type == "spec.resynthesized":
-                if event.payload.get("spec_id") in (None, "", spec.spec_id):
-                    return False
-                continue
-            if event.event_type in ("spec.clarified", "spec.clarification_note") and (
-                event.payload.get("spec_id") in (None, "", spec.spec_id)
-            ):
-                saw_clarification = True
-        if not saw_clarification:
+        if spec is None:
             return False
         strict_canonical = (
             _workflow_strict_canonical(self._effective_definition(definition))
             if definition is not None
             else False
         )
-        return _needs_clarification_resynthesis(spec, [], strict_canonical=strict_canonical)
+        return has_pending_resynthesis(
+            self.store.list_events(run_id),
+            spec,
+            spec_approved=self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            ),
+            strict_canonical=strict_canonical,
+        )
 
     def _ensure_clarified_spec_resynthesized(
         self,

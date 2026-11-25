@@ -966,6 +966,26 @@ def seed_demo_runs(
                 checks_total=len(task.acceptance_checks),
             )
 
+        # Momus / Argus receipts close the waterfall with real recorded tool durations
+        _append_receipt(
+            turn_id="turn-momus-1",
+            actor="momus",
+            task_id="T03-R1",
+            tools=[("read_file", False, 460), ("read_file", False, 520)],
+            calls=1,
+            input_tokens=5120,
+            output_tokens=980,
+        )
+        _append_receipt(
+            turn_id="turn-argus-1",
+            actor="argus",
+            task_id=None,
+            tools=[("run_bash", False, 2480)],
+            calls=1,
+            input_tokens=4200,
+            output_tokens=760,
+        )
+
         seeded.append(demo_id)
 
     return seeded

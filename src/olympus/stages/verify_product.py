@@ -91,9 +91,10 @@ class ProductVerificationResult:
     boot_log_path: str | None
     screenshot_path: str | None
     checks: list[dict[str, Any]] = field(default_factory=list)
+    screenshot_sha256: str | None = None
 
     def as_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "passed": self.passed,
             "summary": self.summary,
             "failures": list(self.failures),
@@ -102,6 +103,9 @@ class ProductVerificationResult:
             "screenshot_path": self.screenshot_path,
             "checks": self.checks,
         }
+        if self.screenshot_sha256 is not None:
+            payload["screenshot_sha256"] = self.screenshot_sha256
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1197,6 +1201,14 @@ def verify_product_delivery(
         workspace=workspace if workspace is not None else workspace_root,
         delivery_receipt=receipt,
     )
+    screenshot_sha256: str | None = None
+    if screenshot_path:
+        try:
+            import hashlib
+
+            screenshot_sha256 = hashlib.sha256(Path(screenshot_path).read_bytes()).hexdigest()
+        except OSError:
+            screenshot_sha256 = None
     return ProductVerificationResult(
         passed=passed,
         summary=_summary(passed, failures_tuple, checks),
@@ -1205,4 +1217,5 @@ def verify_product_delivery(
         boot_log_path=str(boot_log_path) if boot_log_path.exists() else None,
         screenshot_path=screenshot_path,
         checks=checks,
+        screenshot_sha256=screenshot_sha256,
     )

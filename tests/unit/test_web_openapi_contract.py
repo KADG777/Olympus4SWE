@@ -24,6 +24,8 @@ EXPECTED_COMMANDS = {
     "reassign_human",
     "retry_workflow",
     "promote_to_execute",
+    "request_revision",
+    "reopen_run",
 }
 
 
@@ -40,9 +42,18 @@ def test_openapi_projection_and_command_contracts_are_concrete() -> None:
 
     projection = components["RunProjection"]
     assert projection["additionalProperties"] is False
-    assert {"dag", "workflow", "approval_reviews", "events", "budget", "progress"} <= set(
-        projection["properties"]
-    )
+    assert {
+        "dag",
+        "workflow",
+        "approval_reviews",
+        "events",
+        "budget",
+        "progress",
+        "pending_resynthesis",
+        "resynthesis_error",
+        "clarification_notes",
+    } <= set(projection["properties"])
+    assert "ClarificationNoteView" in components
 
     command = schema["paths"]["/api/runs/{run_id}/command"]["post"]
     body = command["requestBody"]["content"]["application/json"]["schema"]
@@ -98,6 +109,7 @@ def test_openapi_covers_every_ariadne_route() -> None:
         "/api/board/stream",
         "/api/runs/{run_id}/task-artifacts/{task_id}/{attempt}",
         "/api/runs/{run_id}/delivery-log/{event_seq}/{position}",
+        "/api/runs/{run_id}/product-artifact/{kind}",
         "/api/providers",
         "/api/workflows",
         "/api/demos",
@@ -165,6 +177,65 @@ def test_openapi_covers_filesystem_browse_and_workspace_clone_contracts() -> Non
     assert clone_request["additionalProperties"] is False
     assert set(clone_request["required"]) == {"remote_url", "parent_dir"}
     assert {"folder_name", "name"} <= set(clone_request["properties"])
+
+
+def test_openapi_covers_v01_projection_and_product_artifact_contracts() -> None:
+    schema = build_openapi_schema()
+    components = schema["components"]["schemas"]
+
+    projection = components["RunProjection"]
+    assert "stage_activity" not in projection["properties"]
+    assert projection["properties"]["post_dag"]["anyOf"][1] == {"type": "null"}
+
+    node = components["DagNode"]
+    assert {"review_deferred", "escape_hatch_rejections", "escape_hatch_findings"} <= set(
+        node["properties"]
+    )
+    assert "review_deferred" not in node.get("required", [])
+
+    product = components["ProductVerificationView"]
+    assert product["additionalProperties"] is False
+    assert set(product["properties"]) == {
+        "passed",
+        "summary",
+        "failures",
+        "event_seq",
+        "verified_at",
+        "checks",
+        "has_report",
+        "has_boot_log",
+        "has_screenshot",
+        "screenshot_sha256",
+    }
+    assert product["properties"]["checks"]["items"]["$ref"].endswith("ProductCheckItem")
+
+    post_dag = components["PostDagSummary"]
+    assert post_dag["additionalProperties"] is False
+    round_item = components["PostDagRoundItem"]
+    assert {"sequence", "reported_round", "phase", "outcome"} <= set(round_item["properties"])
+    assert set(round_item["properties"]["phase"]["enum"]) == {
+        "verify",
+        "recheck",
+        "review",
+        "repair",
+    }
+
+    waterfall = components["WaterfallTurn"]
+    assert waterfall["properties"]["receipt"]["anyOf"][1] == {"type": "null"}
+
+    artifact = schema["paths"]["/api/runs/{run_id}/product-artifact/{kind}"]["get"]
+    assert set(artifact["responses"]) == {"200", "400", "404"}
+    assert set(artifact["responses"]["200"]["content"]) == {
+        "application/json",
+        "text/plain",
+        "image/png",
+    }
+    assert artifact["responses"]["200"]["content"]["application/json"]["schema"]["type"] == "object"
+    kind = next(p for p in artifact["parameters"] if p["name"] == "kind")
+    assert set(kind["schema"]["enum"]) == {"report", "boot_log", "screenshot"}
+    assert artifact["responses"]["404"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("ErrorResponse")
 
 
 def test_openapi_board_projection_contract_is_concrete() -> None:

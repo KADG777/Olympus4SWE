@@ -143,3 +143,15 @@
   overflow: auto;
   white-space: pre-wrap;
 }
+
+.approval-revise {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex-basis: 100%;
+}
+
+.approval-revise textarea {
+  min-block-size: 4rem;
+  resize: vertical;
+}

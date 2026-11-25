@@ -721,6 +721,7 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
             }
         ],
         "out_of_scope": ["new third-party dependencies", "changing HTTP routes"],
+        "test_seams": ["HTTP request handling"],
         "constraints": ["不得新增第三方依赖", "保持现有 HTTP 路由不变"],
         "open_ambiguities": [
             {
@@ -799,6 +800,14 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
     def _b001_responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
         del tools
         system = messages[0].content
+        if "Fuse EVERY human clarification" in system:
+            fused = json.loads(json.dumps(b001_spec_blocked))
+            answer = "复用现有 SQLite 限流 100 req/min"
+            fused["constraints"] = [*fused["constraints"], answer]
+            fused["requirements"][0]["description"] = (
+                f"{fused['requirements'][0]['description']}；{answer}"
+            )
+            return LLMResponse(content=json.dumps(fused))
         if "Requirements Alignment Architect" in system:
             captured_align_prompts.append(messages[-1].content)
             return LLMResponse(content=json.dumps(b001_spec_blocked))
@@ -873,7 +882,8 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
                 json={
                     "action": "clarify",
                     "answers": {"A1": "复用现有 SQLite 限流 100 req/min"},
-                    "auto_advance": False,
+                    "auto_advance": True,
+                    "sync": True,
                 },
             ).json()["projection"]
             assert "关口 1 待批准" in clarified["hitl_banner"]["headline"]
@@ -921,7 +931,6 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
             client,
             "new-run-worker-driver",
             "new-run-reviewer-driver",
-            "new-run-monitor-model",
         )
         response = client.post(
             "/api/runs",

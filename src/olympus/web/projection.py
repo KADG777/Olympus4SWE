@@ -5,18 +5,21 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
+
+from pydantic import ValidationError
 
 import olympus.web.acceptance as delivery_review
 from olympus.core.contracts import (
     ApprovalTarget,
     BudgetLedger,
     BudgetPolicy,
-    CheckKind,
     DesignSpec,
     GoalSpec,
     ProviderTimeoutRetry,
+    ReviewVerdict,
     RunEvent,
     RunStatus,
     TaskNode,
@@ -34,6 +37,7 @@ from olympus.graph.progress import (
 )
 from olympus.harness.activity import tool_output_status
 from olympus.harness.receipt import build_turn_receipt
+from olympus.stages.align import clarification_note_states, has_pending_resynthesis
 from olympus.web.approval_review import (
     APPROVAL_ARTIFACTS,
     ApprovalReview,
@@ -44,22 +48,12 @@ from olympus.web.approval_review import (
     goal_review_sections,
     plan_review_sections,
 )
+from olympus.web.schemas import TurnReceipt
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
 _NOISE_LINE = re.compile(r"[=\-_*·~]{4,}(?:.*[=\-_*·~]{4,})?")
 
 _TOOL_STATUSES = ("ok", "error", "denied")
-
-# Waterfall timeline, as percent of the shared track. Align holds [0, 16];
-# worker layers fan out in cumulative waves; Momus and Argus close the tail.
-_WF_ALIGN_WIDTH = 16.0
-_WF_WORKERS_START = 18.0
-_WF_WORKERS_SPAN = 66.0
-_WF_WAVE_SLOTS = 5
-_WF_FAN_OUT = 2.0
-_WF_MIN_WIDTH = 8.0
-_WF_MAX_OFFSET = 90.0
-_WF_REVIEW_WIDTH = 8.0
 
 
 class TaskBlocker(TypedDict):
@@ -324,19 +318,17 @@ def _synthesize_tool_stream(task: TaskNode) -> list[dict[str, Any]]:
 
 
 def _build_subagent_stream(task: TaskNode, art: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compact tool events for the dock: recorded trace first, contextual synthesis otherwise."""
+    """Compact tool events for the dock, strictly from the recorded worker trace."""
     recorded = art.get("tool_calls") or []
-    if recorded:
-        return [
-            {
-                "tool": str(call.get("tool") or "unknown"),
-                "target": str(call.get("target") or ""),
-                "status": str(call.get("status") or "ok"),
-                "duration_ms": int(call.get("duration_ms") or 0),
-            }
-            for call in recorded[:8]
-        ]
-    return _synthesize_tool_stream(task)
+    return [
+        {
+            "tool": str(call.get("tool") or "unknown"),
+            "target": str(call.get("target") or ""),
+            "status": str(call.get("status") or "ok"),
+            "duration_ms": int(call.get("duration_ms") or 0),
+        }
+        for call in recorded[:8]
+    ]
 
 
 def _build_terminal_lines(
@@ -726,226 +718,313 @@ def _build_traceability_matrix(
     return rows
 
 
+def _safe_turn_receipt(payload: Any) -> dict[str, Any] | None:
+    """Validate one recorded ``turn.receipt`` payload; drop malformed legacy rows."""
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        return TurnReceipt.model_validate(payload).model_dump(mode="json")
+    except ValidationError:
+        return None
+
+
+def _receipt_tool_duration_ms(receipt: dict[str, Any] | None) -> int:
+    """Sum real recorded tool durations from one turn receipt."""
+    if not receipt:
+        return 0
+    tools = receipt.get("tools")
+    if not isinstance(tools, list):
+        return 0
+    total = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        duration = tool.get("duration_ms")
+        if isinstance(duration, int) and not isinstance(duration, bool):
+            total += max(0, duration)
+    return total
+
+
+def _receipt_tool_count(receipt: dict[str, Any] | None) -> int:
+    if not receipt:
+        return 0
+    tools = receipt.get("tools")
+    return len(tools) if isinstance(tools, list) else 0
+
+
+def _stage_spans_ms(events: list[RunEvent]) -> dict[str, int]:
+    """Real elapsed milliseconds per workflow node, from ISO event timestamps."""
+    started: dict[str, datetime] = {}
+    spans: dict[str, int] = {}
+    for event in events:
+        node = event.payload.get("node")
+        if not isinstance(node, str):
+            continue
+        if event.event_type == "graph.node_started":
+            started[node] = event.created_at
+        elif event.event_type == "graph.node_finished":
+            began = started.pop(node, None)
+            if began is not None:
+                elapsed = (event.created_at - began).total_seconds() * 1000
+                spans[node] = max(0, int(elapsed))
+    return spans
+
+
 def _build_waterfall_turns(
     spec: GoalSpec | None,
     tasks: list[TaskNode],
     nodes_by_id: dict[str, dict[str, Any]],
-    receipt_by_actor: dict[str, dict[str, Any]],
+    receipt_by_task: dict[str, dict[str, Any]],
+    events: list[RunEvent],
     *,
     spec_approved: bool,
+    post_dag: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Flatten Align / Hephaestus / Momus / Argus turns into one chronological list.
+    """Flatten real recorded turns into one chronological list.
 
-    Computes duration-proportional ``offset_pct`` and ``width_pct`` over the
-    cumulative timeline span so longer stages (e.g. Align 18.4s) render visibly
-    wider than short worker turns (4.8s) and wave layers stagger left-to-right.
+    Every duration comes from a recorded ``turn.receipt`` tool trace or from
+    ``graph.node_started`` -> ``graph.node_finished`` timestamps; nothing is
+    synthesized. Offsets and widths scale by each turn's share of the real
+    total duration, or fall back to even slots when no duration is recorded.
     """
     turns: list[dict[str, Any]] = []
     ordered = sorted(tasks, key=lambda item: (nodes_by_id[item.task_id]["layer"], item.task_id))
     executed = [task for task in ordered if task.attempt > 0]
+    spans = _stage_spans_ms(events)
 
-    # Collect raw wave durations first so offsets and widths scale strictly by ms.
-    align_dur = 18420 if spec is not None else 0
-    layer_ids = sorted({int(nodes_by_id[task.task_id]["layer"]) for task in executed})
-    wave_dur_by_layer: dict[int, int] = {lid: 0 for lid in layer_ids}
-    task_durs: dict[str, int] = {}
-    for task in executed:
-        node = nodes_by_id[task.task_id]
-        stream = node["subagent_stream"]
-        dur = sum(int(step["duration_ms"]) for step in stream) + 900
-        task_durs[task.task_id] = dur
-        lid = int(node["layer"])
-        wave_dur_by_layer[lid] = max(wave_dur_by_layer[lid], dur)
+    receipts_by_actor: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.event_type == "turn.receipt":
+            validated = _safe_turn_receipt(event.payload)
+            if validated is not None:
+                receipts_by_actor[event.actor] = validated
 
-    reviewed = [t for t in ordered if t.review_cycle > 0]
-    momus_dur = 9360 if reviewed else 0
-    verified = [
-        t
-        for t in ordered
-        if t.status == TaskStatus.ACCEPTED
-        or any(c.kind == CheckKind.INDEPENDENT_REVIEW for c in t.acceptance_checks)
-    ]
-    argus_dur = 12680 if verified else 0
+    def _actor_receipt(*prefixes: str) -> dict[str, Any] | None:
+        found: dict[str, Any] | None = None
+        for actor, payload in receipts_by_actor.items():
+            if actor.split(":", 1)[0].strip().lower() in prefixes:
+                found = payload
+        return found
 
-    wave_start_ms: dict[int, int] = {}
-    cursor_ms = align_dur
-    for lid in layer_ids:
-        wave_start_ms[lid] = cursor_ms
-        cursor_ms += wave_dur_by_layer[lid]
-    momus_start_ms = cursor_ms
-    if reviewed:
-        cursor_ms += momus_dur
-    argus_start_ms = cursor_ms
-    total_span_ms = max(1, cursor_ms + argus_dur)
-
-    def _span(start_ms: int, dur_ms: int) -> tuple[float, float]:
-        off = min(92.0, round(start_ms / total_span_ms * 100.0, 1))
-        wid = max(6.0, min(100.0 - off, round(dur_ms / total_span_ms * 100.0, 1)))
-        return off, wid
-
-    if spec is not None:
-        align_receipt = (
-            receipt_by_actor.get("align")
-            or receipt_by_actor.get("Align")
-            or build_turn_receipt(
-                turn_id="turn-align-1",
-                actor="Align",
-                events=[
-                    {
-                        "kind": "llm",
-                        "calls": max(1, len(spec.requirements)),
-                        "input_tokens": 8400,
-                        "output_tokens": 2150,
-                    }
-                ],
-            )
-        )
-        align_manifest = "\n".join(
-            [
-                f"# MANIFEST — Align ({spec.spec_id})",
-                "",
-                f"- Requirements: {len(spec.requirements)}",
-                f"- Open ambiguities: {len(spec.open_ambiguities)}",
-                f"- Blocking ambiguities: {len(spec.unresolved_blockers())}",
-                f"- Status: {spec.status.value}",
-                "",
-                "## Goal",
-                "",
-                spec.goal,
-                "",
-            ]
-        )
-        off, wid = _span(0, align_dur)
+    def _add(
+        *,
+        turn_id: str,
+        actor: str,
+        task_id: str | None,
+        title: str,
+        status: str,
+        summary: str,
+        duration_ms: int,
+        steps: int,
+        receipt: dict[str, Any] | None,
+        manifest_md: str,
+    ) -> None:
         turns.append(
             {
-                "turn_id": str(align_receipt.get("turn_id") or "turn-align-1"),
-                "actor": "Align",
-                "task_id": None,
-                "title": f"需求对齐 · {spec.spec_id}",
-                "status": "accepted" if spec_approved else "running",
-                "summary": spec.goal,
-                "duration_ms": align_dur,
-                "steps": max(1, len(spec.requirements)),
-                "offset_pct": off,
-                "width_pct": wid,
-                "receipt": align_receipt,
-                "manifest_md": align_manifest,
+                "turn_id": turn_id,
+                "actor": actor,
+                "task_id": task_id,
+                "title": title,
+                "status": status,
+                "summary": summary,
+                "duration_ms": max(0, duration_ms),
+                "steps": max(0, steps),
+                "offset_pct": 0.0,
+                "width_pct": 0.0,
+                "receipt": receipt,
+                "manifest_md": manifest_md,
             }
         )
 
-    layer_slot: dict[int, int] = {}
+    align_receipt = _actor_receipt("align")
+    if spec is not None or align_receipt is not None:
+        align_duration = (
+            _receipt_tool_duration_ms(align_receipt)
+            if align_receipt is not None
+            else spans.get("align", 0)
+        )
+        align_manifest = (
+            "\n".join(
+                [
+                    f"# MANIFEST — Align ({spec.spec_id})",
+                    "",
+                    f"- Requirements: {len(spec.requirements)}",
+                    f"- Open ambiguities: {len(spec.open_ambiguities)}",
+                    f"- Blocking ambiguities: {len(spec.unresolved_blockers())}",
+                    f"- Status: {spec.status.value}",
+                    "",
+                    "## Goal",
+                    "",
+                    spec.goal,
+                    "",
+                ]
+            )
+            if spec is not None
+            else "# MANIFEST — Align"
+        )
+        _add(
+            turn_id=str((align_receipt or {}).get("turn_id") or "turn-align-1"),
+            actor="Align",
+            task_id=None,
+            title=f"需求对齐 · {spec.spec_id}" if spec is not None else "需求对齐",
+            status=("accepted" if spec_approved else "running") if spec is not None else "accepted",
+            summary=spec.goal
+            if spec is not None
+            else str((align_receipt or {}).get("one_line") or ""),
+            duration_ms=align_duration,
+            steps=_receipt_tool_count(align_receipt) or (len(spec.requirements) if spec else 1),
+            receipt=align_receipt,
+            manifest_md=align_manifest,
+        )
+
+    for prefix, actor, title, node_name in (
+        ("design", "Athena", "白盒架构设计", "design"),
+        ("orchestrate", "Orchestrate", "任务分解与计划", "plan"),
+    ):
+        receipt = _actor_receipt(prefix)
+        if receipt is None and node_name not in spans:
+            continue
+        duration = _receipt_tool_duration_ms(receipt) or spans.get(node_name, 0)
+        _add(
+            turn_id=str((receipt or {}).get("turn_id") or f"turn-{prefix}"),
+            actor=actor,
+            task_id=None,
+            title=title,
+            status="accepted",
+            summary=str((receipt or {}).get("one_line") or ""),
+            duration_ms=duration,
+            steps=_receipt_tool_count(receipt),
+            receipt=receipt,
+            manifest_md=f"# MANIFEST — {actor}",
+        )
+
     for task in executed:
         node = nodes_by_id[task.task_id]
+        receipt = receipt_by_task.get(task.task_id)
         stream = node["subagent_stream"]
+        trace_duration = sum(int(step["duration_ms"]) for step in stream)
+        duration = _receipt_tool_duration_ms(receipt) if receipt is not None else trace_duration
         error_lines = [
             line.strip() for line in (task.last_error or "").splitlines() if line.strip()
         ]
-        layer = int(node["layer"])
-        slot = layer_slot.get(layer, 0)
-        layer_slot[layer] = slot + 1
-        dur = task_durs[task.task_id]
-        # Slight horizontal stagger within parallel sibling waves so overlaps stay readable
-        start = wave_start_ms.get(layer, align_dur) + slot * 400
-        off, wid = _span(start, dur)
-        turns.append(
-            {
-                "turn_id": str(node["receipt"].get("turn_id") or f"turn-{task.task_id.lower()}"),
-                "actor": str(node["executor"]),
-                "task_id": task.task_id,
-                "title": f"{task.task_id} · {task.title}",
-                "status": task.status.value,
-                "summary": error_lines[0] if error_lines else task.objective,
-                "duration_ms": dur,
-                "steps": max(1, len(stream)),
-                "offset_pct": off,
-                "width_pct": wid,
-                "receipt": node["receipt"],
-                "manifest_md": node["manifest_md"],
-            }
+        _add(
+            turn_id=str((receipt or {}).get("turn_id") or f"turn-{task.task_id.lower()}"),
+            actor=str(node["executor"]),
+            task_id=task.task_id,
+            title=f"{task.task_id} · {task.title}",
+            status=task.status.value,
+            summary=(
+                str(receipt.get("one_line"))
+                if receipt is not None and receipt.get("one_line")
+                else (error_lines[0] if error_lines else task.objective)
+            ),
+            duration_ms=duration,
+            steps=_receipt_tool_count(receipt) if receipt is not None else len(stream),
+            receipt=receipt,
+            manifest_md=str(node["manifest_md"]),
         )
 
-    if reviewed:
-        reviewed_task = reviewed[0]
-        momus_receipt = build_turn_receipt(
-            turn_id="turn-momus-1",
+    momus_receipt = _actor_receipt("momus")
+    if momus_receipt is not None:
+        reviewed = next((task for task in ordered if task.review_cycle > 0), None)
+        reviewed_id = reviewed.task_id if reviewed is not None else None
+        _add(
+            turn_id=str(momus_receipt.get("turn_id") or "turn-momus-1"),
             actor="Momus",
-            task_id=reviewed_task.task_id,
-            events=[
-                {"kind": "llm", "calls": 1, "input_tokens": 5120, "output_tokens": 980},
-                {"kind": "tool_end", "tool": "read_file", "is_error": False, "duration_ms": 460},
-                {"kind": "tool_end", "tool": "read_file", "is_error": False, "duration_ms": 520},
-            ],
-        )
-        off, wid = _span(momus_start_ms, momus_dur)
-        turns.append(
-            {
-                "turn_id": "turn-momus-1",
-                "actor": "Momus",
-                "task_id": reviewed_task.task_id,
-                "title": f"对抗式审查 · {reviewed_task.task_id}",
-                "status": "accepted",
-                "summary": (
-                    "指出最早候补者已取消边界并给出事务归因"
-                    if reviewed_task.status == TaskStatus.BLOCKED
-                    else "审查未发现新的阻断性风险"
-                ),
-                "duration_ms": momus_dur,
-                "steps": 2,
-                "offset_pct": off,
-                "width_pct": wid,
-                "receipt": momus_receipt,
-                "manifest_md": "\n".join(
-                    [
-                        f"# MANIFEST — Momus ({reviewed_task.task_id})",
-                        "",
-                        "- Perspective: QA / adversarial review",
-                        "- Findings: 1 important",
-                        "",
-                        reviewed_task.last_error or "无阻断性发现",
-                        "",
-                    ]
-                ),
-            }
+            task_id=reviewed_id,
+            title=f"对抗式审查 · {reviewed_id}" if reviewed_id else "对抗式审查",
+            status="accepted",
+            summary=str(momus_receipt.get("one_line") or ""),
+            duration_ms=_receipt_tool_duration_ms(momus_receipt) or spans.get("critic", 0),
+            steps=_receipt_tool_count(momus_receipt),
+            receipt=momus_receipt,
+            manifest_md="\n".join(
+                [
+                    f"# MANIFEST — Momus ({reviewed_id or 'delivery'})",
+                    "",
+                    "- Perspective: QA / adversarial review",
+                    "",
+                    (reviewed.last_error or "") if reviewed is not None else "",
+                    "",
+                ]
+            ),
         )
 
-    if verified:
-        argus_receipt = build_turn_receipt(
-            turn_id="turn-argus-1",
+    post_dag_events = [
+        event
+        for event in events
+        if event.event_type.startswith("post_dag.")
+        or event.event_type == "product.verified"
+        or (
+            event.event_type == "review.verdict_recorded"
+            and event.payload.get("task_id") == "post-dag"
+        )
+    ]
+    argus_receipt = _actor_receipt("argus")
+    if argus_receipt is not None or post_dag_events:
+        if post_dag_events:
+            elapsed = (
+                post_dag_events[-1].created_at - post_dag_events[0].created_at
+            ).total_seconds() * 1000
+            duration = _receipt_tool_duration_ms(argus_receipt) or max(0, int(elapsed))
+            steps = _receipt_tool_count(argus_receipt) or len(post_dag_events)
+            title = "交付级独立复核 · Post-DAG"
+            pd_status = post_dag["status"] if post_dag is not None else "verifying"
+            latest_round_outcome = (
+                post_dag["rounds"][-1]["outcome"]
+                if post_dag is not None and post_dag["rounds"]
+                else None
+            )
+            if pd_status == "passed":
+                status = "accepted"
+            elif pd_status == "paused":
+                status = "paused"
+            elif pd_status in ("failed", "awaiting_human") or latest_round_outcome in (
+                "failed",
+                "rejected",
+            ):
+                status = "blocked"
+            else:
+                status = "running"
+        else:
+            duration = _receipt_tool_duration_ms(argus_receipt)
+            steps = _receipt_tool_count(argus_receipt)
+            title = "冷启动独立复核 · 全量验收"
+            status = "accepted"
+        _add(
+            turn_id=str((argus_receipt or {}).get("turn_id") or "turn-argus-1"),
             actor="Argus",
-            events=[
-                {"kind": "llm", "calls": 1, "input_tokens": 4200, "output_tokens": 760},
-                {"kind": "tool_end", "tool": "run_bash", "is_error": False, "duration_ms": 2480},
-            ],
+            task_id="post-dag" if post_dag_events else None,
+            title=title,
+            status=status,
+            summary=(
+                str(argus_receipt.get("one_line"))
+                if argus_receipt is not None and argus_receipt.get("one_line")
+                else "交付级产品验证与独立复核"
+            ),
+            duration_ms=duration,
+            steps=steps,
+            receipt=argus_receipt,
+            manifest_md="# MANIFEST — Argus\n",
         )
-        off, wid = _span(argus_start_ms, argus_dur)
-        turns.append(
-            {
-                "turn_id": "turn-argus-1",
-                "actor": "Argus",
-                "task_id": None,
-                "title": "冷启动独立复核 · 全量验收",
-                "status": (
-                    "accepted"
-                    if all(t.status == TaskStatus.ACCEPTED for t in verified)
-                    else "running"
-                ),
-                "summary": f"独立复核 {len(verified)} 个任务的命令门禁与产物指纹",
-                "duration_ms": argus_dur,
-                "steps": 1,
-                "offset_pct": off,
-                "width_pct": wid,
-                "receipt": argus_receipt,
-                "manifest_md": "\n".join(
-                    [
-                        "# MANIFEST — Argus",
-                        "",
-                        f"- Reviewed tasks: {', '.join(t.task_id for t in verified)}",
-                        "- Cold-start review: no worker context reused",
-                        "",
-                    ]
-                ),
-            }
-        )
+
+    total_ms = sum(int(turn["duration_ms"]) for turn in turns)
+    if turns and total_ms > 0:
+        cursor = 0.0
+        for turn in turns:
+            offset = min(92.0, round(cursor / total_ms * 100.0, 1))
+            width = max(
+                6.0, min(100.0 - offset, round(turn["duration_ms"] / total_ms * 100.0, 1))
+            )
+            turn["offset_pct"] = offset
+            turn["width_pct"] = width
+            cursor += int(turn["duration_ms"])
+    elif turns:
+        slot = round(100.0 / len(turns), 1)
+        for index, turn in enumerate(turns):
+            offset = min(92.0, round(index * slot, 1))
+            turn["offset_pct"] = offset
+            turn["width_pct"] = max(6.0, min(100.0 - offset, slot))
 
     return turns
 
@@ -975,6 +1054,15 @@ def _build_run_progress(
         "graph.node_started", "graph.node_finished", "graph.paused", "graph.failed",
         "graph.finished", "run.status_changed", "run.workflow_promoted", "task.requeued",
         "task.blocked", "task.accepted", "task.accepted_with_risk",
+        "spec.clarification_note", "spec.resynthesized", "spec.resynthesis_failed",
+        "run.revision_requested",
+        "run.reopened", "task.ephemeral_artifacts_cleaned", "task.diff_gate_rejected",
+        "task.escape_hatch_rejected", "task.review_deferred",
+        "task.deferred_review_passed", "review.verdict_verified",
+        "review.repro_rechecked", "review.repro_commands_cleared",
+        "product.verified",
+        "post_dag.repro_rechecked", "post_dag.repair_turn_completed",
+        "post_dag.repair_applied", "post_dag.repair_rejected",
     }
     tasks = {node["task_id"]: node for node in dag_nodes}
     attempts: dict[str, tuple[int, int]] = {}
@@ -984,13 +1072,16 @@ def _build_run_progress(
     for event in events:
         kind = event.event_type
         payload = event.payload
+        raw_node = payload.get("node")
+        raw_task_id = payload.get("task_id")
+        raw_to = payload.get("to")
         entry = {
             "event_seq": event.event_seq,
             "created_at": event.created_at.isoformat(),
             "event_type": kind,
-            "node": payload.get("node"),
-            "task_id": payload.get("task_id"),
-            "to": payload.get("to"),
+            "node": raw_node if isinstance(raw_node, str) else None,
+            "task_id": raw_task_id if isinstance(raw_task_id, str) else None,
+            "to": raw_to if isinstance(raw_to, str) else None,
         }
         output = None
         if kind in publications:
@@ -1017,6 +1108,26 @@ def _build_run_progress(
             output = {
                 "key": key, "kind": category, "artifact_id": artifact_id,
                 "version": version, "content_hash": fingerprint, "current": current,
+                "summary": summary,
+            }
+        elif kind == "product.verified":
+            verification = delivery_review.latest_product_verification([event], run_dir)
+            if verification is None:
+                continue
+            passed = bool(verification["passed"])
+            failure_count = len(verification["failures"])
+            summary = (
+                "产品端到端验证通过"
+                if passed
+                else f"产品端到端验证未通过（{failure_count} 项失败）"
+            )
+            output = {
+                "key": f"verification:product:{event.event_seq}",
+                "kind": "verification",
+                "artifact_id": "product",
+                "version": None,
+                "current": False,
+                "detail_available": False,
                 "summary": summary,
             }
         elif kind == "task.leased":
@@ -1083,8 +1194,6 @@ def _live_task_progress(
             "last_event_at": None,
             "recent_tools": [],
             "steer_count": 0,
-            "watchdog_verdict": None,
-            "watchdog_summary": None,
         }
         for task in tasks
     }
@@ -1115,10 +1224,7 @@ def _live_task_progress(
                 ]
         elif kind == "agent.steered":
             entry["steer_count"] += 1
-        elif kind in ("watchdog.checked", "watchdog.paused"):
-            entry["watchdog_verdict"] = payload.get("verdict")
-            entry["watchdog_summary"] = payload.get("summary")
-        elif kind != "watchdog.error":
+        else:
             continue
         entry["last_event_at"] = event.created_at.isoformat()
 
@@ -1131,12 +1237,300 @@ def _live_task_progress(
     return progress
 
 
+def _task_review_flags(
+    tasks: list[TaskNode], events: list[RunEvent]
+) -> tuple[dict[str, bool], dict[str, int], dict[str, list[str]]]:
+    """Track per-task deferred-review state and bounded escape-hatch rejections."""
+    by_id = {task.task_id: task for task in tasks}
+    deferred: dict[str, bool] = {}
+    deferred_seq: dict[str, int] = {}
+    rejections: dict[str, int] = {}
+    findings: dict[str, list[str]] = {}
+    for event in events:
+        task_id = event.payload.get("task_id")
+        if not isinstance(task_id, str) or task_id not in by_id:
+            continue
+        kind = event.event_type
+        if kind == "task.review_deferred":
+            attempt = event.payload.get("attempt")
+            if (
+                isinstance(attempt, int)
+                and not isinstance(attempt, bool)
+                and attempt != by_id[task_id].attempt
+            ):
+                continue
+            deferred[task_id] = True
+            deferred_seq[task_id] = event.event_seq
+        elif kind in ("task.deferred_review_passed", "task.leased"):
+            if event.event_seq > deferred_seq.get(task_id, 0):
+                deferred[task_id] = False
+        elif kind == "task.escape_hatch_rejected":
+            rejections[task_id] = rejections.get(task_id, 0) + 1
+            raw = event.payload.get("violations")
+            if not isinstance(raw, list):
+                continue
+            latest_findings: list[str] = []
+            for item in raw:
+                if len(latest_findings) >= 10:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                rule = item.get("rule") if isinstance(item.get("rule"), str) else ""
+                message = item.get("message") if isinstance(item.get("message"), str) else ""
+                path = item.get("file_path") if isinstance(item.get("file_path"), str) else ""
+                line = item.get("line")
+                position = (
+                    line if isinstance(line, int) and not isinstance(line, bool) else None
+                )
+                location = f"{path}:{position}" if path and position is not None else path
+                prefix = f"{location} {rule}".strip()
+                text = f"{prefix}: {message}".strip(": ").strip()
+                if text:
+                    latest_findings.append(text[:240])
+            if latest_findings:
+                findings[task_id] = latest_findings
+    for task in tasks:
+        if task.status not in (TaskStatus.ACCEPTED, TaskStatus.VERIFYING):
+            deferred[task.task_id] = False
+    return deferred, rejections, findings
+
+
+def _post_dag_round_entry(event: RunEvent, sequence: int) -> dict[str, Any] | None:
+    """Whitelist one post-DAG event into a round row (never pass raw payloads on)."""
+    kind = event.event_type
+    payload = event.payload
+    raw_round = payload.get("repair_round")
+    if raw_round is None and kind == "review.verdict_recorded":
+        raw_round = payload.get("review_cycle")
+    reported_round = (
+        raw_round if isinstance(raw_round, int) and not isinstance(raw_round, bool) else 0
+    )
+    entry: dict[str, Any] = {
+        "sequence": sequence,
+        "reported_round": reported_round,
+        "event_seq": event.event_seq,
+        "created_at": event.created_at.isoformat(),
+        "phase": "verify",
+        "outcome": "completed",
+        "summary": "",
+        "changed_paths": [],
+        "repro_checked": None,
+        "repro_failed": None,
+    }
+    if kind == "product.verified":
+        passed = payload.get("passed")
+        if not isinstance(passed, bool):
+            return None
+        raw_summary = payload.get("summary")
+        entry["phase"] = "verify"
+        entry["outcome"] = "passed" if passed else "failed"
+        entry["summary"] = (
+            raw_summary
+            if isinstance(raw_summary, str) and raw_summary
+            else ("产品端到端验证通过" if passed else "产品端到端验证未通过")
+        )
+    elif kind == "post_dag.repro_rechecked":
+        checked = payload.get("checked_count")
+        failing = payload.get("still_failing_count")
+        checked_val = (
+            checked
+            if isinstance(checked, int) and not isinstance(checked, bool) and checked >= 0
+            else None
+        )
+        failing_val = (
+            failing
+            if isinstance(failing, int) and not isinstance(failing, bool) and failing >= 0
+            else None
+        )
+        entry["phase"] = "recheck"
+        entry["repro_checked"] = checked_val
+        entry["repro_failed"] = failing_val
+        entry["outcome"] = (
+            "passed" if checked_val is not None and failing_val == 0 else "failed"
+        )
+        entry["summary"] = f"复检 {checked_val or 0} 条复现命令"
+    elif kind == "post_dag.repair_turn_completed":
+        completed = payload.get("completed")
+        stop_reason = payload.get("stop_reason")
+        entry["phase"] = "repair"
+        entry["outcome"] = "completed" if completed is True else "failed"
+        entry["summary"] = (
+            f"修复轮次完成（{stop_reason}）"
+            if isinstance(stop_reason, str) and stop_reason
+            else ("修复轮次完成" if completed is True else "修复轮次未完成")
+        )
+    elif kind == "post_dag.repair_applied":
+        raw_paths = payload.get("changed_paths")
+        changed = (
+            [item for item in raw_paths if isinstance(item, str)]
+            if isinstance(raw_paths, list)
+            else []
+        )
+        entry["phase"] = "repair"
+        entry["outcome"] = "applied"
+        entry["changed_paths"] = changed
+        entry["summary"] = f"修复已应用（{len(changed)} 个路径变更）"
+    elif kind == "post_dag.repair_rejected":
+        reason = payload.get("reason")
+        entry["phase"] = "repair"
+        entry["outcome"] = "rejected"
+        entry["summary"] = (
+            str(reason) if isinstance(reason, str) and reason else "修复被确定性门禁拒绝"
+        )
+    elif kind == "review.verdict_recorded":
+        if payload.get("task_id") != "post-dag":
+            return None
+        passed = payload.get("passed")
+        entry["phase"] = "review"
+        entry["outcome"] = "passed" if passed is True else "failed"
+        entry["summary"] = f"交付级 Argus 复核{'通过' if passed is True else '未通过'}"
+    else:
+        return None
+    return entry
+
+
+def _latest_post_dag_verdict(
+    events: list[RunEvent], run_dir: Path, *, artifacts_root: Path
+) -> ReviewVerdict | None:
+    latest: RunEvent | None = None
+    for event in events:
+        if (
+            event.event_type == "review.verdict_recorded"
+            and event.payload.get("task_id") == "post-dag"
+        ):
+            latest = event
+    if latest is None:
+        return None
+    cycle = latest.payload.get("review_cycle")
+    if not isinstance(cycle, int) or isinstance(cycle, bool) or cycle < 1:
+        return None
+    raw = delivery_review.open_safe_artifact_bytes(
+        artifacts_root, run_dir.name, "artifacts", "post_dag", f"round-{cycle}", "verdict.json"
+    )
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return ReviewVerdict.model_validate(data)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _build_post_dag_summary(
+    events: list[RunEvent], run_status: RunStatus, run_dir: Path, *, artifacts_root: Path
+) -> dict[str, Any] | None:
+    round_events = [
+        event
+        for event in events
+        if event.event_type.startswith("post_dag.")
+        or event.event_type == "product.verified"
+        or (
+            event.event_type == "review.verdict_recorded"
+            and event.payload.get("task_id") == "post-dag"
+        )
+    ]
+    has_deferred = any(
+        event.event_type in ("task.review_deferred", "task.deferred_review_passed")
+        for event in events
+    )
+    if not round_events and not has_deferred:
+        return None
+    rounds: list[dict[str, Any]] = []
+    for event in round_events:
+        entry = _post_dag_round_entry(event, len(rounds) + 1)
+        if entry is not None:
+            rounds.append(entry)
+    latest = round_events[-1] if round_events else None
+    latest_round = rounds[-1] if rounds else None
+    latest_product = next(
+        (event for event in reversed(round_events) if event.event_type == "product.verified"),
+        None,
+    )
+    latest_repro = next(
+        (
+            row
+            for row in reversed(rounds)
+            if row["phase"] == "recheck"
+        ),
+        None,
+    )
+    latest_verdict = next(
+        (
+            event
+            for event in reversed(round_events)
+            if event.event_type == "review.verdict_recorded"
+            and event.payload.get("task_id") == "post-dag"
+        ),
+        None,
+    )
+    product_passed = (
+        latest_product.payload.get("passed") is True if latest_product is not None else None
+    )
+    repro_failed = bool(
+        latest_repro is not None
+        and latest_repro["outcome"] == "failed"
+        and (
+            latest_product is None
+            or latest_repro["event_seq"] >= latest_product.event_seq
+        )
+    )
+    verdict_passed = (
+        latest_verdict.payload.get("passed") is True if latest_verdict is not None else None
+    )
+    if run_status == RunStatus.AWAITING_HUMAN:
+        status = "awaiting_human"
+    elif run_status == RunStatus.PAUSED:
+        status = "paused"
+    elif run_status == RunStatus.FAILED:
+        status = "failed"
+    elif latest is None:
+        status = "idle"
+    elif run_status == RunStatus.COMPLETED:
+        status = (
+            "passed"
+            if (
+                product_passed is not False
+                and not repro_failed
+                and verdict_passed is not False
+            )
+            else "failed"
+        )
+    elif (
+        latest.event_type == "review.verdict_recorded"
+        and verdict_passed is True
+        and product_passed is True
+        and not repro_failed
+    ):
+        status = "passed"
+    elif latest.event_type in (
+        "post_dag.repair_turn_completed",
+        "post_dag.repair_rejected",
+        "post_dag.repair_applied",
+    ):
+        status = "repairing"
+    elif latest_round is not None:
+        status = "verifying"
+    else:
+        status = "idle"
+    return {
+        "status": status,
+        "total_rounds": len(rounds),
+        "rounds": rounds,
+        "latest_argus_verdict": _latest_post_dag_verdict(
+            events, run_dir, artifacts_root=artifacts_root
+        ),
+    }
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
     run_id: str,
     *,
     artifacts_root: Path | None = None,
+    supervised: bool | None = None,
 ) -> dict[str, Any]:
     """Derive a complete read-only Ariadne console view from SQLite events and run artifacts."""
     snap = store.get_run(run_id, include_approval_baselines=True)
@@ -1147,11 +1541,12 @@ def build_run_projection(
         event for event in store.list_events(run_id, after_seq=0)
         if event.state_revision <= snap["state_revision"]
     ]
-    run_dir = (
+    resolved_artifacts_root = (
         artifacts_root
         if artifacts_root is not None
         else Path(workspace_root).resolve() / ".olympus" / "runs"
-    ) / run_id
+    )
+    run_dir = resolved_artifacts_root / run_id
 
     approved = snap["artifact_approved"]
     spec_approved = approved[ApprovalTarget.GOAL_SPEC]
@@ -1231,10 +1626,16 @@ def build_run_projection(
         plan if plan_approved else None,
         [event for event in events if event.state_revision <= snap["state_revision"]],
         run_dir,
+        artifacts_root=resolved_artifacts_root,
+    )
+    product_verification = delivery_review.latest_product_verification(
+        events, run_dir, artifacts_root=resolved_artifacts_root
+    )
+    post_dag = _build_post_dag_summary(
+        events, snap["status"], run_dir, artifacts_root=resolved_artifacts_root
     )
 
     receipt_by_task: dict[str, dict[str, Any]] = {}
-    receipt_by_actor: dict[str, dict[str, Any]] = {}
     retries_by_task: dict[str, list[dict[str, Any]]] = {}
     for ev in events:
         if ev.event_type == ProviderTimeoutRetry.event_type:
@@ -1244,11 +1645,17 @@ def build_run_projection(
             )
         if ev.event_type != "turn.receipt":
             continue
-        payload = dict(ev.payload)
-        recorded_task = payload.get("task_id")
-        if isinstance(recorded_task, str) and recorded_task:
-            receipt_by_task.setdefault(recorded_task, payload)
-        receipt_by_actor.setdefault(ev.actor, payload)
+        validated_receipt = _safe_turn_receipt(ev.payload)
+        if validated_receipt is None:
+            continue
+        recorded_task = validated_receipt.get("task_id")
+        actor_prefix = ev.actor.split(":", 1)[0].strip().lower()
+        if (
+            isinstance(recorded_task, str)
+            and recorded_task
+            and actor_prefix not in ("momus", "argus")
+        ):
+            receipt_by_task[recorded_task] = validated_receipt
 
     workflow_name = str(snap.get("workflow_name") or "product_blueprint")
     workflow_view = build_workflow_view(
@@ -1266,7 +1673,44 @@ def build_run_projection(
         stop_after=workflow_view.get("stop_after"),
     )
 
+    is_supervised = (
+        any(ev.stage == "graph" for ev in events) if supervised is None else supervised
+    )
+    try:
+        strict_canonical = load_workflow(workflow_name).align_strict_canonical()
+    except Exception:  # noqa: BLE001 - fallback for legacy/unknown workflows
+        strict_canonical = True
+    pending_resynthesis = is_supervised and has_pending_resynthesis(
+        events,
+        spec,
+        spec_approved=spec_approved,
+        strict_canonical=strict_canonical,
+    )
+    clarification_notes: list[dict[str, Any]] = []
+    resynthesis_error: str | None = None
+    if spec is not None:
+        clarification_notes = [
+            {
+                "event_seq": event.event_seq,
+                "created_at": event.created_at.isoformat(),
+                "feedback": str(event.payload.get("feedback") or "").strip(),
+                "consumed": consumed,
+            }
+            for event, consumed in clarification_note_states(events, spec_id=spec.spec_id)
+        ]
+        for event in reversed(events):
+            if event.event_type == "spec.resynthesis_failed":
+                if event.payload.get("spec_id") in (None, "", spec.spec_id):
+                    resynthesis_error = str(event.payload.get("error") or "").strip() or None
+                    break
+                continue
+            if event.event_type in ("spec.resynthesized", "spec.saved") and (
+                event.payload.get("spec_id") in (None, "", spec.spec_id)
+            ):
+                break
+
     live_progress = _live_task_progress(tasks, events)
+    review_deferred, escape_rejections, escape_findings = _task_review_flags(tasks, events)
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
     for order, t in enumerate(tasks):
@@ -1380,6 +1824,9 @@ def build_run_projection(
                 "receipt": receipt,
                 "manifest_md": manifest_md,
                 "artifacts": art,
+                "review_deferred": review_deferred.get(t.task_id, False),
+                "escape_hatch_rejections": escape_rejections.get(t.task_id, 0),
+                "escape_hatch_findings": escape_findings.get(t.task_id, []),
             }
         )
         for dep in t.depends_on:
@@ -1422,6 +1869,24 @@ def build_run_projection(
             "headline": "运行已暂停：当前停止派发新任务，等待人工恢复",
             "detail": "点击右上角「恢复运行」继续调度就绪任务",
             "actions": ["resume"],
+        }
+    elif pending_resynthesis and resynthesis_error:
+        hitl_banner = {
+            "kind": "resynthesis_failed",
+            "tone": "danger",
+            "task_id": None,
+            "headline": "需求融合（Resynthesize）失败，可原地重试或补充说明",
+            "detail": resynthesis_error,
+            "actions": ["retry_workflow"],
+        }
+    elif pending_resynthesis:
+        hitl_banner = {
+            "kind": "resynthesizing",
+            "tone": "info",
+            "task_id": None,
+            "headline": "正在将澄清与补充约束融合进 GoalSpec…",
+            "detail": "融合完成后将生成新版本供您确认，期间暂不可批准旧版规格。",
+            "actions": [],
         }
     elif spec is not None and not spec_approved:
         blockers = spec.unresolved_blockers()
@@ -1490,6 +1955,71 @@ def build_run_projection(
                 "detail": "当前运行已耗尽显式配置的调用或 Token 上限，未继续消耗任务重试次数。",
                 "actions": [],
             }
+        elif tasks and all(
+            task.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for task in tasks
+        ):
+            product_failed = (
+                product_verification is not None and not product_verification["passed"]
+            )
+            post_dag_failed = bool(
+                post_dag is not None
+                and post_dag["rounds"]
+                and post_dag["rounds"][-1]["outcome"] in ("failed", "rejected")
+            )
+            latest_status = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.event_type == "run.status_changed"
+                    and event.payload.get("to") == RunStatus.AWAITING_HUMAN.value
+                ),
+                None,
+            )
+            status_failure = ""
+            status_reason = ""
+            if latest_status is not None:
+                raw_failure = latest_status.payload.get("failure")
+                if isinstance(raw_failure, str) and raw_failure.strip():
+                    status_failure = raw_failure.strip()
+                raw_reason = latest_status.payload.get("reason") or latest_status.payload.get(
+                    "detail"
+                )
+                if isinstance(raw_reason, str) and raw_reason.strip():
+                    status_reason = raw_reason.strip()
+            blocking_status = bool(status_failure) or status_reason in (
+                "post_dag_verification_failed",
+                "review_output_invalid",
+                "turn_cancelled",
+            )
+            failed = product_failed or post_dag_failed or blocking_status
+            pieces: list[str] = []
+            if status_failure:
+                pieces.append(status_failure)
+            elif blocking_status and status_reason:
+                pieces.append(status_reason)
+            if product_verification is not None:
+                if not blocking_status and product_verification["summary"]:
+                    pieces.append(product_verification["summary"])
+                pieces.extend(product_verification["failures"][:2])
+            if post_dag is not None and post_dag["rounds"]:
+                latest_round = post_dag["rounds"][-1]
+                if not blocking_status or latest_round["outcome"] in ("failed", "rejected"):
+                    pieces.append(latest_round["summary"])
+            if not pieces:
+                pieces.append(status_reason or "全部任务已验收，等待人工确认交付验收结果")
+            deduped_pieces = list(dict.fromkeys(piece for piece in pieces if piece))
+            hitl_banner = {
+                "kind": "review_delivery",
+                "tone": "danger" if failed else "warn",
+                "task_id": None,
+                "headline": (
+                    "交付验收未通过：产品端到端验证或交付级复核仍需人工决策"
+                    if failed
+                    else "交付验收待人工确认：全部任务已验收，等待放行交付"
+                ),
+                "detail": "；".join(deduped_pieces),
+                "actions": ["retry_workflow"],
+            }
         elif compute_dispatchable_tasks(plan, max_concurrent=1):
             hitl_banner = {
                 "kind": "ready_to_resume",
@@ -1506,19 +2036,6 @@ def build_run_projection(
     )
     raw_input = spec.goal if spec is not None else str(snap["title"])
     triage_payload: dict[str, Any] | None = None
-    stage_activity: list[dict[str, Any]] = []
-    stage_event_types = {
-        "intake.triaged",
-        "spec.drafted",
-        "spec.clarified",
-        "spec.confirmed",
-        "design.generated",
-        "design.approved",
-        "plan.generated",
-        "plan.approved",
-        "run.workflow_promoted",
-        "graph.failed",
-    }
     for event in events:
         if event.event_type == "graph.input_recorded":
             recorded = str(event.payload.get("raw_input") or "").strip()
@@ -1526,22 +2043,6 @@ def build_run_projection(
                 raw_input = recorded
         elif event.event_type == "intake.triaged":
             triage_payload = dict(event.payload)
-        if event.event_type in stage_event_types or (
-            event.event_type == "turn.receipt" and event.payload.get("task_id") is None
-        ):
-            stage_activity.append(
-                {
-                    "event_seq": event.event_seq,
-                    "stage": event.stage,
-                    "event_type": event.event_type,
-                    "actor": event.actor,
-                    "summary": str(
-                        event.payload.get("one_line")
-                        or event.payload.get("error")
-                        or event.event_type
-                    ),
-                }
-            )
 
     recent_progress, key_outputs = _build_run_progress(snap, events, dag_nodes, run_dir)
     return {
@@ -1558,7 +2059,6 @@ def build_run_projection(
         "workflow": workflow_view,
         "blueprint_completed": blueprint_completed,
         "triage": triage_payload,
-        "stage_activity": stage_activity[-12:],
         "recent_progress": recent_progress,
         "key_outputs": key_outputs,
         "spec_approved": spec_approved,
@@ -1593,6 +2093,9 @@ def build_run_projection(
         },
         "hitl_banner": hitl_banner,
         "approval_reviews": approval_reviews,
+        "pending_resynthesis": pending_resynthesis,
+        "resynthesis_error": resynthesis_error,
+        "clarification_notes": clarification_notes,
         "spec": spec.model_dump(mode="json") if spec else None,
         "design": design.model_dump(mode="json") if design else None,
         "plan": plan.model_dump(mode="json") if plan else None,
@@ -1605,13 +2108,16 @@ def build_run_projection(
             spec,
             tasks,
             {node["task_id"]: node for node in dag_nodes},
-            receipt_by_actor,
+            receipt_by_task,
+            events,
             spec_approved=spec_approved,
+            post_dag=post_dag,
         ),
         "traceability_matrix": _build_traceability_matrix(
             spec, tasks, design, delivery_acceptance=delivery_acceptance
         ),
         "delivery_acceptance": delivery_acceptance,
+        "post_dag": post_dag,
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }

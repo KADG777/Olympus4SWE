@@ -215,7 +215,6 @@ class CreateRunRequest(StrictModel):
     provider_config: ProviderConfig = Field(default_factory=ProviderConfig)
     worker_driver: str | None = None
     reviewer_driver: str | None = None
-    monitor_model: str | None = None
     auto_approve: bool = False
     sync: bool = False
     constraints: list[str] | None = None
@@ -325,6 +324,27 @@ class ClarifyCommand(_CommandBase):
     answers: dict[str, str] = Field(default_factory=dict)
     resolutions: dict[str, str] = Field(default_factory=dict)
     out_of_scope: list[str] = Field(default_factory=list)
+    clarification_note: str = ""
+
+
+class RequestRevisionCommand(_CommandBase):
+    action: Literal["request_revision"]
+    feedback: str = Field(min_length=1)
+
+    @field_validator("feedback")
+    @classmethod
+    def _validate_feedback(cls, value: str) -> str:
+        return _strip_non_empty(value)
+
+
+class ReopenRunCommand(_CommandBase):
+    action: Literal["reopen_run"]
+    feedback: str = Field(min_length=1)
+
+    @field_validator("feedback")
+    @classmethod
+    def _validate_feedback(cls, value: str) -> str:
+        return _strip_non_empty(value)
 
 
 class RetryTaskCommand(_CommandBase):
@@ -381,7 +401,9 @@ CommandRequest = Annotated[
     | AcceptRiskCommand
     | ReassignHumanCommand
     | RetryWorkflowCommand
-    | PromoteToExecuteCommand,
+    | PromoteToExecuteCommand
+    | RequestRevisionCommand
+    | ReopenRunCommand,
     Field(discriminator="action"),
 ]
 
@@ -497,14 +519,6 @@ class TriageView(StrictModel):
     has_design: bool = False
 
 
-class StageActivityItem(StrictModel):
-    event_seq: int
-    stage: str
-    event_type: str
-    actor: str
-    summary: str
-
-
 class RunProgressItem(StrictModel):
     event_seq: int
     created_at: str
@@ -604,8 +618,6 @@ class LiveProgress(StrictModel):
     last_event_at: str | None = None
     recent_tools: list[RecentTool]
     steer_count: int
-    watchdog_verdict: str | None = None
-    watchdog_summary: str | None = None
     preview: str | None = Field(default=None, exclude_if=_omit_none)
 
 
@@ -723,6 +735,9 @@ class DagNode(StrictModel):
     receipt: TurnReceipt
     manifest_md: str
     artifacts: TaskArtifacts
+    review_deferred: bool = False
+    escape_hatch_rejections: int = 0
+    escape_hatch_findings: list[str] = Field(default_factory=list)
 
 
 class DagEdge(StrictModel):
@@ -765,7 +780,7 @@ class WaterfallTurn(StrictModel):
     steps: int
     offset_pct: float
     width_pct: float
-    receipt: TurnReceipt
+    receipt: TurnReceipt | None = None
     manifest_md: str
 
 
@@ -813,12 +828,62 @@ class DeliveryCounts(StrictModel):
     unverified: int
 
 
+class ProductCheckItem(StrictModel):
+    name: str
+    status: str
+    detail: str = ""
+    port: int | None = None
+
+
+class ProductVerificationView(StrictModel):
+    passed: bool
+    summary: str
+    failures: list[str] = Field(default_factory=list)
+    event_seq: int
+    verified_at: str
+    checks: list[ProductCheckItem] = Field(default_factory=list)
+    has_report: bool = False
+    has_boot_log: bool = False
+    has_screenshot: bool = False
+    screenshot_sha256: str | None = None
+
+
 class DeliveryAcceptance(StrictModel):
     spec_id: str
     spec_version: int
     spec_hash: str
     counts: DeliveryCounts
     criteria: list[DeliveryCriterion]
+    product_verification: ProductVerificationView | None = None
+
+
+class PostDagRoundItem(StrictModel):
+    sequence: int
+    reported_round: int
+    event_seq: int
+    created_at: str
+    phase: Literal["verify", "recheck", "review", "repair"]
+    outcome: Literal["passed", "failed", "applied", "rejected", "completed"]
+    summary: str
+    changed_paths: list[str] = Field(default_factory=list)
+    repro_checked: int | None = None
+    repro_failed: int | None = None
+
+
+class PostDagSummary(StrictModel):
+    status: Literal[
+        "idle", "verifying", "repairing", "passed", "paused", "failed", "awaiting_human"
+    ]
+    total_rounds: int
+    rounds: list[PostDagRoundItem] = Field(default_factory=list)
+    latest_argus_verdict: ReviewVerdict | None = None
+
+
+class ClarificationNoteView(StrictModel):
+    event_seq: int
+    created_at: str
+    feedback: str
+    consumed: bool
 
 
 class RunProjection(StrictModel):
@@ -835,7 +900,6 @@ class RunProjection(StrictModel):
     workflow: WorkflowView
     blueprint_completed: bool
     triage: TriageView | None = None
-    stage_activity: list[StageActivityItem]
     recent_progress: RunProgressItem | None = None
     key_outputs: list[KeyOutputItem]
     spec_approved: bool
@@ -846,6 +910,9 @@ class RunProjection(StrictModel):
     progress: ProgressSummary
     hitl_banner: HitlBanner | None = None
     approval_reviews: dict[str, ApprovalReview]
+    pending_resynthesis: bool = False
+    resynthesis_error: str | None = None
+    clarification_notes: list[ClarificationNoteView] = Field(default_factory=list)
     spec: GoalSpec | None = None
     design: DesignSpec | None = None
     plan: TaskPlan | None = None
@@ -854,6 +921,7 @@ class RunProjection(StrictModel):
     waterfall_turns: list[WaterfallTurn]
     traceability_matrix: list[TraceabilityMatrix]
     delivery_acceptance: DeliveryAcceptance | None = None
+    post_dag: PostDagSummary | None = None
     events: list[RunEvent]
     latest_event_seq: int
 
@@ -941,6 +1009,7 @@ __all__ = [
     "AttemptArtifactsResponse",
     "BallHolder",
     "BudgetSummary",
+    "ClarificationNoteView",
     "ClarifyCommand",
     "CommandRequest",
     "CommandResponse",
@@ -970,11 +1039,17 @@ __all__ = [
     "PauseCommand",
     "PauseInfo",
     "PendingAction",
+    "PostDagRoundItem",
+    "PostDagSummary",
+    "ProductCheckItem",
+    "ProductVerificationView",
     "PromoteToExecuteCommand",
     "ProviderConfig",
     "ProviderStatus",
     "ProvidersResponse",
     "ReassignHumanCommand",
+    "ReopenRunCommand",
+    "RequestRevisionCommand",
     "ResumeCommand",
     "RetryTaskCommand",
     "RetryWorkflowCommand",
@@ -985,7 +1060,6 @@ __all__ = [
     "RunSummary",
     "SeatState",
     "SeedDemoResponse",
-    "StageActivityItem",
     "StagePipelineItem",
     "SwimlaneRow",
     "TaskType",

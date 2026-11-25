@@ -251,7 +251,6 @@ def test_issue_oracle_benchmark_sample_disclosure_and_advanced_overrides(board_s
         "#new-run-model",
         "#new-run-worker-driver",
         "#new-run-reviewer-driver",
-        "#new-run-monitor-model",
     ):
         expect(dialog.locator(control_id)).to_be_visible()
     page.close()

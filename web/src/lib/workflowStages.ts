@@ -74,7 +74,6 @@ const NODE_PHASE_BY_ID = new Map<string, string>([
   ["validate_plan", "plan"],
   ["gate_plan", "plan"],
   ["execute", "execute"],
-  ["verify", "execute"],
 ]);
 
 const KIND_LABELS: Record<WorkflowNodeKind, string> = {

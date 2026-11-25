@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from collections import Counter, defaultdict
 from hashlib import file_digest, sha256
 from pathlib import Path
@@ -12,7 +14,187 @@ from olympus.core.contracts import GoalSpec, RunEvent, TaskPlan
 from olympus.harness.delivery import DELIVERY_EVENT
 
 _VERSION = re.compile(r"sha256:[a-f0-9]{64}")
+_SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 _RECEIPT_ID = re.compile(r"delivery-[a-f0-9]{12}")
+
+_PRODUCT_ARTIFACTS: dict[str, tuple[str, str]] = {
+    "report": ("report.json", "application/json; charset=utf-8"),
+    "boot_log": ("boot.log", "text/plain; charset=utf-8"),
+    "screenshot": ("home.png", "image/png"),
+}
+
+
+def _valid_segment(part: str) -> bool:
+    return bool(part) and part not in (".", "..") and "/" not in part and "\\" not in part
+
+
+def _open_safe_regular_fd(trusted_root: Path, *parts: str) -> int | None:
+    """Walk ``trusted_root / *parts`` via dirfd + ``O_NOFOLLOW | O_NONBLOCK``."""
+    if not parts or not all(_valid_segment(part) for part in parts):
+        return None
+    o_directory = getattr(os, "O_DIRECTORY", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if os.open not in os.supports_dir_fd or not o_directory or not o_nofollow:
+        return None
+    dir_flags = os.O_RDONLY | o_directory | o_nofollow
+    file_flags = os.O_RDONLY | o_nofollow | getattr(os, "O_NONBLOCK", 0)
+    try:
+        root_resolved = trusted_root.resolve()
+        if not root_resolved.is_dir():
+            return None
+        cur_fd = os.open(str(root_resolved), os.O_RDONLY | o_directory)
+        try:
+            for directory in parts[:-1]:
+                nxt_fd = os.open(directory, dir_flags, dir_fd=cur_fd)
+                os.close(cur_fd)
+                cur_fd = nxt_fd
+            fd = os.open(parts[-1], file_flags, dir_fd=cur_fd)
+        finally:
+            os.close(cur_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def open_safe_artifact_bytes(trusted_root: Path, *parts: str) -> bytes | None:
+    """Read one regular file strictly under ``trusted_root`` without following symlinks."""
+    fd = _open_safe_regular_fd(trusted_root, *parts)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _safe_artifact_exists(trusted_root: Path, *parts: str) -> bool:
+    fd = _open_safe_regular_fd(trusted_root, *parts)
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
+
+
+def read_product_artifact(
+    run_dir: Path,
+    kind: str,
+    *,
+    artifacts_root: Path | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[bytes, str] | None:
+    """Read one allowlisted product verification artifact under ``artifacts_root``."""
+    entry = _PRODUCT_ARTIFACTS.get(kind)
+    if entry is None:
+        return None
+    filename, media_type = entry
+    root = artifacts_root if artifacts_root is not None else run_dir.parent
+    content = open_safe_artifact_bytes(root, run_dir.name, "artifacts", "verify_product", filename)
+    if content is None:
+        return None
+    if expected_sha256 is not None and sha256(content).hexdigest() != expected_sha256:
+        return None
+    return content, media_type
+
+
+def latest_product_verification(
+    events: list[RunEvent], run_dir: Path, *, artifacts_root: Path | None = None
+) -> dict[str, Any] | None:
+    """Whitelist the latest ``product.verified`` payload into a safe view."""
+    latest: RunEvent | None = None
+    for event in events:
+        if event.event_type == "product.verified":
+            latest = event
+    if latest is None:
+        return None
+    payload = latest.payload
+    passed = payload.get("passed")
+    if not isinstance(passed, bool):
+        return None
+    raw_summary = payload.get("summary")
+    summary = raw_summary if isinstance(raw_summary, str) else ""
+    failures: list[str] = []
+    raw_failures = payload.get("failures")
+    if isinstance(raw_failures, list):
+        failures = [item for item in raw_failures if isinstance(item, str)]
+    checks: list[dict[str, Any]] = []
+    raw_checks = payload.get("checks")
+    if isinstance(raw_checks, list):
+        for item in raw_checks:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            status = item.get("status")
+            if not isinstance(name, str) or not isinstance(status, str):
+                continue
+            raw_detail = item.get("detail")
+            raw_port = item.get("port")
+            checks.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "detail": raw_detail if isinstance(raw_detail, str) else "",
+                    "port": (
+                        raw_port
+                        if isinstance(raw_port, int) and not isinstance(raw_port, bool)
+                        else None
+                    ),
+                }
+            )
+    root = artifacts_root if artifacts_root is not None else run_dir.parent
+    run_name = run_dir.name
+    screenshot_declared_absent = (
+        "screenshot_path" in payload
+        and not (
+            isinstance(payload.get("screenshot_path"), str)
+            and bool(payload["screenshot_path"].strip())
+        )
+    ) or any(
+        check["name"] == "screenshot" and check["status"] != "passed" for check in checks
+    )
+    has_screenshot = False
+    screenshot_sha256: str | None = None
+    if not screenshot_declared_absent:
+        shot_bytes = open_safe_artifact_bytes(
+            root, run_name, "artifacts", "verify_product", "home.png"
+        )
+        disk_sha = sha256(shot_bytes).hexdigest() if shot_bytes is not None else None
+        raw_recorded_sha = payload.get("screenshot_sha256")
+        recorded_sha = (
+            raw_recorded_sha
+            if isinstance(raw_recorded_sha, str) and _SHA256_HEX.match(raw_recorded_sha)
+            else None
+        )
+        if recorded_sha is not None and disk_sha == recorded_sha:
+            has_screenshot = True
+            screenshot_sha256 = recorded_sha
+    return {
+        "passed": passed,
+        "summary": summary,
+        "failures": failures,
+        "event_seq": latest.event_seq,
+        "verified_at": latest.created_at.isoformat(),
+        "checks": checks,
+        "has_report": _safe_artifact_exists(
+            root, run_name, "artifacts", "verify_product", "report.json"
+        ),
+        "has_boot_log": _safe_artifact_exists(
+            root, run_name, "artifacts", "verify_product", "boot.log"
+        ),
+        "has_screenshot": has_screenshot,
+        "screenshot_sha256": screenshot_sha256,
+    }
 
 
 def _current_receipt(events: list[RunEvent], plan: TaskPlan) -> RunEvent | None:
@@ -105,6 +287,8 @@ def build_delivery_acceptance(
     plan: TaskPlan | None,
     events: list[RunEvent],
     run_dir: Path,
+    *,
+    artifacts_root: Path | None = None,
 ) -> dict[str, Any] | None:
     if spec is None:
         return None
@@ -161,4 +345,7 @@ def build_delivery_acceptance(
         "spec_hash": spec.content_hash,
         "counts": counts,
         "criteria": rows,
+        "product_verification": latest_product_verification(
+            events, run_dir, artifacts_root=artifacts_root
+        ),
     }

@@ -81,6 +81,13 @@ class WorkflowDefinition(StrictModel):
     def node(self, name: str) -> WorkflowNodeDef | None:
         return next((n for n in self.nodes if n.name == name), None)
 
+    def align_strict_canonical(self) -> bool:
+        """Return the ``align_goal`` node's canonical-contract switch."""
+        for node in self.nodes:
+            if node.type == "align_goal":
+                return bool(node.params.get("strict_canonical", True))
+        return True
+
 
 @dataclass
 class WorkflowRuntime:
@@ -217,6 +224,12 @@ def _node_align(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, A
     runtime = _runtime(state)
     run_id = _run_id(state)
     stage = _align_stage(runtime)
+    raw_rev_seq = state.get("revision_event_seq")
+    expected_rev_seq = (
+        raw_rev_seq
+        if isinstance(raw_rev_seq, int) and not isinstance(raw_rev_seq, bool)
+        else None
+    )
     spec = stage.propose_spec(
         run_id=run_id,
         raw_goal=str(state.get("raw_input", "")),
@@ -228,6 +241,7 @@ def _node_align(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, A
         task_type=state.get("task_type"),
         base_ref=state.get("base_ref"),
         scope_paths=list(state.get("scope_paths") or []),
+        expected_revision_event_seq=expected_rev_seq,
     )
     if bool(params.get("auto_approve", False)) and not spec.unresolved_blockers():
         spec = stage.confirm_spec(run_id=run_id, approver=runtime.approver)
