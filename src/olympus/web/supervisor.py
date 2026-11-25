@@ -362,11 +362,23 @@ class RunSupervisor:
             resynth_spec = snap["spec"]
             entry_node = definition.node(effective_start) if effective_start else None
             pre_events = self.store.list_events(run_id)
+            if (entry_node is None or entry_node.type != "align_goal") and (
+                self._has_pending_restart(run_id) or has_unfulfilled_revision(pre_events)
+            ):
+                latest_snap = self.store.get_run(run_id)
+                return {
+                    "run_id": run_id,
+                    "workflow": definition.name,
+                    "topology": definition.topology,
+                    "stop_after": definition.stop_after,
+                    "status": latest_snap["status"].value,
+                    "state_revision": latest_snap["state_revision"],
+                    "paused": None,
+                    "superseded": True,
+                }
             if (
                 resynth_spec is not None
                 and not (entry_node is not None and entry_node.type == "align_goal")
-                and not self._has_pending_restart(run_id)
-                and not has_unfulfilled_revision(pre_events)
                 and has_pending_resynthesis(
                     pre_events,
                     resynth_spec,
@@ -474,7 +486,10 @@ class RunSupervisor:
             finally:
                 with self._guard:
                     self._active_turns.pop(run_id, None)
-            if self._has_pending_restart(run_id):
+            if self._has_pending_restart(run_id) or (
+                (entry_node is None or entry_node.type != "align_goal")
+                and has_unfulfilled_revision(self.store.list_events(run_id))
+            ):
                 latest_snap = self.store.get_run(run_id)
                 return {
                     "run_id": run_id,
@@ -610,16 +625,42 @@ class RunSupervisor:
         exc: Exception,
     ) -> dict[str, Any]:
         reason = str(exc)
-        self.store.append_event(
-            run_id=run_id,
-            stage="align",
-            event_type="spec.resynthesis_failed",
-            actor="supervisor",
-            payload={"spec_id": spec.spec_id, "error": reason},
-        )
+        while True:
+            pre = self.store.get_run(run_id)
+            if (
+                pre["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+                or self._has_pending_restart(run_id)
+                or has_unfulfilled_revision(self.store.list_events(run_id))
+            ):
+                return {
+                    "run_id": run_id,
+                    "workflow": definition.name,
+                    "topology": definition.topology,
+                    "stop_after": definition.stop_after,
+                    "status": pre["status"].value,
+                    "state_revision": pre["state_revision"],
+                    "paused": None,
+                    "superseded": True,
+                }
+            try:
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="align",
+                    event_type="spec.resynthesis_failed",
+                    actor="supervisor",
+                    payload={"spec_id": spec.spec_id, "error": reason},
+                    expected_state_revision=int(pre["state_revision"]),
+                )
+                break
+            except ConcurrencyConflictError:
+                continue
         while True:
             latest = self.store.get_run(run_id)
-            if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            if (
+                latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+                or self._has_pending_restart(run_id)
+                or has_unfulfilled_revision(self.store.list_events(run_id))
+            ):
                 break
             try:
                 self.store.set_run_status(

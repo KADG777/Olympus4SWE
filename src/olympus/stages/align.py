@@ -611,7 +611,9 @@ def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
     if latest_restart_seq == 0:
         return False
     return not any(
-        ev.event_seq > latest_restart_seq and ev.event_type == "spec.saved"
+        ev.event_seq > latest_restart_seq
+        and ev.event_type == "spec.saved"
+        and ev.actor == "align"
         for ev in events
     )
 

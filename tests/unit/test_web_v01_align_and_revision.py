@@ -1067,3 +1067,86 @@ def test_consecutive_revisions_never_shadow_newer_feedback(tmp_path: Path) -> No
         assert "Second revision" in align_prompts[1]
     finally:
         supervisor.shutdown()
+
+
+def test_approve_spec_rejected_while_revision_unfulfilled(tmp_path: Path) -> None:
+    """Approving the pre-revision GoalSpec before align runs must return 400."""
+    responder = _BlueprintResponder(answers={}, blocking=False)
+    app, supervisor, client = _make_app(tmp_path, responder)
+    responder.store = app.store
+    try:
+        run_id = _start_run(supervisor)
+        rev = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "改成按周汇总",
+                "auto_advance": False,
+            },
+        )
+        assert rev.status_code == 200, rev.text
+        proj = _projection(client, run_id)
+        blocked = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": proj["spec"]["content_hash"],
+                "expected_state_revision": proj["state_revision"],
+                "auto_advance": False,
+            },
+        )
+        assert blocked.status_code == 400, blocked.text
+        assert "awaiting revision realignment" in blocked.text
+    finally:
+        supervisor.shutdown()
+
+
+def test_revision_during_resynthesis_failure_abort_does_not_clobber_running(
+    tmp_path: Path,
+) -> None:
+    """Revision arriving right before spec.resynthesis_failed must not revert status to awaiting."""
+    from unittest.mock import patch
+
+    answers = {"A1-format": "Excel 工作簿", "A2-scope": "全量订单"}
+    responder = _BlueprintResponder(answers=answers, fail_first_resynthesis=True)
+    app, supervisor, client = _make_app(tmp_path, responder)
+    responder.store = app.store
+    try:
+        run_id = _start_run(supervisor)
+        orig_append = app.store.append_event
+        inserted = False
+
+        def inject_before_failure_event(*args: object, **kwargs: object):
+            nonlocal inserted
+            if kwargs.get("event_type") == "spec.resynthesis_failed" and not inserted:
+                inserted = True
+                res = client.post(
+                    f"/api/runs/{run_id}/command",
+                    json={
+                        "action": "request_revision",
+                        "feedback": "改成按月导出",
+                        "auto_advance": False,
+                    },
+                )
+                assert res.status_code == 200, res.text
+            return orig_append(*args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(app.store, "append_event", inject_before_failure_event):
+            clarify = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "clarify", "answers": answers},
+            )
+            assert clarify.status_code == 200, clarify.text
+            supervisor.wait(run_id, timeout=30)
+
+        events = app.store.list_events(run_id)
+        rev_seq = next(
+            ev.event_seq for ev in events if ev.event_type == "run.revision_requested"
+        )
+        assert not any(
+            ev.event_seq > rev_seq and ev.event_type == "spec.resynthesis_failed"
+            for ev in events
+        )
+        assert app.store.get_run(run_id)["status"] == RunStatus.RUNNING
+    finally:
+        supervisor.shutdown()
