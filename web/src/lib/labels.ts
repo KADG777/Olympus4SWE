@@ -307,8 +307,38 @@ export function unresolvedAmbiguities(spec: { open_ambiguities?: { blocking: boo
   return (spec?.open_ambiguities || []).filter((amb) => amb && amb.blocking && !amb.answer);
 }
 
+export function isAlignClarificationActive(projection: RunProjection | null | undefined): boolean {
+  return Boolean(
+    projection &&
+      !projection.spec_approved &&
+      projection.status !== "completed" &&
+      projection.status !== "cancelled",
+  );
+}
+
 export function pendingAmbiguities(projection: RunProjection) {
+  if (!isAlignClarificationActive(projection)) return [];
   return (projection.spec?.open_ambiguities || []).filter((amb) => amb && !amb.answer);
+}
+
+export function clarifyPanelVisibility(projection: RunProjection | null | undefined) {
+  const isTerminal =
+    projection?.status === "completed" || projection?.status === "cancelled";
+  const inAlign = isAlignClarificationActive(projection);
+  const pending = projection ? pendingAmbiguities(projection) : [];
+  const submittedNotes = projection?.clarification_notes || [];
+  const hasUnconsumedNotes = !isTerminal && submittedNotes.some((note) => !note.consumed);
+  const showForm =
+    pending.length > 0 ||
+    Boolean(inAlign && projection?.spec && projection.resynthesis_error);
+  const showNotes = submittedNotes.length > 0 && (inAlign || hasUnconsumedNotes);
+  return {
+    pending,
+    submittedNotes,
+    showForm,
+    showNotes,
+    showPanel: showForm || showNotes,
+  };
 }
 
 /** The task whose blocker drives the banner: the selected task's own blocker, else the banner. */
