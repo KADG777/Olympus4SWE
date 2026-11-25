@@ -283,11 +283,16 @@ def test_product_artifact_endpoint_serves_allowlisted_files_only(tmp_path: Path)
 
     with TestClient(create_fastapi_app(app)) as client:
         proj = client.get(f"/api/runs/{run_id}").json()["projection"]
+        from hashlib import sha256
+
         _append_product_verified(
             store,
             run_id,
             passed=True,
-            extra={"screenshot_path": str(verify_dir / "home.png")},
+            extra={
+                "screenshot_path": str(verify_dir / "home.png"),
+                "screenshot_sha256": sha256(png).hexdigest(),
+            },
         )
         proj = client.get(f"/api/runs/{run_id}").json()["projection"]
         assert proj["delivery_acceptance"]["product_verification"]["has_screenshot"] is True
@@ -584,11 +589,14 @@ def test_waterfall_uses_latest_worker_receipt_and_clears_stale_review_deferred(
 def test_product_verification_hides_stale_screenshot_when_latest_round_skips_it(
     tmp_path: Path,
 ) -> None:
+    from hashlib import sha256
+
     store = RunStore(tmp_path / "runs.db")
     run_id = _seed_approved_run(store, status=RunStatus.COMPLETED)
     art_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "verify_product"
     art_dir.mkdir(parents=True, exist_ok=True)
-    (art_dir / "home.png").write_bytes(b"\x89PNG\r\n\x1a\nold")
+    png_old = b"\x89PNG\r\n\x1a\nold"
+    (art_dir / "home.png").write_bytes(png_old)
 
     store.append_event(
         run_id=run_id,
@@ -599,6 +607,7 @@ def test_product_verification_hides_stale_screenshot_when_latest_round_skips_it(
             "passed": False,
             "summary": "Round 1 failed",
             "screenshot_path": str(art_dir / "home.png"),
+            "screenshot_sha256": sha256(png_old).hexdigest(),
             "checks": [{"name": "screenshot", "status": "passed", "detail": "ok"}],
         },
     )
@@ -625,6 +634,8 @@ def test_product_verification_hides_stale_screenshot_when_latest_round_skips_it(
 
 
 def test_product_screenshot_endpoint_binds_to_event_seq_and_sha256(tmp_path: Path) -> None:
+    from hashlib import sha256
+
     store = RunStore(tmp_path / "runs.db")
     run_id = _seed_approved_run(store, status=RunStatus.AWAITING_HUMAN)
     app = AriadneApp(store=store, workspace_root=tmp_path)
@@ -633,32 +644,68 @@ def test_product_screenshot_endpoint_binds_to_event_seq_and_sha256(tmp_path: Pat
     png1 = b"\x89PNG\r\n\x1a\nround1"
     png2 = b"\x89PNG\r\n\x1a\nround2"
     (art_dir / "home.png").write_bytes(png1)
+
+    # Legacy/unhashed product.verified without screenshot_sha256 fails closed.
     _append_product_verified(
         store, run_id, passed=False, extra={"screenshot_path": str(art_dir / "home.png")}
     )
-
     with TestClient(create_fastapi_app(app)) as client:
+        unhashed = client.get(f"/api/runs/{run_id}").json()["projection"]["delivery_acceptance"][
+            "product_verification"
+        ]
+        assert unhashed["has_screenshot"] is False
+        assert unhashed["screenshot_sha256"] is None
+        assert (
+            client.get(
+                f"/api/runs/{run_id}/product-artifact/screenshot?v={unhashed['event_seq']}"
+            ).status_code
+            == 404
+        )
+
+        # Hashed product.verified binds to exact round-1 bytes.
+        _append_product_verified(
+            store,
+            run_id,
+            passed=False,
+            extra={
+                "screenshot_path": str(art_dir / "home.png"),
+                "screenshot_sha256": sha256(png1).hexdigest(),
+            },
+        )
         pv1 = client.get(f"/api/runs/{run_id}").json()["projection"]["delivery_acceptance"][
             "product_verification"
         ]
         seq1 = pv1["event_seq"]
         sha1 = pv1["screenshot_sha256"]
-        assert sha1
+        assert pv1["has_screenshot"] is True
+        assert sha1 == sha256(png1).hexdigest()
 
         ok1 = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}&sha={sha1}")
         assert ok1.status_code == 200
         assert ok1.content == png1
 
-        # Next round overwrites home.png on disk before emitting its product.verified event:
+        # Overwriting home.png before round-2 event hides screenshot on refresh & returns 404.
         (art_dir / "home.png").write_bytes(png2)
+        refreshed_mid = client.get(f"/api/runs/{run_id}").json()["projection"][
+            "delivery_acceptance"
+        ]["product_verification"]
+        assert refreshed_mid["event_seq"] == seq1
+        assert refreshed_mid["has_screenshot"] is False
+        assert refreshed_mid["screenshot_sha256"] is None
         stale_mid = client.get(
             f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}&sha={sha1}"
         )
         assert stale_mid.status_code == 404
 
-        # Next round publishes product.verified event: old seq stays 404, new seq+sha returns png2.
+        # Publishing round-2 event with png2 sha restores screenshot for seq2 only.
         _append_product_verified(
-            store, run_id, passed=True, extra={"screenshot_path": str(art_dir / "home.png")}
+            store,
+            run_id,
+            passed=True,
+            extra={
+                "screenshot_path": str(art_dir / "home.png"),
+                "screenshot_sha256": sha256(png2).hexdigest(),
+            },
         )
         pv2 = client.get(f"/api/runs/{run_id}").json()["projection"]["delivery_acceptance"][
             "product_verification"
@@ -666,7 +713,8 @@ def test_product_screenshot_endpoint_binds_to_event_seq_and_sha256(tmp_path: Pat
         seq2 = pv2["event_seq"]
         sha2 = pv2["screenshot_sha256"]
         assert seq2 > seq1
-        assert sha2 != sha1
+        assert pv2["has_screenshot"] is True
+        assert sha2 == sha256(png2).hexdigest()
         stale_after = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq1}")
         assert stale_after.status_code == 404
         ok2 = client.get(f"/api/runs/{run_id}/product-artifact/screenshot?v={seq2}&sha={sha2}")

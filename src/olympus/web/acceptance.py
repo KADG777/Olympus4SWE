@@ -176,13 +176,9 @@ def latest_product_verification(
             if isinstance(raw_recorded_sha, str) and _SHA256_HEX.match(raw_recorded_sha)
             else None
         )
-        if recorded_sha is not None:
-            if disk_sha == recorded_sha:
-                has_screenshot = True
-                screenshot_sha256 = recorded_sha
-        elif disk_sha is not None:
+        if recorded_sha is not None and disk_sha == recorded_sha:
             has_screenshot = True
-            screenshot_sha256 = disk_sha
+            screenshot_sha256 = recorded_sha
     return {
         "passed": passed,
         "summary": summary,
