@@ -602,6 +602,20 @@ def unconsumed_clarification_notes(
     ]
 
 
+def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
+    """True when a persisted revision/reopen has not yet been re-aligned into a saved spec."""
+    latest_restart_seq = 0
+    for ev in events:
+        if ev.event_type in ("run.revision_requested", "run.reopened"):
+            latest_restart_seq = max(latest_restart_seq, ev.event_seq)
+    if latest_restart_seq == 0:
+        return False
+    return not any(
+        ev.event_seq > latest_restart_seq and ev.event_type == "spec.saved"
+        for ev in events
+    )
+
+
 def _clarify_event_has_input(payload: dict[str, object]) -> bool:
     """Distinguish real human clarification submissions from empty no-op ``clarify({})`` calls."""
     tracked_keys = ("answered_ids", "resolved_note_ids", "added_out_of_scope")
@@ -927,7 +941,12 @@ class AlignStage:
                 f"{current.unresolved_blockers()}"
             )
         initial_events = self.store.list_events(run_id)
-        start_event_seq = initial_events[-1].event_seq if initial_events else 0
+        if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED) or has_unfulfilled_revision(
+            initial_events
+        ):
+            raise ConcurrencyConflictError(
+                f"Run {run_id} was revised or interrupted before resynthesis"
+            )
         initial_note_ids = [
             ev.event_id
             for ev in initial_events
@@ -1051,17 +1070,18 @@ class AlignStage:
             on_validation_exhausted=record_validation_failure,
         )
         latest = self.store.get_run(run_id)
-        new_events = self.store.list_events(run_id, after_seq=start_event_seq)
-        if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED) or any(
-            ev.event_type in ("run.revision_requested", "run.reopened") for ev in new_events
-        ):
+        latest_events = self.store.list_events(run_id)
+        if latest["status"] in (
+            RunStatus.PAUSED,
+            RunStatus.CANCELLED,
+        ) or has_unfulfilled_revision(latest_events):
             raise ConcurrencyConflictError(
                 f"Run {run_id} was revised or interrupted during resynthesis"
             )
         latest_spec: GoalSpec | None = latest["spec"]
         latest_note_ids = [
             ev.event_id
-            for ev in self.store.list_events(run_id)
+            for ev in latest_events
             if ev.event_type == "spec.clarification_note"
             and ev.payload.get("spec_id") in (None, "", current.spec_id)
         ]
@@ -1086,6 +1106,7 @@ class AlignStage:
                     "violations": list(exhausted_violations),
                     "spec_hash": current.content_hash,
                 },
+                expected_state_revision=int(latest["state_revision"]),
             )
             raise ValueError(
                 "GoalSpec resynthesis failed validation: " + "; ".join(exhausted_violations)

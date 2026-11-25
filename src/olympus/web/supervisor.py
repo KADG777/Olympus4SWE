@@ -36,6 +36,7 @@ from olympus.providers.registry import ProviderRegistry, ProviderSpec
 from olympus.stages.align import (
     AlignStage,
     has_pending_resynthesis,
+    has_unfulfilled_revision,
     unconsumed_clarification_notes,
 )
 
@@ -360,11 +361,14 @@ class RunSupervisor:
             active_provider = self.resolve_provider(run_id)
             resynth_spec = snap["spec"]
             entry_node = definition.node(effective_start) if effective_start else None
+            pre_events = self.store.list_events(run_id)
             if (
                 resynth_spec is not None
                 and not (entry_node is not None and entry_node.type == "align_goal")
+                and not self._has_pending_restart(run_id)
+                and not has_unfulfilled_revision(pre_events)
                 and has_pending_resynthesis(
-                    self.store.list_events(run_id),
+                    pre_events,
                     resynth_spec,
                     spec_approved=self.store.is_approved(
                         run_id=run_id,
@@ -384,7 +388,10 @@ class RunSupervisor:
                     workspace_root=ws,
                 )
                 latest_after_resynth = self.store.get_run(run_id)
-                if self._has_pending_restart(run_id) or latest_after_resynth["status"] in (
+                revised_mid_flight = self._has_pending_restart(run_id) or has_unfulfilled_revision(
+                    self.store.list_events(run_id)
+                )
+                if revised_mid_flight or latest_after_resynth["status"] in (
                     RunStatus.PAUSED,
                     RunStatus.CANCELLED,
                 ):
@@ -396,11 +403,12 @@ class RunSupervisor:
                         "status": latest_after_resynth["status"].value,
                         "state_revision": latest_after_resynth["state_revision"],
                         "paused": None,
-                        "superseded": self._has_pending_restart(run_id),
+                        "superseded": revised_mid_flight,
                     }
                 if resynth_failed is not None:
                     return resynth_failed
                 snap = latest_after_resynth
+            effective_raw_input = self._recorded_raw_input(run_id, raw_input)
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
@@ -423,7 +431,7 @@ class RunSupervisor:
             )
             state: dict[str, Any] = {
                 "run_id": run_id,
-                "raw_input": raw_input,
+                "raw_input": effective_raw_input,
                 "constraints": self._recorded_constraints(run_id),
                 "topology": definition.topology,
                 "route": None,
@@ -584,9 +592,11 @@ class RunSupervisor:
                 strict_canonical=definition.align_strict_canonical(),
             )
         except Exception as exc:  # noqa: BLE001 - pause in place, never drop human answers
-            if self._has_pending_restart(run_id) or self.store.get_run(run_id)["status"] in (
-                RunStatus.PAUSED,
-                RunStatus.CANCELLED,
+            if (
+                isinstance(exc, ConcurrencyConflictError)
+                or self._has_pending_restart(run_id)
+                or has_unfulfilled_revision(self.store.list_events(run_id))
+                or self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
             ):
                 return None
             return self._pause_after_resynthesis_failure(run_id, definition, spec, exc)
@@ -991,16 +1001,12 @@ class RunSupervisor:
     def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
         events = self.store.list_events(run_id, after_seq=0)
         base_input = fallback
-        last_input_seq = 0
         for ev in events:
-            if ev.event_type == "graph.input_recorded":
+            if ev.event_type == "graph.input_recorded" and not ev.payload.get("feedback"):
                 raw = ev.payload.get("raw_input")
                 if isinstance(raw, str) and raw.strip():
                     base_input = raw
-                    last_input_seq = ev.event_seq
         for ev in events:
-            if ev.event_seq <= last_input_seq:
-                continue
             if ev.event_type in ("run.revision_requested", "run.reopened"):
                 fb = str(ev.payload.get("feedback") or "").strip()
                 if fb:
@@ -1097,23 +1103,6 @@ class RunSupervisor:
         )
         if align_node is None:
             raise ValueError(f"Workflow {definition.name} has no align stage node")
-        self.store.append_event(
-            run_id=run_id,
-            stage="graph",
-            event_type="graph.input_recorded",
-            actor="human",
-            payload={
-                "raw_input": augmented,
-                "constraints": self._recorded_constraints(run_id),
-                "feedback": clean,
-                "restart_node": align_node,
-                "workspace_id": snap.get("workspace_id"),
-                "workspace_mode": snap.get("workspace_mode") or "brownfield",
-                "task_type": snap.get("task_type") or "feature",
-                "base_ref": snap.get("base_ref"),
-                "scope_paths": list(snap.get("scope_paths") or []),
-            },
-        )
         self.cancel_active_turns(run_id, reason="revision_requested")
         return self._launch(
             run_id,

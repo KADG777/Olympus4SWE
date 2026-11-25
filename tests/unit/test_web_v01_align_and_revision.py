@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from olympus.core.contracts import (
@@ -469,12 +470,10 @@ def test_request_revision_restarts_from_align_and_is_idempotent(tmp_path: Path) 
 
         events = app.store.list_events(run_id)
         assert sum(event.event_type == "run.revision_requested" for event in events) == 1
-        recorded = [
-            event for event in events if event.event_type == "graph.input_recorded"
-        ][-1]
-        assert "[User revision feedback]" in recorded.payload["raw_input"]
-        assert "按周汇总" in recorded.payload["raw_input"]
-        assert recorded.payload["constraints"] == ["使用服务端数据库持久化"]
+        recorded = supervisor._recorded_raw_input(run_id, "")
+        assert "[User revision feedback]" in recorded
+        assert "按周汇总" in recorded
+        assert supervisor._recorded_constraints(run_id) == ["使用服务端数据库持久化"]
 
         again = client.post(f"/api/runs/{run_id}/command", json=payload)
         assert again.status_code == 200, again.text
@@ -519,10 +518,7 @@ def test_reopen_run_restarts_completed_run_and_is_idempotent(tmp_path: Path) -> 
 
         events = app.store.list_events(run_id)
         assert sum(event.event_type == "run.reopened" for event in events) == 1
-        recorded = [
-            event for event in events if event.event_type == "graph.input_recorded"
-        ][-1]
-        assert "追加导出历史记录的下载链接" in recorded.payload["raw_input"]
+        assert "追加导出历史记录的下载链接" in supervisor._recorded_raw_input(run_id, "")
 
         again = client.post(f"/api/runs/{run_id}/command", json=payload)
         assert again.status_code == 200, again.text
@@ -933,3 +929,141 @@ def test_malformed_consumed_note_ids_does_not_mark_notes_consumed(tmp_path: Path
     assert len(states) == 1
     assert states[0][1] is False
     assert has_pending_resynthesis(events, spec, spec_approved=False) is True
+
+
+@pytest.mark.parametrize("mode", ["anchor", "append"])
+def test_revision_before_resynth_anchor_or_validation_append_prevents_stale_writes(
+    tmp_path: Path, mode: str
+) -> None:
+    """Revision landing before resynthesis anchor or validation append prevents stale writes."""
+    from unittest.mock import patch
+
+    from olympus.stages.align import AlignStage
+
+    answers = {"A1-format": "Excel 工作簿", "A2-scope": "全量订单"}
+    notes = ["新增按财务月份分组"]
+    responder = _BlueprintResponder(
+        answers=answers, notes=notes if mode == "anchor" else []
+    )
+    app, supervisor, client = _make_app(tmp_path / mode, responder)
+    responder.store = app.store
+    try:
+        run_id = _start_run(supervisor)
+        gate = threading.local()
+        orig_resynth = AlignStage.resynthesize_after_clarification
+        orig_list = app.store.list_events
+        orig_append = app.store.append_event
+        inserted = False
+
+        def revise() -> None:
+            nonlocal inserted
+            inserted = True
+            res = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "action": "request_revision",
+                    "feedback": "改为按周导出",
+                    "auto_advance": False,
+                },
+            )
+            assert res.status_code == 200, res.text
+
+        def wrapped(stage: AlignStage, **kwargs: object) -> GoalSpec:
+            gate.in_resynthesize = True
+            try:
+                return orig_resynth(stage, **kwargs)  # type: ignore[arg-type]
+            finally:
+                gate.in_resynthesize = False
+
+        def before_anchor(*args: object, **kwargs: object):
+            if mode == "anchor" and getattr(gate, "in_resynthesize", False) and not inserted:
+                revise()
+            return orig_list(*args, **kwargs)  # type: ignore[arg-type]
+
+        def before_validation_append(*args: object, **kwargs: object):
+            if (
+                mode == "append"
+                and kwargs.get("event_type") == "spec.validation_failed"
+                and not inserted
+            ):
+                revise()
+            return orig_append(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(AlignStage, "resynthesize_after_clarification", wrapped),
+            patch.object(app.store, "list_events", before_anchor),
+            patch.object(app.store, "append_event", before_validation_append),
+        ):
+            clarify = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "action": "clarify",
+                    "answers": answers,
+                    "clarification_note": notes[0],
+                },
+            )
+            assert clarify.status_code == 200, clarify.text
+            supervisor.wait(run_id, timeout=30)
+
+        events = app.store.list_events(run_id)
+        rev_seq = next(
+            ev.event_seq for ev in events if ev.event_type == "run.revision_requested"
+        )
+        stale_types = {
+            "spec.resynthesized",
+            "spec.validation_failed",
+            "spec.resynthesis_failed",
+        }
+        assert not any(
+            ev.event_seq > rev_seq and ev.event_type in stale_types for ev in events
+        )
+    finally:
+        supervisor.shutdown()
+
+
+def test_consecutive_revisions_never_shadow_newer_feedback(tmp_path: Path) -> None:
+    """Monotonic event-log folding preserves both earlier and newer revision feedback."""
+    align_prompts: list[str] = []
+    draft = _draft_spec()
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        if "Requirements Alignment Architect" in messages[0].content:
+            align_prompts.append(messages[1].content)
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {messages[0].content[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "First revision",
+                "auto_advance": False,
+            },
+        ).status_code == 200
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "pause"},
+        ).status_code == 200
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "Second revision",
+                "auto_advance": False,
+            },
+        ).status_code == 200
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        ).status_code == 200
+        supervisor.wait(run_id, timeout=30)
+
+        assert len(align_prompts) == 2
+        assert "First revision" in align_prompts[1]
+        assert "Second revision" in align_prompts[1]
+    finally:
+        supervisor.shutdown()
