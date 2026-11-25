@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ApprovalAction, CommandBody, GoalSpec, RunProjection } from "../api/types";
+import { productArtifactUrl } from "../api/client";
 import { useRunStream, type StreamPhase } from "../api/useRunStream";
 import {
   APPROVAL_LABELS,
@@ -302,6 +303,7 @@ export function QuickRulingDrawer({
   );
   const runFailed = gateBanner?.kind === "run_failed" || projection?.status === "failed";
   const resynthesizing = gateBanner?.kind === "resynthesizing";
+  const reviewDelivery = gateBanner?.kind === "review_delivery";
   const hasAnyRuling =
     pendingClarifications.length > 0 ||
     reviews.size > 0 ||
@@ -310,7 +312,8 @@ export function QuickRulingDrawer({
     promoteGate ||
     canRetryWorkflow ||
     runFailed ||
-    resynthesizing;
+    resynthesizing ||
+    reviewDelivery;
 
   const openBlockerHint = () => {
     const current = projectionRef.current;
@@ -620,7 +623,69 @@ export function QuickRulingDrawer({
                 </section>
               ) : null}
 
-              {canRetryWorkflow || runFailed ? (
+              {reviewDelivery ? (
+                <section
+                  className="hitl-banner"
+                  id="quick-drawer-delivery"
+                  data-tone={gateBanner?.tone === "danger" ? "danger" : "warn"}
+                  data-kind="review_delivery"
+                >
+                  <div className="hitl-copy">
+                    <p className="hitl-headline">
+                      <span aria-hidden="true">{gateBanner?.tone === "danger" ? "✕" : "⚠"}</span>
+                      <span>{gateBanner?.headline || "交付验收待人工决策"}</span>
+                    </p>
+                    {gateBanner?.detail ? <p className="hitl-detail">{gateBanner.detail}</p> : null}
+                    {projection.delivery_acceptance?.product_verification?.has_screenshot ? (
+                      <a
+                        className="product-dock-shot"
+                        href={productArtifactUrl(runId, "screenshot")}
+                        target="_blank"
+                        rel="noopener"
+                      >
+                        <img
+                          src={productArtifactUrl(runId, "screenshot")}
+                          alt="实机首页截图"
+                          loading="lazy"
+                        />
+                      </a>
+                    ) : null}
+                  </div>
+                  <div className="hitl-actions">
+                    {canRetryWorkflow ? (
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        id="btn-drawer-delivery-retry"
+                        disabled={busy}
+                        onClick={() =>
+                          void sendDrawerCommand(
+                            { action: "retry_workflow" },
+                            "已重新启动交付验证与修复工作流",
+                          )
+                        }
+                      >
+                        从断点重试
+                      </button>
+                    ) : null}
+                    {projection.delivery_acceptance?.product_verification?.has_boot_log ? (
+                      <a
+                        className="btn btn-quiet"
+                        href={productArtifactUrl(runId, "boot_log")}
+                        target="_blank"
+                        rel="noopener"
+                      >
+                        查看启动日志
+                      </a>
+                    ) : null}
+                    <button type="button" className="btn" onClick={openCockpit}>
+                      查看完整交付证据
+                    </button>
+                  </div>
+                </section>
+              ) : null}
+
+              {!reviewDelivery && (canRetryWorkflow || runFailed) ? (
                 <section
                   className="hitl-banner"
                   id="quick-drawer-failed"

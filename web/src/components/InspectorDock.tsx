@@ -1,11 +1,14 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import type { DagNode, DeliveryAcceptance, DeliveryCriterion, RunProjection } from "../api/types";
-import { deliveryLogUrl } from "../api/client";
+import { deliveryLogUrl, fetchProductArtifactText, productArtifactUrl } from "../api/client";
 import {
   DELIVERY_STATUS,
   localizeError,
   NODE_LABELS,
+  POST_DAG_OUTCOME,
+  POST_DAG_PHASE,
+  POST_DAG_STATUS,
   RETRY_MESSAGE,
   RETRY_NEXT_STEP,
   statusMeta,
@@ -195,6 +198,14 @@ function TaskBody({ workbench, state, projection, task }: { workbench: Workbench
         </KeyValues>
       </Card>
       {task.accepted_risk_reason ? <Notice level="warn">{`未验证 · 人工接受：${task.accepted_risk_reason}`}</Notice> : null}
+      {task.review_deferred ? (
+        <Notice level="info">单任务命令门禁已通过，独立审查已延后至 Post-DAG 全局交付复核。</Notice>
+      ) : null}
+      {task.escape_hatch_findings && task.escape_hatch_findings.length ? (
+        <Card title={`0-Token 逃生舱预检拦截（累计 ${task.escape_hatch_rejections || task.escape_hatch_findings.length} 次）`}>
+          <pre className="code-block scroller">{task.escape_hatch_findings.join("\n")}</pre>
+        </Card>
+      ) : null}
       <Card title="验收检查">
         <pre className="code-block scroller">{checks || "（暂无验收检查）"}</pre>
       </Card>
@@ -213,6 +224,10 @@ function taskDock(workbench: Workbench, state: WorkbenchState, projection: RunPr
         <Badge variant={meta.variant}>{`${meta.glyph} ${meta.label}`}</Badge>
         <Badge>{`尝试 ${task.attempt} / ${task.max_cycles}`}</Badge>
         <Badge>{`审查 ${task.review_cycle} 轮`}</Badge>
+        {task.review_deferred ? <Badge variant="live">延后至 Post-DAG</Badge> : null}
+        {task.escape_hatch_rejections ? (
+          <Badge variant="warn">{`逃生舱拦截 ×${task.escape_hatch_rejections}`}</Badge>
+        ) : null}
         <Badge>{task.executor}</Badge>
         <Badge>{`角色 ${task.role || "engineer"}`}</Badge>
         <Badge>{`类型 ${task.kind || "implement"}`}</Badge>
@@ -319,6 +334,175 @@ function deliveryDock(projection: RunProjection, review: DeliveryAcceptance, row
   };
 }
 
+function ProductArtifactPreview({
+  runId,
+  kind,
+  title,
+  linkLabel,
+  cacheKey,
+}: {
+  runId: string;
+  kind: "boot_log" | "report";
+  title: string;
+  linkLabel: string;
+  cacheKey: string;
+}) {
+  const [content, setContent] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    setContent(null);
+    setError(null);
+    fetchProductArtifactText(runId, kind)
+      .then((text) => {
+        if (!active) return;
+        setContent(text.length > 16000 ? `${text.slice(0, 16000)}\n…` : text);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setError((err as Error).message || "读取产物失败");
+      });
+    return () => {
+      active = false;
+    };
+  }, [runId, kind, cacheKey]);
+  const url = productArtifactUrl(runId, kind);
+  return (
+    <Card title={title}>
+      {error ? (
+        <Notice level="bad">{error}</Notice>
+      ) : content === null ? (
+        <p className="card-note">正在读取产物…</p>
+      ) : (
+        <pre className="code-block scroller">{content || "（空文件）"}</pre>
+      )}
+      <a className="btn btn-quiet" href={url} target="_blank" rel="noopener">
+        {linkLabel}
+      </a>
+    </Card>
+  );
+}
+
+function productDock(projection: RunProjection): DockContent {
+  const verification = projection.delivery_acceptance?.product_verification ?? null;
+  const postDag = projection.post_dag ?? null;
+  const [postDagLabel, postDagVariant] = postDag
+    ? POST_DAG_STATUS[postDag.status] || POST_DAG_STATUS.idle
+    : POST_DAG_STATUS.idle;
+  const shotUrl = verification?.has_screenshot
+    ? productArtifactUrl(projection.run_id, "screenshot")
+    : null;
+  const cacheKey = `${projection.state_revision}:${verification?.event_seq ?? 0}`;
+  const verdict = postDag?.latest_argus_verdict ?? null;
+  return {
+    title: "实机交付验收 · Product E2E",
+    stages: (
+      <>
+        {verification ? (
+          <Badge variant={verification.passed ? "ok" : "bad"}>
+            {verification.passed ? "✓ 实机通过" : "✕ 实机未通过"}
+          </Badge>
+        ) : null}
+        {postDag ? <Badge variant={postDagVariant}>{postDagLabel}</Badge> : null}
+        {postDag ? <Badge>{`${postDag.total_rounds} 轮记录`}</Badge> : null}
+      </>
+    ),
+    body: (
+      <>
+        {verification ? (
+          <>
+            <Card title="实机验证摘要">
+              <KeyValues>
+                <Row label="结论">{verification.summary || (verification.passed ? "通过" : "未通过")}</Row>
+                <Row label="记录事件" mono>
+                  {`#${verification.event_seq}`}
+                </Row>
+                <Row label="检查数" mono>
+                  {String((verification.checks || []).length)}
+                </Row>
+              </KeyValues>
+              {verification.failures && verification.failures.length ? (
+                <pre className="code-block scroller">{verification.failures.join("\n")}</pre>
+              ) : null}
+            </Card>
+            {shotUrl ? (
+              <Card title="实机首页截图 (home.png)">
+                <a
+                  className="product-dock-shot"
+                  href={shotUrl}
+                  target="_blank"
+                  rel="noopener"
+                  title="在新标签页打开原图"
+                >
+                  <img src={shotUrl} alt="实机首页截图" />
+                </a>
+              </Card>
+            ) : null}
+            {verification.has_boot_log ? (
+              <ProductArtifactPreview
+                runId={projection.run_id}
+                kind="boot_log"
+                title="启动日志 (boot.log)"
+                linkLabel="打开完整启动日志"
+                cacheKey={cacheKey}
+              />
+            ) : null}
+            {verification.has_report ? (
+              <ProductArtifactPreview
+                runId={projection.run_id}
+                kind="report"
+                title="验证报告 (report.json)"
+                linkLabel="打开完整验证报告"
+                cacheKey={cacheKey}
+              />
+            ) : null}
+          </>
+        ) : null}
+        {verdict ? (
+          <Card title="Argus 全局交付复核">
+            <KeyValues>
+              <Row label="结论">
+                <Badge variant={verdict.passed ? "ok" : "bad"}>
+                  {verdict.passed ? "✓ 通过" : "✕ 未通过"}
+                </Badge>
+              </Row>
+              <Row label="摘要">{verdict.summary || "（无摘要）"}</Row>
+            </KeyValues>
+            {verdict.findings && verdict.findings.length ? (
+              <pre className="code-block scroller">
+                {verdict.findings
+                  .map(
+                    (f) =>
+                      `[${f.severity}] ${f.file_path || ""}${f.line ? `:${f.line}` : ""}: ${f.message}${f.repro_command ? `\n  repro: ${f.repro_command}` : ""}`,
+                  )
+                  .join("\n\n")}
+              </pre>
+            ) : null}
+          </Card>
+        ) : null}
+        {postDag && postDag.rounds && postDag.rounds.length ? (
+          <Card title="Post-DAG 轮次历史">
+            <KeyValues>
+              {postDag.rounds.map((round) => {
+                const [label, variant] =
+                  POST_DAG_OUTCOME[round.outcome] || POST_DAG_OUTCOME.completed;
+                return (
+                  <Row
+                    label={`#${round.sequence} · ${POST_DAG_PHASE[round.phase] || round.phase}`}
+                    key={`${round.sequence}-${round.event_seq}`}
+                  >
+                    <Badge variant={variant}>{label}</Badge> <span>{round.summary}</span>
+                  </Row>
+                );
+              })}
+            </KeyValues>
+          </Card>
+        ) : null}
+      </>
+    ),
+  };
+}
+
 function dockContent(workbench: Workbench, state: WorkbenchState): DockContent {
   const projection = state.projection;
   if (!projection) {
@@ -328,6 +512,12 @@ function dockContent(workbench: Workbench, state: WorkbenchState): DockContent {
       tabs: <Tabs workbench={workbench} active={state.activeTab} />,
       body: null,
     };
+  }
+  if (
+    state.productInspection &&
+    (projection.delivery_acceptance?.product_verification || projection.post_dag)
+  ) {
+    return productDock(projection);
   }
   const review = projection.delivery_acceptance;
   const selection = state.deliveryEvidence;

@@ -185,6 +185,7 @@ export interface WorkbenchState {
   selectedTaskId: string | null;
   workflowNode: string | null;
   deliveryEvidence: DeliverySelection | null;
+  productInspection: boolean;
   activeTab: Tab;
   approvalSnapshot: ApprovalSnapshot | null;
   approvalOrigins: Partial<Record<ApprovalAction, ApprovalOrigin>>;
@@ -362,6 +363,7 @@ export class Workbench {
       selectedTaskId: this.params.get("task") || null,
       workflowNode: null,
       deliveryEvidence: null,
+      productInspection: false,
       activeTab: isTab(queryTab) ? queryTab : "overview",
       approvalSnapshot: null,
       approvalOrigins: {},
@@ -759,6 +761,7 @@ export class Workbench {
     if (s.runId !== runId) {
       this.pendingAction = null;
       s.dialog = null;
+      s.productInspection = false;
       const hitlDialog = byId<HTMLDialogElement>("hitl-dialog");
       if (hitlDialog?.open) hitlDialog.close();
     }
@@ -885,7 +888,14 @@ export class Workbench {
     ) {
       s.deliveryEvidence = null;
     }
-    if (!s.deliveryEvidence && !s.workflowNode) {
+    if (
+      s.productInspection &&
+      !projection.delivery_acceptance?.product_verification &&
+      !projection.post_dag
+    ) {
+      s.productInspection = false;
+    }
+    if (!s.deliveryEvidence && !s.workflowNode && !s.productInspection) {
       const task = this.currentTask();
       if (task) s.selectedTaskId = task.task_id;
     }
@@ -964,6 +974,7 @@ export class Workbench {
     const s = this.state;
     if (!s.projection || !taskId) return;
     s.deliveryEvidence = null;
+    s.productInspection = false;
     s.workflowNode = null;
     s.selectedTaskId = taskId;
     s.userOpenedDock = true;
@@ -976,6 +987,7 @@ export class Workbench {
     const s = this.state;
     if (!s.projection || !name) return;
     s.deliveryEvidence = null;
+    s.productInspection = false;
     s.workflowNode = name;
     s.userOpenedDock = true;
     s.dockOpen = true;
@@ -991,10 +1003,29 @@ export class Workbench {
     const s = this.state;
     const review = s.projection?.delivery_acceptance;
     if (!s.projection || !review) return;
+    s.productInspection = false;
+    s.workflowNode = null;
     s.deliveryEvidence = { index, specHash: review.spec_hash, runId: s.projection.run_id };
     s.userOpenedDock = true;
     s.dockOpen = true;
     this.normalizeDock();
+    this.commit();
+    byId("dock-title")?.focus();
+  }
+
+  showProductEvidence(): void {
+    const s = this.state;
+    if (
+      !s.projection ||
+      (!s.projection.delivery_acceptance?.product_verification && !s.projection.post_dag)
+    ) {
+      return;
+    }
+    s.deliveryEvidence = null;
+    s.workflowNode = null;
+    s.productInspection = true;
+    s.userOpenedDock = true;
+    s.dockOpen = true;
     this.commit();
     byId("dock-title")?.focus();
   }
@@ -1042,6 +1073,10 @@ export class Workbench {
     }
     if (output.kind === "plan" && output.current) {
       this.openTaskGraph(s.projection.plan?.content_hash);
+      return;
+    }
+    if (output.artifact_id === "product") {
+      this.showProductEvidence();
       return;
     }
     if (output.current) {

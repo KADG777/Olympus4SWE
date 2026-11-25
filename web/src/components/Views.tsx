@@ -1,6 +1,6 @@
 import { Fragment, type CSSProperties } from "react";
 
-import { statusMeta } from "../lib/labels";
+import { formatDurationMs, statusMeta } from "../lib/labels";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { DesignSpecCard, GoalSpecCard } from "./spec";
 import { Badge, Notice } from "./ui";
@@ -152,45 +152,55 @@ export function WaterfallView({ state }: { state: WorkbenchState }) {
         <Badge id="waterfall-count">{`${turns.length} turns`}</Badge>
       </header>
       <div className="waterfall" id="waterfall-list">
-        {turns.map((turn) => {
-          const meta = statusMeta(turn.status);
-          const offset = Math.min(90, Math.max(0, Number(turn.offset_pct) || 0));
-          const width = Math.min(100 - offset, Math.max(8, Number(turn.width_pct) || 8));
-          const barStyle = { "--wf-offset": `${offset}%`, "--wf-fill": `${width}%` } as CSSProperties;
-          return (
-            <article className="wf-row" data-status={turn.status} key={turn.turn_id}>
-              <div className="wf-actor">
-                <span>{turn.actor}</span>
-                <Badge variant={meta.variant}>{meta.label}</Badge>
-              </div>
-              <div className="wf-main">
-                <span className="wf-title">{turn.title}</span>
-                <span className="wf-summary">{turn.summary}</span>
-                <span className="wf-track">
-                  <span className="wf-bar" style={barStyle} />
-                </span>
-                <span className="wf-summary">{turn.receipt ? turn.receipt.one_line : ""}</span>
-                {turn.manifest_md ? (
-                  <div className="tool-list">
-                    <details className="tool-row">
-                      <summary>
-                        <span className="tool-mark">▤</span>
-                        <span className="tool-name">MANIFEST.md</span>
-                        <span className="tool-target">{turn.title}</span>
-                        <span className="tool-duration" />
-                      </summary>
-                      <pre className="tool-body">{turn.manifest_md}</pre>
-                    </details>
-                  </div>
-                ) : null}
-              </div>
-              <div className="wf-meta">
-                <span>{`${turn.duration_ms} ms`}</span>
-                <span>{`${turn.steps} steps`}</span>
-              </div>
-            </article>
-          );
-        })}
+        {!turns.length ? (
+          <Notice level="info">当前运行尚无已记录的执行回合。</Notice>
+        ) : (
+          turns.map((turn) => {
+            const meta = statusMeta(turn.status);
+            const timed = (Number(turn.duration_ms) || 0) > 0;
+            const offset = Math.min(90, Math.max(0, Number(turn.offset_pct) || 0));
+            const width = Math.min(100 - offset, Math.max(8, Number(turn.width_pct) || 8));
+            const barStyle = { "--wf-offset": `${offset}%`, "--wf-fill": `${width}%` } as CSSProperties;
+            return (
+              <article
+                className="wf-row"
+                data-status={turn.status}
+                data-timed={timed ? "true" : "false"}
+                key={turn.turn_id}
+              >
+                <div className="wf-actor">
+                  <span>{turn.actor}</span>
+                  <Badge variant={meta.variant}>{meta.label}</Badge>
+                </div>
+                <div className="wf-main">
+                  <span className="wf-title">{turn.title}</span>
+                  <span className="wf-summary">{turn.summary}</span>
+                  <span className="wf-track">
+                    <span className="wf-bar" style={barStyle} />
+                  </span>
+                  <span className="wf-summary">{turn.receipt ? turn.receipt.one_line : ""}</span>
+                  {turn.manifest_md ? (
+                    <div className="tool-list">
+                      <details className="tool-row">
+                        <summary>
+                          <span className="tool-mark">▤</span>
+                          <span className="tool-name">MANIFEST.md</span>
+                          <span className="tool-target">{turn.title}</span>
+                          <span className="tool-duration" />
+                        </summary>
+                        <pre className="tool-body">{turn.manifest_md}</pre>
+                      </details>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="wf-meta">
+                  <span>{formatDurationMs(turn.duration_ms)}</span>
+                  <span>{turn.steps > 0 ? `${turn.steps} steps` : "事件节点"}</span>
+                </div>
+              </article>
+            );
+          })
+        )}
       </div>
     </section>
   );

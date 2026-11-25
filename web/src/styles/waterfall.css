@@ -79,6 +79,11 @@
   background: var(--bad);
 }
 
+.wf-row[data-timed="false"] .wf-bar {
+  background: var(--rule-hard);
+  opacity: 0.65;
+}
+
 .wf-meta {
   display: flex;
   flex-direction: column;
