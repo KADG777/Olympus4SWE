@@ -441,7 +441,9 @@ class RunSupervisor:
                 if resynth_failed is not None:
                     return resynth_failed
                 snap = latest_after_resynth
-            effective_raw_input = self._recorded_raw_input(run_id, raw_input)
+            effective_raw_input, entry_restart_seq = self._recorded_raw_input_snapshot(
+                run_id, raw_input
+            )
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
@@ -465,6 +467,7 @@ class RunSupervisor:
             state: dict[str, Any] = {
                 "run_id": run_id,
                 "raw_input": effective_raw_input,
+                "revision_event_seq": entry_restart_seq,
                 "constraints": self._recorded_constraints(run_id),
                 "topology": definition.topology,
                 "route": None,
@@ -483,7 +486,6 @@ class RunSupervisor:
                 state["plan"] = snap["plan"].model_dump(mode="json")
 
             is_align_pass = entry_node is not None and entry_node.type == "align_goal"
-            entry_restart_seq = latest_revision_event_seq(self.store.list_events(run_id))
             try:
                 result = run_graph(
                     graph,
@@ -1072,7 +1074,7 @@ class RunSupervisor:
         """Pick the graph entry point implied by the run's confirmed artifacts."""
         return resolve_resume_node(definition, snap, store=self.store)
 
-    def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
+    def _recorded_raw_input_snapshot(self, run_id: str, fallback: str) -> tuple[str, int]:
         events = self.store.list_events(run_id, after_seq=0)
         base_input = fallback
         for ev in events:
@@ -1080,12 +1082,18 @@ class RunSupervisor:
                 raw = ev.payload.get("raw_input")
                 if isinstance(raw, str) and raw.strip():
                     base_input = raw
+        latest_rev_seq = 0
         for ev in events:
             if ev.event_type in ("run.revision_requested", "run.reopened"):
+                latest_rev_seq = max(latest_rev_seq, ev.event_seq)
                 fb = str(ev.payload.get("feedback") or "").strip()
                 if fb:
                     base_input = f"{base_input}\n\n[User revision feedback]\n{fb}"
-        return base_input
+        return base_input, latest_rev_seq
+
+    def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
+        raw_input, _ = self._recorded_raw_input_snapshot(run_id, fallback)
+        return raw_input
 
     def _recorded_constraints(self, run_id: str) -> list[str]:
         for ev in reversed(self.store.list_events(run_id, after_seq=0)):

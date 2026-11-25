@@ -694,6 +694,7 @@ class AlignStage:
         task_type: str | None = None,
         base_ref: str | None = None,
         scope_paths: Sequence[str] | None = None,
+        expected_revision_event_seq: int | None = None,
     ) -> GoalSpec:
         """Probe repo context, draft GoalSpec, and optionally run cold-start critique.
 
@@ -704,8 +705,27 @@ class AlignStage:
         deterministic inputs: a ``greenfield`` run skips host inventory scanning and a
         ``brownfield`` run binds its scoped paths and git ref into the prompt.
         """
-        entry_restart_seq = latest_revision_event_seq(self.store.list_events(run_id))
-        self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
+        pre_snap = self.store.get_run(run_id)
+        pre_events = self.store.list_events(run_id)
+        entry_restart_seq = (
+            expected_revision_event_seq
+            if expected_revision_event_seq is not None
+            else latest_revision_event_seq(pre_events)
+        )
+        if (
+            pre_snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+            or latest_revision_event_seq(pre_events) > entry_restart_seq
+        ):
+            raise ConcurrencyConflictError(
+                f"Run {run_id} was revised or interrupted before alignment"
+            )
+        self.store.set_run_status(
+            run_id,
+            RunStatus.ALIGNING,
+            expected_revision=int(pre_snap["state_revision"]),
+            actor="align",
+            stage="align",
+        )
         driver, driver_model = resolve_stage_driver(
             settings=self.execution_drivers,
             registry=self.driver_registry,

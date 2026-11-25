@@ -1434,3 +1434,74 @@ def test_second_revision_during_align_generation_prevents_stale_spec_aligned(
     finally:
         allow_rev1_align.set()
         supervisor.shutdown()
+
+
+def test_second_revision_between_prompt_snapshot_and_propose_spec_entry_is_not_lost(
+    tmp_path: Path,
+) -> None:
+    """Revision landing after prompt snapshot and before propose_spec entry must abort stale run."""
+    from unittest.mock import patch
+
+    from olympus.stages.align import AlignStage
+
+    align_prompts: list[str] = []
+    draft = _draft_spec().model_copy(update={"open_ambiguities": []})
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        if "Requirements Alignment Architect" in messages[0].content:
+            user = messages[1].content
+            align_prompts.append(user)
+            spec_id = "spec-rev2" if "第二轮反馈" in user else "spec-rev1"
+            updated = draft.model_copy(update={"spec_id": spec_id})
+            return LLMResponse(content=updated.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {messages[0].content[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        orig_propose = AlignStage.propose_spec
+        injected = False
+
+        def inject_before_propose(stage: AlignStage, **kwargs: object) -> GoalSpec:
+            nonlocal injected
+            if not injected and "第一轮反馈" in str(kwargs.get("raw_goal", "")):
+                injected = True
+                assert client.post(
+                    f"/api/runs/{run_id}/command", json={"action": "pause"}
+                ).status_code == 200
+                assert client.post(
+                    f"/api/runs/{run_id}/command",
+                    json={
+                        "action": "request_revision",
+                        "feedback": "第二轮反馈",
+                        "auto_advance": False,
+                    },
+                ).status_code == 200
+            return orig_propose(stage, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(AlignStage, "propose_spec", inject_before_propose):
+            rev1 = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "request_revision", "feedback": "第一轮反馈", "sync": True},
+            )
+            assert rev1.status_code == 200, rev1.text
+
+        assert injected is True
+        events = app.store.list_events(run_id)
+        rev2_seq = [ev.event_seq for ev in events if ev.event_type == "run.revision_requested"][-1]
+        assert not any(
+            ev.event_seq > rev2_seq and ev.event_type == "spec.aligned" for ev in events
+        )
+
+        retry = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        )
+        assert retry.status_code == 200, retry.text
+        supervisor.wait(run_id, timeout=30)
+        final = _projection(client, run_id)
+        assert final["spec"]["spec_id"] == "spec-rev2"
+        assert "第二轮反馈" in align_prompts[-1]
+    finally:
+        supervisor.shutdown()
