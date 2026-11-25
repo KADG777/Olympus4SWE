@@ -295,18 +295,18 @@ class RunSupervisor:
             snap = self.store.get_run(run_id)
             ws = self.resolve_workspace(run_id)
             definition = load_workflow(snap["workflow_name"])
+            if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                return {
+                    "run_id": run_id,
+                    "workflow": definition.name,
+                    "topology": definition.topology,
+                    "stop_after": definition.stop_after,
+                    "status": snap["status"].value,
+                    "state_revision": snap["state_revision"],
+                    "paused": None,
+                }
             effective_start = start_from
             if recompute_entry:
-                if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
-                    return {
-                        "run_id": run_id,
-                        "workflow": definition.name,
-                        "topology": definition.topology,
-                        "stop_after": definition.stop_after,
-                        "status": snap["status"].value,
-                        "state_revision": snap["state_revision"],
-                        "paused": None,
-                    }
                 resolved = self.resume_node(definition, snap)
                 if snap["status"] == RunStatus.COMPLETED and resolved in (
                     None,
@@ -383,21 +383,24 @@ class RunSupervisor:
                     driver_config=driver_config,
                     workspace_root=ws,
                 )
-                if self._has_pending_restart(run_id):
-                    latest_snap = self.store.get_run(run_id)
+                latest_after_resynth = self.store.get_run(run_id)
+                if self._has_pending_restart(run_id) or latest_after_resynth["status"] in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                ):
                     return {
                         "run_id": run_id,
                         "workflow": definition.name,
                         "topology": definition.topology,
                         "stop_after": definition.stop_after,
-                        "status": latest_snap["status"].value,
-                        "state_revision": latest_snap["state_revision"],
+                        "status": latest_after_resynth["status"].value,
+                        "state_revision": latest_after_resynth["state_revision"],
                         "paused": None,
-                        "superseded": True,
+                        "superseded": self._has_pending_restart(run_id),
                     }
                 if resynth_failed is not None:
                     return resynth_failed
-                snap = self.store.get_run(run_id)
+                snap = latest_after_resynth
             runtime = WorkflowRuntime(
                 store=self.store,
                 workspace_root=ws,
@@ -581,7 +584,10 @@ class RunSupervisor:
                 strict_canonical=definition.align_strict_canonical(),
             )
         except Exception as exc:  # noqa: BLE001 - pause in place, never drop human answers
-            if self._has_pending_restart(run_id):
+            if self._has_pending_restart(run_id) or self.store.get_run(run_id)["status"] in (
+                RunStatus.PAUSED,
+                RunStatus.CANCELLED,
+            ):
                 return None
             return self._pause_after_resynthesis_failure(run_id, definition, spec, exc)
         return None
@@ -696,6 +702,14 @@ class RunSupervisor:
                     self._active_tokens.pop(run_id, None)
                     return result
             if pending_restart is not None:
+                if self.store.get_run(run_id)["status"] in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                ):
+                    with self._guard:
+                        if self._active_tokens.get(run_id) == token:
+                            self._active_tokens.pop(run_id, None)
+                    return result
                 _, current_start, current_raw_input = pending_restart
                 current_recompute = False
                 continue
@@ -975,12 +989,23 @@ class RunSupervisor:
         return resolve_resume_node(definition, snap, store=self.store)
 
     def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
-        for ev in reversed(self.store.list_events(run_id, after_seq=0)):
+        events = self.store.list_events(run_id, after_seq=0)
+        base_input = fallback
+        last_input_seq = 0
+        for ev in events:
             if ev.event_type == "graph.input_recorded":
                 raw = ev.payload.get("raw_input")
                 if isinstance(raw, str) and raw.strip():
-                    return raw
-        return fallback
+                    base_input = raw
+                    last_input_seq = ev.event_seq
+        for ev in events:
+            if ev.event_seq <= last_input_seq:
+                continue
+            if ev.event_type in ("run.revision_requested", "run.reopened"):
+                fb = str(ev.payload.get("feedback") or "").strip()
+                if fb:
+                    base_input = f"{base_input}\n\n[User revision feedback]\n{fb}"
+        return base_input
 
     def _recorded_constraints(self, run_id: str) -> list[str]:
         for ev in reversed(self.store.list_events(run_id, after_seq=0)):
@@ -1063,10 +1088,9 @@ class RunSupervisor:
         if not clean:
             raise ValueError("revise_run requires non-empty feedback")
         snap = self.store.get_run(run_id)
-        augmented = (
-            f"{self._recorded_raw_input(run_id, str(snap['title']))}"
-            f"\n\n[User revision feedback]\n{clean}"
-        )
+        recorded = self._recorded_raw_input(run_id, str(snap["title"]))
+        feedback_block = f"\n\n[User revision feedback]\n{clean}"
+        augmented = recorded if recorded.endswith(feedback_block) else f"{recorded}{feedback_block}"
         definition = load_workflow(snap["workflow_name"])
         align_node = next(
             (node.name for node in definition.nodes if node.type == "align_goal"), None

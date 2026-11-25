@@ -602,6 +602,17 @@ def unconsumed_clarification_notes(
     ]
 
 
+def _clarify_event_has_input(payload: dict[str, object]) -> bool:
+    """Distinguish real human clarification submissions from empty no-op ``clarify({})`` calls."""
+    tracked_keys = ("answered_ids", "resolved_note_ids", "added_out_of_scope")
+    if any(key in payload for key in tracked_keys):
+        return any(
+            isinstance(payload.get(key), list) and bool(payload.get(key))
+            for key in tracked_keys
+        )
+    return True
+
+
 def has_pending_resynthesis(
     events: Sequence[RunEvent],
     spec: GoalSpec | None,
@@ -615,19 +626,27 @@ def has_pending_resynthesis(
     if unconsumed_clarification_notes(events, spec_id=spec.spec_id):
         return True
     saw_clarification = False
+    saw_prior_resynthesis = False
     for event in reversed(list(events)):
         if event.event_type in _CLARIFICATION_WINDOW_RESETS:
             break
         if event.event_type == "spec.resynthesized":
             if event.payload.get("spec_id") in (None, "", spec.spec_id):
-                return False
+                saw_prior_resynthesis = True
+                break
             continue
-        if event.event_type in ("spec.clarified", "spec.clarification_note") and (
-            event.payload.get("spec_id") in (None, "", spec.spec_id)
+        if event.payload.get("spec_id") in (None, "", spec.spec_id) and (
+            event.event_type == "spec.clarification_note"
+            or (
+                event.event_type == "spec.clarified"
+                and _clarify_event_has_input(event.payload)
+            )
         ):
             saw_clarification = True
     if not saw_clarification:
         return False
+    if saw_prior_resynthesis:
+        return True
     return _needs_clarification_resynthesis(spec, [], strict_canonical=strict_canonical)
 
 
@@ -907,9 +926,11 @@ class AlignStage:
                 f"Cannot resynthesize GoalSpec {current.spec_id} with unresolved blockers: "
                 f"{current.unresolved_blockers()}"
             )
+        initial_events = self.store.list_events(run_id)
+        start_event_seq = initial_events[-1].event_seq if initial_events else 0
         initial_note_ids = [
             ev.event_id
-            for ev in self.store.list_events(run_id)
+            for ev in initial_events
             if ev.event_type == "spec.clarification_note"
             and ev.payload.get("spec_id") in (None, "", current.spec_id)
         ]
@@ -1029,21 +1050,14 @@ class AlignStage:
             validator=validation_gate,
             on_validation_exhausted=record_validation_failure,
         )
-        if exhausted_violations:
-            self.store.append_event(
-                run_id=run_id,
-                stage="align",
-                event_type="spec.validation_failed",
-                actor="align",
-                payload={
-                    "violations": list(exhausted_violations),
-                    "spec_hash": current.content_hash,
-                },
-            )
-            raise ValueError(
-                "GoalSpec resynthesis failed validation: " + "; ".join(exhausted_violations)
-            )
         latest = self.store.get_run(run_id)
+        new_events = self.store.list_events(run_id, after_seq=start_event_seq)
+        if latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED) or any(
+            ev.event_type in ("run.revision_requested", "run.reopened") for ev in new_events
+        ):
+            raise ConcurrencyConflictError(
+                f"Run {run_id} was revised or interrupted during resynthesis"
+            )
         latest_spec: GoalSpec | None = latest["spec"]
         latest_note_ids = [
             ev.event_id
@@ -1061,6 +1075,20 @@ class AlignStage:
             raise ConcurrencyConflictError(
                 f"GoalSpec or clarification notes changed concurrently during resynthesis "
                 f"for run {run_id}"
+            )
+        if exhausted_violations:
+            self.store.append_event(
+                run_id=run_id,
+                stage="align",
+                event_type="spec.validation_failed",
+                actor="align",
+                payload={
+                    "violations": list(exhausted_violations),
+                    "spec_hash": current.content_hash,
+                },
+            )
+            raise ValueError(
+                "GoalSpec resynthesis failed validation: " + "; ".join(exhausted_violations)
             )
         updated = lock_deterministic_fields(draft)
         self.store.save_spec(

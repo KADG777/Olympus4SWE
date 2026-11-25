@@ -387,6 +387,9 @@ class RunControl:
                         "version": next_spec.version,
                         "spec_hash": next_spec.content_hash,
                         "remaining_blockers": next_spec.unresolved_blockers(),
+                        "answered_ids": sorted(answers.keys()),
+                        "resolved_note_ids": sorted(res_map.keys()),
+                        "added_out_of_scope": list(extra_out_of_scope or []),
                     },
                 )
             ]

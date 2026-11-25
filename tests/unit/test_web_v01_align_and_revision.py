@@ -594,6 +594,11 @@ def test_request_revision_during_inflight_resynthesis_realigns_with_feedback(
         supervisor.wait(run_id, timeout=30)
 
         after = _projection(client, run_id)
+        events = app.store.list_events(run_id)
+        rev_seq = next(ev.event_seq for ev in events if ev.event_type == "run.revision_requested")
+        assert not any(
+            ev.event_type == "spec.resynthesized" and ev.event_seq > rev_seq for ev in events
+        )
         assert len(align_prompts) == 2
         assert "改为按周汇总并保留下载历史" in align_prompts[1]
         assert after["spec"]["spec_id"] == "spec-orders-weekly"
@@ -601,6 +606,168 @@ def test_request_revision_during_inflight_resynthesis_realigns_with_feedback(
         assert after["pending_resynthesis"] is False
     finally:
         allow_resynth.set()
+        supervisor.shutdown()
+
+
+def test_queued_revision_respects_subsequent_human_pause(tmp_path: Path) -> None:
+    """Pause arriving after a coalesced revision must keep the run paused."""
+    resynth_entered = threading.Event()
+    allow_resynth = threading.Event()
+    align_calls = 0
+    answers = {"A1-format": "Excel 工作簿", "A2-scope": "全量订单"}
+    draft = _draft_spec()
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal align_calls
+        del tools
+        system = messages[0].content
+        if "Fuse EVERY human clarification" in system:
+            resynth_entered.set()
+            assert allow_resynth.wait(timeout=10.0)
+            return LLMResponse(content=_fused_spec(draft, answers, []).model_dump_json())
+        if "Requirements Alignment Architect" in system:
+            align_calls += 1
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {system[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        assert align_calls == 1
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "clarify", "answers": answers},
+        ).status_code == 200
+        assert resynth_entered.wait(timeout=10.0)
+
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "request_revision", "feedback": "改为按月导出"},
+        ).status_code == 200
+        paused_resp = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "pause"},
+        )
+        assert paused_resp.status_code == 200, paused_resp.text
+        assert paused_resp.json()["projection"]["status"] == "paused"
+
+        allow_resynth.set()
+        supervisor.wait(run_id, timeout=30)
+
+        after = _projection(client, run_id)
+        assert after["status"] == "paused"
+        assert align_calls == 1
+    finally:
+        allow_resynth.set()
+        supervisor.shutdown()
+
+
+def test_persisted_revision_auto_advance_false_preserves_feedback_on_retry(
+    tmp_path: Path,
+) -> None:
+    """Retry after request_revision(auto_advance=False) must pass saved feedback to align."""
+    align_prompts: list[str] = []
+    draft = _draft_spec()
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system = messages[0].content
+        user = messages[1].content
+        if "Requirements Alignment Architect" in system:
+            align_prompts.append(user)
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {system[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        rev = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "request_revision",
+                "feedback": "新增按门店维度分组导出",
+                "auto_advance": False,
+            },
+        )
+        assert rev.status_code == 200, rev.text
+        retry = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        )
+        assert retry.status_code == 200, retry.text
+        supervisor.wait(run_id, timeout=30)
+
+        assert len(align_prompts) == 2
+        assert "新增按门店维度分组导出" in align_prompts[1]
+    finally:
+        supervisor.shutdown()
+
+
+def test_second_clarify_after_resynthesis_triggers_fresh_resynthesis(tmp_path: Path) -> None:
+    """Changing an answer after a prior resynthesis must re-enter resynthesis before approval."""
+    first_answers = {"A1-format": "Excel 工作簿", "A2-scope": "全量订单"}
+    second_answers = {"A1-format": "PDF 报表", "A2-scope": "全量订单"}
+    draft = _draft_spec()
+    resynth_calls = 0
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal resynth_calls
+        del tools
+        system = messages[0].content
+        user = messages[1].content
+        if "Fuse EVERY human clarification" in system:
+            resynth_calls += 1
+            active_answers = second_answers if "PDF 报表" in user else first_answers
+            return LLMResponse(content=_fused_spec(draft, active_answers, []).model_dump_json())
+        if "Requirements Alignment Architect" in system:
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {system[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        r1 = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "clarify", "answers": first_answers},
+        )
+        assert r1.status_code == 200, r1.text
+        supervisor.wait(run_id, timeout=30)
+        assert resynth_calls == 1
+
+        # Second clarify changes Excel -> PDF without advancing yet: must mark pending & block.
+        r2 = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "clarify",
+                "answers": {"A1-format": "PDF 报表"},
+                "auto_advance": False,
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        pending = _projection(client, run_id)
+        assert pending["pending_resynthesis"] is True
+
+        blocked = client.post(
+            f"/api/runs/{run_id}/command",
+            json={
+                "action": "approve_spec",
+                "target_hash": pending["spec"]["content_hash"],
+                "expected_state_revision": pending["state_revision"],
+            },
+        )
+        assert blocked.status_code == 400, blocked.text
+
+        resumed = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        )
+        assert resumed.status_code == 200, resumed.text
+        supervisor.wait(run_id, timeout=30)
+        assert resynth_calls == 2
+        final = _projection(client, run_id)
+        assert final["pending_resynthesis"] is False
+        assert any("PDF 报表" in c for c in final["spec"]["constraints"])
+    finally:
         supervisor.shutdown()
 
 

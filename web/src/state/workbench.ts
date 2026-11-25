@@ -1322,19 +1322,19 @@ export class Workbench {
     const projection = this.state.projection;
     if (!projection) return;
     const note = clarificationNote.trim();
-    const missing = pendingAmbiguities(projection).filter((amb) => amb.blocking && !answers[amb.id]);
-    if (missing.length) {
-      this.toast(`还有 ${missing.length} 个阻断歧义未回答`);
-      return;
-    }
     if (!Object.keys(answers).length && !note) {
-      this.toast("请先回答澄清问题或填写补充说明");
+      this.toast("请先回答至少一项澄清问题或填写补充说明");
       return;
     }
+    const remaining = pendingAmbiguities(projection).filter(
+      (amb) => amb.blocking && !answers[amb.id],
+    );
     this.state.clarifyGeneration += 1;
     await this.sendCommand(
       { action: "clarify", answers, clarification_note: note },
-      "已提交澄清并生成新的 GoalSpec 版本",
+      remaining.length
+        ? "已保存澄清进度，仍可继续回答剩余阻断项"
+        : "已提交澄清并生成新的 GoalSpec 版本",
     );
   }
 
