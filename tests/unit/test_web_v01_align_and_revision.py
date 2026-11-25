@@ -1341,3 +1341,96 @@ def test_second_revision_during_align_aborts_stale_graph_events_and_retries_alig
         assert _projection(client, run_id)["status"] == "awaiting_human"
     finally:
         supervisor.shutdown()
+
+
+def test_confirm_spec_with_approver_align_does_not_fulfill_revision(tmp_path: Path) -> None:
+    """Legacy confirm_spec(approver='align') must not be mistaken for AlignStage realignment."""
+    from olympus.core.control import RunControl, has_unfulfilled_revision
+    from olympus.graph.loader import load_workflow
+    from olympus.graph.progress import resolve_resume_node
+
+    store = RunStore(tmp_path / "legacy-confirm.db")
+    run_id = store.create_run(title="Legacy Confirm Actor", workflow_name="product_blueprint")
+    spec = _draft_spec().model_copy(update={"open_ambiguities": []})
+    store.save_spec(run_id, spec, actor="align")
+    store.set_run_status(run_id, RunStatus.AWAITING_HUMAN, actor="align", stage="align")
+    control = RunControl(store)
+    control.request_revision(run_id, feedback="需要重新对齐", actor="zeus")
+
+    # Even if confirm_spec is invoked directly with approver="align", spec.saved has status
+    # "confirmed" and approval.recorded lands at rev+1, so revision remains unfulfilled.
+    control.confirm_spec(run_id, approver="align", reason="legacy")
+    assert has_unfulfilled_revision(store.list_events(run_id)) is True
+    definition = load_workflow("product_blueprint")
+    assert resolve_resume_node(definition, store.get_run(run_id), store=store) == "align"
+
+
+def test_second_revision_during_align_generation_prevents_stale_spec_aligned(
+    tmp_path: Path,
+) -> None:
+    """Pause + second revision arriving during Align LLM turn must abort stale spec.aligned."""
+    in_rev1_align = threading.Event()
+    allow_rev1_align = threading.Event()
+    align_prompts: list[str] = []
+    draft = _draft_spec().model_copy(update={"open_ambiguities": []})
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        if "Requirements Alignment Architect" in messages[0].content:
+            user = messages[1].content
+            align_prompts.append(user)
+            if "第一轮反馈" in user and "第二轮反馈" not in user:
+                in_rev1_align.set()
+                assert allow_rev1_align.wait(timeout=10.0)
+                stale_spec = draft.model_copy(update={"spec_id": "spec-stale-rev1"})
+                return LLMResponse(content=stale_spec.model_dump_json())
+            if "第二轮反馈" in user:
+                fresh_spec = draft.model_copy(update={"spec_id": "spec-fresh-rev2"})
+                return LLMResponse(content=fresh_spec.model_dump_json())
+            return LLMResponse(content=draft.model_dump_json())
+        raise AssertionError(f"Unexpected prompt: {messages[0].content[:100]}")
+
+    app, supervisor, client = _make_app(tmp_path, responder)
+    try:
+        run_id = _start_run(supervisor)
+        rev1_res: list[int] = []
+
+        def run_rev1() -> None:
+            r = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "request_revision", "feedback": "第一轮反馈", "sync": True},
+            )
+            rev1_res.append(r.status_code)
+
+        t = threading.Thread(target=run_rev1)
+        t.start()
+        assert in_rev1_align.wait(timeout=10.0)
+
+        pause_res = client.post(f"/api/runs/{run_id}/command", json={"action": "pause"})
+        assert pause_res.status_code == 200
+        assert client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "request_revision", "feedback": "第二轮反馈", "auto_advance": False},
+        ).status_code == 200
+        allow_rev1_align.set()
+        t.join(timeout=15.0)
+        assert rev1_res == [200]
+
+        events = app.store.list_events(run_id)
+        rev2_seq = [ev.event_seq for ev in events if ev.event_type == "run.revision_requested"][-1]
+        assert not any(
+            ev.event_seq > rev2_seq and ev.event_type == "spec.aligned" for ev in events
+        )
+
+        retry = client.post(
+            f"/api/runs/{run_id}/command",
+            json={"action": "retry_workflow", "sync": True},
+        )
+        assert retry.status_code == 200, retry.text
+        supervisor.wait(run_id, timeout=30)
+        final = _projection(client, run_id)
+        assert final["spec"]["spec_id"] == "spec-fresh-rev2"
+        assert final["status"] == "awaiting_human"
+    finally:
+        allow_rev1_align.set()
+        supervisor.shutdown()

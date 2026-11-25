@@ -59,7 +59,14 @@ def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
         ev.state_revision
         for ev in events
         if ev.event_seq > latest_restart_seq
-        and ev.event_type in ("spec.clarified", "approval.recorded", "spec.resynthesized")
+        and ev.event_type in ("spec.clarified", "spec.resynthesized")
+    }
+    approval_revs = {
+        ev.state_revision
+        for ev in events
+        if ev.event_seq > latest_restart_seq
+        and ev.event_type == "approval.recorded"
+        and ev.payload.get("target") == ApprovalTarget.GOAL_SPEC.value
     }
     return not any(
         ev.event_seq > latest_restart_seq
@@ -68,7 +75,10 @@ def has_unfulfilled_revision(events: Sequence[RunEvent]) -> bool:
             or (
                 ev.event_type == "spec.saved"
                 and ev.actor == "align"
+                and ev.payload.get("status") != SpecStatus.CONFIRMED.value
                 and ev.state_revision not in non_align_revs
+                and (ev.state_revision + 1) not in approval_revs
+                and ev.state_revision not in approval_revs
             )
         )
         for ev in events

@@ -21,6 +21,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import (
     RunControl,
+    latest_revision_event_seq,
 )
 from olympus.core.control import (
     has_unfulfilled_revision as has_unfulfilled_revision,
@@ -703,6 +704,7 @@ class AlignStage:
         deterministic inputs: a ``greenfield`` run skips host inventory scanning and a
         ``brownfield`` run binds its scoped paths and git ref into the prompt.
         """
+        entry_restart_seq = latest_revision_event_seq(self.store.list_events(run_id))
         self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
         driver, driver_model = resolve_stage_driver(
             settings=self.execution_drivers,
@@ -813,10 +815,20 @@ class AlignStage:
                 "status": SpecStatus.AWAITING_HUMAN,
             }
         )
-        self.store.save_spec(
+        latest = self.store.get_run(run_id)
+        latest_events = self.store.list_events(run_id)
+        if (
+            latest["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+            or latest_revision_event_seq(latest_events) > entry_restart_seq
+        ):
+            raise ConcurrencyConflictError(
+                f"Run {run_id} was revised or interrupted during alignment"
+            )
+        saved_rev = self.store.save_spec(
             run_id,
             spec,
             actor="align",
+            expected_revision=int(latest["state_revision"]),
             extra_events=[
                 (
                     "align",
@@ -839,10 +851,12 @@ class AlignStage:
                     "violations": list(exhausted_violations),
                     "spec_hash": spec.content_hash,
                 },
+                expected_state_revision=saved_rev,
             )
         self.store.set_run_status(
             run_id,
             RunStatus.AWAITING_HUMAN,
+            expected_revision=saved_rev,
             actor="align",
             stage="align",
             detail={

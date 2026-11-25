@@ -497,18 +497,21 @@ class RunSupervisor:
                     start_from=effective_start,
                 )
             except Exception as exc:
+                latest_after_exc = self.store.get_run(run_id)
                 if self._has_pending_restart(run_id) or (
                     isinstance(exc, ConcurrencyConflictError)
-                    and has_unfulfilled_revision(self.store.list_events(run_id))
+                    and (
+                        has_unfulfilled_revision(self.store.list_events(run_id))
+                        or latest_after_exc["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED)
+                    )
                 ):
-                    latest_snap = self.store.get_run(run_id)
                     return {
                         "run_id": run_id,
                         "workflow": definition.name,
                         "topology": definition.topology,
                         "stop_after": definition.stop_after,
-                        "status": latest_snap["status"].value,
-                        "state_revision": latest_snap["state_revision"],
+                        "status": latest_after_exc["status"].value,
+                        "state_revision": latest_after_exc["state_revision"],
                         "paused": None,
                     }
                 raise
