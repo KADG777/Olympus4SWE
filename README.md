@@ -14,9 +14,9 @@ Olympus4SWE pairs a **deterministic SDLC control plane** (Python 3.13 + SQLite W
 
 Olympus4SWE is designed from first principles around four irreducible failure modes in agentic software engineering—without adopting opaque, black-box orchestration frameworks:
 
-1. **Ambiguous intent → building the wrong system**: Stage 1 (`Align`) inspects the repository read-only, surfaces blocking ambiguities (with optional cold-start parallel critiques), and freezes a human-approved EARS `GoalSpec` with explicit `out_of_scope` boundaries before code is written.
-2. **Long-horizon context rot & concurrent write collisions**: Stage 2a (`Design`) locks white-box module boundaries and interface seams (`DesignSpec`), while the planner emits a validated Task DAG with strictly disjoint `write_scope` assignments executed in isolated `git worktree` sandboxes and verified by a post-flight `Diff Gate`.
-3. **Self-review confirmation bias**: Cold-start `Momus` (code review) and `Argus` (independent verification) inspect diffs and executable check outputs against frozen contracts with **zero shared conversation history** with the implementer, grading `Important` vs. `Nit` defects under bounded rework limits (`max_cycles=3`).
+1. **Ambiguous intent → building the wrong system**: Stage 1 (`Align`) inspects the repository read-only, surfaces blocking ambiguities (with optional cold-start parallel critiques), preserves human clarification notes via async resynthesis, and freezes a human-approved EARS `GoalSpec` with explicit `out_of_scope` boundaries before code is written.
+2. **Long-horizon context rot & concurrent write collisions**: Stage 2a (`Design`) locks white-box module boundaries and interface seams (`DesignSpec`), while the planner emits a validated Task DAG (with parallel vertical slicing in `tdd_first` and `vertical_slices` topologies) enforcing strictly disjoint `write_scope` assignments across concurrent tasks in isolated `git worktree` sandboxes, verified by a post-flight `Diff Gate`.
+3. **Self-review confirmation bias**: The orchestrator runs a 0-token escape-hatch pre-gate and clean-directory product E2E checks (`verify_product`), while cold-start `Momus` (code review) and `Argus` (independent verification, defaulting to `pi` when installed on an eligible remote provider) inspect diffs and check outputs against frozen contracts with **zero shared conversation history** with `Hephaestus`. Defects are graded `Important` vs. `Nit` under bounded rework limits (`max_cycles=3` per task; default `max_repair_rounds=2` for multi-task post-DAG unified review and repair).
 4. **Black-box runs that are hard to monitor or steer**: Every state transition, milestone, diff, delivery check, and human ruling is recorded in an append-only SQLite event store projected live over SSE, while operators can issue mid-turn `steer` guidance or pause safely without discarding work.
 
 ---
@@ -40,11 +40,11 @@ flowchart LR
 | **Athena** *(Design & Plan)* | Authors the white-box `DesignSpec` (modules, data models, interfaces) and decomposes work into a validated dependency `TaskPlan` DAG. |
 | **Hephaestus** *(Build)* | Implements each `TaskNode` inside an isolated sandbox via its configured `AgentDriver` (`auto`, `pi`, or `native`). |
 | **Momus** *(Review & Audit)* | Cold-start diff reviewer classifying `Important` vs. `Nit` defects and enforcing bounded convergence. |
-| **Argus** *(Verify)* | Cold-start read-only verifier auditing sandbox diffs and isolated delivery checks against frozen upstream contracts. |
+| **Argus** *(Verify)* | Cold-start read-only verifier (defaulting to `pi` when installed on an eligible remote provider) auditing sandbox diffs, post-DAG unified multi-task reviews, and orchestrator-run delivery/E2E evidence (`verify_product`) against frozen upstream contracts. |
 
 The **Web Workbench** exposes two coordinated surfaces over the same SQLite event stream:
-- **L1 · Oracle Board**: Multi-workspace switching, Ball-in-Court columns (`Awaiting Your Ruling` · `In Flight` · `Delivered`), inline **Quick Ruling Drawer** for clarifications/approvals, and the pinned five-seat **Pantheon Dock**.
-- **L2 · Ariadne Cockpit**: Deep-dive tabs per Oracle featuring dual live topologies (Workflow Graph + Task DAG via React Flow + ELK), hash-bound contract diff reviews, task matrix, event waterfall, and resizable inspector dock.
+- **L1 · Oracle Board**: Multi-workspace switching, Ball-in-Court columns (`Awaiting Your Ruling` · `In Flight · Pantheon Active` · `Delivered & Verified`), inline **Quick Ruling Drawer** for clarifications/approvals/revisions, and the pinned five-seat **Pantheon Dock**.
+- **L2 · Ariadne Cockpit**: Deep-dive tabs per Oracle featuring dual live topologies (Workflow Graph + Task DAG via React Flow + ELK), hash-bound contract diff reviews with explicit revision gates, Product E2E screenshots and Post-DAG timelines, task matrix, event waterfall, and resizable inspector dock.
 
 ---
 
@@ -165,7 +165,7 @@ uv run olympus accept-risk <run_id> <task_id> --revision <n> --reason "Accepted 
 
 ## Meta-Harness: Pluggable Execution Drivers
 
-Per [ADR-0002](docs/adr/0002-meta-harness-driver-and-watchdog.md), Olympus4SWE separates its deterministic SDLC control plane from agent execution loops behind the `AgentDriver` protocol:
+Per [ADR-0002](docs/adr/0002-meta-harness-driver-and-watchdog.md), Olympus4SWE separates its deterministic SDLC control plane from agent execution loops behind the `AgentDriver` protocol. The LLM Watchdog described in ADR-0002 was removed in `v0.1.0` (`#140`); runtime safety now relies on deterministic post-flight `Diff Gate` checks, 0-token escape-hatch pre-gates, and cold-start `Argus` / `verify_product` verification.
 
 - **Default `auto` resolution**: `stage_driver`, `worker_driver`, and `reviewer_driver` default to `auto`. On a real remote provider when the `pi` CLI is installed, `auto` selects `pi` (with `--mode rpc`, live milestones, mid-turn `steer`, and read-only tool lockdown for planning/review stages). In offline tests or zero-Node environments, `auto` transparently falls back to the built-in pure-Python `native` driver.
 - **Role-scoped heterogeneous overrides**: Mix drivers and models across roles via CLI flags (`--stage-driver`, `--worker-driver`, `--reviewer-driver`) or environment variables (`OLYMPUS_STAGE_DRIVER`, `OLYMPUS_WORKER_DRIVER`, `OLYMPUS_REVIEWER_DRIVER`), using `auto`, `pi`, `native`, or `driver@model`:
@@ -193,13 +193,14 @@ Olympus4SWE/
 │   ├── core/          # Strict Pydantic contracts, SHA-256 fingerprints, DAG/scope validation, SQLite store, RunControl
 │   ├── providers/     # Pluggable LLM registry, sticky failover pool, thin official OpenAI/Anthropic SDK dialects
 │   ├── tools/         # Safe ACI file/shell primitives with absolute-path enforcement and bounded output
-│   ├── harness/       # Append-only loop, AgentDriver (native + pi), DiffGate, worktree sandbox, TurnReceipt
-│   ├── stages/        # Stage 1 Align, Stage 2a Design, Stage 2 Orchestrate & Verify
+│   ├── harness/       # Append-only loop, AgentDriver (native + pi), DiffGate, escape hatches, worktree sandbox, TurnReceipt
+│   ├── stages/        # Stage 1 Align, Stage 2a Design, Stage 2 Orchestrate, post-DAG Argus & verify_product
 │   ├── graph/         # Declarative YAML workflow loader, blackboard engine, conditional routing, progress projection
 │   ├── session/       # Headless pause/resume runner, gate policies, and natural-language reply router
 │   ├── web/           # FastAPI server, strict OpenAPI schema (openapi.json), SSE streams, RunSupervisor, static SPA
 │   └── cli/           # Typer CLI (olympus & olympus session)
 ├── web/               # React 19 + TypeScript + Vite SPA (Oracle Board & Ariadne) consuming generated OpenAPI types
+├── tools/             # Optional standalone operational utilities (api-key-ledger rotation proxy)
 ├── tests/
 │   ├── unit/          # Unit, contract, architecture invariant, design-system, and Playwright browser E2E tests
 │   └── evals/         # Isolated evaluation harness, datasets, scorers, and external benchmark adapters
@@ -264,9 +265,10 @@ Cross-version full-lifecycle metrics and runnable archived overlays are tracked 
 
 ## Documentation & Contributing
 
+- **Release History**: [CHANGELOG.md](CHANGELOG.md)
 - **Architecture & Principles**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - **Architecture Decision Records**:
-  - [ADR-0002: Meta-Harness AgentDriver Seam, Diff Gate, and Two-Tier Watchdog](docs/adr/0002-meta-harness-driver-and-watchdog.md)
+  - [ADR-0002: Meta-Harness AgentDriver Seam and Post-Flight Diff Gate](docs/adr/0002-meta-harness-driver-and-watchdog.md) *(historical; LLM Watchdog removed in `v0.1.0`)*
   - [ADR-0003: Pragmatic Build-vs-Buy Foundation](docs/adr/0003-pragmatic-foundation-fastapi-react-sdks.md)
 - **Canonical Domain Glossary**: [GLOSSARY.md](GLOSSARY.md)
 - **Technical & Agent Guide**: [AGENTS.md](AGENTS.md)
