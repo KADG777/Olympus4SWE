@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <style>
+    .frame { fill: #f2e2c8; fill-opacity: 0.78; stroke: #a8621b; }
+    .peak { stroke: #8a4d12; }
+    .base { stroke: #a8621b; opacity: 0.9; }
+    .core { fill: #8a4d12; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #372a18; fill-opacity: 0.9; stroke: #d99a4c; }
+      .peak { stroke: #eebc7b; }
+      .base { stroke: #d99a4c; }
+      .core { fill: #eebc7b; }
+    }
+  </style>
+  <path class="frame" d="M12 2L22 12L12 22L2 12Z" stroke-width="1.65" stroke-linejoin="miter"/>
+  <path class="peak" d="M7.5 14.25L12 7.75L16.5 14.25" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+  <path class="base" d="M9 16.5H15" stroke-width="1.5" stroke-linecap="round"/>
+  <path class="core" d="M12 11.2L13.45 12.65L12 14.1L10.55 12.65Z"/>
+</svg>
