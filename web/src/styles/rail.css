@@ -23,15 +23,19 @@
   align-items: center;
   gap: var(--space-2);
   min-inline-size: 0;
-  padding: var(--space-1);
+  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-1);
   border-radius: var(--radius);
   background: transparent;
   cursor: pointer;
-  transition: background-color var(--motion-fast);
+  transition: background-color var(--motion-fast), transform var(--motion-fast);
 }
 
 .rail-brand:hover {
   background: var(--surface-sunk);
+}
+
+.rail-brand:active {
+  transform: scale(0.98);
 }
 
 .rail-brand:focus-visible {
@@ -40,20 +44,66 @@
 }
 
 .rail-mark {
-  font-family: var(--face-display);
-  font-size: var(--text-lg);
-  color: var(--accent-fg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 22px;
+  block-size: 22px;
+  flex: 0 0 auto;
+}
+
+.rail-mark-svg {
+  inline-size: 22px;
+  block-size: 22px;
+  display: block;
+}
+
+.rail-mark-frame {
+  fill: var(--accent-soft);
+  fill-opacity: 0.42;
+  stroke: var(--accent);
+  transition: fill-opacity var(--motion-fast), stroke var(--motion-fast);
+}
+
+.rail-mark-peak {
+  stroke: var(--accent-fg);
+  transition: stroke var(--motion-fast);
+}
+
+.rail-mark-base {
+  stroke: var(--accent);
+  opacity: 0.85;
+}
+
+.rail-mark-core {
+  fill: var(--accent-fg);
+}
+
+.rail-brand:hover .rail-mark-frame {
+  fill-opacity: 0.72;
+  stroke: var(--accent-fg);
 }
 
 .rail-wordmark {
-  font-family: var(--face-sans);
-  font-size: var(--text-base);
+  font-family: var(--face-display);
+  font-size: var(--text-lg);
   font-weight: var(--font-weight-medium);
   letter-spacing: var(--tracking-label);
+  line-height: 1;
   text-transform: uppercase;
   color: var(--text-ink);
   white-space: nowrap;
   overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-brand {
+    transition: background-color var(--motion-fast);
+  }
+
+  .rail-brand:active {
+    transform: none;
+  }
 }
 
 .rail-actions {
@@ -423,6 +473,12 @@ body[data-rail="collapsed"] .rail-head-row,
 #rail.collapsed .rail-head-row {
   flex-direction: column;
   align-items: center;
+}
+
+body[data-rail="collapsed"] .rail-brand,
+#rail.collapsed .rail-brand {
+  justify-content: center;
+  padding: var(--space-1);
 }
 
 body[data-rail="collapsed"] .rail-head-actions,

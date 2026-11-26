@@ -3,6 +3,36 @@ import type { Workbench, WorkbenchState } from "../state/workbench";
 
 const REGISTER_OPTION = "__register__";
 
+function OlympusMark() {
+  return (
+    <svg className="rail-mark-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        className="rail-mark-frame"
+        d="M12 2L22 12L12 22L2 12Z"
+        strokeWidth="1.35"
+        strokeLinejoin="miter"
+      />
+      <path
+        className="rail-mark-peak"
+        d="M7.5 14.25L12 7.75L16.5 14.25"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        className="rail-mark-base"
+        d="M9 16.5H15"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+      />
+      <path
+        className="rail-mark-core"
+        d="M12 11.4L13.25 12.65L12 13.9L10.75 12.65Z"
+      />
+    </svg>
+  );
+}
+
 function BoardIcon() {
   return (
     <svg className="rail-nav-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -93,7 +123,7 @@ export function ThreadRail({ workbench, state }: { workbench: Workbench; state: 
           onClick={() => workbench.openBoard({ archived: false })}
         >
           <span className="rail-mark" aria-hidden="true">
-            ◈
+            <OlympusMark />
           </span>
           <span className="rail-wordmark">OLYMPUS</span>
         </button>
