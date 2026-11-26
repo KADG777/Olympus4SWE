@@ -208,7 +208,8 @@ Olympus4SWE/
 │   └── blacknote/     # 跨版本纵向全生命周期基准（BlackNote Dev）评分记录与归档产物
 └── docs/
     ├── ARCHITECTURE.md
-    └── adr/           # 架构决策记录（ADR-0001 .. ADR-0003）
+    ├── adr/           # 架构决策记录（ADR-0001 .. ADR-0003）
+    └── releases/      # 每版本归档的独立 HTML 产品架构与效果可视化演示（详见 v0.1.0）
 ```
 
 ### CI 机械守护的架构不变量
@@ -266,6 +267,7 @@ uv run python -m tests.evals.run_eval --live --provider openai --model gpt-4o-mi
 ## 相关文档与贡献指南
 
 - **版本变更记录**：[CHANGELOG.md](CHANGELOG.md)
+- **版本架构与效果可视化**：[docs/releases/v0.1.0/](docs/releases/v0.1.0/README.md) *（每个版本均归档一版独立 HTML 产品架构与基准对比演示）*
 - **架构与第一性原理设计**：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - **架构决策记录（ADR）**：
   - [ADR-0002：Meta-Harness `AgentDriver` 接缝与后置 `Diff Gate`](docs/adr/0002-meta-harness-driver-and-watchdog.md) *（历史文档；LLM Watchdog 已于 `v0.1.0` 移除）*
