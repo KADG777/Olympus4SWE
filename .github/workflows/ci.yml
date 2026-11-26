@@ -44,6 +44,74 @@ jobs:
       - name: Test
         run: uv run --no-sync pytest -q
 
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --group browser
+
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: |
+          version="$(uv run --no-sync python -c "import importlib.metadata; print(importlib.metadata.version('playwright'))")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install headless Chromium
+        run: uv run --no-sync playwright install --with-deps chromium
+
+      - name: Run browser regression suite
+        env:
+          OLYMPUS_REQUIRE_BROWSER_TESTS: "1"
+          BROWSER_JUNIT: ${{ runner.temp }}/browser-junit.xml
+        run: |
+          set +e
+          uv run --no-sync pytest -v -rs --junitxml="$BROWSER_JUNIT" tests/unit/test_web_*_browser.py
+          status=$?
+          set -e
+          uv run --no-sync python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report = os.environ["BROWSER_JUNIT"]
+          if not os.path.exists(report):
+              sys.exit(f"missing JUnit report: {report}")
+          root = ET.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          if not suites:
+              sys.exit(f"JUnit report has no testsuite: {report}")
+          tests = sum(int(s.get("tests", "0")) for s in suites)
+          skipped = sum(int(s.get("skipped", "0")) for s in suites)
+          errors = sum(int(s.get("errors", "0")) for s in suites)
+          failures = sum(int(s.get("failures", "0")) for s in suites)
+          executed = max(0, tests - skipped - errors)
+          print(f"executed={executed} passed={max(0, executed - failures)} failed={failures} errors={errors} skipped={skipped}")
+          if tests == 0 or skipped > 0:
+              sys.exit("browser suite executed no tests or silently skipped tests")
+          PY
+          exit "$status"
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 10
