@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import subprocess
 import threading
@@ -16,7 +17,11 @@ from olympus.web.demos import seed_demo_runs
 from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
 
-playwright = pytest.importorskip("playwright.sync_api")
+playwright = (
+    importlib.import_module("playwright.sync_api")
+    if os.environ.get("OLYMPUS_REQUIRE_BROWSER_TESTS") == "1"
+    else pytest.importorskip("playwright.sync_api")
+)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -127,10 +132,22 @@ def picker_server(tmp_path: Path):
 
 @pytest.fixture
 def browser():
-    existing = sorted(Path.home().glob(".cache/ms-playwright/chromium-*/chrome-linux64/chrome"))
-    executable = os.environ.get("CHROME_PATH") or (str(existing[-1]) if existing else None)
     with playwright.sync_playwright() as runtime:
-        launched = runtime.chromium.launch(executable_path=executable)
+        chrome_path = os.environ.get("CHROME_PATH")
+        if chrome_path:
+            launched = runtime.chromium.launch(executable_path=chrome_path)
+        else:
+            try:
+                launched = runtime.chromium.launch()
+            except playwright.Error:
+                if os.environ.get("OLYMPUS_REQUIRE_BROWSER_TESTS") == "1":
+                    raise
+                existing = sorted(
+                    Path.home().glob(".cache/ms-playwright/chromium-*/chrome-linux*/chrome")
+                )
+                if not existing:
+                    raise
+                launched = runtime.chromium.launch(executable_path=str(existing[-1]))
         try:
             yield launched
         finally:

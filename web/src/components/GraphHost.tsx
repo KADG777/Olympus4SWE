@@ -11,6 +11,8 @@ let graphLoadAttempt = 0;
 
 /** Upper bound so a never-firing `load`/`error` event cannot wedge the graph import. */
 const STYLESHEET_LOAD_TIMEOUT_MS = 4000;
+/** The ~1.7 MB bundle must survive slow remote / cold-cache downloads. */
+const BUNDLE_LOAD_TIMEOUT_MS = 20_000;
 
 /**
  * Keep this import unconditional and alone: Vite/Rolldown analyses the literal specifier here and
@@ -122,32 +124,58 @@ function loadGraphModule(): Promise<GraphModule> {
 
   const attemptPromise = new Promise<GraphModule>((resolve, reject) => {
     let settled = false;
-    const timer = setTimeout(() => {
+    let cleanupInitialStylesheet = () => {};
+
+    const fail = (error: unknown) => {
       if (settled) return;
       settled = true;
+      clearTimeout(bundleTimer);
+      cleanupInitialStylesheet();
       if (graphModulePromise === attemptPromise) graphModulePromise = null;
       pruneUnloadedStylesheets();
-      reject(new Error("ariadne-graph bundle load timed out"));
-    }, STYLESHEET_LOAD_TIMEOUT_MS);
+      reject(error);
+    };
+
+    const bundleTimer = setTimeout(
+      () => fail(new Error("ariadne-graph bundle load timed out")),
+      BUNDLE_LOAD_TIMEOUT_MS,
+    );
+
+    // In production Vite's __vitePreload appends and awaits ariadne-graph.css synchronously inside
+    // importInitialGraphModule(), outside waitForStylesheet, so watch that link here to keep CSS
+    // failures fast while the JS bundle keeps the longer budget.
+    if (attempt === 0 && typeof document !== "undefined" && !import.meta.env.DEV) {
+      const pendingLink = findGraphStylesheetLinks(graphStylesheetUrl().pathname).find(
+        (link) => !hasLoadedRules(link),
+      );
+      if (pendingLink) {
+        const onLinkSettled = () => cleanupInitialStylesheet();
+        const stylesheetTimer = setTimeout(
+          () => fail(new Error("ariadne-graph.css load timed out")),
+          STYLESHEET_LOAD_TIMEOUT_MS,
+        );
+        cleanupInitialStylesheet = () => {
+          clearTimeout(stylesheetTimer);
+          pendingLink.removeEventListener("load", onLinkSettled);
+          pendingLink.removeEventListener("error", onLinkSettled);
+        };
+        pendingLink.addEventListener("load", onLinkSettled);
+        pendingLink.addEventListener("error", onLinkSettled);
+      }
+    }
 
     importPromise
       .then(async (mod) => {
         if (settled) return;
+        clearTimeout(bundleTimer);
+        cleanupInitialStylesheet();
         await ensureGraphStylesheet(attempt);
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
         cachedGraphModule = mod;
         resolve(mod);
       })
-      .catch((error: unknown) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (graphModulePromise === attemptPromise) graphModulePromise = null;
-        pruneUnloadedStylesheets();
-        reject(error);
-      });
+      .catch(fail);
   });
 
   graphModulePromise = attemptPromise;
@@ -158,6 +186,7 @@ interface BoundaryProps {
   name: string;
   /** Changing this key (e.g. switching runs) retries a graph that failed to load or render. */
   resetKey: string;
+  onRetry?: () => void;
   children: ReactNode;
 }
 
@@ -184,8 +213,25 @@ export class GraphErrorBoundary extends Component<BoundaryProps, BoundaryState> 
   render() {
     const { error } = this.state;
     if (error) {
+      const { onRetry } = this.props;
       return (
-        <Notice level="warn">
+        <Notice
+          level="warn"
+          action={
+            onRetry && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  this.setState({ error: null });
+                  onRetry();
+                }}
+              >
+                重试加载
+              </button>
+            )
+          }
+        >
           {`${this.props.name}组件未能加载（ariadne-graph：${error.message || "未知错误"}），其余控制台功能不受影响。`}
         </Notice>
       );
@@ -199,16 +245,24 @@ export function DagGraphHost(props: DagGraphProps) {
   // later re-render would swap <LazyDag> for <Loaded>, remounting the graph and dropping focus and
   // the panned/zoomed viewport on the first interaction.
   const [Loaded] = useState(() => cachedGraphModule?.DagGraphView ?? null);
+  const [retryToken, setRetryToken] = useState(0);
   const LazyDag = useMemo(
     () =>
       Loaded
         ? null
         : lazy(() => loadGraphModule().then((module) => ({ default: module.DagGraphView }))),
-    [Loaded, props.runId],
+    [Loaded, props.runId, retryToken],
   );
   return (
     <div className="graph-host" id="dag-graph" data-graph-host="dag">
-      <GraphErrorBoundary name="任务依赖图" resetKey={props.runId}>
+      <GraphErrorBoundary
+        name="任务依赖图"
+        resetKey={`${props.runId}:${retryToken}`}
+        onRetry={() => {
+          if (!cachedGraphModule) graphModulePromise = null;
+          setRetryToken((token) => token + 1);
+        }}
+      >
         {Loaded ? (
           <Loaded {...props} />
         ) : LazyDag ? (
