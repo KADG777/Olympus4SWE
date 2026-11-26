@@ -1025,7 +1025,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     stalled_css.route("**/static/assets/ariadne-graph*.css*", lambda _route: None)
     stalled_css.goto(f"{url}/?run={run_id}")
     expect(stalled_css.locator("#dag-graph")).to_contain_text(
-        "任务依赖图组件未能加载", timeout=7000
+        "ariadne-graph.css load timed out", timeout=7000
     )
     expect(stalled_css.locator("#workflow-graph[data-workflow-view='staged']")).to_be_visible()
     assert stalled_css.locator("#dag-graph .ag-island").count() == 0
@@ -1042,6 +1042,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     held_js = []
     held_retry_css = []
     late_js = browser.new_page()
+    late_js.clock.install()
     initial_js_re = re.compile(r"/static/assets/ariadne-graph\.js$")
     initial_css_re = re.compile(r"/static/assets/ariadne-graph\.css$")
     retry_css_re = re.compile(r"/static/assets/ariadne-graph\.css\?retry=")
@@ -1051,7 +1052,9 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     )
     late_js.route(initial_js_re, lambda route: held_js.append(route))
     late_js.route(retry_css_re, lambda route: held_retry_css.append(route))
-    late_js.goto(f"{url}/?run={run_id}")
+    late_js.goto(f"{url}/?run={run_id}&nosse=1")
+    _wait_for_intercepted(late_js, held_js)
+    late_js.clock.fast_forward(20_500)
     expect(late_js.locator("#dag-graph")).to_contain_text(
         "任务依赖图组件未能加载", timeout=7000
     )
@@ -1068,9 +1071,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
         for route in held_js:
             route.continue_()
     late_js.unroute(initial_js_re)
-    late_js.evaluate(
-        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
-    )
+    late_js.wait_for_timeout(200)
     assert late_js.evaluate(
         "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
         ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
@@ -1082,6 +1083,78 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(late_js.locator("#workflow-graph[data-workflow-view='staged']")).to_be_visible()
     _assert_graph_stylesheet_applied(late_js, allow_retry=True)
     late_js.close()
+
+
+def _wait_for_intercepted(page, routes: list, *, timeout_s: float = 7.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not routes and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert routes, "expected intercepted request was not observed before timeout"
+
+
+def test_task_dag_bundle_slow_download_survives_stylesheet_timeout_and_retries_in_place(
+    workbench, browser
+):
+    _, run_id, url = workbench
+    expect = playwright.expect
+
+    # 1. Slow JS bundle (> 4s CSS timeout, < 20s bundle timeout) must succeed once CSS loads.
+    slow = browser.new_page()
+    slow.clock.install()
+    held_slow_js = []
+    initial_js_re = re.compile(r"/static/assets/ariadne-graph\.js$")
+    slow.route(initial_js_re, lambda route: held_slow_js.append(route))
+    slow.goto(f"{url}/?run={run_id}&nosse=1")
+    slow.wait_for_function(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css')"
+        " && node.sheet && node.sheet.cssRules.length > 0)"
+    )
+    _wait_for_intercepted(slow, held_slow_js)
+    slow.clock.fast_forward(5_000)
+    expect(slow.locator("#dag-graph")).not_to_contain_text("任务依赖图组件未能加载")
+    for route in held_slow_js:
+        route.continue_()
+    slow.unroute(initial_js_re)
+    expect(slow.locator("#dag-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(slow)
+    slow.close()
+
+    # 2. JS bundle stalling past 20s surfaces fallback Notice + one-click retry that recovers
+    #    in place (even across a failed retry attempt) without switching runs.
+    timed_out = browser.new_page()
+    timed_out.clock.install()
+    stalled_js = []
+    timed_out.route(initial_js_re, lambda route: stalled_js.append(route))
+    timed_out.goto(f"{url}/?run={run_id}&nosse=1")
+    timed_out.wait_for_function(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css')"
+        " && node.sheet && node.sheet.cssRules.length > 0)"
+    )
+    _wait_for_intercepted(timed_out, stalled_js)
+    timed_out.clock.fast_forward(5_000)
+    expect(timed_out.locator("#dag-graph")).not_to_contain_text("任务依赖图组件未能加载")
+    timed_out.clock.fast_forward(16_000)
+    expect(timed_out.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+    expect(timed_out.locator("#dag-graph")).to_contain_text("ariadne-graph bundle load timed out")
+    retry_btn = timed_out.locator("#dag-graph").get_by_role("button", name="重试加载")
+    expect(retry_btn).to_be_visible()
+
+    # First retry fails over the network: boundary must stay recoverable and clear pending state.
+    retry_js_re = re.compile(r"/static/assets/ariadne-graph\.js\?retry=")
+    timed_out.route(retry_js_re, lambda route: route.abort())
+    retry_btn.click()
+    expect(timed_out.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+    expect(retry_btn).to_be_visible()
+
+    # Second retry succeeds in place on the same run without navigating away.
+    timed_out.unroute(retry_js_re)
+    timed_out.unroute(initial_js_re)
+    retry_btn.click()
+    expect(timed_out.locator("#dag-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(timed_out, allow_retry=True)
+    timed_out.close()
 
 
 # ---------------------------------------------------------------------------
