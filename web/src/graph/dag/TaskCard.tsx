@@ -17,9 +17,9 @@ export interface TaskCardData extends Record<string, unknown> {
 
 export type TaskCardNode = Node<TaskCardData, "task">;
 
-/** Editorial three-row task card: id + pill | role · kind | status capsule. */
 function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
   const { view, height, selected, lineage, select, hover, focus } = data;
+  const title = view.title?.trim();
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -41,8 +41,8 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
       role="button"
       tabIndex={0}
       aria-selected={selected ? "true" : "false"}
-      aria-label={view.ariaLabel}
-      title={view.title || undefined}
+      aria-label={title ? `${view.ariaLabel}，${title}` : view.ariaLabel}
+      title={title || undefined}
       onClick={() => select(view.id)}
       onKeyDown={onKeyDown}
       onMouseEnter={() => hover(view.id)}
@@ -52,7 +52,15 @@ function TaskCardComponent({ data }: NodeProps<TaskCardNode>) {
     >
       <Handle className="ag-handle" type="target" position={Position.Left} isConnectable={false} />
       <div className="ag-card-head">
-        <span className="ag-card-id">{view.id}</span>
+        <span className="ag-task-heading">
+          <span className="ag-card-id">{view.id}</span>
+          {title ? (
+            <span className="ag-task-title">
+              <span aria-hidden="true">· </span>
+              {title}
+            </span>
+          ) : null}
+        </span>
         {view.pill ? (
           <span className="ag-card-pill" data-tone={view.pill.tone || "muted"}>
             {view.pill.text}

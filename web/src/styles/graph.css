@@ -157,6 +157,28 @@
   font-weight: var(--font-weight-medium);
 }
 
+.ag-task-heading {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  min-inline-size: 0;
+}
+
+.ag-task-heading .ag-card-id {
+  flex: none;
+  max-inline-size: 100%;
+}
+
+.ag-task-title {
+  min-inline-size: 0;
+  max-inline-size: 10em;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .ag-card-meta {
   color: var(--text-secondary);
   font-size: var(--text-xs);
