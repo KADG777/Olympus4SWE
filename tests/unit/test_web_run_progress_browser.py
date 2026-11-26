@@ -944,6 +944,63 @@ def test_task_dag_island_preserves_viewport_on_live_updates(workbench, browser):
     page.close()
 
 
+def test_task_dag_shows_inline_titles_within_fixed_cards(workbench, browser):
+    _, run_id, url = workbench
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    long_titles = {
+        "T02": "实现报名注册以及同账号唯一校验和容量上限事务锁",
+        "T04": "Implement the registration status endpoint and the waiting list position display",
+    }
+
+    def set_graph_titles(route):
+        response = route.fetch()
+        data = response.json()
+        nodes = {node["task_id"]: node for node in data["projection"]["dag"]["nodes"]}
+        for task_id, title in long_titles.items():
+            nodes[task_id].update(title=title, attempt=2)
+        nodes["T03"]["title"] = "   "
+        nodes["T05"].pop("title")
+        route.fulfill(response=response, json=data)
+
+    page.route(f"**/api/runs/{run_id}", set_graph_titles)
+    page.goto(f"{url}/?run={run_id}&nosse=1")
+    _wait_for_layout(page)
+    expect = playwright.expect
+    first = page.locator("#dag-graph .ag-task-card[data-task-id='T01']")
+    expect(first.locator(".ag-task-title")).to_have_text("· 接口类型与测试夹具")
+    expect(first).to_have_attribute("aria-label", re.compile("接口类型与测试夹具"))
+    assert first.locator(".ag-task-title").evaluate("(el) => el.scrollWidth <= el.clientWidth")
+
+    for task_id, title in long_titles.items():
+        card = page.locator(f"#dag-graph .ag-task-card[data-task-id='{task_id}']")
+        label = card.locator(".ag-task-title")
+        expect(label).to_have_text(f"· {title}")
+        expect(label).to_have_css("white-space", "nowrap")
+        expect(label).to_have_css("text-overflow", "ellipsis")
+        expect(card).to_have_attribute("title", title)
+        expect(card.locator(".ag-card-pill")).to_have_text("×2")
+        expect(card.locator(".ag-card-status")).to_be_visible()
+        assert label.evaluate("(el) => el.scrollWidth > el.clientWidth")
+        label_box = label.bounding_box()
+        badge_box = card.locator(".ag-card-pill").bounding_box()
+        assert label_box["x"] + label_box["width"] <= badge_box["x"] + 1
+        assert abs(card.bounding_box()["width"] - 184) <= 0.5
+
+    for task_id in ("T03", "T05"):
+        untitled = page.locator(f"#dag-graph .ag-task-card[data-task-id='{task_id}']")
+        expect(untitled.locator(".ag-task-heading")).to_have_text(task_id)
+        expect(untitled.locator(".ag-task-title")).to_have_count(0)
+        assert untitled.get_attribute("title") is None
+
+    page.locator("#dag-graph .ag-task-card[data-task-id='T02']").click()
+    expect(page.locator("#dock-title")).to_have_text(f"T02 · {long_titles['T02']}")
+
+    first.focus()
+    first.press("Enter")
+    expect(page.locator("#dock-title")).to_contain_text("T01")
+    page.close()
+
+
 def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, browser):
     _, run_id, url = workbench
     page = browser.new_page(viewport={"width": 1400, "height": 900})
