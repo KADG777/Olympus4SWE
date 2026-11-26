@@ -208,7 +208,8 @@ Olympus4SWE/
 │   └── blacknote/     # Longitudinal full-lifecycle benchmark (BlackNote Dev) tracking cross-version scorecards
 └── docs/
     ├── ARCHITECTURE.md
-    └── adr/           # Architecture Decision Records (ADR-0001 .. ADR-0003)
+    ├── adr/           # Architecture Decision Records (ADR-0001 .. ADR-0003)
+    └── releases/      # Per-release standalone HTML architecture and benchmark visualizations (see v0.1.0)
 ```
 
 ### Mechanically Enforced Architecture Invariants
@@ -266,6 +267,7 @@ Cross-version full-lifecycle metrics and runnable archived overlays are tracked 
 ## Documentation & Contributing
 
 - **Release History**: [CHANGELOG.md](CHANGELOG.md)
+- **Release Visuals & Demos**: [docs/releases/v0.1.0/](docs/releases/v0.1.0/README.md) *(each release archives standalone HTML architecture and benchmark comparison pages)*
 - **Architecture & Principles**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - **Architecture Decision Records**:
   - [ADR-0002: Meta-Harness AgentDriver Seam and Post-Flight Diff Gate](docs/adr/0002-meta-harness-driver-and-watchdog.md) *(historical; LLM Watchdog removed in `v0.1.0`)*

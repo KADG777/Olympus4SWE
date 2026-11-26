@@ -16,6 +16,7 @@ First stable release covering the evolution from `v0.0` (`e87b7e3`) to `main` (`
 - **Headless session CLI and benchmark adapters.** Added `olympus session start` and `olympus session reply`, Harbor interactive benchmark adapters, and local Docker judging (`#107`), plus the archived `BlackNote Dev` `v0.0` longitudinal benchmark snapshot (`#82`).
 - **Standalone API key rotation proxy.** Added `tools/api-key-ledger/` for multi-key ledger tracking and rotation (`#134`), aligned with upstream keep-alive and read timeouts (`#146`).
 - **Repository governance and bilingual docs.** Added `CONTRIBUTING.md`, `.github/CODEOWNERS`, CI-enforced architecture invariant tests (`#120`), and bilingual `README.md` and `README.zh-CN.md` (`#128`).
+- **Release architecture and benchmark visuals.** Archived standalone HTML architecture and BlackNote comparison demos under [`docs/releases/v0.1.0/`](docs/releases/v0.1.0/README.md) as a per-release visual asset convention.
 
 ### Changed
 

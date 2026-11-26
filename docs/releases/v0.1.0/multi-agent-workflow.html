@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Olympus4SWE 后端 Multi-Agent Workflow 架构</title>
+<style>
+  :root {
+    --bg: #f8fafc;
+    --surface: #ffffff;
+    --surface-2: #f1f5f9;
+    --fg: #0f172a;
+    --fg-muted: #475569;
+    --line: #e2e8ec;
+    --accent: #0f766e;
+    --accent-soft: rgba(15, 118, 110, 0.10);
+    --warn: #b45309;
+    --warn-soft: rgba(180, 83, 9, 0.11);
+    --ok: #15803d;
+    --ok-soft: rgba(21, 128, 61, 0.10);
+    --err: #b91c1c;
+    --err-soft: rgba(185, 28, 28, 0.10);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 1px 3px rgba(15, 23, 42, 0.05), 0 6px 20px rgba(15, 23, 42, 0.04);
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b0f17;
+      --surface: #111827;
+      --surface-2: #1a2232;
+      --fg: #e2e8f0;
+      --fg-muted: #94a3b8;
+      --line: #273244;
+      --accent: #2dd4bf;
+      --accent-soft: rgba(45, 212, 191, 0.12);
+      --warn: #f59e0b;
+      --warn-soft: rgba(245, 158, 11, 0.14);
+      --ok: #34d399;
+      --ok-soft: rgba(52, 211, 153, 0.12);
+      --err: #f87171;
+      --err-soft: rgba(248, 113, 113, 0.12);
+      --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #0b0f17;
+    --surface: #111827;
+    --surface-2: #1a2232;
+    --fg: #e2e8f0;
+    --fg-muted: #94a3b8;
+    --line: #273244;
+    --accent: #2dd4bf;
+    --accent-soft: rgba(45, 212, 191, 0.12);
+    --warn: #f59e0b;
+    --warn-soft: rgba(245, 158, 11, 0.14);
+    --ok: #34d399;
+    --ok-soft: rgba(52, 211, 153, 0.12);
+    --err: #f87171;
+    --err-soft: rgba(248, 113, 113, 0.12);
+    --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 36px 24px 64px;
+  }
+
+  .sec { margin-bottom: 36px; }
+  .sec:last-child { margin-bottom: 0; }
+
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .kicker {
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+  }
+  .theme-btn {
+    background: var(--surface);
+    color: var(--fg-muted);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+  .theme-btn:hover { border-color: var(--accent); color: var(--fg); }
+
+  .headline {
+    font-size: 30px;
+    font-weight: 750;
+    line-height: 1.22;
+    letter-spacing: -0.02em;
+    margin: 0 0 10px 0;
+  }
+  .deck {
+    font-size: 15px;
+    color: var(--fg-muted);
+    margin: 0;
+    max-width: 860px;
+  }
+
+  .sec-kicker {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0 0 4px 0;
+  }
+  .sec-title {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 14px 0;
+  }
+
+  .diagram-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px;
+    box-shadow: var(--shadow);
+    overflow-x: auto;
+  }
+  .wf-svg {
+    width: 100%;
+    min-width: 760px;
+    height: auto;
+    display: block;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: var(--shadow);
+  }
+  .card.accent-border {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  }
+  .card-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 10px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .pill-accent { background: var(--accent-soft); color: var(--accent); }
+  .pill-ok { background: var(--ok-soft); color: var(--ok); }
+  .pill-warn { background: var(--warn-soft); color: var(--warn); }
+  .pill-err { background: var(--err-soft); color: var(--err); }
+  .pill-muted { background: var(--surface-2); color: var(--fg-muted); border: 1px solid var(--line); }
+
+  .step-list {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 13px;
+    color: var(--fg-muted);
+  }
+  .step-list li { margin-bottom: 7px; }
+  .step-list li:last-child { margin-bottom: 0; }
+  .step-list b { color: var(--fg); }
+
+  .table-wrap {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: var(--fg-muted);
+    background: var(--surface-2);
+  }
+  tbody tr:nth-child(even) td {
+    background: color-mix(in srgb, var(--surface-2) 45%, transparent);
+  }
+  tr:last-child td { border-bottom: 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: var(--surface-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--fg);
+  }
+
+  @media (max-width: 780px) {
+    .grid-2 { grid-template-columns: 1fr; }
+    .headline { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+  <main class="page">
+    <section class="sec">
+      <div class="topbar">
+        <p class="kicker">Olympus4SWE 后端编排内核 · Multi-Agent Workflow（main @ 1b4fc18）</p>
+        <button class="theme-btn" id="themeBtn" type="button">切换深/浅色</button>
+      </div>
+      <h1 class="headline">图引擎驱动 × 沙盒并行施工 × 零历史冷启动交叉验证</h1>
+      <p class="deck">后端没有任何黑盒“Agent 群聊”。所有多智能体协作都由 <code>graph/engine.py</code> 与 <code>Chronos</code> 调度器按确定性状态机推进：LLM 只在受限作用域与独立沙盒里产出结构化制品或 Diff，交接与门禁全部由确定性代码裁决。</p>
+    </section>
+
+    <section class="sec">
+      <p class="sec-kicker">01 · End-to-End Orchestration Graph</p>
+      <h2 class="sec-title">后端 Multi-Agent 编排全链路（full_sdlc_tdd.yaml）</h2>
+      <div class="diagram-card">
+        <svg class="wf-svg" viewBox="0 0 1020 470" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--fg-muted)" />
+            </marker>
+            <marker id="arr-acc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--accent)" />
+            </marker>
+            <marker id="arr-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--warn)" />
+            </marker>
+          </defs>
+
+          <!-- Band 1: Stage 1 & 2a (Graph Engine) -->
+          <rect x="10" y="10" width="1000" height="128" rx="12" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1.5" />
+          <text x="26" y="33" fill="var(--fg)" font-size="12.5" font-weight="700">外层图引擎（graph/engine.py · run_graph）— 阶段串行 + 人工哈希门禁（GraphPaused 断点持久化）</text>
+
+          <!-- Stage 1 nodes -->
+          <rect x="26" y="48" width="110" height="72" rx="8" fill="var(--surface)" stroke="var(--line)" />
+          <text x="81" y="69" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">intake</text>
+          <text x="81" y="86" text-anchor="middle" fill="var(--fg-muted)" font-size="10">只读摸底仓库</text>
+          <text x="81" y="102" text-anchor="middle" fill="var(--fg-muted)" font-size="10" font-family="var(--mono)">intake_triage</text>
+
+          <line x1="136" y1="84" x2="154" y2="84" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <rect x="156" y="48" width="136" height="72" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.4" />
+          <text x="224" y="68" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">Prometheus</text>
+          <text x="224" y="84" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">align + critic</text>
+          <text x="224" y="100" text-anchor="middle" fill="var(--fg-muted)" font-size="10">1-3 阻塞歧义 · Critic 挑刺</text>
+          <text x="224" y="113" text-anchor="middle" fill="var(--fg-muted)" font-size="9.5" font-family="var(--mono)">resynthesize</text>
+
+          <line x1="292" y1="84" x2="310" y2="84" stroke="var(--warn)" stroke-width="1.5" marker-end="url(#arr-warn)" />
+
+          <rect x="312" y="48" width="102" height="72" rx="8" fill="var(--warn-soft)" stroke="var(--warn)" />
+          <text x="363" y="72" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="700">gate_spec</text>
+          <text x="363" y="90" text-anchor="middle" fill="var(--fg-muted)" font-size="10">SHA-256 锁定</text>
+          <text x="363" y="104" text-anchor="middle" fill="var(--fg-muted)" font-size="10">GoalSpec</text>
+
+          <line x1="414" y1="84" x2="432" y2="84" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <!-- Stage 2a nodes -->
+          <rect x="434" y="48" width="142" height="72" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.4" />
+          <text x="505" y="68" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">Athena · Design</text>
+          <text x="505" y="84" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">design + validate</text>
+          <text x="505" y="100" text-anchor="middle" fill="var(--fg-muted)" font-size="10">模块边界 + 文件接缝</text>
+          <text x="505" y="113" text-anchor="middle" fill="var(--fg-muted)" font-size="9.5" font-family="var(--mono)">DesignSpec</text>
+
+          <line x1="576" y1="84" x2="594" y2="84" stroke="var(--warn)" stroke-width="1.5" marker-end="url(#arr-warn)" />
+
+          <rect x="596" y="48" width="102" height="72" rx="8" fill="var(--warn-soft)" stroke="var(--warn)" />
+          <text x="647" y="72" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="700">gate_design</text>
+          <text x="647" y="90" text-anchor="middle" fill="var(--fg-muted)" font-size="10">人工确认</text>
+          <text x="647" y="104" text-anchor="middle" fill="var(--fg-muted)" font-size="10">白盒架构</text>
+
+          <line x1="698" y1="84" x2="716" y2="84" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <rect x="718" y="48" width="152" height="72" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.4" />
+          <text x="794" y="68" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="700">Athena · Planner</text>
+          <text x="794" y="84" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">plan + validate</text>
+          <text x="794" y="100" text-anchor="middle" fill="var(--fg-muted)" font-size="10">DAG 无环 + scope 互斥</text>
+          <text x="794" y="113" text-anchor="middle" fill="var(--fg-muted)" font-size="9.5" font-family="var(--mono)">swe-to-tickets</text>
+
+          <line x1="870" y1="84" x2="888" y2="84" stroke="var(--warn)" stroke-width="1.5" marker-end="url(#arr-warn)" />
+
+          <rect x="890" y="48" width="104" height="72" rx="8" fill="var(--warn-soft)" stroke="var(--warn)" />
+          <text x="942" y="72" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="700">gate_plan</text>
+          <text x="942" y="90" text-anchor="middle" fill="var(--fg-muted)" font-size="10">冻结切片</text>
+          <text x="942" y="104" text-anchor="middle" fill="var(--fg-muted)" font-size="10">TaskPlan DAG</text>
+
+          <!-- Arrow down to Execute DAG -->
+          <path d="M 942 120 L 942 152 L 510 152 L 510 172" fill="none" stroke="var(--accent)" stroke-width="1.8" marker-end="url(#arr-acc)" />
+
+          <!-- Band 2: Stage 2b (Chronos DAG Executor) -->
+          <rect x="10" y="174" width="1000" height="154" rx="12" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6" />
+          <text x="26" y="197" fill="var(--fg)" font-size="12.5" font-weight="700">执行引擎（stages/orchestrate.py · Chronos 调度器）— ThreadPoolExecutor 波次并发 + 确定性沙盒门禁</text>
+
+          <!-- Parallel Workers -->
+          <rect x="26" y="212" width="176" height="100" rx="8" fill="var(--surface)" stroke="var(--line)" />
+          <text x="114" y="232" text-anchor="middle" fill="var(--accent)" font-size="10.5" font-weight="700">Wave 并发调度池</text>
+          <text x="114" y="250" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">T2 ∥ T4 / T3 ∥ T5 ∥ T6</text>
+          <text x="114" y="268" text-anchor="middle" fill="var(--fg-muted)" font-size="10">同波次 write_scope 零重叠</text>
+          <text x="114" y="284" text-anchor="middle" fill="var(--fg-muted)" font-size="10">从 accepted_overlay</text>
+          <text x="114" y="298" text-anchor="middle" fill="var(--fg-muted)" font-size="10">初始化独立 git worktree</text>
+
+          <line x1="202" y1="262" x2="226" y2="262" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <!-- Single Task Loop -->
+          <rect x="228" y="212" width="185" height="100" rx="8" fill="var(--surface)" stroke="var(--line)" />
+          <text x="320" y="232" text-anchor="middle" fill="var(--accent)" font-size="10.5" font-weight="700">Hephaestus 施工</text>
+          <text x="320" y="250" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">AgentDriver (native/pi)</text>
+          <text x="320" y="268" text-anchor="middle" fill="var(--fg-muted)" font-size="10">受限绝对路径 ACI + Bash</text>
+          <text x="320" y="284" text-anchor="middle" fill="var(--fg-muted)" font-size="10">运行切片 TDD 与契约测试</text>
+          <text x="320" y="298" text-anchor="middle" fill="var(--fg-muted)" font-size="9.5" font-family="var(--mono)">steer / max_cycles</text>
+
+          <line x1="413" y1="262" x2="437" y2="262" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <!-- 0-token gate -->
+          <rect x="439" y="212" width="175" height="100" rx="8" fill="var(--surface)" stroke="var(--warn)" stroke-width="1.3" />
+          <text x="526" y="232" text-anchor="middle" fill="var(--warn)" font-size="10.5" font-weight="700">0-token 预门禁</text>
+          <text x="526" y="250" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">Escape-Hatch 扫描</text>
+          <text x="526" y="268" text-anchor="middle" fill="var(--fg-muted)" font-size="10">静态拦截裸 # noqa /</text>
+          <text x="526" y="284" text-anchor="middle" fill="var(--fg-muted)" font-size="10">占位符 / 跳过断言等投机</text>
+          <text x="526" y="298" text-anchor="middle" fill="var(--warn)" font-size="9.5">命中即打回，零 LLM 消耗</text>
+
+          <line x1="614" y1="262" x2="638" y2="262" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <!-- DiffGate -->
+          <rect x="640" y="212" width="166" height="100" rx="8" fill="var(--surface)" stroke="var(--line)" />
+          <text x="723" y="232" text-anchor="middle" fill="var(--ok)" font-size="10.5" font-weight="700">确定性作用域守卫</text>
+          <text x="723" y="250" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">DiffGate + 核验</text>
+          <text x="723" y="268" text-anchor="middle" fill="var(--fg-muted)" font-size="10">严查改动文件 ∈ write_scope</text>
+          <text x="723" y="284" text-anchor="middle" fill="var(--fg-muted)" font-size="10">清理临时产物</text>
+          <text x="723" y="298" text-anchor="middle" fill="var(--ok)" font-size="9.5">通过 → 合入 accepted_overlay</text>
+
+          <line x1="806" y1="262" x2="830" y2="262" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <!-- Overlay -->
+          <rect x="832" y="212" width="162" height="100" rx="8" fill="var(--surface)" stroke="var(--accent)" />
+          <text x="913" y="234" text-anchor="middle" fill="var(--accent)" font-size="11" font-weight="700">accepted_overlay</text>
+          <text x="913" y="254" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">只累加已通过门禁的</text>
+          <text x="913" y="270" text-anchor="middle" fill="var(--fg-muted)" font-size="10.5">切片增量与删除清单</text>
+          <text x="913" y="292" text-anchor="middle" fill="var(--fg-muted)" font-size="9.5" font-family="var(--mono)">post_dag 默认延迟单任务审</text>
+
+          <!-- Arrow down to Post-DAG -->
+          <path d="M 913 312 L 913 344 L 510 344 L 510 362" fill="none" stroke="var(--accent)" stroke-width="1.8" marker-end="url(#arr-acc)" />
+
+          <!-- Band 3: Stage 3 (Post-DAG Global Verify & Repair) -->
+          <rect x="10" y="364" width="1000" height="96" rx="12" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1.5" />
+          <text x="26" y="386" fill="var(--fg)" font-size="12.5" font-weight="700">Post-DAG 终态验证闭环 — 组合交付全局审查 + 实证复现裁剪 + 洁净目录实机 E2E</text>
+
+          <rect x="26" y="400" width="224" height="48" rx="8" fill="var(--surface)" stroke="var(--accent)" />
+          <text x="138" y="420" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">Argus 全局冷启动复核</text>
+          <text x="138" y="436" text-anchor="middle" fill="var(--fg-muted)" font-size="10">零共享历史 · 审查完整组合 Diff</text>
+
+          <line x1="250" y1="424" x2="274" y2="424" stroke="var(--fg-muted)" stroke-width="1.5" marker-end="url(#arr)" />
+
+          <rect x="276" y="400" width="224" height="48" rx="8" fill="var(--surface)" stroke="var(--line)" />
+          <text x="388" y="420" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">Chronos Axis A 实证裁剪</text>
+          <text x="388" y="436" text-anchor="middle" fill="var(--fg-muted)" font-size="10">实跑 repro_command，丢弃未复现幻觉</text>
+
+          <line x1="500" y1="424" x2="524" y2="424" stroke="var(--warn)" stroke-width="1.5" marker-end="url(#arr-warn)" />
+
+          <rect x="526" y="400" width="224" height="48" rx="8" fill="var(--surface)" stroke="var(--warn)" />
+          <text x="638" y="420" text-anchor="middle" fill="var(--fg)" font-size="11.5" font-weight="700">有界修复循环 (repair ≤ 3)</text>
+          <text x="638" y="436" text-anchor="middle" fill="var(--fg-muted)" font-size="10">修完 0-token 重跑旧 repro 验证清零</text>
+
+          <line x1="750" y1="424" x2="774" y2="424" stroke="var(--ok)" stroke-width="1.5" marker-end="url(#arr-acc)" />
+
+          <rect x="776" y="400" width="218" height="48" rx="8" fill="var(--ok-soft)" stroke="var(--ok)" />
+          <text x="885" y="420" text-anchor="middle" fill="var(--ok)" font-size="11.5" font-weight="700">verify_product 实机验收</text>
+          <text x="885" y="436" text-anchor="middle" fill="var(--fg-muted)" font-size="10">洁净目录启动 · Playwright · 重启验库</text>
+        </svg>
+      </div>
+    </section>
+
+    <section class="sec">
+      <p class="sec-kicker">02 · Agent Roster &amp; Isolation</p>
+      <h2 class="sec-title">后端 Multi-Agent 角色分工与上下文隔离边界</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:18%">Agent / 角色</th>
+              <th style="width:18%">所属模块</th>
+              <th style="width:24%">上下文隔离方式</th>
+              <th style="width:40%">核心职责与输出物</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Prometheus</b><br><span class="pill pill-accent">需求对齐</span></td>
+              <td><code>stages/align.py</code></td>
+              <td>只读仓库探针 + 隔离会话</td>
+              <td>提取 EARS <code>GoalSpec</code>，识别 1–3 个阻塞歧义；支持补充反馈异步重合成 <code>resynthesize</code></td>
+            </tr>
+            <tr>
+              <td><b>Critic</b><br><span class="pill pill-muted">并行挑刺</span></td>
+              <td><code>stages/align.py</code></td>
+              <td>冷启动并行上下文（不共享对齐推演）</td>
+              <td>独立审视需求遗漏与模糊边界，降低需求阶段盲区</td>
+            </tr>
+            <tr>
+              <td><b>Athena</b><br><span class="pill pill-accent">设计 &amp; 规划</span></td>
+              <td><code>stages/design.py</code><br><code>graph/loader.py</code></td>
+              <td>仅消费冻结后的 <code>GoalSpec</code></td>
+              <td>先产出白盒 <code>DesignSpec</code>（模块接缝），再按 <code>swe-to-tickets</code> 拆出无环并行 <code>TaskPlan</code> DAG</td>
+            </tr>
+            <tr>
+              <td><b>Hephaestus</b><br><span class="pill pill-ok">切片施工</span></td>
+              <td><code>stages/orchestrate.py</code><br><code>harness/driver.py</code></td>
+              <td>独立 <code>git worktree</code> 沙盒 + 受限 ACI（<code>native</code>/<code>pi</code>）</td>
+              <td>按 DAG 波次并行施工，运行单元测试；受 <code>write_scope</code>、逃生舱门禁与 <code>max_cycles</code> 约束</td>
+            </tr>
+            <tr>
+              <td><b>Momus / Argus</b><br><span class="pill pill-warn">独立评审</span></td>
+              <td><code>stages/orchestrate.py</code></td>
+              <td><b>零共享历史冷启动</b>（仅见冻结契约 + Diff + 验证日志）</td>
+              <td>单任务或 Post-DAG 组合交付复核；所有阻塞缺陷必须附带可执行 <code>repro_command</code></td>
+            </tr>
+            <tr>
+              <td><b>Chronos</b><br><span class="pill pill-accent">确定性调度</span></td>
+              <td><code>stages/orchestrate.py</code><br><code>stages/verify_product.py</code></td>
+              <td><b>非 LLM（纯确定性 Python）</b></td>
+              <td>管理线程池波次调度、Axis A 实证裁剪、预算账本结算、<code>accepted_overlay</code> 合成与实机 E2E 验收</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="sec grid-2">
+      <div class="card accent-border">
+        <div class="card-title">
+          <span>并发冲突是怎么从根上消除的？</span>
+          <span class="pill pill-accent">DAG 静态互斥</span>
+        </div>
+        <ol class="step-list">
+          <li><b>规划期硬校验</b>：<code>validate_plan</code> 检查同一波次可并发任务之间的 <code>write_scope</code>，存在路径重叠直接拒绝规划，不进入执行期。</li>
+          <li><b>执行期物理隔离</b>：每个任务从 <code>accepted_overlay</code> 克隆出独立 <code>git worktree</code>，彼此完全看不见对方未验收的中间态。</li>
+          <li><b>合入前门禁把关</b>：只有同时通过 <code>0-token 逃生舱</code>、<code>DiffGate</code>（改了作用域外文件立即打回）和切片测试后，改动才合入 <code>accepted_overlay</code>。</li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>为什么评审不会陷入“死循环或幻觉打回”？</span>
+          <span class="pill pill-ok">Axis A 实证裁剪</span>
+        </div>
+        <ol class="step-list">
+          <li><b>用代码验证评审意见</b>：<code>Argus</code> 提出的所有 <code>Important</code> 阻塞项都必须给出可复现命令 <code>repro_command</code>，由确定性的 <code>Chronos</code> 在沙盒中实际执行；跑不失败的“幻觉问题”直接被确定性裁剪丢弃。</li>
+          <li><b>修复后 0-token 复测</b>：修复轮（<code>hephaestus:repair-*</code>）完成后，<code>Chronos</code> 直接重跑之前失败过的 <code>repro_command</code> 确认清零，再决定是否放行。</li>
+          <li><b>有界收敛</b>：每个任务与 Post-DAG 均设 <code>max_cycles</code> 上限，耗尽即挂起转人工（<code>AWAITING_HUMAN</code>），绝不无限烧 Token。</li>
+        </ol>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const root = document.documentElement;
+    document.getElementById('themeBtn').addEventListener('click', () => {
+      const isDark = root.getAttribute('data-theme') === 'dark' ||
+        (!root.getAttribute('data-theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      root.setAttribute('data-theme', isDark ? 'light' : 'dark');
+    });
+  </script>
+</body>
+</html>
