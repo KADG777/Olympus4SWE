@@ -512,7 +512,7 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
         expect(plan_cta).to_contain_text("Approve Plan")
         plan_cta.click()
         expect(drawer).to_be_visible()
-        expect(drawer.get_by_role("heading", name="任务计划 · v1")).to_be_visible()
+        expect(drawer.get_by_role("heading", name="Task plan · v1")).to_be_visible()
 
         plan_v2 = plan_v1.model_copy(
             update={
@@ -530,8 +530,8 @@ def test_quick_ruling_drawer_clarify_approve_conflict_resync_without_opening_tab
             drawer.locator("[data-approve='approve_plan']").click()
         assert stale_res.value.status == 409
         expect(drawer).to_be_visible()
-        expect(drawer.locator("#quick-drawer-notice")).to_contain_text("请确认后重试")
-        expect(drawer.get_by_role("heading", name="任务计划 · v2")).to_be_visible()
+        expect(drawer.locator("#quick-drawer-notice")).to_contain_text("review and retry")
+        expect(drawer.get_by_role("heading", name="Task plan · v2")).to_be_visible()
 
         with page.expect_response(f"{url}/api/runs/{plan_id}/command") as fresh_res:
             drawer.locator("[data-approve='approve_plan']").click()
