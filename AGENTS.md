@@ -13,7 +13,7 @@ This file is the canonical technical guide for both human contributors and AI co
   - `core/` — Strict Pydantic contracts, SHA-256 content fingerprints, DAG & `write_scope` validation, SQLite event/state store, deterministic control primitives
   - `providers/` — Pluggable LLM provider layer (`dialects/`, `registry.py`, `factory.py`, `base.py`, `types.py`) isolating official vendor SDKs (`openai`, `anthropic`)
   - `tools/` — Safe ACI file/shell primitives with absolute-path enforcement and bounded output
-  - `harness/` — Transparent append-only loop, `AgentDriver` abstraction (`native`, `pi`), `DiffGate`, `Watchdog`, `git worktree` sandbox, `TurnReceipt`
+  - `harness/` — Transparent append-only loop, `AgentDriver` abstraction (`native`, `pi`), `DiffGate`, `escape_hatches`, `git worktree` sandbox, `TurnReceipt`
   - `stages/` — Stage 1 `Align` (`align.py`), Stage 2a `Design` (`design.py`), Stage 2 `Orchestrate & Verify` (`orchestrate.py`)
   - `graph/` — Declarative workflow loader/engine (`engine.py`, `loader.py`, `progress.py`) and YAML workflow templates (`workflows/*.yaml`)
   - `session/` — Headless session routing, policy, and runner (`contracts.py`, `policy.py`, `router.py`, `runner.py`)
