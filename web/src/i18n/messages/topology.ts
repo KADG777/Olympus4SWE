@@ -1,6 +1,18 @@
 /** Copy for the topology surface. Chinese keys map to EN; English keys map to ZH. */
 export const EN: Record<string, string> = {
   "故障复盘": "Failure review",
+  "查看尝试证据": "Inspect attempt evidence",
+  "故障记录缺少有效的尝试编号。": "No valid attempt number was recorded for this failure.",
+  "正在读取尝试产物…": "Loading attempt artifacts…",
+  "本次尝试没有归档产物。": "No artifacts were archived for this attempt.",
+  "尝试产物读取失败。": "Could not load attempt artifacts.",
+  "重试": "Retry",
+  "没有已记录的检查结果。": "No check results recorded.",
+  "结果未记录": "Outcome not recorded",
+  "独立复核：{pass}/{total} 份通过": "Independent reviews passed: {pass}/{total}",
+  "已记录的补丁片段": "Recorded patch excerpt",
+  "没有已记录的补丁。": "No patch recorded.",
+  "截至回放终点，未记录后续尝试。": "No later attempt was recorded by the end of this review.",
   "涉及 {n} 个故障任务": "{n} tasks with recorded failures",
   "截至事件 {n}": "Through event #{n}",
   "这段历史中没有记录到任务故障。": "No task failures recorded in this history.",

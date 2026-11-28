@@ -1,5 +1,5 @@
 import type { RunEvent } from "../api/types";
-import { taskIncidents } from "./taskIncidents";
+import { positiveAttempt, taskIncidents } from "./taskIncidents";
 
 interface ObservedTask {
   id: string;
@@ -34,8 +34,7 @@ function observation(event: RunEvent, prior?: ObservedTask): ObservedTask | unde
   if (typeof status !== "string" || (!STATES.has(status) && status !== "accepted_with_risk")) return;
   return {
     id: p.task_id, actor: event.actor, status, seq: event.event_seq,
-    attempt: typeof attempt === "number" && Number.isInteger(attempt) && attempt > 0
-      ? attempt : prior?.attempt,
+    attempt: attempt == null ? prior?.attempt : positiveAttempt(attempt),
   };
 }
 

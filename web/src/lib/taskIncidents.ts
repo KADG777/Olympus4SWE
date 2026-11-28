@@ -1,14 +1,21 @@
 import type { RunEvent } from "../api/types";
 
 type Note = { seq: number; actor: string; label: string };
+export type AttemptRef = { number: number; seq: number };
 export interface TaskIncident {
   id: string;
   failure: Note;
   reason?: string;
   attempt?: number;
+  previousFailure?: AttemptRef;
+  nextAttempt?: AttemptRef;
   intervention?: Note;
   restart?: Note;
   result?: Note;
+}
+
+export function positiveAttempt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function failureLabel(event: RunEvent) {
@@ -40,20 +47,31 @@ export function taskIncidents(events: RunEvent[]): TaskIncident[] {
     const kind = event.event_type;
     const seq = event.event_seq;
     const actor = event.actor;
-    const count = kind === "agent.swimlane" ? p.attempts : p.attempt;
-    if (kind === "task.leased" && typeof count === "number") attempts.set(id, count);
-    const attempt = typeof count === "number" ? count : attempts.get(id);
+    const raw = kind === "agent.swimlane" ? p.attempts : p.attempt;
+    const count = positiveAttempt(raw);
+    if (kind === "task.leased") {
+      if (count === undefined) attempts.delete(id);
+      else attempts.set(id, count);
+    }
+    const attempt = raw == null ? attempts.get(id) : count;
     const incident = byTask.get(id);
     const failure = failureLabel(event);
     if (failure) {
+      if (attempt && incident?.attempt && attempt < incident.attempt) continue;
       // A terminal blocked event can follow the specific rejection in the same attempt.
       if (kind === "task.blocked" && incident && attempt !== undefined && attempt === incident.attempt &&
           !incident.result && !incident.restart && !incident.intervention) continue;
-      byTask.set(id, { id, attempt, failure: { seq, actor, label: failure },
+      const previousFailure = attempt && incident?.attempt && incident.attempt < attempt
+        ? { number: incident.attempt, seq: incident.failure.seq } : incident?.previousFailure;
+      byTask.set(id, { id, attempt, previousFailure, failure: { seq, actor, label: failure },
         reason: kind === "agent.swimlane" ? summaryText(p.summary) : undefined });
       continue;
     }
     if (!incident || incident.result || (incident.attempt !== undefined && attempt !== undefined && attempt < incident.attempt)) continue;
+    if (!incident.nextAttempt && incident.attempt && count && count > incident.attempt &&
+        (kind === "task.leased" || kind === "review.verdict_recorded" || kind === "task.accepted")) {
+      incident.nextAttempt = { number: count, seq };
+    }
     const note = (label: string): Note => ({ label, seq, actor });
     if (kind === "task.retried_by_human") incident.intervention = note("人工已请求重试");
     if (kind === "task.requeued") incident.intervention = note("已重新排队");

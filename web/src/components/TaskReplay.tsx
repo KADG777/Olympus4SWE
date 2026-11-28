@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchRunEvents } from "../api/client";
+import { AttemptEvidence } from "./AttemptEvidence";
 import { useT } from "../i18n";
 import { statusMeta } from "../lib/labels";
 import { indexReplay } from "../lib/taskReplay";
@@ -95,6 +96,7 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
                 setCursor(item.result!.seq); setRaw(true);
               }}>{t(item.result.label)} · #{item.result.seq}</button> : t("尚未记录该任务后续通过验收")}</dd>
             </dl>
+            <AttemptEvidence runId={runId} incident={item} onEvent={seq => { setCursor(seq); setRaw(true); }} />
           </article>)}
           <button className="btn" onClick={() => setRaw(true)}>{t("查看原始事件")}</button>
         </> : <>
