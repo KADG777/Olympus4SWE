@@ -292,6 +292,9 @@ export async function executeRunCommand(
   expectedRevision: number,
   body: CommandBody,
 ): Promise<RunCommandResult> {
+  if (document.querySelector("#run-replay:modal")) {
+    return { kind: "rejected", message: tr("只读回放") };
+  }
   const payload: CommandBody = {
     operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     expected_state_revision: expectedRevision,

@@ -94,6 +94,75 @@ def browser():
             launched.close()
 
 
+def test_task_replay_freezes_horizon_and_reconstructs_only_observed_tasks(workbench, browser):
+    store, run_id, url = workbench
+    events = store.list_events(run_id)
+    blocked = next(e for e in events if e.event_type == "agent.swimlane"
+                   and e.payload.get("task_id") == "T03-R1" and e.payload["status"] == "blocked")
+    end = events[-1].event_seq
+    page = browser.new_page()
+    writes = []
+    page.on("request", lambda req: writes.append(req.url) if req.method == "POST" else None)
+    page.goto(f"{url}/?run={run_id}&lang=zh")
+    page.get_by_role("button", name="故障复盘").click()
+    dialog = page.locator("#run-replay")
+    incident = dialog.get_by_role("article", name="T03-R1")
+    expect = playwright.expect
+    expect(incident).to_contain_text("同一候补者被递补 2 次")
+    expect(incident).to_contain_text("暂无重试或改派记录")
+    expect(incident).to_contain_text("尚未记录该任务后续通过验收")
+    expect(dialog.get_by_role("slider")).to_have_count(0)
+    incident.get_by_role("button", name=f"任务执行受阻 · #{blocked.event_seq}").click()
+    tasks = dialog.get_by_role("region", name="已观测任务")
+    expect(tasks).to_contain_text("T03-R1")
+    expect(dialog.get_by_role("slider")).to_have_value(str(blocked.event_seq))
+    dialog.get_by_role("button", name="上一步").click()
+    expect(tasks).not_to_contain_text("T03-R1")
+    dialog.get_by_role("button", name="下一步").click()
+    row = tasks.get_by_role("listitem").filter(has_text="T03-R1")
+    expect(row).to_contain_text("阻塞")
+    expect(row).to_contain_text("第 2 次尝试")
+    dialog.get_by_role("slider").press("End")
+    expect(dialog.get_by_role("slider")).to_have_value(str(end))
+    row.filter(has_text="Hephaestus").get_by_role("button").click()
+    expect(dialog.get_by_role("slider")).to_have_value(str(blocked.event_seq))
+    store.append_event(
+        run_id=run_id, stage="orchestrate", actor="chronos", event_type="task.leased",
+        payload={"task_id": "FUTURE-ONLY", "attempt": 1},
+    )
+    expect(dialog).to_contain_text("实时新增 1 条")
+    expect(dialog).not_to_contain_text("FUTURE-ONLY")
+    expect(dialog.get_by_role("slider")).to_have_value(str(blocked.event_seq))
+    dialog.get_by_role("button", name="回到实时").click()
+    expect(dialog).to_have_count(0)
+    assert not writes
+
+
+def test_failure_review_groups_retries_and_requires_task_acceptance(workbench, browser):
+    store, run_id, url = workbench
+    for kind, payload in [
+        ("task.retried_by_human", {"hint": "private hint"}),
+        ("task.leased", {"attempt": 3, "lease_generation": 3}),
+        ("review.verdict_recorded", {"attempt": 3, "passed": True}),
+        ("task.accepted", {"status": "accepted", "lease_generation": 3}),
+    ]:
+        store.append_event(run_id=run_id, stage="verify", actor="tester", event_type=kind,
+                           payload={"task_id": "T03-R1", **payload})
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}&lang=en")
+    page.get_by_role("button", name="Failure review").click()
+    dialog = page.get_by_role("dialog", name="Failure review")
+    row = dialog.get_by_role("article", name="T03-R1")
+    expect = playwright.expect
+    expect(dialog.get_by_role("article")).to_have_count(1)
+    expect(row).to_contain_text("Human retry requested")
+    expect(row).to_contain_text("New execution lease acquired")
+    expect(row).to_contain_text("Task accepted")
+    expect(dialog).not_to_contain_text("private hint")
+    row.get_by_role("button", name="Task accepted", exact=False).click()
+    expect(page.get_by_role("region", name="Selected event")).to_contain_text("task.accepted")
+
+
 def test_goal_rereview_shows_permission_impact_after_live_update(workbench, browser):
     store, _, url = workbench
     run_id = store.create_run(title="导出权限返审")
