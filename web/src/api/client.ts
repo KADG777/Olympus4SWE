@@ -11,6 +11,7 @@ import type {
   DeleteWorkspaceResponse,
   DemosResponse,
   ErrorResponse,
+  EventsResponse,
   FilesystemBrowseResponse,
   ProvidersResponse,
   RecordedAttemptArtifacts,
@@ -174,6 +175,15 @@ export async function fetchSnapshot(runId: string): Promise<RunProjection> {
     throw new ApiError((!data.ok && data.error) || tr("加载运行快照失败"), response.status);
   }
   return data.projection;
+}
+
+export async function fetchRunEvents(runId: string, signal: AbortSignal) {
+  const response = await fetch(`${runPath(runId)}/events?after_seq=0`, { signal, cache: "no-store" });
+  const data = await json<EventsResponse | ErrorResponse>(response);
+  if (!response.ok || !data.ok || data.run_id !== runId) {
+    throw new ApiError("Run event history unavailable", response.status);
+  }
+  return data.events;
 }
 
 export async function createRun(body: CreateRunBody): Promise<CreateRunResponse> {

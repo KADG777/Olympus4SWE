@@ -22,6 +22,7 @@ export type PantheonGod = RunSummary["active_god"];
 export type PendingAction = RunSummary["pending_action"];
 export type SeatState = PantheonSeatSummary["state"];
 export type RunEvent = Schemas["RunEvent"];
+export type EventsResponse = Schemas["EventsResponse"];
 export type RunProgressItem = Schemas["RunProgressItem"];
 export type DagNode = Schemas["DagNode"];
 export type DagEdge = Schemas["DagEdge"];

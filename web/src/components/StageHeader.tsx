@@ -4,6 +4,7 @@ import { localized, useT } from "../i18n";
 import type { Workbench, WorkbenchState } from "../state/workbench";
 import { statusMeta, VIEWS, type View } from "../lib/labels";
 import { StatCells } from "./ui";
+import { TaskReplay } from "./TaskReplay";
 
 const VIEW_LABELS: Record<View, string> = localized({
   topology: "工作流",
@@ -70,6 +71,10 @@ export function StageHeader({ workbench, state }: { workbench: Workbench; state:
           ))}
         </nav>
         <div className="stage-actions">
+          {projection && projection.run_id === state.runId && (
+            <TaskReplay key={projection.run_id} runId={projection.run_id}
+              latestSeq={projection.latest_event_seq} workbench={workbench} />
+          )}
           <button
             type="button"
             className="btn"
