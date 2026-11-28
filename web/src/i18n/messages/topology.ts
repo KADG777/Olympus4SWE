@@ -2,6 +2,8 @@
 export const EN: Record<string, string> = {
   "故障复盘": "Failure review",
   "查看尝试证据": "Inspect attempt evidence",
+  "收起尝试证据": "Hide attempt evidence",
+  "收起原始事件": "Hide source events",
   "故障记录缺少有效的尝试编号。": "No valid attempt number was recorded for this failure.",
   "正在读取尝试产物…": "Loading attempt artifacts…",
   "本次尝试没有归档产物。": "No artifacts were archived for this attempt.",

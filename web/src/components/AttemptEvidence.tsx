@@ -63,7 +63,7 @@ export function AttemptEvidence({ runId, incident, onEvent }: {
   const pair = incident.nextAttempt ? [current, incident.nextAttempt] : [incident.previousFailure, current];
   return <div className="attempt-evidence">
     <button className="btn" type="button" aria-expanded={open} aria-controls={panelId}
-      onClick={() => setOpen(value => !value)}>{t("查看尝试证据")}</button>
+      onClick={() => setOpen(value => !value)}>{t(open ? "收起尝试证据" : "查看尝试证据")}</button>
     {open && <div id={panelId}>
       <div className="attempt-columns">
         {pair.map(ref => ref && <AttemptColumn key={ref.number} runId={runId} taskId={incident.id}

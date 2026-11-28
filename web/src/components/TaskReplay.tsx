@@ -31,6 +31,7 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
 }) {
   const t = useT();
   const dialog = useRef<HTMLDialogElement>(null);
+  const sourceToggle = useRef<HTMLButtonElement>(null);
   const [index, setIndex] = useState<ReturnType<typeof indexReplay> | null>(null);
   const [cursor, setCursor] = useState(0);
   const [raw, setRaw] = useState(false);
@@ -46,11 +47,18 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
       if (abort.signal.aborted) return;
       const loaded = indexReplay(runId, horizon, events);
       setIndex(loaded);
-      setCursor(loaded.incidents[0]?.failure.seq ?? horizon);
+      setCursor(horizon);
     }).catch(() => { if (!abort.signal.aborted) setFailed(true); });
     return () => abort.abort();
   }, [runId, horizon, request]);
   const tasks = useMemo(() => index?.tasksAt(cursor) ?? [], [index, cursor]);
+  const through = raw ? cursor : horizon;
+  const incidents = useMemo(() => index?.incidentsAt(through) ?? [], [index, through]);
+  function openSource(seq: number) {
+    setCursor(seq);
+    setRaw(true);
+    sourceToggle.current?.focus();
+  }
   const event = index?.events[cursor - 1];
   const step = (delta: number) => setCursor(value => Math.max(0, Math.min(value + delta, horizon)));
   return (
@@ -64,20 +72,20 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
       }}>
       <header className="replay-head">
         <div><span className="badge" data-variant="live">{t("只读回放")}</span>
-          <h2 id="replay-title" className="dialog-title">{raw ? t("原始事件") : t("故障复盘")}</h2><code>{runId}</code></div>
+          <h2 id="replay-title" className="dialog-title">{t("故障复盘")}</h2><code>{runId}</code></div>
         <button type="button" className="btn" onClick={() => dialog.current?.close()}>{t("回到实时")}</button>
       </header>
       {failed ? <div role="alert">{t("未能读取完整历史。")}
         <button type="button" className="btn" onClick={() => setRequest(n => n + 1)}>{t("重试")}</button></div>
         : !index ? <p role="status">{t("正在读取事件…")}</p>
-        : !raw ? <>
+        : <>
           <div className="replay-row replay-summary">
-            <strong>{t("涉及 {n} 个故障任务", { n: index.incidents.length })}</strong>
-            <small>{t("截至事件 {n}", { n: horizon })}</small>
+            <strong>{t("涉及 {n} 个故障任务", { n: incidents.length })}</strong>
+            <small>{t("截至事件 {n}", { n: through })}</small>
             {liveSeq > horizon && <span className="badge" data-variant="live">{t("实时新增 {n} 条", { n: liveSeq - horizon })}</span>}
           </div>
-          {!index.incidents.length && <p>{t("这段历史中没有记录到任务故障。")}</p>}
-          {index.incidents.map(item => <article key={item.id} className="incident-card" aria-label={item.id}>
+          {!incidents.length && <p>{t("这段历史中没有记录到任务故障。")}</p>}
+          {incidents.map(item => <article key={item.id} className="incident-card" aria-label={item.id}>
             <header className="replay-row"><strong>{item.id}</strong>
               <span className="badge" data-variant={item.result?.label === "任务已验收" ? "ok" : "warn"}>
                 {t(item.result?.label ?? "尚无验收结果")}
@@ -86,25 +94,24 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
             <h3>{item.reason ?? t(item.failure.label)}</h3>
             <p>{item.failure.actor}{item.attempt && <> · {t("第 {n} 次尝试", { n: item.attempt })}</>}</p>
             <dl>
-              <dt>{t("故障证据")}</dt><dd><button className="btn" onClick={() => { setCursor(item.failure.seq); setRaw(true); }}>
+              <dt>{t("故障证据")}</dt><dd><button className="btn" onClick={() => openSource(item.failure.seq)}>
                 {t(item.failure.label)} · #{item.failure.seq}</button></dd>
               <dt>{t("后续处理")}</dt><dd>{!item.intervention && !item.restart && t("暂无重试或改派记录")}
                 {[item.intervention, item.restart].map(note => note && <button key={note.seq} className="btn" onClick={() => {
-                  setCursor(note.seq); setRaw(true);
+                  openSource(note.seq);
                 }}>{t(note.label)} · {note.actor} · #{note.seq}</button>)}</dd>
               <dt>{t("验证结果")}</dt><dd>{item.result ? <button className="btn" onClick={() => {
-                setCursor(item.result!.seq); setRaw(true);
+                openSource(item.result!.seq);
               }}>{t(item.result.label)} · #{item.result.seq}</button> : t("尚未记录该任务后续通过验收")}</dd>
             </dl>
-            <AttemptEvidence runId={runId} incident={item} onEvent={seq => { setCursor(seq); setRaw(true); }} />
+            {through === horizon && <AttemptEvidence runId={runId} incident={item} onEvent={openSource} />}
           </article>)}
-          <button className="btn" onClick={() => setRaw(true)}>{t("查看原始事件")}</button>
-        </> : <>
-          <button className="btn" onClick={() => setRaw(false)}>{t("返回故障摘要")}</button>
+          <button ref={sourceToggle} type="button" className="btn" aria-expanded={raw} aria-controls="replay-source"
+            onClick={() => setRaw(value => !value)}>{t(raw ? "收起原始事件" : "查看原始事件")}</button>
+          <div id="replay-source" hidden={!raw}>{raw && <>
           <section className="replay-controls" aria-label={t("回放位置")}>
             <div className="replay-row">
               <strong>{t("事件序号")} <output>#{cursor}</output> / {horizon}</strong>
-              {liveSeq > horizon && <span className="badge" data-variant="live">{t("实时新增 {n} 条", { n: liveSeq - horizon })}</span>}
             </div>
             <input type="range" min={0} max={horizon} value={cursor} disabled={!horizon}
               aria-label={t("回放位置")} onChange={e => setCursor(Number(e.target.value))} />
@@ -133,6 +140,7 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
                 </li>;
               })}</ul>}
           </section>
+          </>}</div>
         </>}
     </dialog>
   );
