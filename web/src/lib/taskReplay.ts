@@ -1,5 +1,5 @@
 import type { RunEvent } from "../api/types";
-import { taskIncidents } from "./taskIncidents";
+import { indexIncidents, positiveAttempt } from "./taskIncidents";
 
 interface ObservedTask {
   id: string;
@@ -34,8 +34,7 @@ function observation(event: RunEvent, prior?: ObservedTask): ObservedTask | unde
   if (typeof status !== "string" || (!STATES.has(status) && status !== "accepted_with_risk")) return;
   return {
     id: p.task_id, actor: event.actor, status, seq: event.event_seq,
-    attempt: typeof attempt === "number" && Number.isInteger(attempt) && attempt > 0
-      ? attempt : prior?.attempt,
+    attempt: attempt == null ? prior?.attempt : positiveAttempt(attempt),
   };
 }
 
@@ -61,7 +60,7 @@ export function indexReplay(runId: string, horizon: number, history: RunEvent[])
     if ((index + 1) % CHECKPOINT_INTERVAL === 0) checkpoints.push(new Map(tasks));
   });
   return {
-    events, incidents: taskIncidents(events),
+    events, incidentsAt: indexIncidents(events),
     tasksAt(cursor: number) {
       const block = Math.floor(cursor / CHECKPOINT_INTERVAL);
       const current = new Map(checkpoints[block]);

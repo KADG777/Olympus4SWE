@@ -111,13 +111,35 @@ def test_task_replay_freezes_horizon_and_reconstructs_only_observed_tasks(workbe
     expect(incident).to_contain_text("同一候补者被递补 2 次")
     expect(incident).to_contain_text("暂无重试或改派记录")
     expect(incident).to_contain_text("尚未记录该任务后续通过验收")
+    incident.get_by_role("button", name="查看尝试证据").click()
+    attempt = incident.get_by_role("region", name="第 2 次尝试")
+    expect(attempt.get_by_role("listitem").filter(has_text="T03-R1-cmd")).to_contain_text("未通过")
+    expect(attempt).to_contain_text("src/waitlist/waitlist.py")
+    expect(incident).to_contain_text("截至回放终点，未记录后续尝试。")
+    expect(incident.get_by_role("region")).to_have_count(1)
+    expect(dialog.get_by_role("slider")).to_have_count(0)
+    # Both disclosures expand and collapse at their own controls, including via keyboard.
+    incident.get_by_role("button", name="收起尝试证据").press("Enter")
+    expect(incident.get_by_role("region")).to_have_count(0)
+    source = dialog.get_by_role("button", name=re.compile(r"^(查看|收起)原始事件$"))
+    source.press("Enter")
+    expect(source).to_have_attribute("aria-expanded", "true")
+    expect(dialog.get_by_role("slider")).to_have_value(str(end))
+    source.press("Space")
+    expect(source).to_have_attribute("aria-expanded", "false")
     expect(dialog.get_by_role("slider")).to_have_count(0)
     incident.get_by_role("button", name=f"任务执行受阻 · #{blocked.event_seq}").click()
+    expect(dialog.get_by_role("button", name="查看尝试证据")).to_have_count(0)
     tasks = dialog.get_by_role("region", name="已观测任务")
     expect(tasks).to_contain_text("T03-R1")
     expect(dialog.get_by_role("slider")).to_have_value(str(blocked.event_seq))
     dialog.get_by_role("button", name="上一步").click()
     expect(tasks).not_to_contain_text("T03-R1")
+    expect(incident).to_have_count(0)
+    source.click()
+    expect(incident).to_contain_text("同一候补者被递补 2 次")
+    source.click()
+    expect(incident).to_have_count(0)
     dialog.get_by_role("button", name="下一步").click()
     row = tasks.get_by_role("listitem").filter(has_text="T03-R1")
     expect(row).to_contain_text("阻塞")
@@ -138,8 +160,17 @@ def test_task_replay_freezes_horizon_and_reconstructs_only_observed_tasks(workbe
     assert not writes
 
 
-def test_failure_review_groups_retries_and_requires_task_acceptance(workbench, browser):
+def test_failure_review_groups_retries_and_requires_task_acceptance(workbench, browser, tmp_path):
     store, run_id, url = workbench
+    later = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T03-R1" / "attempt-3"
+    later.mkdir()
+    (later / "check-T03-R1-cmd.log").write_text(
+        "command: pytest\nexit_code: 0\n--- stdout ---\nFAKE_PRIVATE_OUTPUT\n", encoding="utf-8"
+    )
+    (later / "diff.patch").write_text(
+        "--- a/fix.py\n+++ b/fix.py\n@@ -1 +1 @@\n-old\n+FAKE_PRIVATE_OUTPUT\n", encoding="utf-8"
+    )
+    (later / "check-sk-fixture-private-label.log").write_text("test only", encoding="utf-8")
     for kind, payload in [
         ("task.retried_by_human", {"hint": "private hint"}),
         ("task.leased", {"attempt": 3, "lease_generation": 3}),
@@ -158,9 +189,68 @@ def test_failure_review_groups_retries_and_requires_task_acceptance(workbench, b
     expect(row).to_contain_text("Human retry requested")
     expect(row).to_contain_text("New execution lease acquired")
     expect(row).to_contain_text("Task accepted")
+    row.get_by_role("button", name="Inspect attempt evidence").click()
+    before = row.get_by_role("region", name="Attempt 2")
+    after = row.get_by_role("region", name="Attempt 3")
+    expect(before.get_by_role("listitem").filter(has_text="T03-R1-cmd")).to_contain_text(
+        "Not passed"
+    )
+    expect(after.get_by_role("listitem").filter(has_text="T03-R1-cmd")).to_contain_text("Passed")
+    expect(after).to_contain_text("fix.py")
+    expect(after).to_contain_text("+1 / −1")
+    expect(dialog).not_to_contain_text("FAKE_PRIVATE_OUTPUT")
+    expect(dialog).not_to_contain_text("sk-fixture")
     expect(dialog).not_to_contain_text("private hint")
+    before.get_by_role("button").click()
+    expect(row).not_to_contain_text("Task accepted")
+    expect(row).not_to_contain_text("New execution lease acquired")
+    dialog.get_by_role("button", name="Hide source events").click()
     row.get_by_role("button", name="Task accepted", exact=False).click()
     expect(page.get_by_role("region", name="Selected event")).to_contain_text("task.accepted")
+
+
+def test_attempt_evidence_handles_absent_empty_and_retried_reads(workbench, browser, tmp_path):
+    store, run_id, url = workbench
+    for task, number in [("T01", 6), ("T02", 0)]:
+        store.append_event(run_id=run_id, stage="verify", actor="tester", event_type="task.failed",
+                           payload={"task_id": task, "attempt": number})
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}&lang=en")
+    page.get_by_role("button", name="Failure review").click()
+    dialog = page.get_by_role("dialog", name="Failure review")
+    invalid = dialog.get_by_role("article", name="T02")
+    playwright.expect(invalid).to_contain_text("No valid attempt number")
+    missing_button = invalid.get_by_role("button", name="Inspect attempt evidence")
+    playwright.expect(missing_button).to_have_count(0)
+
+    # Hold another task's read while switching evidence panels.
+    pending = []
+    page.route("**/task-artifacts/T03-R1/2", lambda route: pending.append(route))
+    original = dialog.get_by_role("article", name="T03-R1")
+    toggle = original.get_by_role("button", name=re.compile("attempt evidence", re.I))
+    with page.expect_request("**/task-artifacts/T03-R1/2"):
+        toggle.click()
+    toggle.click()
+    row = dialog.get_by_role("article", name="T01")
+    button = row.get_by_role("button", name=re.compile("attempt evidence", re.I))
+    button.click()
+    playwright.expect(row).to_contain_text("No artifacts were archived")
+    assert pending
+    pending[0].fulfill(json={"ok": True, "artifacts": {
+        "manifest_md": "", "verdicts": [], "diff_patch": "", "check_logs": {"STALE": ""},
+    }})
+    playwright.expect(dialog).not_to_contain_text("STALE")
+    button.click()
+    attempt_dir = tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T01" / "attempt-6"
+    attempt_dir.mkdir(parents=True)
+    page.route("**/task-artifacts/T01/6", lambda route: route.fulfill(
+        status=503, json={"ok": False, "error": "temporary"},
+    ), times=1)
+    button.click()
+    playwright.expect(row.get_by_role("alert")).to_contain_text("Could not load")
+    row.get_by_role("button", name="Retry", exact=True).click()
+    playwright.expect(row).to_contain_text("No check results recorded")
+    playwright.expect(row).to_contain_text("No patch recorded")
 
 
 def test_goal_rereview_shows_permission_impact_after_live_update(workbench, browser):

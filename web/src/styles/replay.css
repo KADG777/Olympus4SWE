@@ -25,6 +25,13 @@
 .incident-card dl { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: var(--space-2) var(--space-3); }
 .incident-card dd { margin: 0; }
 .incident-card dd button { margin-inline-end: var(--space-1); }
+.attempt-evidence { margin-block-start: var(--space-3); }
+.attempt-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: var(--space-2); }
+.attempt-column { margin-block-start: var(--space-2); padding: var(--space-3); border: 1px solid var(--rule); border-radius: var(--radius); }
+.attempt-column header { justify-content: space-between; }
+.attempt-column h4 { margin: var(--space-3) 0 var(--space-1); }
+.attempt-column ul { list-style: none; margin: 0; padding: 0; }
+.attempt-column li { padding-block: var(--space-1); }
 .replay-event { margin-block: var(--space-4); padding-inline-start: var(--space-3); border-inline-start: 2px solid var(--accent); }
 #run-replay h3 { font-size: var(--text-base); margin-block: var(--space-2); }
 .replay-event p { margin-block: var(--space-1); }

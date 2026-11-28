@@ -259,9 +259,10 @@ export async function fetchAttemptArtifacts(
   runId: string,
   taskId: string,
   attempt: number,
+  signal?: AbortSignal,
 ): Promise<RecordedAttemptArtifacts> {
   const url = `${runPath(runId)}/task-artifacts/${encodeURIComponent(taskId)}/${attempt}`;
-  const response = await fetch(url);
+  const response = await fetch(url, { signal, cache: "no-store" });
   const data = await json<AttemptArtifactsResponse | ErrorResponse>(response);
   if (!response.ok || !data.ok) {
     throw new ApiError((!data.ok && data.error) || tr("读取执行产物失败"), response.status);
